@@ -8779,8 +8779,8 @@ const DIRECT_GROUP_HISTORY_MAX = 200;
 function directGroupId(value) { const id = String(value || '').trim().toLowerCase(); return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id) ? id : ''; }
 function serializeDirectGroupMessage(row) {
   if (!row) return null;
-  const type = row.message_type === 'poll' ? 'poll' : normalizeDirectMessageType(row.message_type, normalizeDirectMessageMedia(row.content));
-  return { id:String(row.id), groupId:String(row.group_id), from:normalizeDirectMessageUser(row.sender_name), text:String(row.text || '').slice(0,DIRECT_MESSAGE_TEXT_MAX), type, content:type === 'poll' ? normalizeDirectGroupPoll(row.content,true) : normalizeDirectMessageMedia(row.content), replyTo:normalizeDirectMessageReply(row.reply_to), reactions:normalizeDirectMessageReactions(row.reactions,DIRECT_GROUP_MAX_MEMBERS), pinnedAt:row.pinned_at ? new Date(row.pinned_at).toISOString():null, editedAt:row.edited_at ? new Date(row.edited_at).toISOString():null, createdAt:new Date(row.created_at).toISOString() };
+  const type = row.message_type === 'playing' ? 'playing' : (row.message_type === 'poll' ? 'poll' : normalizeDirectMessageType(row.message_type, normalizeDirectMessageMedia(row.content)));
+  return { id:String(row.id), groupId:String(row.group_id), from:normalizeDirectMessageUser(row.sender_name), text:String(row.text || '').slice(0,DIRECT_MESSAGE_TEXT_MAX), type, content:type === 'playing' ? normalizeSocialPlaying(row.content) : (type === 'poll' ? normalizeDirectGroupPoll(row.content,true) : normalizeDirectMessageMedia(row.content)), replyTo:normalizeDirectMessageReply(row.reply_to), reactions:normalizeDirectMessageReactions(row.reactions,DIRECT_GROUP_MAX_MEMBERS), pinnedAt:row.pinned_at ? new Date(row.pinned_at).toISOString():null, editedAt:row.edited_at ? new Date(row.edited_at).toISOString():null, createdAt:new Date(row.created_at).toISOString() };
 }
 function normalizeDirectGroupPoll(value, allowVoters = false) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
@@ -8871,7 +8871,7 @@ async function getDirectGroupList(viewer) {
   return (result.rows||[]).map(row=>{
     let lastMessage=row.last_id?{
       id:String(row.last_id),from:row.last_sender,
-      text:row.last_type==='poll'?'📊 Created a poll.':row.last_text,
+      text:row.last_type==='poll'?'📊 Created a poll.':(row.last_type==='playing'?'🎮 Playing on PS3'+(row.last_text?' · '+row.last_text:''):row.last_text),
       createdAt:row.last_created
     }:null;
     if(lastMessage&&lastMessage.from===viewer)lastMessage=addDirectGroupReadReceipts(lastMessage,Array.isArray(row.receipt_members)?row.receipt_members:[]);
@@ -8906,7 +8906,7 @@ async function getDirectGroupPreview(viewer) {
     createdAt:row.created_at, memberCount:null, unread:null,
     lastMessage:row.last_id ? {
       id:String(row.last_id), from:row.last_sender,
-      text:row.last_type === 'poll' ? '📊 Created a poll.' : row.last_text,
+      text:row.last_type === 'poll' ? '📊 Created a poll.' : (row.last_type === 'playing' ? '🎮 Playing on PS3'+(row.last_text ? ' · '+row.last_text : '') : row.last_text),
       createdAt:row.last_created
     } : null
   }));
@@ -9080,16 +9080,18 @@ function newestDirectActivityIso(...values) {
 
 function serializeDirectMessage(row) {
   if (!row) return null;
-  const pollType = String(row.message_type || row.type || '') === 'poll';
-  const content = pollType ? normalizeDirectPoll(row.content, true) : normalizeDirectMessageMedia(row.content);
-  const type = pollType ? 'poll' : normalizeDirectMessageType(row.message_type || row.type, content);
+  const rawType = String(row.message_type || row.type || '');
+  const pollType = rawType === 'poll';
+  const playingType = rawType === 'playing';
+  const content = playingType ? normalizeSocialPlaying(row.content) : (pollType ? normalizeDirectPoll(row.content, true) : normalizeDirectMessageMedia(row.content));
+  const type = playingType && content ? 'playing' : (pollType ? 'poll' : normalizeDirectMessageType(rawType, content));
   return {
     id: String(row.id || ''),
     from: normalizeDirectMessageUser(row.sender_name || row.from),
     to: normalizeDirectMessageUser(row.recipient_name || row.to),
     text: String(row.text == null ? '' : row.text).slice(0, DIRECT_MESSAGE_TEXT_MAX),
     type,
-    content: type === 'poll' ? content : (content.length ? content : null),
+    content: type === 'playing' || type === 'poll' ? content : (content.length ? content : null),
     replyTo: normalizeDirectMessageReply(row.reply_to || row.replyTo),
     reactions: normalizeDirectMessageReactions(row.reactions),
     createdAt: row.created_at ? new Date(row.created_at).toISOString() : (row.createdAt || new Date().toISOString()),
@@ -16073,10 +16075,12 @@ io.on('connection', (socket) => {
     const id=directGroupId(data.groupId),sender=normalizeDirectMessageUser(socket.userName);
     const text=normalizeDirectMessageText(data.text);
     const isPoll=String(data.type||'')==='poll';
+    const isPlaying=String(data.type||'')==='playing';
     const poll=isPoll?normalizeDirectGroupPoll(data.content):null;
-    const media=isPoll?[]:normalizeDirectMessageMedia(data.content);
-    const type=isPoll?'poll':normalizeDirectMessageType(data.type,media);
-    if(!id||!sender||(!isPoll&&!directMessagePlainText(text)&&!media.length)||(isPoll&&!poll))return reply({success:false,message:'Enter a message or valid poll.'});
+    const playing=isPlaying?normalizeSocialPlaying(data.content):null;
+    const media=isPoll||isPlaying?[]:normalizeDirectMessageMedia(data.content);
+    const type=isPlaying?'playing':(isPoll?'poll':normalizeDirectMessageType(data.type,media));
+    if(!id||!sender||(isPlaying&&!playing)||(!isPoll&&!isPlaying&&!directMessagePlainText(text)&&!media.length)||(isPoll&&!poll))return reply({success:false,message:'Enter a message or valid game.'});
     const now=Date.now(),last=Number(socket.__groupLastSentAt)||0;
     if(last&&now-last<350)return reply({success:false,message:'You are sending too quickly.'});
     const sends=Array.isArray(socket.__groupSendWindow)?socket.__groupSendWindow.filter(t=>now-t<60000):[];if(sends.length>=60)return reply({success:false,message:'Too many messages. Try again shortly.'});sends.push(now);socket.__groupSendWindow=sends;socket.__groupLastSentAt=now;
@@ -16086,8 +16090,8 @@ io.on('connection', (socket) => {
       if(!member)return reply({success:false,message:'You are not a member of this group.'});
       let replyTo=null;
       const replyId=Math.max(0,Number(data.replyTo?.id||data.replyTo)||0);
-      if(replyId){const found=await pool.query('SELECT * FROM direct_group_messages WHERE group_id=$1 AND id=$2 AND created_at>=$3',[id,replyId,member.joined_at]);const m=serializeDirectGroupMessage(found.rows?.[0]);if(m)replyTo={id:m.id,from:m.from,text:(m.type==='poll'?m.content?.question:directMessagePlainText(m.text)||'[Image]').slice(0,DIRECT_MESSAGE_REPLY_TEXT_MAX),type:m.type};}
-      const result=await pool.query('INSERT INTO direct_group_messages (group_id,sender_name,text,message_type,content,reply_to) VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb) RETURNING *',[id,sender,isPoll?'📊 Created a poll.':text,type,isPoll?JSON.stringify(poll):media.length?JSON.stringify(media):null,replyTo?JSON.stringify(replyTo):null]);
+      if(replyId){const found=await pool.query('SELECT * FROM direct_group_messages WHERE group_id=$1 AND id=$2 AND created_at>=$3',[id,replyId,member.joined_at]);const m=serializeDirectGroupMessage(found.rows?.[0]);if(m)replyTo={id:m.id,from:m.from,text:(m.type==='poll'?m.content?.question:(m.type==='playing'?'🎮 Playing '+String(m.content?.title||'on PS3'):directMessagePlainText(m.text)||'[Image]')).slice(0,DIRECT_MESSAGE_REPLY_TEXT_MAX),type:m.type};}
+      const result=await pool.query('INSERT INTO direct_group_messages (group_id,sender_name,text,message_type,content,reply_to) VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb) RETURNING *',[id,sender,isPoll?'📊 Created a poll.':text,type,isPlaying?JSON.stringify(playing):(isPoll?JSON.stringify(poll):media.length?JSON.stringify(media):null),replyTo?JSON.stringify(replyTo):null]);
       const message=serializeDirectGroupMessage(result.rows[0]);
       await pool.query('UPDATE direct_group_members SET last_read_id=GREATEST(last_read_id,$3) WHERE group_id=$1 AND user_name=$2',[id,sender,Number(message.id)]);
       try {await emitDirectGroupLocal(id,'message',message);} catch(err) {console.error('[GROUP MESSAGE EMIT]',err?.message||err);}
@@ -16295,15 +16299,18 @@ io.on('connection', (socket) => {
     if (sender && recipient && normalizeDirectMessageUser(socket.__directTypingPeer) === recipient) stopDirectTypingForSocket(socket, recipient);
     const text = normalizeDirectMessageText(data.text);
     const isPoll = String(data.type || '') === 'poll';
+    const isPlaying = String(data.type || '') === 'playing';
     const poll = isPoll ? normalizeDirectPoll(data.content) : null;
-    const content = isPoll ? [] : normalizeDirectMessageMedia(data.content);
-    const messageType = isPoll ? 'poll' : normalizeDirectMessageType(data.type, content);
+    const playing = isPlaying ? normalizeSocialPlaying(data.content) : null;
+    const content = isPoll || isPlaying ? [] : normalizeDirectMessageMedia(data.content);
+    const messageType = isPlaying ? 'playing' : (isPoll ? 'poll' : normalizeDirectMessageType(data.type, content));
 
     if (socket.__passwordResetRevoked === true) return respond({ success:false, reason:'password_reset', message:'Your session has ended.' });
     if (!sender) return respond({ success:false, message:'Authentication required.' });
     if (!recipient || recipient === sender) return respond({ success:false, message:'Invalid recipient.' });
     if (isPoll && !poll) return respond({ success:false, message:'Enter a question and 2–4 valid options.' });
-    if (!isPoll && !directMessagePlainText(text) && !content.length) return respond({ success:false, message:'Type a message or attach media first.' });
+    if (isPlaying && !playing) return respond({ success:false, message:'No valid game to share.' });
+    if (!isPoll && !isPlaying && !directMessagePlainText(text) && !content.length) return respond({ success:false, message:'Type a message or attach media first.' });
 
     const directNow = Date.now();
     const directLastAt = Math.max(0, Number(socket.__directMessageLastAt) || 0);
@@ -16341,7 +16348,7 @@ io.on('connection', (socket) => {
         if (replyMessage) replySnapshot = {
           id:replyMessage.id,
           from:replyMessage.from,
-          text:(replyMessage.type === 'poll' ? String(replyMessage.content?.question || '') : directMessagePlainText(replyMessage.text)).slice(0, DIRECT_MESSAGE_REPLY_TEXT_MAX),
+          text:(replyMessage.type === 'poll' ? String(replyMessage.content?.question || '') : (replyMessage.type === 'playing' ? '🎮 Playing ' + String(replyMessage.content?.title || 'on PS3') : directMessagePlainText(replyMessage.text))).slice(0, DIRECT_MESSAGE_REPLY_TEXT_MAX),
           type:replyMessage.type || 'text'
         };
       }
@@ -16355,7 +16362,7 @@ io.on('connection', (socket) => {
              OR (blocker_name = $2 AND blocked_name = $1)
         )
         RETURNING id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, pinned_at, edited_at, created_at
-      `, [sender, recipient, isPoll ? '📊 Created a poll.' : text, messageType, isPoll ? JSON.stringify(poll) : (content.length ? JSON.stringify(content) : null), replySnapshot ? JSON.stringify(replySnapshot) : null], { attempts:2, label:'DIRECT MESSAGE INSERT' });
+      `, [sender, recipient, isPoll ? '📊 Created a poll.' : text, messageType, isPlaying ? JSON.stringify(playing) : (isPoll ? JSON.stringify(poll) : (content.length ? JSON.stringify(content) : null)), replySnapshot ? JSON.stringify(replySnapshot) : null], { attempts:2, label:'DIRECT MESSAGE INSERT' });
       const message = serializeDirectMessage(inserted.rows[0]);
       if (!message) return respond({ success:false, reason:'blocked', message:'This Private Chat is blocked.' });
 
@@ -16814,6 +16821,10 @@ io.on('connection', (socket) => {
         totalVotes: options.reduce((sum, option) => sum + option.voters.length, 0)
       };
       messageType = 'poll';
+    } else if (incomingType === 'playing') {
+      safeContent = normalizeSocialPlaying(incoming.content);
+      if (!safeContent) return respond({success:false,message:'No valid game to share.'});
+      messageType = 'playing';
     } else {
       const rawContent = Array.isArray(incoming.content) ? incoming.content : [];
       const media = rawContent.slice(0, CHAT_MESSAGE_MEDIA_MAX)
@@ -18450,7 +18461,8 @@ io.on('connection', (socket) => {
         const wasEditedByStaff = (!isOwner && canModerate);
         const wasEditedByAdmin = (!isOwner && isAdmin);
         const nextText = String(data.newText == null ? '' : data.newText);
-        const nextType = data.content ? (data.type || 'image') : msg.type;
+        const editingPlaying = data.type === 'playing' && msg.type === 'playing' ? normalizeSocialPlaying(data.content) : null;
+        const nextType = editingPlaying ? 'playing' : (data.content ? (data.type || 'image') : msg.type);
         const textUnchanged = String(msg.text == null ? '' : msg.text) === nextText;
         const contentUnchanged = !data.content || stableStringifySmall(msg.content || null) === stableStringifySmall(data.content || null);
         const typeUnchanged = !data.content || String(msg.type || '') === String(nextType || '');
@@ -18465,7 +18477,10 @@ io.on('connection', (socket) => {
           msg.editedByRole = actorRole;
         }
 
-        if (data.content) {
+        if (editingPlaying) {
+          msg.type = 'playing';
+          msg.content = editingPlaying;
+        } else if (data.content && data.type !== 'playing') {
           msg.type = data.type || 'image';
           msg.content = data.content;
         }
