@@ -9014,7 +9014,7 @@ html.psn-scroll-nav-active #psn-floating-status-dock {--psn-status-right:82px;}
 							<button type="button" class="psn-social-feed-option" data-social-filter="friends" aria-pressed="false">Friends</button>
 							<button type="button" class="psn-social-feed-option" data-social-filter="mine" aria-pressed="false">My Activity</button>
 						</div>
-						<button type="button" id="psn-social-online-wrapper" onmouseenter="if(typeof playUiHover==='function')playUiHover()" onclick="playUiClick();openOnlineModal()" title="View online players" aria-label="View online players"><span id="psn-social-online-count">0 Online</span><i class="fas fa-comments" style="opacity: 0.2;" aria-hidden="true"></i></button>
+						<button type="button" id="psn-social-online-wrapper" onmouseenter="if(typeof playUiHover==='function')playUiHover()" onclick="playUiClick();openOnlineModal('social')" title="View online players" aria-label="View online players"><span id="psn-social-online-count">0 Online</span><i class="fas fa-comments" style="opacity: 0.2;" aria-hidden="true"></i></button>
 					</header>
 					<section class="psn-social-card psn-social-composer is-collapsed" aria-label="Create a public post">
 						<div class="psn-social-compose-bar">
@@ -30504,6 +30504,7 @@ P
 		const navItem = PSN_TOP_NAV_BY_TAB[tab] || document.getElementById(`top-nav-${tab}`);
 		
 		const currentView = getCurrentPsnViewElement()?.id || '';
+		if (tab === 'social' && currentView !== 'view-social') window.psnSocialResetFeedFilter?.();
 		
 		let isPrimaryView = false;
 		if (tab === 'home' && currentView === 'view-explore') isPrimaryView = true;
@@ -73428,7 +73429,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
     // CHAT LOGIC
     // ==========================================================================
     const serverUrls = [
-		"https://psn-content-ok3c.onrender.com",
+		"https://psn-content-35hq.onrender.com",
 		
 
 	];
@@ -98390,7 +98391,7 @@ function getVisibleChatStackEl(id) {
 		return (match && match[2].length === 11) ? match[2] : null;
 	}
 	
-	function openOnlineModal() {
+	function openOnlineModal(source = '') {
 		if (typeof playUiModal === 'function') playUiModal();
 		
 		const modal = document.getElementById('modal-sys-online');
@@ -98398,6 +98399,7 @@ function getVisibleChatStackEl(id) {
 		const countElement = PSN_STATIC_NAV_DOM.onlineCount;
 		
 		if (!modal || !container) return;
+		modal.dataset.onlineScope = source === 'social' && document.querySelector('#view-social .psn-social-feed-option.is-selected')?.dataset.socialFilter === 'friends' ? 'friends' : 'all';
 	
 		modal.style.opacity = '';
 		modal.style.pointerEvents = '';
@@ -98424,11 +98426,6 @@ function getVisibleChatStackEl(id) {
 			for (const user of (Array.isArray(currentOnlineList) ? currentOnlineList : [])) if (user && user.online === true) activeUserCount++;
 		}
 		if (countElement) window.setLiveCountText(countElement, `${activeUserCount} Online`, activeUserCount);
-		const onlinePlayersTitle = PSN_STATIC_NAV_DOM.onlinePlayersTitle;
-		if (onlinePlayersTitle) { const nextTitle = activeUserCount === 1 ? 'Online Player' : 'Online Players'; if (onlinePlayersTitle.textContent !== nextTitle) onlinePlayersTitle.textContent = nextTitle; }
-		const onlinePlayersTitleCount = PSN_STATIC_NAV_DOM.onlinePlayersTitleCount;
-		if (onlinePlayersTitleCount) window.setLiveCountText(onlinePlayersTitleCount, `${activeUserCount} ${activeUserCount === 1 ? 'player' : 'players'}`, activeUserCount);
-	
 		renderOnlineList();
 	
 		requestAnimationFrame(() => {
@@ -98639,19 +98636,25 @@ function getVisibleChatStackEl(id) {
 		const friendNames = window.__friendsNameSetSource === friendList && window.__friendsNameSetLength === friendList.length && window.__friendsNameSet instanceof Set
 			? window.__friendsNameSet
 			: (window.__friendsNameSetSource = friendList, window.__friendsNameSetLength = friendList.length, window.__friendsNameSet = new Set(friendMap.keys()));
+		const friendsOnly = document.getElementById('modal-sys-online')?.dataset.onlineScope === 'friends';
+		const pendingRemovals = friendsOnly && window.__pendingFriendUndoRemovals instanceof Set ? window.__pendingFriendUndoRemovals : null;
+		const visibleFriendNames = pendingRemovals?.size
+			? new Set(friendList.filter(friend => !pendingRemovals.has(getPendingFriendRemovalKey(friend && (friend.name || friend)))).map(friend => String(friend && (friend.name || friend) || '')))
+			: friendNames;
 		let me = null;
 		const others = [];
 		let activeCount = 0;
 		for (const user of (Array.isArray(currentOnlineList) ? currentOnlineList : [])) {
 			if (!user || user.online !== true) continue;
+			if (friendsOnly && !visibleFriendNames.has(String(user.name || user))) continue;
 			activeCount++;
 			if ((user.name || user) === myName) me = user;
 			else others.push(user);
 		}
 		const onlinePlayersTitle = PSN_STATIC_NAV_DOM.onlinePlayersTitle;
-		if (onlinePlayersTitle) { const nextTitle = activeCount === 1 ? 'Online Player' : 'Online Players'; if (onlinePlayersTitle.textContent !== nextTitle) onlinePlayersTitle.textContent = nextTitle; }
+		if (onlinePlayersTitle) { const nextTitle = friendsOnly ? (activeCount === 1 ? 'Online Friend' : 'Online Friends') : (activeCount === 1 ? 'Online Player' : 'Online Players'); if (onlinePlayersTitle.textContent !== nextTitle) onlinePlayersTitle.textContent = nextTitle; }
 		const onlinePlayersTitleCount = PSN_STATIC_NAV_DOM.onlinePlayersTitleCount;
-		if (onlinePlayersTitleCount) window.setLiveCountText(onlinePlayersTitleCount, `${activeCount} ${activeCount === 1 ? 'player' : 'players'}`, activeCount);
+		if (onlinePlayersTitleCount) window.setLiveCountText(onlinePlayersTitleCount, `${activeCount} ${friendsOnly ? (activeCount === 1 ? 'friend' : 'friends') : (activeCount === 1 ? 'player' : 'players')}`, activeCount);
 
 		const rolePriority = { admin: 3, mod: 2, trusted: 1, user: 0 };
 		const sortRoleByName = new Map();
@@ -98675,7 +98678,7 @@ function getVisibleChatStackEl(id) {
 			window.queuePsnUserMetaRefresh(orderedUsers.map(user => user && (user.name || user)), { maxAge:PSN_VISIBLE_AVATAR_FRESH_MS });
 		}
 		const onlineRenderContext = buildOnlineListRenderContext(orderedUsers, myName, friendNames, sortRoleByUser);
-		const renderSignature = onlineRenderContext.renderSignature;
+		const renderSignature = `${friendsOnly ? 'friends' : 'all'}|${onlineRenderContext.renderSignature}`;
 		const previousCanModerate = container.dataset.onlineRenderCanModerate;
 		if (window.__onlineListRealtimeAnimation && isOnlinePlayersModalVisible()) {
 			if (container.dataset.onlineRenderSignature !== renderSignature) window.__onlineListRenderPending = true;
@@ -98725,7 +98728,7 @@ function getVisibleChatStackEl(id) {
 			const empty = document.createElement('div');
 			empty.className = 'online-users-empty-state';
 			empty.style.cssText = 'text-align:center; padding:20px; color:var(--text-muted);';
-			empty.textContent = 'No users online.';
+			empty.textContent = friendsOnly ? 'No friends online.' : 'No users online.';
 			nextOnlineFragment.appendChild(empty);
 		} else {
 			for (const user of orderedUsers) renderUserItem(nextOnlineFragment, user, (user.name || user) === myName, friendNames, onlineRenderContext);
@@ -104382,6 +104385,8 @@ function getVisibleChatStackEl(id) {
 			if (wrapper.getAttribute('aria-label') !== label) wrapper.setAttribute('aria-label', label);
 		}
 		window.updateSocialOnlineCount?.();
+		const onlineModal = document.getElementById('modal-sys-online');
+		if (onlineModal?.dataset.onlineScope === 'friends' && onlineModal.classList.contains('show')) renderOnlineList();
 		return count;
 	};
 
@@ -117467,7 +117472,9 @@ function getVisibleChatStackEl(id) {
     }
 
   }
+  window.psnSocialResetFeedFilter=function(){if(state.filter!=='all')setSocialFeedFilter('all',false);};
   window.psnSocialOpen=function(){
+    window.psnSocialResetFeedFilter();
     init();observeSocket();attachUnseen();syncSocialComposerIdentity();window.updateSocialOnlineCount?.();
     const current=identity();
     if(state.owner!==current){
