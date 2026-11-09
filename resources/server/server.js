@@ -5086,6 +5086,11 @@ const CONTENT_DOWNLOAD_COUNT_CACHE_MAX = Math.max(250, parseInt(process.env.CONT
 const CONTENT_DOWNLOAD_COUNT_REQUEST_MAX = Math.max(25, Math.min(500, parseInt(process.env.CONTENT_DOWNLOAD_COUNT_REQUEST_MAX || '400', 10) || 200));
 const contentDownloadCountCache = new Map();
 let contentDownloadCountQueryQueue = Promise.resolve();
+// Short-lived promises coalesce count requests from different sockets. A single
+// 35ms batch avoids scanning every user's downloads once per incoming card.
+const contentDownloadCountPendingKeys = new Map();
+let contentDownloadCountBatchTimer = null;
+
 
 function getContentDownloadCountKeyServer(item = {}) {
   if (!item || typeof item !== 'object' || Array.isArray(item)) return '';
@@ -5194,45 +5199,37 @@ function setCachedContentDownloadCount(key, count) {
   }
 }
 
-async function getContentDownloadCountsForKeys(rawKeys = []) {
-  const keys = [...new Set((Array.isArray(rawKeys) ? rawKeys : [])
-    .map(value => String(value || '').trim())
-    .filter(value => value && value.length <= 512))]
-    .slice(0, CONTENT_DOWNLOAD_COUNT_REQUEST_MAX);
-  if (!keys.length) return {};
-
-  const now = Date.now();
-  const counts = {};
-  const missing = [];
-  keys.forEach(key => {
-    const cached = contentDownloadCountCache.get(key);
-    if (cached && now - cached.at < CONTENT_DOWNLOAD_COUNT_CACHE_TTL_MS) {
-      counts[key] = cached.count;
-      contentDownloadCountCache.delete(key);
-      contentDownloadCountCache.set(key, cached);
-    } else {
-      if (cached) contentDownloadCountCache.delete(key);
-      missing.push(key);
+// Requests arriving together share a single full-table scan. Never retain
+// in-flight promises after completion; durable results use the existing LRU.
+function scheduleContentDownloadCountBatch() {
+  if (contentDownloadCountBatchTimer !== null) return;
+  contentDownloadCountBatchTimer = setTimeout(() => {
+    contentDownloadCountBatchTimer = null;
+    const batch = [];
+    for (const pending of contentDownloadCountPendingKeys.values()) {
+      if (pending.started) continue;
+      pending.started = true;
+      batch.push(pending);
+      if (batch.length >= CONTENT_DOWNLOAD_COUNT_REQUEST_MAX) break;
     }
-  });
-
-  if (missing.length) {
-    await runSerializedContentDownloadCountQuery(async () => {
+    if (!batch.length) return;
+    // A second batch may queue behind the first, but never uses another DB
+    // connection concurrently with it.
+    if (contentDownloadCountPendingKeys.size > batch.length) scheduleContentDownloadCountBatch();
+    runSerializedContentDownloadCountQuery(async () => {
+      const now = Date.now();
       const queryKeys = [];
-      const recheckNow = Date.now();
-      missing.forEach(key => {
-        const cached = contentDownloadCountCache.get(key);
-        if (cached && recheckNow - cached.at < CONTENT_DOWNLOAD_COUNT_CACHE_TTL_MS) {
-          counts[key] = cached.count;
-          contentDownloadCountCache.delete(key);
-          contentDownloadCountCache.set(key, cached);
+      const batchCounts = {};
+      for (const pending of batch) {
+        const cached = contentDownloadCountCache.get(pending.key);
+        if (cached && now - cached.at < CONTENT_DOWNLOAD_COUNT_CACHE_TTL_MS) {
+          batchCounts[pending.key] = cached.count;
         } else {
-          if (cached) contentDownloadCountCache.delete(key);
-          queryKeys.push(key);
+          if (cached) contentDownloadCountCache.delete(pending.key);
+          queryKeys.push(pending.key);
         }
-      });
-      if (!queryKeys.length) return;
-
+      }
+      if (queryKeys.length) {
       const rows = await queryDbWithRetry(`
         WITH download_items AS (
           SELECT
@@ -5289,13 +5286,64 @@ async function getContentDownloadCountsForKeys(rawKeys = []) {
         GROUP BY content_key
       `, [queryKeys], { attempts: 2, label: 'CONTENT DOWNLOAD COUNTS' });
 
-      const found = new Map(rows.rows.map(row => [String(row.key || ''), Math.max(0, Number(row.count) || 0)]));
-      queryKeys.forEach(key => {
-        const count = found.get(key) || 0;
-        counts[key] = count;
-        setCachedContentDownloadCount(key, count);
-      });
+        const found = new Map((rows.rows || []).map(row => [String(row.key || ''), Math.max(0, Number(row.count) || 0)]));
+        for (const key of queryKeys) {
+          const count = found.get(key) || 0;
+          batchCounts[key] = count;
+          setCachedContentDownloadCount(key, count);
+        }
+      }
+      return batchCounts;
+    }).then(counts => {
+      for (const pending of batch) pending.resolve(counts[pending.key] || 0);
+    }).catch(error => {
+      for (const pending of batch) pending.reject(error);
+    }).finally(() => {
+      for (const pending of batch) {
+        if (contentDownloadCountPendingKeys.get(pending.key) === pending) contentDownloadCountPendingKeys.delete(pending.key);
+      }
+      for (const pending of contentDownloadCountPendingKeys.values()) {
+        if (!pending.started) { scheduleContentDownloadCountBatch(); break; }
+      }
     });
+  }, 35);
+}
+
+function getPendingContentDownloadCount(key) {
+  let pending = contentDownloadCountPendingKeys.get(key);
+  if (!pending) {
+    pending = { key, started:false, resolve:null, reject:null, promise:null };
+    pending.promise = new Promise((resolve, reject) => { pending.resolve = resolve; pending.reject = reject; });
+    contentDownloadCountPendingKeys.set(key, pending);
+    scheduleContentDownloadCountBatch();
+  }
+  return pending.promise;
+}
+
+async function getContentDownloadCountsForKeys(rawKeys = []) {
+  const keys = [...new Set((Array.isArray(rawKeys) ? rawKeys : [])
+    .map(value => String(value || '').trim())
+    .filter(value => value && value.length <= 512))]
+    .slice(0, CONTENT_DOWNLOAD_COUNT_REQUEST_MAX);
+  if (!keys.length) return {};
+
+  const now = Date.now();
+  const counts = {};
+  const missing = [];
+  for (const key of keys) {
+    const cached = contentDownloadCountCache.get(key);
+    if (cached && now - cached.at < CONTENT_DOWNLOAD_COUNT_CACHE_TTL_MS) {
+      counts[key] = cached.count;
+      contentDownloadCountCache.delete(key);
+      contentDownloadCountCache.set(key, cached);
+    } else {
+      if (cached) contentDownloadCountCache.delete(key);
+      missing.push(key);
+    }
+  }
+  if (missing.length) {
+    const values = await Promise.all(missing.map(key => getPendingContentDownloadCount(key)));
+    missing.forEach((key, index) => { counts[key] = values[index]; });
   }
   return counts;
 }
@@ -8279,14 +8327,30 @@ async function getChatSeenSnapshotForUser(userName = '') {
   if (!targetUser) return [];
   const messageIds = getCurrentChatMessageIds();
   if (!messageIds.length) return [];
+  // The UNIQUE(message_id, reader) index already exists. Probe the current
+  // message IDs directly instead of letting the planner scan a growing Seen
+  // event history for OR(sender,reader). Disable with CHAT_SEEN_INDEX_LOOKUP=0.
+  const useIndexedLookup = process.env.CHAT_SEEN_INDEX_LOOKUP !== '0';
+  const query = useIndexedLookup
+    ? `SELECT seen.id, seen.message_id, seen.sender, seen.reader, seen.seen_at
+       FROM (SELECT DISTINCT unnest($1::text[]) AS message_id) wanted
+       JOIN LATERAL (
+         SELECT id, message_id, sender, reader, seen_at
+         FROM chat_seen_events
+         WHERE message_id = wanted.message_id
+           AND (sender = $2::text OR reader = $2::text)
+         OFFSET 0
+       ) seen ON TRUE
+       ORDER BY seen.id ASC`
+    : `SELECT id, message_id, sender, reader, seen_at
+       FROM chat_seen_events
+       WHERE message_id = ANY($1::text[])
+         AND (sender = $2 OR reader = $2)
+       ORDER BY id ASC`;
   const res = await queryDbWithRetry(
-    `SELECT id, message_id, sender, reader, seen_at
-     FROM chat_seen_events
-     WHERE message_id = ANY($1::text[])
-       AND (sender = $2 OR reader = $2)
-     ORDER BY id ASC`,
+    query,
     [messageIds, targetUser],
-    { attempts: 2, label: 'CHAT SEEN SNAPSHOT READ' }
+    { attempts: 1, label: 'CHAT SEEN SNAPSHOT READ' }
   );
   return (res.rows || []).map(row => ({
     eventId: Math.max(0, Number(row.id) || 0),
@@ -8368,6 +8432,22 @@ async function getChatSeenSyncForUser(userName = '', cursor = 0) {
       seenAt: row.seen_at ? new Date(row.seen_at).toISOString() : ''
     }))
   };
+}
+
+// Seen is optional metadata: a slow/failed Seen snapshot must not prevent
+// Global Chat messages from opening. Keep the client's cursor unchanged so
+// the next sync can retry without silently marking missing events as seen.
+let chatSeenSyncErrorLastLogAt = 0;
+async function getChatSeenSyncSafely(userName = '', cursor = 0) {
+  try {
+    return await getChatSeenSyncForUser(userName, cursor);
+  } catch (err) {
+    if (Date.now() - chatSeenSyncErrorLastLogAt > 30000) {
+      chatSeenSyncErrorLastLogAt = Date.now();
+      console.warn('[CHAT SEEN SYNC DEGRADED] Messages will load; Seen will retry on the next sync:', err && err.message ? err.message : err);
+    }
+    return { mode:'changes', cursor:Math.max(0, Number(cursor) || 0), events:[], degraded:true };
+  }
 }
 
 async function recordChatSeenEventsBatch(entries = [], readerName = '') {
@@ -8955,7 +9035,7 @@ async function getStableInitialChatSyncForUser(userName = '', clientSeenCursor =
         && Math.max(0, Number(stateAfter.revision) || 0) === Math.max(0, Number(confirmedState.revision) || 0);
 
       if (stillStable) {
-        const seenSync = await getChatSeenSyncForUser(userName, clientSeenCursor);
+        const seenSync = await getChatSeenSyncSafely(userName, clientSeenCursor);
         return {
           success: true,
           syncV1: true,
@@ -16564,7 +16644,7 @@ io.on('connection', (socket) => {
 
         const state = await refreshChatSyncStateFromDb();
         const forceSnapshot = request && request.forceSnapshot === true;
-        const seenSync = await getChatSeenSyncForUser(socket.userName, clientSeenCursor);
+        const seenSync = await getChatSeenSyncSafely(socket.userName, clientSeenCursor);
 
         const withSeenSync = payload => ({
           ...payload,
