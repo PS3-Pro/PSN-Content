@@ -75204,7 +75204,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
     }
     window.refreshChatSeenDomForMessage = refreshChatSeenDomForMessage;
 
-    function applyRealtimeChatSeenChange(event = {}) {
+    function applyRealtimeChatSeenChange(event = {}, batch = null) {
         if (!event || event.seenSyncV1 !== true) return false;
         if (window.__chatInitialSnapshotPending === true) {
             if (!Array.isArray(window.__chatInitialPendingSeenEvents)) window.__chatInitialPendingSeenEvents = [];
@@ -75234,8 +75234,15 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         if (changed) {
             if (semanticDataChanged && typeof markChatMessageSeenDataDirty === 'function') markChatMessageSeenDataDirty(msg);
             if (semanticDataChanged && reader && typeof window.queuePsnUserMetaRefresh === 'function') window.queuePsnUserMetaRefresh(reader, { maxAge:PSN_VISIBLE_AVATAR_FRESH_MS });
-            refreshChatSeenDomForMessage(msgId);
-            scheduleChatPersistentCacheWrite();
+            // Batch notifications can update the same message several times. Paint it once
+            // after applying all events, without delaying single realtime acknowledgments.
+            if (batch && batch.ids instanceof Set) {
+                batch.ids.add(msgId);
+                batch.changed = true;
+            } else {
+                refreshChatSeenDomForMessage(msgId);
+                scheduleChatPersistentCacheWrite();
+            }
         }
         return true;
     }
@@ -76278,6 +76285,13 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             const allowUnreadDivider = options.allowUnreadDivider !== false;
             let unreadDividerAdded = !!(box.querySelector && box.querySelector('#unread-divider'));
             if (!unreadDividerAdded && box.isConnected) unreadDividerAdded = !!document.getElementById('unread-divider');
+            // Detached history windows have no per-message DOM dependencies until hydration.
+            // Parse each prepared chunk once, then attach its message handlers in order.
+            const batchDetached = box.dataset && box.dataset.chatDetachedRenderBuffer === '1';
+            const previousDeferred = batchContext.deferredChatInsert || null;
+            const deferredChatInsert = batchDetached ? { box, html: [], rows: [] } : null;
+            batchContext.deferredChatInsert = deferredChatInsert;
+            const previousChildCount = box.childElementCount;
             window.lastChatRawDate = options.initialRawDate || '';
 
             for (let index = Math.max(0, startIndex); index < Math.min(endIndex, history.length); index++) {
@@ -76288,17 +76302,20 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
                 const msgRawDate = messageDate.toDateString();
                 if (msgRawDate !== window.lastChatRawDate) {
                     const divider = createChatDateDivider(data.time);
-                    box.appendChild(divider);
+                    if (deferredChatInsert) deferredChatInsert.html.push(divider.outerHTML);
+                    else box.appendChild(divider);
                     window.lastChatRawDate = msgRawDate;
                 }
                 const msgTime = messageDate.getTime();
                 if (allowUnreadDivider && !unreadDividerAdded && firstUnreadIndex > -1 && index >= firstUnreadIndex && data.user !== myName && lastReadTime > 0 && Number.isFinite(msgTime) && msgTime > lastReadTime) {
-                    box.insertAdjacentHTML('beforeend', `
+                    const dividerHtml = `
                         <div id="unread-divider" class="ps-new-messages-container">
                             <div class="ps-line left"></div>
                             <span class="ps-unread-text">UNREAD MESSAGES</span>
                             <div class="ps-line right"></div>
-                        </div>`);
+                        </div>`;
+                    if (deferredChatInsert) deferredChatInsert.html.push(dividerHtml);
+                    else box.insertAdjacentHTML('beforeend', dividerHtml);
                     unreadDividerAdded = true;
                 }
                 if (typeof appendMessageToChat === 'function') {
@@ -76310,6 +76327,21 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
                     }
                 }
             }
+            if (deferredChatInsert && deferredChatInsert.html.length) {
+                box.insertAdjacentHTML('beforeend', deferredChatInsert.html.join(''));
+                // Walk only the freshly inserted top-level nodes, not the entire history.
+                let actionIndex = 0;
+                const children = box.children;
+                for (let index = previousChildCount; index < children.length && actionIndex < deferredChatInsert.rows.length; index++) {
+                    const row = children[index];
+                    if (!row.hasAttribute('data-chat-msg-id')) continue;
+                    const action = deferredChatInsert.rows[actionIndex++];
+                    if (row.getAttribute('data-chat-msg-id') !== action.msgId) throw new Error('Chat history batch order mismatch.');
+                    finalizeChatAppendedRow(box, row, action, batchContext);
+                }
+                if (actionIndex !== deferredChatInsert.rows.length) throw new Error('Chat history batch incomplete.');
+            }
+            batchContext.deferredChatInsert = previousDeferred;
             if (batchContext.trackedUsers.size) trackUsersBatch(batchContext.trackedUsers);
             batchContext.trackedUsers.clear();
             const activeChatBox = box.isConnected && document.getElementById('chat-messages') === box;
@@ -76320,6 +76352,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             if (activeChatBox && typeof window.scheduleSeenChatNotificationConsumption === 'function') requestAnimationFrame(() => window.scheduleSeenChatNotificationConsumption('global'));
             return true;
         } finally {
+            const context = window.__chatRenderBatchContext;
+            if (context && context.deferredChatInsert && context.deferredChatInsert.box === box) context.deferredChatInsert = null;
             window.__chatDisableMessageEntryAnimation = previousEntryAnimationState;
             window.__chatRenderTargetBox = previousRenderTargetBox;
             window.__chatRenderBatchContext = previousBatchContext;
@@ -82235,11 +82269,27 @@ function getVisibleChatStackEl(id) {
 		} catch (e) { return ''; }
 	}
 
+	// Feed and chats share the same bounded cover memo and metadata override awareness.
+	window.psnGetSharedContentCover = getChatInternalSharedCover;
+
 	function applyChatInternalShareDescriptor(anchor, descriptor) {
 		anchor = prepareChatInternalShareAnchor(anchor);
 		if (!anchor) return false;
 		const label = String(getChatInternalShareLabel(descriptor) || 'Shared Content').slice(0, 180);
 		const category = String(descriptor?.category || '').trim().toLowerCase();
+		// Pinned previews stay one-line links; only regular messages use cover cards.
+		if (anchor.closest('#pin-preview-text, #direct-pin-preview-text, #direct-group-pin')) {
+			const renderKey = JSON.stringify(['pinned', label, category]);
+			if (anchor.dataset.psnShareRenderKey !== renderKey || anchor.classList.contains('psn-shared-content-card')) {
+				anchor.dataset.psnShareRenderKey = renderKey;
+				anchor.classList.remove('psn-shared-content-card');
+				anchor.style.setProperty('--chat-share-color', getChatInternalShareCategoryColor(category));
+				anchor.style.removeProperty('--chat-share-hover');
+				anchor.title = `${label} — Open shared content`;
+				anchor.textContent = label;
+			}
+			return true;
+		}
 		const titleId = String(descriptor?.titleId || '').trim().slice(0, 40);
 		const contentId = String(descriptor?.contentId || '').trim().slice(0, 130);
 		const displayId = titleId || contentId;
@@ -82261,6 +82311,7 @@ function getVisibleChatStackEl(id) {
 	const chatSharedDescriptorPending = new Map();
 	const chatSharedDescriptorRetryAfter = new Map();
 	let chatSharedDescriptorObserver = null;
+	const chatSharedObservedAnchors = new Set();
 	function fetchChatSharedDescriptor(token) {
 		const cached = chatSharedDescriptorCache.get(token);
 		if (cached) return Promise.resolve(cached);
@@ -82290,6 +82341,9 @@ function getVisibleChatStackEl(id) {
 		return promise;
 	}
 
+	// One in-flight descriptor lookup per link token across the Feed and chat views.
+	window.psnResolveSharedContentDescriptor = fetchChatSharedDescriptor;
+
 	function resolveChatSharedLinkWhenVisible(anchor) {
 		if (!anchor?.isConnected || anchor.dataset.psnShareResolveStarted === '1') return;
 		anchor.dataset.psnShareResolveStarted = '1';
@@ -82313,9 +82367,20 @@ function getVisibleChatStackEl(id) {
 				for (const entry of entries) {
 					if (!entry.isIntersecting) continue;
 					chatSharedDescriptorObserver.unobserve(entry.target);
+					chatSharedObservedAnchors.delete(entry.target);
 					resolveChatSharedLinkWhenVisible(entry.target);
 				}
 			}, {rootMargin:'240px 0px'});
+		}
+		if (chatSharedObservedAnchors.has(anchor)) return;
+		chatSharedObservedAnchors.add(anchor);
+		// Message rows can be recycled; release detached anchors without a polling timer.
+		if (chatSharedObservedAnchors.size >= 160 && chatSharedObservedAnchors.size % 64 === 0) {
+			for (const observed of chatSharedObservedAnchors) {
+				if (observed.isConnected) continue;
+				chatSharedDescriptorObserver.unobserve(observed);
+				chatSharedObservedAnchors.delete(observed);
+			}
 		}
 		chatSharedDescriptorObserver.observe(anchor);
 	}
@@ -83669,7 +83734,43 @@ function getVisibleChatStackEl(id) {
 	}
 
 
+	function finalizeChatAppendedRow(box, insertedRow, action, batchContext) {
+		const { msgId, isAuthor, encodedText, hasTranslatableText, hasShareLink, firstLinkUrl, isImage, ytId } = action;
+		if (insertedRow && hasShareLink && typeof hydrateChatInternalShareLinks === 'function') {
+			hydrateChatInternalShareLinks(insertedRow);
+		}
+		const insertedEntry = insertedRow && insertedRow.matches && insertedRow.matches(`[data-chat-msg-id="${msgId}"]`) && typeof registerChatRenderedMessageRow === 'function'
+			? registerChatRenderedMessageRow(insertedRow, msgId)
+			: null;
+		if (isAuthor && typeof window.setChatJumpAvatarAnchor === 'function') {
+			const insertedAvatar = insertedEntry && typeof getChatRenderedMessagePart === 'function'
+				? getChatRenderedMessagePart(msgId, 'avatar', insertedEntry)
+				: (insertedRow && insertedRow.querySelector ? insertedRow.querySelector('.chat-avatar-status') : document.getElementById(`msg-row-${msgId}`)?.querySelector('.chat-avatar-status'));
+			if (insertedAvatar) window.setChatJumpAvatarAnchor(insertedAvatar);
+		}
+		if (batchContext) batchContext.selectionRefreshNeeded = true;
+		else if (typeof updateChatSelectionUi === 'function') updateChatSelectionUi();
+		if (typeof autoTranslateMessage === 'function' && hasTranslatableText) {
+			if (batchContext && batchContext.autoTranslateEnabled === null) batchContext.autoTranslateEnabled = isChatAutoTranslateEnabled();
+			if (batchContext ? batchContext.autoTranslateEnabled : isChatAutoTranslateEnabled()) {
+				setTimeout(() => autoTranslateMessage(msgId, encodedText, box), 0);
+			}
+		}
+		if (firstLinkUrl && !isImage && !ytId && !window.__loginRevealBusy) {
+			if (batchContext && batchContext.chatPreviewViewVisible === null) {
+				batchContext.chatPreviewViewVisible = document.getElementById('view-chat')?.style.display === 'block';
+			}
+			const chatViewVisibleForPreview = batchContext
+				? batchContext.chatPreviewViewVisible
+				: document.getElementById('view-chat')?.style.display === 'block';
+			if (chatViewVisibleForPreview) setTimeout(() => fetchLinkMetadata(firstLinkUrl, `lp-${msgId}`, box), 350);
+		}
+		if (batchContext) batchContext.mentionRefreshNeeded = true;
+		else if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
+	}
+
 	function appendMessageToChat(msg, isMe = false, timestamp = null) {
+
 		const renderTarget = window.__chatRenderTargetBox;
 		const box = renderTarget && renderTarget.nodeType === 1 ? renderTarget : document.getElementById('chat-messages');
 		if (!box) return;
@@ -84067,38 +84168,19 @@ function getVisibleChatStackEl(id) {
 			</div>
 		</div>`;
 	
+		const action = {
+			msgId: String(msgId), isAuthor, encodedText, hasTranslatableText,
+			hasShareLink: messageText.includes('data-psn-share-url=') || messageText.includes('#share='),
+			firstLinkUrl: firstLink && firstLink[0], isImage, ytId
+		};
+		const deferred = batchContext && batchContext.deferredChatInsert;
+		if (deferred && deferred.box === box) {
+			deferred.html.push(msgHtml);
+			deferred.rows.push(action);
+			return;
+		}
 		box.insertAdjacentHTML('beforeend', msgHtml);
-		const insertedRow = box.lastElementChild;
-		if (insertedRow && typeof hydrateChatInternalShareLinks === 'function') hydrateChatInternalShareLinks(insertedRow);
-		const insertedEntry = insertedRow && insertedRow.matches && insertedRow.matches(`[data-chat-msg-id="${msgId}"]`) && typeof registerChatRenderedMessageRow === 'function'
-			? registerChatRenderedMessageRow(insertedRow, msgId)
-			: null;
-		if (isAuthor && typeof window.setChatJumpAvatarAnchor === 'function') {
-			const insertedAvatar = insertedEntry && typeof getChatRenderedMessagePart === 'function'
-				? getChatRenderedMessagePart(msgId, 'avatar', insertedEntry)
-				: (insertedRow && insertedRow.querySelector ? insertedRow.querySelector('.chat-avatar-status') : document.getElementById(`msg-row-${msgId}`)?.querySelector('.chat-avatar-status'));
-			if (insertedAvatar) window.setChatJumpAvatarAnchor(insertedAvatar);
-		}
-		if (batchContext) batchContext.selectionRefreshNeeded = true;
-		else if (typeof updateChatSelectionUi === 'function') updateChatSelectionUi();
-		if (typeof autoTranslateMessage === 'function' && hasTranslatableText) {
-			if (batchContext && batchContext.autoTranslateEnabled === null) batchContext.autoTranslateEnabled = isChatAutoTranslateEnabled();
-			if (batchContext ? batchContext.autoTranslateEnabled : isChatAutoTranslateEnabled()) {
-				setTimeout(() => autoTranslateMessage(msgId, encodedText, box), 0);
-			}
-		}
-	
-		if (firstLink && !isImage && !ytId && !window.__loginRevealBusy) {
-			if (batchContext && batchContext.chatPreviewViewVisible === null) {
-				batchContext.chatPreviewViewVisible = document.getElementById('view-chat')?.style.display === 'block';
-			}
-			const chatViewVisibleForPreview = batchContext
-				? batchContext.chatPreviewViewVisible
-				: document.getElementById('view-chat')?.style.display === 'block';
-			if (chatViewVisibleForPreview) setTimeout(() => fetchLinkMetadata(firstLink[0], `lp-${msgId}`, box), 350);
-		}
-		if (batchContext) batchContext.mentionRefreshNeeded = true;
-		else if (typeof refreshMentionJumpButton === 'function') refreshMentionJumpButton();
+		finalizeChatAppendedRow(box, box.lastElementChild, action, batchContext);
 	}
 	
 	// Reuse chat sender/formatting caches for messages delivered within the same
@@ -87017,8 +87099,8 @@ function getVisibleChatStackEl(id) {
     if(keepBottom)list.scrollTop=list.scrollHeight;
     else list.scrollTop=Math.max(0,beforeTop-(beforeHeight-list.scrollHeight));
   }
-  function directGroupMessageHtml(m){
-    const own=String(m.from||'').trim()===directGroupMyName(),id=directGroupEscape(m.id),media=Array.isArray(m.content)?m.content:[],poll=m.type==='poll';
+  function directGroupMessageHtml(m,currentUser){
+    const own=String(m.from||'').trim()===(currentUser===undefined?directGroupMyName():currentUser),id=directGroupEscape(m.id),media=Array.isArray(m.content)?m.content:[],poll=m.type==='poll';
     const reactions=directGroupReactionsHtml(m);
     const reply=m.replyTo?.id?`<button class="direct-message-reply" type="button" onclick="window.jumpDirectGroupMessage('${directGroupEscape(m.replyTo.id)}')"><span class="direct-message-reply-user">${directGroupEscape(m.replyTo.from)}</span><span class="direct-message-reply-text">${directGroupEscape(directMessagePlainText(m.replyTo.text).slice(0,90))}</span></button>`:'';
     const imageUrls=media.filter(u=>/^https?:\/\//i.test(u));
@@ -87032,7 +87114,8 @@ function getVisibleChatStackEl(id) {
     document.getElementById('direct-group-title').textContent=s.group?.title||'Group';
     document.getElementById('direct-group-members').textContent=(s.group?.members||[]).join(', ');
     document.getElementById('direct-group-count').textContent=s.messages.length;
-    list.innerHTML=s.messages.length?s.messages.map(directGroupMessageHtml).join(''):'<div class="direct-thread-empty" style="min-height:100%"><i class="fas fa-comments"></i><div>No messages yet. Say hi.</div></div>';
+    const currentUser=directGroupMyName();
+    list.innerHTML=s.messages.length?s.messages.map(message=>directGroupMessageHtml(message,currentUser)).join(''):'<div class="direct-thread-empty" style="min-height:100%"><i class="fas fa-comments"></i><div>No messages yet. Say hi.</div></div>';
     if(typeof hydrateChatInternalShareLinks==='function')hydrateChatInternalShareLinks(list);
     if(typeof hydrateChatMediaImages==='function')hydrateChatMediaImages(list);
     renderDirectGroupPins();
@@ -87238,12 +87321,13 @@ function getVisibleChatStackEl(id) {
         if(row){
           if(!row.classList.contains('psn-undo-delete-pending'))window.stagePsnUndoChatMessageCollapse(row);
           setTimeout(()=>{if(row.isConnected)row.remove();},410);
-        }else{renderDirectGroupMessages();renderedAll=true;}
+        }else if(removedMessage){renderDirectGroupMessages();renderedAll=true;}
+        // A delete for a message outside the loaded history is a no-op for this view.
         if(!renderedAll){
           pruneRenderedDirectGroupRows(list,prunedIds,nearBottom);
           if(pinsAffected)renderDirectGroupPins();
         }
-        const count=document.getElementById('direct-group-count');if(count)count.textContent=s.messages.length;
+        const count=document.getElementById('direct-group-count');if(count&&count.textContent!==String(s.messages.length))count.textContent=s.messages.length;
       }else renderDirectGroupMessages();
       if((groupEdited||groupPinned)&&payload.message)window.flashPsnChatMessageAction(() => document.querySelector(`#direct-group-messages [data-direct-group-message="${CSS.escape(String(payload.message.id))}"]`),groupEdited?'edit':'pin',`group:${s.activeId}:${payload.message.id}`);
       directGroupMarkRead();
@@ -87263,8 +87347,12 @@ function getVisibleChatStackEl(id) {
           }
         }
         const list=document.getElementById('direct-group-messages');
+        // Batch receipt updates: index visible rows once instead of searching the list for each receipt.
+        const rowById=list&&changedOwnMessages.length>2
+          ? new Map(Array.from(list.querySelectorAll('[data-direct-group-message]'),row=>[row.dataset.directGroupMessage,row]))
+          : null;
         if(list)for(const m of changedOwnMessages){
-          const row=list.querySelector(`[data-direct-group-message="${CSS.escape(String(m.id))}"]`);
+          const row=rowById ? rowById.get(String(m.id)) : list.querySelector(`[data-direct-group-message="${CSS.escape(String(m.id))}"]`);
           const prior=row?.querySelector('.direct-message-actions .direct-group-read-indicator');
           if(prior){
             const replacement=document.createElement('span');
@@ -87887,8 +87975,8 @@ function getVisibleChatStackEl(id) {
 		return true;
 	}
 
-	function directExtractFirstLink(value) {
-		const plain = directMessagePlainText(value);
+	function directExtractFirstLink(value, knownPlainText) {
+		const plain = typeof knownPlainText === 'string' ? knownPlainText : directMessagePlainText(value);
 		const match = plain.match(/https?:\/\/[^\s<>]+/i);
 		if (!match) return '';
 		let url = match[0];
@@ -87896,6 +87984,19 @@ function getVisibleChatStackEl(id) {
 		if (!/^https?:\/\//i.test(url)) return '';
 		if (/\.(?:jpe?g|gif|png|bmp|webp)(?:[?#].*)?$/i.test(url)) return '';
 		if (typeof window.getPsnContentShareTokenFromUrl === 'function' && window.getPsnContentShareTokenFromUrl(url)) return '';
+		return url;
+	}
+
+	// Reuse link parsing between the first row render and its preview hydration.
+	// Weak keys avoid retaining old conversations; edited text invalidates the result.
+	const directMessagePreviewUrlCache = new WeakMap();
+	function directMessagePreviewUrl(message, knownPlainText) {
+		if (!message || typeof message !== 'object') return '';
+		const raw = String(message.text || '');
+		const cached = directMessagePreviewUrlCache.get(message);
+		if (cached && cached.raw === raw) return cached.url;
+		const url = directExtractFirstLink(raw, knownPlainText);
+		directMessagePreviewUrlCache.set(message, { raw, url });
 		return url;
 	}
 
@@ -87958,7 +88059,7 @@ function getVisibleChatStackEl(id) {
 		(Array.isArray(messages) ? messages : []).forEach(msg => {
 			if (!msg || !msg.id || (Array.isArray(msg.content) && msg.content.length)) return;
 			if (typeof msg.text === 'string' && !/[<&]/.test(msg.text) && !/https?:\/\//i.test(msg.text)) return;
-			const url = directExtractFirstLink(msg.text);
+			const url = directMessagePreviewUrl(msg);
 			if (!url || (typeof getYoutubeId === 'function' && getYoutubeId(url))) return;
 			fetchDirectLinkMetadata(url, `direct-lp-${msg.id}`);
 		});
@@ -89864,26 +89965,24 @@ function getVisibleChatStackEl(id) {
 		const rows = list.querySelectorAll('.direct-message-row[data-direct-own="1"]');
 		if (!rows.length) return;
 		const messages = state.messages;
-		const seenById = rows.length >= 5 ? new Map() : null;
-		if (seenById) {
-			messages.forEach(message => {
-				const id = directMessageIdNumber(message && message.id);
-				if (!seenById.has(id)) seenById.set(id, message);
-			});
-		}
+		// Resolve only rendered messages; do not scan the whole private history for each Seen event.
 		rows.forEach(row => {
 			const id = directMessageIdNumber(row.dataset.directMessageId);
 			const delivery = row.querySelector('.direct-message-delivery');
 			if (!delivery) return;
 			const seen = id > 0 && id <= peerRead;
-			const message = seenById ? seenById.get(id) : messages.find(item => directMessageIdNumber(item && item.id) === id);
+			const index = seen ? directRenderedRowIndex(row, messages) : -1;
+			const message = index >= 0 ? messages[index] : null;
 			const label = seen ? directSeenDisplayLabel(message && message.seenAt) : 'Sent';
-			delivery.classList.toggle('is-seen', seen);
-			delivery.title = label;
-			delivery.dataset.psnTooltipTitle = label;
-			delivery.setAttribute('aria-label', label);
+			if (delivery.classList.contains('is-seen') !== seen) delivery.classList.toggle('is-seen', seen);
+			if (delivery.title !== label) delivery.title = label;
+			if (delivery.dataset.psnTooltipTitle !== label) delivery.dataset.psnTooltipTitle = label;
+			if (delivery.getAttribute('aria-label') !== label) delivery.setAttribute('aria-label', label);
 			const secondIcon = delivery.querySelector('.direct-message-delivery-second');
-			if (secondIcon) secondIcon.style.display = seen ? 'block' : 'none';
+			if (secondIcon) {
+				const display = seen ? 'block' : 'none';
+				if (secondIcon.style.display !== display) secondIcon.style.display = display;
+			}
 		});
 	}
 
@@ -90229,7 +90328,8 @@ function getVisibleChatStackEl(id) {
 		const pollHtml = isPoll ? `<div class="poll-wrapper direct-message-poll" data-direct-poll-id="${escapedMessageId}">${buildDirectPollHtml(msg)}</div>` : '';
 		const mediaHtml = media.length ? `<div class="direct-message-media${media.length === 1 ? ' single' : ''}">${media.map((url, index) => `<button type="button" class="direct-message-media-item"${media.length === 1 ? getChatMediaFrameAttributes(url) : ''} data-direct-media-index="${index}" aria-label="Open attached image"><img src="${directEscapeHtml(url)}" alt="" loading="lazy" decoding="async"></button>`).join('')}</div>` : '';
 		const hasImageCaption = media.length === 1 && msg.type !== 'poll' && !!String(msg.text || '').trim();
-		const directTranslationPlainText = !isPoll && msg.text ? directMessagePlainText(msg.text).replace(/\s+/g, ' ').trim() : '';
+		const directPlainMessageText = !isPoll && msg.text ? directMessagePlainText(msg.text) : '';
+		const directTranslationPlainText = directPlainMessageText.replace(/\s+/g, ' ').trim();
 		const textHasTranslatableText = chatTextHasUsefulTranslatableContent(directTranslationPlainText);
 		const editedTagHtml = msg.editedAt ? ' <span class="chat-edited-tag direct-message-edited" data-no-translate="true" translate="no">(Edited)</span>' : '';
 		const textHtml = !isPoll && msg.text ? `<div id="direct-msg-text-${escapedMessageId}" class="direct-message-text" data-direct-message-id="${escapedMessageId}" data-no-translate="true" translate="no">${directLinkifyMessageHtml(msg.text)}${editedTagHtml}</div>` : '';
@@ -90237,7 +90337,7 @@ function getVisibleChatStackEl(id) {
 		const reply = msg.replyTo && msg.replyTo.id ? msg.replyTo : null;
 		const replyPreview = reply ? (directMessagePlainText(reply.text).replace(/\s+/g,' ').trim() || (reply.type === 'poll' ? '[Poll]' : (reply.type === 'gif' ? '[GIF]' : '[Image]'))) : '';
 		const replyHtml = reply ? `<button type="button" class="direct-message-reply" onclick="event.stopPropagation(); window.scrollToDirectMessage('${directEscapeHtml(reply.id)}')"><span class="direct-message-reply-user" data-no-translate="true" translate="no">${directEscapeHtml(reply.from)}</span><span class="direct-message-reply-text" data-no-translate="true" translate="no">${directEscapeHtml(replyPreview)}</span></button>` : '';
-		const previewUrl = media.length || isPoll ? '' : directExtractFirstLink(msg.text);
+		const previewUrl = media.length || isPoll ? '' : directMessagePreviewUrl(msg, directPlainMessageText);
 		const ytId = previewUrl && typeof getYoutubeId === 'function' ? getYoutubeId(previewUrl) : null;
 		const previewHtml = ytId ? `<div class="yt-video-card direct-message-youtube" onclick="playTrailerDirect('${directEscapeHtml(ytId)}')"><img src="https://img.youtube.com/vi/${directEscapeHtml(ytId)}/mqdefault.jpg" class="yt-thumb" loading="lazy" decoding="async"><div class="yt-play-overlay"><i class="fas fa-play"></i></div><div class="yt-card-info"><span>Watch Video</span><i class="fab fa-youtube"></i></div></div>` : (previewUrl ? `<div id="direct-lp-${escapedMessageId}" class="direct-link-preview-host"></div>` : '');
 		const reactionsHtml = directReactionHtml(msg);
@@ -93391,10 +93491,14 @@ function getVisibleChatStackEl(id) {
             if (typeof applyRealtimeChatSeenChange === 'function') applyRealtimeChatSeenChange(event || {});
         });
 
-        socketChat.on('chat_seen_sync_batch', function(batch = {}) {
+        socketChat.on('chat_seen_sync_batch', function(payload = {}) {
             if (typeof applyRealtimeChatSeenChange !== 'function') return;
-            const events = Array.isArray(batch && batch.events) ? batch.events.slice().sort((a, b) => (Number(a && a.cursor) || 0) - (Number(b && b.cursor) || 0)) : [];
-            for (const event of events) applyRealtimeChatSeenChange(event || {});
+            const events = Array.isArray(payload && payload.events) ? payload.events.slice().sort((a, b) => (Number(a && a.cursor) || 0) - (Number(b && b.cursor) || 0)) : [];
+            const batch = { ids:new Set(), changed:false };
+            for (const event of events) applyRealtimeChatSeenChange(event || {}, batch);
+            if (!batch.changed) return;
+            for (const id of batch.ids) refreshChatSeenDomForMessage(id);
+            scheduleChatPersistentCacheWrite();
         });
 
         socketChat.on('chat_history', function(history, respond) {
@@ -106860,9 +106964,8 @@ function getVisibleChatStackEl(id) {
 		}
 		let raw = '';
 		try {
-			raw = typeof window.getProfileSyncComparableSignature === 'function'
-				? window.getProfileSyncComparableSignature(value)
-				: JSON.stringify(value == null ? null : value);
+			// Row updates only need a full value signature; sorted deep clones belong to profile sync comparisons.
+			raw = JSON.stringify(value == null ? null : value);
 		} catch (e) {
 			raw = String(value == null ? '' : value);
 		}
@@ -107120,6 +107223,8 @@ function getVisibleChatStackEl(id) {
 			Number(window.__profileListVisualRevision || 0)
 		].join('|');
 	
+		const profileTrophyColors = { bronze: '#cd7f32', silver: '#c0c0c0', gold: '#ffcc00', platinum: '#00f0ff' };
+		const profileTrophyRgbColors = { bronze: '205, 127, 50', silver: '192, 192, 192', gold: '255, 204, 0', platinum: '0, 240, 255' };
 		const buildProfileListItemsHtml = function(items, startIndex = 0) {
 			let html = '';
 			items.forEach((item, itemIndex) => {
@@ -107146,10 +107251,8 @@ function getVisibleChatStackEl(id) {
 				}
 				const profileListRowHtmlStart = html.length;
 				if (isTrophyView) {
-					const colors = { bronze: '#cd7f32', silver: '#c0c0c0', gold: '#ffcc00', platinum: '#00f0ff' };
-					const rgbColors = { bronze: '205, 127, 50', silver: '192, 192, 192', gold: '255, 204, 0', platinum: '0, 240, 255' };
-					const color = colors[item.type] || '#fff';
-					const cardRgb = rgbColors[item.type] || '255, 255, 255';
+					const color = profileTrophyColors[item.type] || '#fff';
+					const cardRgb = profileTrophyRgbColors[item.type] || '255, 255, 255';
 					const isLocked = !item.unlocked;
 					const lockClass = isLocked ? 'locked' : '';
 					const trophyIconMarkup = isLocked ? '<i class="fas fa-lock" style="color: rgba(255,255,255,0.28);"></i>' : `<span class="ps-trophy-icon ps-trophy-${item.type}" aria-hidden="true"></span>`;
@@ -107320,8 +107423,8 @@ function getVisibleChatStackEl(id) {
 					const typeClass = `dl-kind-${typeMeta.cls || 'default'}`;
 					const profileCoverKeyAttr = window.escapePlayerListText(profileCoverKey || '');
 					const profileCoverImgHtml = profileUsesBingCover
-						? `<img src="${resolvedItemCover}" data-cover-key="${profileCoverKeyAttr}" data-name="${itemCoverName}" data-console="${itemCoverConsole}" data-cover-category="${itemCoverCategory}" data-no-bing="${itemNoBingCover}" data-title-id="${itemCoverData.id || itemCoverData.titleId || ''}" data-content-id="${itemCoverData.contentId || ''}" data-region="${itemCoverData.region || ''}" data-github-cover="${String(itemGithubCover || '').replace(/"/g, '&quot;')}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, this.getAttribute('data-cover-category'))">`
-						: `<img src="${resolvedItemCover}" data-cover-key="${profileCoverKeyAttr}" data-name="${itemCoverName}" data-console="${itemCoverConsole}" data-cover-category="${itemCoverCategory}" data-github-cover="${String(itemGithubCover || '').replace(/"/g, '&quot;')}" data-title-id="${itemCoverData.id || itemCoverData.titleId || ''}" data-content-id="${itemCoverData.contentId || ''}" data-region="${itemCoverData.region || ''}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, this.getAttribute('data-cover-category'))">`;
+						? `<img src="${resolvedItemCover}" loading="lazy" decoding="async" data-cover-key="${profileCoverKeyAttr}" data-name="${itemCoverName}" data-console="${itemCoverConsole}" data-cover-category="${itemCoverCategory}" data-no-bing="${itemNoBingCover}" data-title-id="${itemCoverData.id || itemCoverData.titleId || ''}" data-content-id="${itemCoverData.contentId || ''}" data-region="${itemCoverData.region || ''}" data-github-cover="${String(itemGithubCover || '').replace(/"/g, '&quot;')}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, this.getAttribute('data-cover-category'))">`
+						: `<img src="${resolvedItemCover}" loading="lazy" decoding="async" data-cover-key="${profileCoverKeyAttr}" data-name="${itemCoverName}" data-console="${itemCoverConsole}" data-cover-category="${itemCoverCategory}" data-github-cover="${String(itemGithubCover || '').replace(/"/g, '&quot;')}" data-title-id="${itemCoverData.id || itemCoverData.titleId || ''}" data-content-id="${itemCoverData.contentId || ''}" data-region="${itemCoverData.region || ''}" onload="markCoverLoaded(this)" onerror="handleCoverError(this, this.getAttribute('data-cover-category'))">`;
 
 					const profileUnavailableClass = profileStoreUnavailable ? ' profile-list-item-unavailable' : '';
 					const profileHoverAttr = profileStoreUnavailable ? '' : `onmouseenter="if(typeof playUiHover === 'function') playUiHover()"`;
@@ -107368,10 +107471,13 @@ function getVisibleChatStackEl(id) {
 				if (!shouldBatchProfileList || renderedProfileListCount >= renderItems.length) return false;
 				const nextCount = Math.min(renderItems.length, renderedProfileListCount + profileListBatchSize);
 				const nextHtml = buildProfileListItemsHtml(renderItems.slice(renderedProfileListCount, nextCount), renderedProfileListCount);
+				const batchTemplate = document.createElement('template');
+				batchTemplate.innerHTML = nextHtml;
+				// Sync only the incoming batch; rescanning all previous rows grows quadratically.
+				if (profileCommonLibraryOwnKeys && typeof window.syncProfileCommonPlayTogetherButtons === 'function') window.syncProfileCommonPlayTogetherButtons(batchTemplate.content);
 				const activeSentinel = profileListBatchSentinel && profileListBatchSentinel.isConnected ? profileListBatchSentinel : null;
-				if (activeSentinel) activeSentinel.insertAdjacentHTML('beforebegin', nextHtml);
-				else body.insertAdjacentHTML('beforeend', nextHtml);
-				if (profileCommonLibraryOwnKeys && typeof window.syncProfileCommonPlayTogetherButtons === 'function') window.syncProfileCommonPlayTogetherButtons(body);
+				if (activeSentinel) activeSentinel.parentNode.insertBefore(batchTemplate.content, activeSentinel);
+				else body.appendChild(batchTemplate.content);
 				renderedProfileListCount = nextCount;
 				return renderedProfileListCount < renderItems.length;
 			};
@@ -115832,6 +115938,12 @@ function getVisibleChatStackEl(id) {
   function socialPreviewSkeleton(){
     return '<div class="psn-social-preview-card psn-social-preview-skeleton" aria-hidden="true"><span class="psn-social-preview-art"></span><span class="psn-social-preview-data"><span class="psn-social-skeleton-bar"></span><span class="psn-social-skeleton-bar"></span><span class="psn-social-skeleton-bar"></span></span></div>';
   }
+  // Keep cover selection identical in Feed and chats, including later metadata overrides.
+  function socialSharedCover(descriptor){
+    if(!descriptor||( !descriptor.titleId&&!descriptor.contentId))return '';
+    if(typeof window.psnGetSharedContentCover==='function')return window.psnGetSharedContentCover(descriptor);
+    try {return typeof getItemCover==='function'?getItemCover({id:descriptor.titleId,titleId:descriptor.titleId,contentId:descriptor.contentId,region:descriptor.region},descriptor.category)||'':'';}catch(e){return '';}
+  }
   function socialPreviewMarkup(raw){
     const url=socialFirstUrl(raw);if(!url)return '';
     const share=socialShareInfo(url),postId=socialPostLinkId(url);
@@ -115839,10 +115951,7 @@ function getVisibleChatStackEl(id) {
     if(ytId)return socialYoutubePreview(url,ytId);
     if(share){
       const hint=share.hint;
-      let cover='';
-      if(hint&&(hint.titleId||hint.contentId)){
-        try {if(typeof getItemCover==='function')cover=getItemCover({id:hint.titleId,titleId:hint.titleId,contentId:hint.contentId},hint.category)||'';}catch(e){}
-      }
+      const cover=socialSharedCover(hint);
       return `<div class="psn-social-preview-host" data-social-preview-url="${esc(url)}" data-social-preview-type="shared">${socialPreviewCard(url,{kind:'shared',title:hint?.name||'',description:hint?.titleId||hint?.contentId||'',site:'Shared Content · '+s(hint?.category||'PSN-Content').replace(/_/g,' '),image:cover})}</div>`;
     }
     if(postId)return `<div class="psn-social-preview-host" data-social-preview-url="${esc(url)}" data-social-preview-type="post">${socialPreviewCard(url,{kind:'post',title:'View community publication',site:'PSN-Content · Social'})}</div>`;
@@ -115885,6 +115994,9 @@ function getVisibleChatStackEl(id) {
     socialPreviewPending.set('web:'+url,pending);return pending;
   }
   async function socialPreviewSharedDescriptor(share){
+    // Shared links in Global/Private/Groups and Social reuse the same pending request.
+    if(window.isProfileLoaded===true&&typeof window.psnResolveSharedContentDescriptor==='function')
+      return window.psnResolveSharedContentDescriptor(share.token);
     const key='share:'+share.token;
     const cached=socialPreviewResults.get(key);
     if(cached&&Date.now()-cached.at<10*60*1000)return cached.value;
@@ -115907,10 +116019,7 @@ function getVisibleChatStackEl(id) {
       const descriptor=await socialPreviewSharedDescriptor(share);
       if(!host.isConnected||host.dataset.socialPreviewUrl!==url||!descriptor)return;
       const category=s(descriptor.category||share.hint?.category||'').replace(/_/g,' ');
-      let image='';
-      if(descriptor.titleId||descriptor.contentId){
-        try {if(typeof getItemCover==='function')image=getItemCover({id:descriptor.titleId,titleId:descriptor.titleId,contentId:descriptor.contentId,region:descriptor.region},descriptor.category)||'';}catch(e){}
-      }
+      const image=socialSharedCover(descriptor);
       host.innerHTML=socialPreviewCard(url,{kind:'shared',title:descriptor.name||share.hint?.name,description:descriptor.titleId||descriptor.contentId||'Open this content in PSN-Content',site:'Shared Content · '+category,image});
       return;
     }
@@ -116385,16 +116494,20 @@ function getVisibleChatStackEl(id) {
     if(!media.length)return '';
     return `<div class="psn-social-media${media.length===1?' one':''}">${media.map((src,i)=>`<button type="button" data-social-action="image" data-index="${i}" title="View image"><img loading="lazy" decoding="async" src="${esc(src)}" alt="Photo ${i+1}"></button>`).join('')}</div>`;
   }
-  function postMarkup(post){
+  function socialPostRenderContext(){
+    return {me:identity(),staff:typeof window.canModerateSession==='function'&&window.canModerateSession()};
+  }
+  function postMarkup(post,renderContext=null){
     const id=idOf(post.id);if(!id)return '';
-    const staff=typeof window.canModerateSession==='function'&&window.canModerateSession();
-    const canDelete=post.author===identity()||staff;
-    const canEdit=post.author===identity();
+    const me=renderContext?.me??identity();
+    const staff=renderContext?renderContext.staff:typeof window.canModerateSession==='function'&&window.canModerateSession();
+    const canDelete=post.author===me||staff;
+    const canEdit=post.author===me;
     const editing=state.editId===id;
     const profile=`<button type="button" class="psn-social-profile" data-social-action="profile" data-user="${esc(post.author)}" aria-label="View ${esc(post.author)} profile" onmouseenter="if(typeof playUiHover==='function')playUiHover()">${socialAvatar(post.author,post.avatar)}<span><span class="psn-social-author">${esc(post.author)}</span><span class="psn-social-age" data-social-post-age>${esc(timeLabel(post.createdAt))} · Public${post.editedAt?'<span class="psn-social-edited" title="Edited after publishing">Edited</span>':''}</span></span></button>`;
     return `<article class="psn-social-card" data-social-post="${id}"${socialReactionToneAttr(post.myReaction)}>
       <div class="psn-social-head"><div class="psn-social-identity">${profile}</div>
-      <div class="psn-social-actions">${canEdit?`<button type="button" class="psn-social-btn" data-social-action="edit" data-id="${id}" title="Edit post" aria-label="Edit post"><i class="fas fa-pen"></i></button>`:''}${canDelete?`<button type="button" class="psn-social-btn danger" data-social-action="delete" data-id="${id}" title="Delete post" aria-label="Delete post"><i class="fas fa-trash-alt"></i></button>`:''}${post.author!==identity()?`<button type="button" class="psn-social-btn" data-social-action="report" data-id="${id}" title="Report post" aria-label="Report post"><i class="far fa-flag"></i></button>`:''}</div></div>
+      <div class="psn-social-actions">${canEdit?`<button type="button" class="psn-social-btn" data-social-action="edit" data-id="${id}" title="Edit post" aria-label="Edit post"><i class="fas fa-pen"></i></button>`:''}${canDelete?`<button type="button" class="psn-social-btn danger" data-social-action="delete" data-id="${id}" title="Delete post" aria-label="Delete post"><i class="fas fa-trash-alt"></i></button>`:''}${post.author!==me?`<button type="button" class="psn-social-btn" data-social-action="report" data-id="${id}" title="Report post" aria-label="Report post"><i class="far fa-flag"></i></button>`:''}</div></div>
       ${post.playing?`<div class="psn-social-playing-post">${socialPlayingMarkup(post.playing)}</div>`:''}
       ${editing?`<div class="psn-social-edit-panel"><div class="psn-social-textarea psn-social-rich-editor" contenteditable="true" role="textbox" aria-multiline="true" data-social-edit-input="${id}" aria-label="Edit publication">${socialSafeHtml(post.text)}</div>${socialFormatToolbar()}<div class="psn-social-attach-list" data-social-edit-attachments="${id}"></div><div class="psn-social-edit-actions"><button type="button" class="psn-social-btn" data-social-action="edit-cancel" data-id="${id}">Cancel</button><button type="button" class="psn-social-btn primary" data-social-action="edit-save" data-id="${id}"><i class="fas fa-check"></i> Save</button></div></div>`:(post.text?`<div class="psn-social-body${s(post.text).startsWith(SOCIAL_RICH_PREFIX)?' is-rich':''}">${socialTranslationContent('post',id,s(post.text))}</div>${socialTranslationButton('post',id,s(post.text))}`:'')}${socialPreviewMarkup(post.text)}${mediaMarkup(post.images)}
       ${postActionbar(post)}
@@ -116435,8 +116548,11 @@ function getVisibleChatStackEl(id) {
       if(!children.has(parent))children.set(parent,[]);
       children.get(parent).push(comment);
     }
-    for(const values of children.values())values.sort((a,b)=>Number(a.id)-Number(b.id));
+    const byCommentId=(a,b)=>Number(a.id)-Number(b.id);
+    const roots=children.get('')||[];
+    roots.sort(byCommentId);
     const visited=new Set();
+    const renderContext=socialPostRenderContext();
     const renderNode=(comment,depth=0)=>{
       const cid=String(comment.id);
       if(visited.has(cid)||depth>25)return '';
@@ -116445,11 +116561,11 @@ function getVisibleChatStackEl(id) {
       const direct=children.get(cid)||[];
       const count=Math.max(Number(comment.replyCount)||0,direct.length);
       const expanded=!!thread?.expanded;
+      if(expanded&&direct.length>1)direct.sort(byCommentId);
       const toggle=count?`<button type="button" class="psn-social-thread-toggle" data-social-thread-toggle="${cid}" data-post="${postId}" aria-controls="psn-social-thread-children-${cid}" aria-expanded="${expanded}"><i class="fas fa-chevron-down" aria-hidden="true"></i>${expanded?'Hide replies':`View ${count} ${count===1?'reply':'replies'}`}</button>`:'';
       const childMarkup=expanded?`<div class="psn-social-thread-children" id="psn-social-thread-children-${cid}">${direct.map(child=>renderNode(child,depth+1)).join('')}${thread?.error?`<p class="psn-social-thread-message" role="status">${esc(thread.error)}</p>`:''}${thread?.loading?'<p class="psn-social-thread-message">Loading replies…</p>':!thread?.loaded||thread?.after?`<button type="button" class="psn-social-thread-more" data-social-thread-more="${cid}" data-post="${postId}"><i class="fas fa-chevron-down" aria-hidden="true"></i>${thread?.loaded?'Load more replies':'Load replies'}</button>`:''}</div>`:count?`<div class="psn-social-thread-children" id="psn-social-thread-children-${cid}" hidden></div>`:'';
-      return `<div class="psn-social-thread-node" data-social-thread-id="${cid}">${socialCommentMarkup(comment,postId,depth)}${toggle}${childMarkup}</div>`;
+      return `<div class="psn-social-thread-node" data-social-thread-id="${cid}">${socialCommentMarkup(comment,postId,depth,renderContext)}${toggle}${childMarkup}</div>`;
     };
-    const roots=children.get('')||[];
     const markup=roots.map(comment=>renderNode(comment)).join('');
     return markup||'<p class="psn-social-muted">No comments yet. Start the conversation!</p>';
   }
@@ -116538,13 +116654,14 @@ function getVisibleChatStackEl(id) {
     if(!thread.loaded&&!thread.loading)await loadSocialCommentReplies(postId,parentId);
   }
 
-  function socialCommentMarkup(c,postId,depth=0){
+  function socialCommentMarkup(c,postId,depth=0,renderContext=null){
     const cid=idOf(c.id);if(!cid)return '';
-    const canDelete=c.author===identity()||(typeof window.canModerateSession==='function'&&window.canModerateSession());
+    const me=renderContext?.me??identity();
+    const canDelete=c.author===me||(renderContext?renderContext.staff:(typeof window.canModerateSession==='function'&&window.canModerateSession()));
     const reply=c.parentId&&idOf(c.parentId);
     const media=(Array.isArray(c.images)?c.images:[]).map(safeImage).filter(Boolean).slice(0,1);
     const mediaHtml=media.length?`<div class="psn-social-comment-media">${media.map((url,index)=>`<button type="button" data-social-action="comment-image" data-id="${cid}" data-post="${postId}" data-index="${index}" aria-label="View attached image"><img src="${esc(url)}" loading="lazy" decoding="async" alt="Comment attachment"></button>`).join('')}</div>`:'';
-    return `<div class="psn-social-comment${reply?' is-reply':''}" data-social-comment="${cid}"${socialReactionToneAttr(c.myReaction)}><button type="button" class="psn-social-profile avatar-link" data-social-action="profile" data-user="${esc(c.author)}" aria-label="View ${esc(c.author)} profile" title="${esc(c.author)}">${socialAvatar(c.author,c.avatar,true)}</button><div class="psn-social-comment-content"><div class="psn-social-comment-bubble">${depth>1&&reply&&c.parentAuthor?`<div class="psn-social-comment-reply-target">Replying to <strong>${esc(c.parentAuthor)}</strong></div>`:''}<div class="psn-social-head"><div class="psn-social-comment-byline"><button type="button" class="psn-social-profile" data-social-action="profile" data-user="${esc(c.author)}"><span class="psn-social-author">${esc(c.author)}</span></button><span class="psn-social-comment-separator" aria-hidden="true">·</span><span class="psn-social-age">${esc(timeLabel(c.createdAt))}</span></div><div class="psn-social-actions">${canDelete?`<button type="button" class="psn-social-btn danger" data-social-action="comment-delete" data-id="${cid}" data-post="${postId}" aria-label="Delete comment" title="Delete comment"><i class="fas fa-trash-alt"></i></button>`:''}${c.author!==identity()?`<button type="button" class="psn-social-btn" data-social-action="comment-report" data-id="${cid}" aria-label="Report comment" title="Report comment"><i class="far fa-flag"></i></button>`:''}</div></div>${c.text?`<p class="psn-social-comment-text">${socialTranslationContent('comment',cid,s(c.text))}</p>`:''}${mediaHtml}</div>${commentActionbar(c,postId)}</div></div>`;
+    return `<div class="psn-social-comment${reply?' is-reply':''}" data-social-comment="${cid}"${socialReactionToneAttr(c.myReaction)}><button type="button" class="psn-social-profile avatar-link" data-social-action="profile" data-user="${esc(c.author)}" aria-label="View ${esc(c.author)} profile" title="${esc(c.author)}">${socialAvatar(c.author,c.avatar,true)}</button><div class="psn-social-comment-content"><div class="psn-social-comment-bubble">${depth>1&&reply&&c.parentAuthor?`<div class="psn-social-comment-reply-target">Replying to <strong>${esc(c.parentAuthor)}</strong></div>`:''}<div class="psn-social-head"><div class="psn-social-comment-byline"><button type="button" class="psn-social-profile" data-social-action="profile" data-user="${esc(c.author)}"><span class="psn-social-author">${esc(c.author)}</span></button><span class="psn-social-comment-separator" aria-hidden="true">·</span><span class="psn-social-age">${esc(timeLabel(c.createdAt))}</span></div><div class="psn-social-actions">${canDelete?`<button type="button" class="psn-social-btn danger" data-social-action="comment-delete" data-id="${cid}" data-post="${postId}" aria-label="Delete comment" title="Delete comment"><i class="fas fa-trash-alt"></i></button>`:''}${c.author!==me?`<button type="button" class="psn-social-btn" data-social-action="comment-report" data-id="${cid}" aria-label="Report comment" title="Report comment"><i class="far fa-flag"></i></button>`:''}</div></div>${c.text?`<p class="psn-social-comment-text">${socialTranslationContent('comment',cid,s(c.text))}</p>`:''}${mediaHtml}</div>${commentActionbar(c,postId)}</div></div>`;
   }
   function commentAreaMarkup(postId){
     const comments=socialCommentListMarkup(postId);
@@ -116795,10 +116912,12 @@ function getVisibleChatStackEl(id) {
     }
     moreButton.dataset.reactorsRetry='more';moreButton.innerHTML='<i class="fas fa-chevron-down" aria-hidden="true"></i><span>Load more</span>';
     const users=Array.isArray(result.users)?result.users:[];
+    const currentName=identity().toLowerCase();
+    const friendNames=new Set((Array.isArray(window.friendsList)?window.friendsList:[]).map(friend=>s(friend?.name||friend).trim().toLowerCase()));
     const markup=users.map(user=>{
       const name=s(user.name);
-      const me=name.toLowerCase()===identity().toLowerCase();
-      const actions=me?'':`<span class="psn-social-reactors-actions">${socialIsFriend(name)?'':`<button type="button" class="btn-mini-round btn-friend-add psn-social-reactors-quick-action" data-reactors-friend="${esc(name)}" data-avatar="${esc(safeImage(user.avatar))}" title="Add ${esc(name)} as friend" aria-label="Add ${esc(name)} as friend"><i class="fas fa-user-plus" aria-hidden="true"></i></button>`}<button type="button" class="btn-mini-round psn-social-reactors-quick-action psn-social-reactors-chat-action" data-reactors-chat="${esc(name)}" title="Chat with ${esc(name)}" aria-label="Chat with ${esc(name)}"><i class="fas fa-comment-dots" aria-hidden="true"></i></button></span>`;
+      const me=name.toLowerCase()===currentName;
+      const actions=me?'':`<span class="psn-social-reactors-actions">${friendNames.has(name.trim().toLowerCase())?'':`<button type="button" class="btn-mini-round btn-friend-add psn-social-reactors-quick-action" data-reactors-friend="${esc(name)}" data-avatar="${esc(safeImage(user.avatar))}" title="Add ${esc(name)} as friend" aria-label="Add ${esc(name)} as friend"><i class="fas fa-user-plus" aria-hidden="true"></i></button>`}<button type="button" class="btn-mini-round psn-social-reactors-quick-action psn-social-reactors-chat-action" data-reactors-chat="${esc(name)}" title="Chat with ${esc(name)}" aria-label="Chat with ${esc(name)}"><i class="fas fa-comment-dots" aria-hidden="true"></i></button></span>`;
       return `<div class="psn-social-reactors-person"><button type="button" class="psn-social-reactors-user" data-reactors-user="${esc(name)}" aria-label="View ${esc(name)} profile">${socialAvatar(name,user.avatar)}<span class="psn-social-reactors-name">${esc(name)}</span></button>${actions}<span class="psn-social-reactors-emoji" aria-label="${esc(user.emoji)}">${esc(user.emoji)}</span></div>`;
     }).join('');
     animateSocialReactorsHeight(()=>{
@@ -116993,7 +117112,8 @@ function getVisibleChatStackEl(id) {
       ? ['No friends have posted yet.','Switch to All to see the community.']
       : ['No publications here yet.','Be the first to share something!'];
     if(socialPreviewObserver)socialPreviewObserver.disconnect();
-    el.innerHTML=state.posts.length?state.posts.map(postMarkup).join(''):
+    const socialPostRenderContextCached=state.posts.length?socialPostRenderContext():null;
+    el.innerHTML=state.posts.length?state.posts.map(post=>postMarkup(post,socialPostRenderContextCached)).join(''):
       `<div class="friend-activity-empty psn-page-empty-state psn-social-empty"><i class="far fa-comments" aria-hidden="true"></i><strong>${empty[0]}</strong><p>${empty[1]}</p></div>`;
     hydrateSocialLinkPreviews(el);
     if(!state.posts.length&&typeof window.registerPsnPageEmptyStates==='function')window.registerPsnPageEmptyStates(el.firstElementChild);
@@ -117053,6 +117173,7 @@ function getVisibleChatStackEl(id) {
       return;
     }
     if(res.counts)saveSocialPostCounts(res.counts);
+    else if(!more) scheduleSocialCountRefresh();
     const incoming=Array.isArray(res.posts)?res.posts:[];
     const hadPosts=state.posts.length>0;
     if(more){
@@ -117060,8 +117181,12 @@ function getVisibleChatStackEl(id) {
       const appended=incoming.filter(post=>!ids.has(post.id));
       state.posts.push(...appended);
       state.before=res.nextBefore||null;
-      if(hadPosts&&appended.length)el.insertAdjacentHTML('beforeend',appended.map(postMarkup).join(''));
-      else if(!hadPosts)renderFeed();
+      if(hadPosts&&appended.length){
+        const previousTail=el.lastElementChild;
+        const context=socialPostRenderContext();
+        el.insertAdjacentHTML('beforeend',appended.map(post=>postMarkup(post,context)).join(''));
+        for(let row=previousTail?previousTail.nextElementSibling:el.firstElementChild;row;row=row.nextElementSibling)hydrateSocialLinkPreviews(row);
+      }else if(!hadPosts)renderFeed();
     } else if(replaceCached){
       const oldPosts=state.posts;
       const oldBefore=state.before;
@@ -117083,8 +117208,15 @@ function getVisibleChatStackEl(id) {
       const added=incoming.filter(post=>!known.has(post.id));
       if(added.length){
         state.posts.unshift(...added);
-        el.insertAdjacentHTML('afterbegin',added.map(postMarkup).join(''));
-        for(const post of added)el.querySelector(`[data-social-post="${post.id}"]`)?.classList.add('is-new-post');
+        const context=socialPostRenderContext();
+        el.insertAdjacentHTML('afterbegin',added.map(post=>postMarkup(post,context)).join(''));
+        let row=el.firstElementChild;
+        for(const post of added){
+          if(!row)break;
+          row.classList.add('is-new-post');
+          hydrateSocialLinkPreviews(row);
+          row=row.nextElementSibling;
+        }
       }
       if(!state.before)state.before=res.nextBefore||null;
     } else {
@@ -117092,7 +117224,7 @@ function getVisibleChatStackEl(id) {
       state.before=res.nextBefore||null;
       renderFeed();
     }
-    hydrateSocialLinkPreviews(el);
+    // Full renders hydrate in renderFeed(); incremental loads hydrate only inserted cards.
     state.loaded=true;
     if(!more){state.stale=false;socialFeedFetchedAt=Date.now();}
     saveSocialFilterSnapshot(!more);
@@ -117151,46 +117283,68 @@ function getVisibleChatStackEl(id) {
     if(!el.querySelector('[data-social-post]'))el.innerHTML='';
     el.querySelector(`[data-social-post="${id}"]`)?.remove();
     el.insertAdjacentHTML('afterbegin',postMarkup(post));
-    el.querySelector(`[data-social-post="${id}"]`)?.classList.add('is-new-post');
-    hydrateSocialLinkPreviews(el);
+    const newRow=el.querySelector(`[data-social-post="${id}"]`);
+    newRow?.classList.add('is-new-post');
+    if(newRow)hydrateSocialLinkPreviews(newRow);
     state.loaded=true;
     saveSocialFilterSnapshot();
     updateInfiniteFeed();
   }
+  let socialCommentsInFlight=null;
   async function loadComments(postId){
     if(state.modalPostId!==postId)return;
-    const request=++state.modalRequest;
-    const focusCommentId=idOf(state.focusReportedCommentId);
-    const res=await call('social_comments_list',{postId,...(focusCommentId?{focusCommentId}:{})});
-    if(state.modalPostId!==postId||request!==state.modalRequest)return;
-    const status=document.getElementById('psn-social-modal-status');
-    if(!res.success){if(status)status.textContent=res.message||'Could not load comments.';return;}
-    if(status)status.textContent='';
-    const comments=Array.isArray(res.comments)?res.comments:[];
-    state.comments.set(postId,comments);
-    if(focusCommentId){
-      const byId=new Map(comments.map(comment=>[String(comment.id),comment]));
-      let target=byId.get(focusCommentId),depth=0;
-      while(target?.parentId&&depth++<25){
-        const parentId=String(target.parentId);
-        socialThreadState(postId,parentId).expanded=true;
-        target=byId.get(parentId);
-      }
+    const current=socialCommentsInFlight;
+    // Events arriving while a read is in flight request one follow-up read instead of
+    // sending overlapping SQL requests. The latest view still wins after reconnection.
+    if(current&&current.postId===postId&&current.request===state.modalRequest){
+      current.dirty=true;
+      if(socialCommentsRefreshTimer){clearTimeout(socialCommentsRefreshTimer);socialCommentsRefreshTimer=0;}
+      return current.promise;
     }
-    const list=document.querySelector('#psn-social-modal-body .psn-social-comments-list');
-    if(!list)return;
-    reconcileSocialCommentRows(list,postId,JSON.stringify(comments));
-    if(focusCommentId&&state.focusReportedCommentId===focusCommentId){
-      state.focusReportedCommentId=null;
-      const row=list.querySelector(`[data-social-comment="${focusCommentId}"]`);
-      if(row){
-        row.classList.add('is-report-target');
-        row.setAttribute('tabindex','-1');
-        const offset=row.getBoundingClientRect().top-list.getBoundingClientRect().top+list.scrollTop-(list.clientHeight-row.offsetHeight)/2;
-        list.scrollTo({top:Math.max(0,offset),behavior:'smooth'});
-        row.focus({preventScroll:true});
-        setTimeout(()=>{if(row.isConnected){row.classList.remove('is-report-target');row.removeAttribute('tabindex');}},3200);
-      }else if(status)status.textContent='This comment is no longer available.';
+    if(socialCommentsRefreshTimer){clearTimeout(socialCommentsRefreshTimer);socialCommentsRefreshTimer=0;}
+    const request=++state.modalRequest;
+    const operation=(async()=>{
+      const focusCommentId=idOf(state.focusReportedCommentId);
+      const res=await call('social_comments_list',{postId,...(focusCommentId?{focusCommentId}:{})});
+      if(state.modalPostId!==postId||request!==state.modalRequest)return;
+      const status=document.getElementById('psn-social-modal-status');
+      if(!res.success){if(status)status.textContent=res.message||'Could not load comments.';return;}
+      if(status)status.textContent='';
+      const comments=Array.isArray(res.comments)?res.comments:[];
+      state.comments.set(postId,comments);
+      if(focusCommentId){
+        const byId=new Map(comments.map(comment=>[String(comment.id),comment]));
+        let target=byId.get(focusCommentId),depth=0;
+        while(target?.parentId&&depth++<25){
+          const parentId=String(target.parentId);
+          socialThreadState(postId,parentId).expanded=true;
+          target=byId.get(parentId);
+        }
+      }
+      const list=document.querySelector('#psn-social-modal-body .psn-social-comments-list');
+      if(!list)return;
+      reconcileSocialCommentRows(list,postId,JSON.stringify(comments));
+      if(focusCommentId&&state.focusReportedCommentId===focusCommentId){
+        state.focusReportedCommentId=null;
+        const row=list.querySelector(`[data-social-comment="${focusCommentId}"]`);
+        if(row){
+          row.classList.add('is-report-target');
+          row.setAttribute('tabindex','-1');
+          const offset=row.getBoundingClientRect().top-list.getBoundingClientRect().top+list.scrollTop-(list.clientHeight-row.offsetHeight)/2;
+          list.scrollTo({top:Math.max(0,offset),behavior:'smooth'});
+          row.focus({preventScroll:true});
+          setTimeout(()=>{if(row.isConnected){row.classList.remove('is-report-target');row.removeAttribute('tabindex');}},3200);
+        }else if(status)status.textContent='This comment is no longer available.';
+      }
+    })();
+    const entry={postId,request,promise:operation,dirty:false};
+    socialCommentsInFlight=entry;
+    try{return await operation;}
+    finally{
+      if(socialCommentsInFlight===entry){
+        socialCommentsInFlight=null;
+        if(entry.dirty&&state.modalPostId===postId)scheduleOpenSocialCommentsRefresh(postId);
+      }
     }
   }
   function renderAttachments(){

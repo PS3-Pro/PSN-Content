@@ -882,8 +882,10 @@ function isPgTransientConnectionError(err) {
   const code = String(err.code || '').toUpperCase();
   const message = String(err.message || err).toLowerCase();
   if (['08000','08001','08003','08004','08006','08007','08P01','57P01','57P02','57P03','53300','55P03','40001','40P01'].includes(code)) return true;
-  if (code === '57014' && /statement timeout|query timeout|canceling statement/.test(message)) return true;
-  return /query read timeout|query timeout|read timeout|connection terminated|connection timeout|timeout exceeded when trying to connect|connection reset|econnreset|etimedout|ehostunreach|enetunreach|socket hang up|broken pipe|server closed the connection|terminating connection|the database system is starting up|too many clients|remaining connection slots/.test(message);
+  // A canceled/over-budget SQL statement is not a broken connection. Retrying it
+  // immediately doubles load on a struggling free PostgreSQL instance.
+  if (code === '57014' || /query read timeout|query timeout|statement timeout|canceling statement/.test(message)) return false;
+  return /read timeout|connection terminated|connection timeout|timeout exceeded when trying to connect|connection reset|econnreset|etimedout|ehostunreach|enetunreach|socket hang up|broken pipe|server closed the connection|terminating connection|the database system is starting up|too many clients|remaining connection slots/.test(message);
 }
 
 function waitMs(ms) {
@@ -896,38 +898,65 @@ const DB_PERF_ENABLED = process.env.DB_PERF_ENABLED !== '0';
 const DB_PERF_SLOW_MS = Math.max(300, Math.min(10000, parseInt(process.env.DB_PERF_SLOW_MS || '1200', 10) || 1200));
 const DB_PERF_INTERVAL_MS = Math.max(60000, Math.min(600000, parseInt(process.env.DB_PERF_INTERVAL_MS || '300000', 10) || 300000));
 const dbQueryPerf = new Map();
-function recordDbQueryPerformance(label, elapsedMs, attempts = 1, failed = false) {
+let dbPerfPeakWaiting = 0;
+let dbPerfPeakConnections = 0;
+function sampleDbPoolPressure() {
+  if (!DB_PERF_ENABLED) return;
+  dbPerfPeakWaiting = Math.max(dbPerfPeakWaiting, pool.waitingCount);
+  dbPerfPeakConnections = Math.max(dbPerfPeakConnections, pool.totalCount);
+}
+function recordDbQueryPerformance(label, elapsedMs, attempts = 1, failed = false, stages = {}) {
   if (!DB_PERF_ENABLED) return;
   const key = dbQueryPerf.has(label) || dbQueryPerf.size < 80 ? label : 'OTHER';
   let stats = dbQueryPerf.get(key);
   if (!stats) {
-    stats = { calls:0, total:0, max:0, slow:0, errors:0, retries:0, samples:[], next:0, lastSlowLogAt:0 };
+    stats = { calls:0, total:0, max:0, slow:0, errors:0, retries:0, samples:[], next:0,
+      acquireTotal:0, acquireMax:0, acquireSamples:[], queryTotal:0, querySamples:[],
+      queued:0, lastSlowLogAt:0 };
     dbQueryPerf.set(key, stats);
   }
+  const acquireMs = Math.max(0, Number(stages.acquireMs) || 0);
+  const queryMs = Math.max(0, Number(stages.queryMs) || 0);
   stats.calls++;
   stats.total += elapsedMs;
   stats.max = Math.max(stats.max, elapsedMs);
+  stats.acquireTotal += acquireMs;
+  stats.acquireMax = Math.max(stats.acquireMax, acquireMs);
+  stats.queryTotal += queryMs;
+  if (stages.queued === true) stats.queued++;
   if (failed) stats.errors++;
   if (attempts > 1) stats.retries += attempts - 1;
-  stats.samples[stats.next++ % 64] = elapsedMs;
+  const slot = stats.next++ % 64;
+  stats.samples[slot] = elapsedMs;
+  stats.acquireSamples[slot] = acquireMs;
+  stats.querySamples[slot] = queryMs;
   if (elapsedMs >= DB_PERF_SLOW_MS) {
     stats.slow++;
     if (Date.now() - stats.lastSlowLogAt >= 30000) {
       stats.lastSlowLogAt = Date.now();
-      console.warn(`[DB SLOW] ${key}: ${elapsedMs}ms (${attempts} attempt(s), queue=${pool.waitingCount})`);
+      console.warn(`[DB SLOW] ${key}: ${elapsedMs}ms (pool=${acquireMs}ms, sql=${queryMs}ms, ${attempts} attempt(s), queue=${pool.waitingCount})`);
     }
   }
 }
+function dbPerfP95(values) {
+  if (!values.length) return 0;
+  const sorted = values.slice().sort((a,b) => a-b);
+  return Math.round(sorted[Math.ceil(sorted.length * .95) - 1] || 0);
+}
 function flushDbQueryPerformance() {
   if (!dbQueryPerf.size) return;
-  const summary = [...dbQueryPerf.entries()].map(([label, stats]) => {
-    const samples = stats.samples.slice().sort((a,b) => a-b);
-    return { label, calls:stats.calls, avgMs:Math.round(stats.total / stats.calls),
-      p95Ms:Math.round(samples[Math.ceil(samples.length * .95) - 1] || 0),
-      maxMs:stats.max, slow:stats.slow, errors:stats.errors, retries:stats.retries, totalMs:stats.total };
-  }).sort((a,b) => b.totalMs-a.totalMs).slice(0,8);
+  const summary = [...dbQueryPerf.entries()].map(([label, stats]) => ({
+    label, calls:stats.calls, avgMs:Math.round(stats.total / stats.calls),
+    p95Ms:dbPerfP95(stats.samples), maxMs:stats.max,
+    avgPoolMs:Math.round(stats.acquireTotal / stats.calls), p95PoolMs:dbPerfP95(stats.acquireSamples),
+    maxPoolMs:stats.acquireMax, avgSqlMs:Math.round(stats.queryTotal / stats.calls),
+    p95SqlMs:dbPerfP95(stats.querySamples), queued:stats.queued,
+    slow:stats.slow, errors:stats.errors, retries:stats.retries, totalMs:stats.total
+  })).sort((a,b) => b.totalMs-a.totalMs).slice(0,8);
   dbQueryPerf.clear();
-  console.log('[DB PERF 5MIN]', JSON.stringify({topQueries:summary, pool:{total:pool.totalCount, idle:pool.idleCount, waiting:pool.waitingCount}}));
+  console.log('[DB PERF 5MIN]', JSON.stringify({topQueries:summary, pool:{total:pool.totalCount, idle:pool.idleCount, waiting:pool.waitingCount, peakWaiting:dbPerfPeakWaiting, peakConnections:dbPerfPeakConnections}}));
+  dbPerfPeakWaiting = 0;
+  dbPerfPeakConnections = 0;
 }
 
 async function queryDbWithRetry(text, params = [], options = {}) {
@@ -935,18 +964,49 @@ async function queryDbWithRetry(text, params = [], options = {}) {
   const label = String(options.label || 'DB QUERY');
   let lastError = null;
   const startedAt = DB_PERF_ENABLED ? Date.now() : 0;
+  let acquireMs = 0;
+  let queryMs = 0;
+  let wasQueued = false;
   for (let attempt = 1; attempt <= attempts; attempt++) {
+    let client = null;
+    let shouldRetry = false;
+    let discardClient = false;
+    sampleDbPoolPressure();
     try {
-      const result = await pool.query(text, params);
-      if (DB_PERF_ENABLED) recordDbQueryPerformance(label, Date.now() - startedAt, attempt);
-      return result;
-    } catch (err) {
-      lastError = err;
-      if (!isPgTransientConnectionError(err) || attempt >= attempts) {
-        if (DB_PERF_ENABLED) recordDbQueryPerformance(label, Date.now() - startedAt, attempt, true);
+      const poolStartedAt = DB_PERF_ENABLED ? Date.now() : 0;
+      if (DB_PERF_ENABLED && pool.waitingCount > 0) wasQueued = true;
+      client = await pool.connect();
+      if (DB_PERF_ENABLED) acquireMs += Date.now() - poolStartedAt;
+      sampleDbPoolPressure();
+      const queryStartedAt = DB_PERF_ENABLED ? Date.now() : 0;
+      try {
+        const result = await client.query(text, params);
+        if (DB_PERF_ENABLED) queryMs += Date.now() - queryStartedAt;
+        if (DB_PERF_ENABLED) recordDbQueryPerformance(label, Date.now() - startedAt, attempt, false, { acquireMs, queryMs, queued:wasQueued });
+        return result;
+      } catch (err) {
+        if (DB_PERF_ENABLED) queryMs += Date.now() - queryStartedAt;
+        // node-postgres can reject a local query_timeout while the backend is
+        // still busy. Do not return that connection to the free-tier pool.
+        discardClient = /query read timeout|query timeout/i.test(String(err && err.message || ''));
         throw err;
       }
-      const delayMs = attempt === 1 ? 180 : 650;
+    } catch (err) {
+      sampleDbPoolPressure();
+      lastError = err;
+      shouldRetry = isPgTransientConnectionError(err) && attempt < attempts;
+      if (!shouldRetry) {
+        if (DB_PERF_ENABLED) recordDbQueryPerformance(label, Date.now() - startedAt, attempt, true, { acquireMs, queryMs, queued:wasQueued });
+        throw err;
+      }
+    } finally {
+      // A locally timed-out query may still be executing server-side. Retire
+      // that socket instead of handing it to another waiting request.
+      if (client) client.release(discardClient ? lastError : undefined);
+    }
+    if (shouldRetry) {
+      // Spread reconnect attempts to avoid a thundering herd on small Aiven tiers.
+      const delayMs = (attempt === 1 ? 180 : 650) + Math.floor(Math.random() * 101);
       console.warn(`[${label}] Temporary PostgreSQL connection failure. Retrying ${attempt + 1}/${attempts} in ${delayMs}ms.`);
       await waitMs(delayMs);
     }
@@ -1349,6 +1409,9 @@ async function readSharedMetadataProviderCache(cacheKey) {
 
 function saveSharedMetadataProviderCache(cacheKey, payload) {
   if (!cacheKey || !payload) return;
+  // This persistent cache is optional: don't queue metadata writes ahead of
+  // logins, social comments and chat requests when all DB clients are busy.
+  if (pool.waitingCount > 0 && pool.idleCount === 0) return;
   const serialized = JSON.stringify(payload);
   if (Buffer.byteLength(serialized) > 150000) return;
   pool.query({
@@ -1966,6 +2029,7 @@ let userNameIndexDirty = true;
 let userNameIndexAlpha = [];
 let userNameIndexByLength = [];
 let userNameLookupLower = new Map();
+let userNameMaxLowerLength = 0;
 
 function markUserNameIndexDirty() {
   userNameIndexDirty = true;
@@ -1978,6 +2042,7 @@ function rebuildUserNameIndexes() {
   userNameIndexAlpha = entries.slice().sort((a, b) => a.lower.localeCompare(b.lower));
   userNameIndexByLength = entries.slice().sort((a, b) => (b.name.length - a.name.length) || a.lower.localeCompare(b.lower));
   userNameLookupLower = new Map(entries.map(entry => [entry.lower, entry.name]));
+  userNameMaxLowerLength = entries.reduce((max, entry) => Math.max(max, entry.lower.length), 0);
   userNameIndexDirty = false;
 }
 
@@ -1992,9 +2057,14 @@ const userProfileWriteInFlight = new Set();
 const fullUserCacheNames = new Set();
 let profileHydrationQueues = [Promise.resolve(), Promise.resolve()];
 let profileHydrationNextLane = 0;
+// Keep only two large profile packets prepared/in-flight, independently of
+// PostgreSQL hydration lanes: slow browser ACKs must not block account reads.
+const profileSectionDeliveryQueues = [Promise.resolve(), Promise.resolve()];
+let profileSectionDeliveryNextLane = 0;
 // Keep history transfers bounded, but do not let one slow user's ACK block everyone.
 // Two lanes keep memory/socket pressure low on the small Render instance.
 const chatHistoryEmitQueues = [Promise.resolve(), Promise.resolve()];
+const chatHistoryQueueDepth = [0, 0];
 let chatHistoryNextLane = 0;
 const USER_HEAVY_CACHE_KEYS = ['downloadsData', 'libraryData', 'libraryPlayHistoryData', 'wishlistData', 'favoritesData', 'trophiesData', 'friendsData'];
 let trendingCache = null;
@@ -2470,6 +2540,51 @@ async function refreshServerLogFromDb() {
   return serverLog;
 }
 
+// Global legacy retention scans entire history tables. Keep them out of the
+// startup path; per-user retention still runs after normal activity/events.
+let startupRetentionBusyDeferrals = 0;
+async function runStartupGlobalRetention() {
+  // Older inactive accounts are covered by this one-off legacy cleanup.
+  // When the free database is congested, postpone the scan rather than making
+  // fresh logins/feed/comments compete with it. Active users use batched trims.
+  if (pool.waitingCount > 0 && startupRetentionBusyDeferrals < 4) {
+    startupRetentionBusyDeferrals++;
+    deferServerTask('STARTUP GLOBAL RETENTION BUSY RETRY', runStartupGlobalRetention, 60000);
+    return;
+  }
+  const activityResult = await queryDbWithRetry(
+    `DELETE FROM friend_activity
+     WHERE id IN (
+       SELECT id FROM (
+         SELECT id, ROW_NUMBER() OVER (PARTITION BY actor_name ORDER BY id DESC) AS row_num
+         FROM friend_activity
+       ) ranked
+       WHERE row_num > ${SOCIAL_HISTORY_MAX}
+     )`,
+    [],
+    { attempts: 2, label: 'FRIEND ACTIVITY RETENTION' }
+  );
+  const notificationsResult = await queryDbWithRetry(
+    `DELETE FROM user_notifications
+     WHERE id IN (
+       SELECT id FROM (
+         SELECT id, ROW_NUMBER() OVER (PARTITION BY user_name ORDER BY id DESC) AS row_num
+         FROM user_notifications
+       ) ranked
+       WHERE row_num > ${SOCIAL_HISTORY_MAX}
+     )`,
+    [],
+    { attempts: 2, label: 'USER NOTIFICATION RETENTION' }
+  );
+  const deleted = Number(activityResult.rowCount || 0) + Number(notificationsResult.rowCount || 0);
+  if (deleted) console.log(`[DB MAINTENANCE] Removed ${deleted} expired historical records.`);
+}
+
+function scheduleStartupGlobalRetention() {
+  // One-shot, not polling. Give incoming logins/chat/feed reads priority after boot.
+  deferServerTask('STARTUP GLOBAL RETENTION', runStartupGlobalRetention, 60000);
+}
+
 async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -2845,31 +2960,6 @@ async function initDb() {
     );
   `);
 
-  await queryDbWithRetry(
-    `DELETE FROM friend_activity
-     WHERE id IN (
-       SELECT id FROM (
-         SELECT id, ROW_NUMBER() OVER (PARTITION BY actor_name ORDER BY id DESC) AS row_num
-         FROM friend_activity
-       ) ranked
-       WHERE row_num > ${SOCIAL_HISTORY_MAX}
-     )`,
-    [],
-    { attempts: 2, label: 'FRIEND ACTIVITY RETENTION' }
-  );
-
-  await queryDbWithRetry(
-    `DELETE FROM user_notifications
-     WHERE id IN (
-       SELECT id FROM (
-         SELECT id, ROW_NUMBER() OVER (PARTITION BY user_name ORDER BY id DESC) AS row_num
-         FROM user_notifications
-       ) ranked
-       WHERE row_num > ${SOCIAL_HISTORY_MAX}
-     )`,
-    [],
-    { attempts: 2, label: 'USER NOTIFICATION RETENTION' }
-  );
 
   await queryDbWithRetry(
     'INSERT INTO chat_sync_state (id, epoch, revision) VALUES (1, $1, 0) ON CONFLICT (id) DO NOTHING',
@@ -4724,6 +4814,25 @@ async function refreshSingleUserSummaryFromDb(name, options = {}) {
   return userDatabase[safeName];
 }
 
+// Multiple tabs (or notifications opening the same friend) share a single
+// authoritative profile-summary read. No settled results are cached here:
+// avatar, public counts and online presence keep their existing refresh path.
+const publicProfileSummaryPending = new Map();
+const PUBLIC_PROFILE_SUMMARY_PENDING_MAX = 64;
+function readPublicProfileSummaryShared(name) {
+  const safeName = normalizeText(name, '').slice(0, 120);
+  if (!safeName) return Promise.resolve(null);
+  const existing = publicProfileSummaryPending.get(safeName);
+  if (existing) return existing;
+  const pending = refreshSingleUserSummaryFromDb(safeName, { invalidateOnlineList: false });
+  if (publicProfileSummaryPending.size >= PUBLIC_PROFILE_SUMMARY_PENDING_MAX) return pending;
+  publicProfileSummaryPending.set(safeName, pending);
+  pending.finally(() => {
+    if (publicProfileSummaryPending.get(safeName) === pending) publicProfileSummaryPending.delete(safeName);
+  }).catch(() => {});
+  return pending;
+}
+
 async function refreshAllUsersCacheFromDb(options = {}) {
   if (userCacheRefreshInFlight) return userCacheRefreshInFlight;
 
@@ -6142,6 +6251,46 @@ async function publishContentBlocksChanged(options = {}) {
   return blockedStoreContent;
 }
 
+// Group identical in-flight authoritative identity lookups (e.g. Seen By
+// opened from two tabs). Do not cache completed rows, and calculate live
+// online/last-seen fields separately for each requester after the DB read.
+const authoritativeFriendsPresencePending = new Map();
+const AUTHORITATIVE_FRIENDS_PENDING_MAX = 32;
+function readAuthoritativeFriendsPresenceShared(keys) {
+  const requestedKeys = [...new Set(keys)].sort();
+  ensureUserNameIndexes();
+  const canonicalNames = [];
+  const unknownKeys = [];
+  for (const key of requestedKeys) {
+    const name = userNameLookupLower.get(key);
+    if (name) canonicalNames.push(name);
+    else unknownKeys.push(key);
+  }
+  const cacheKey = JSON.stringify([canonicalNames, unknownKeys]);
+  const existing = authoritativeFriendsPresencePending.get(cacheKey);
+  if (existing) return existing;
+  const pending = queryDbWithRetry(`
+          SELECT
+            name,
+            data - ARRAY['downloadsData','libraryData','libraryPlayHistoryData','wishlistData','favoritesData','trophiesData','friendsData','passwordHash','password']::text[] AS data,
+            CASE WHEN jsonb_typeof(data->'downloadsData') = 'array' THEN jsonb_array_length(data->'downloadsData') ELSE NULL END AS downloads_count,
+            CASE WHEN jsonb_typeof(data->'wishlistData') = 'array' THEN jsonb_array_length(data->'wishlistData') ELSE NULL END AS wishlist_count,
+            CASE WHEN jsonb_typeof(data->'favoritesData') = 'array' THEN jsonb_array_length(data->'favoritesData') ELSE NULL END AS favorites_count,
+            CASE WHEN jsonb_typeof(data->'libraryData') = 'array' THEN jsonb_array_length(data->'libraryData') ELSE NULL END AS library_count,
+            CASE WHEN jsonb_typeof(data->'friendsData') = 'array' THEN jsonb_array_length(data->'friendsData') ELSE NULL END AS friends_count
+          FROM users
+          WHERE ${unknownKeys.length
+            ? '(name = ANY($1::text[]) OR LOWER(name) = ANY($2::text[]))'
+            : 'name = ANY($1::text[])'}
+`, unknownKeys.length ? [canonicalNames, unknownKeys] : [canonicalNames], { attempts: 2, label: 'AUTHORITATIVE FRIENDS PRESENCE READ' });
+  if (authoritativeFriendsPresencePending.size >= AUTHORITATIVE_FRIENDS_PENDING_MAX) return pending;
+  authoritativeFriendsPresencePending.set(cacheKey, pending);
+  pending.finally(() => {
+    if (authoritativeFriendsPresencePending.get(cacheKey) === pending) authoritativeFriendsPresencePending.delete(cacheKey);
+  }).catch(() => {});
+  return pending;
+}
+
 async function searchUsersFromDb(query, includeAdminFields = false, includeAllMatches = false) {
   await ensureUserCacheReady();
   return searchUsersFromCache(query, includeAdminFields, includeAllMatches);
@@ -6198,6 +6347,186 @@ async function getUserDataPayloadFromDb(targetName, type) {
   if (dataKey === 'downloadsData') return normalizeDownloadHistoryRecordsServer(payload).history;
   if (dataKey === 'recentlyVisitedData') return normalizeRecentlyVisitedRecordsServer(payload);
   return payload;
+}
+
+// Share only overlapping own-profile section reads. A second login tab must not
+// trigger another large JSONB transfer while the first one is still in flight.
+// Never retain the resolved payload here: this also bounds RAM on free Render.
+const profileSyncReadsPending = new Map();
+const PROFILE_SYNC_READ_PENDING_MAX = 32;
+function readProfileSyncShared(name, scope, loader) {
+  const key = `${name}\u0000${scope}`;
+  const existing = profileSyncReadsPending.get(key);
+  if (existing) return existing;
+  const pending = Promise.resolve().then(loader);
+  if (profileSyncReadsPending.size >= PROFILE_SYNC_READ_PENDING_MAX) return pending;
+  profileSyncReadsPending.set(key, pending);
+  pending.finally(() => {
+    if (profileSyncReadsPending.get(key) === pending) profileSyncReadsPending.delete(key);
+  }).catch(() => {});
+  return pending;
+}
+function invalidateProfileSyncReads(name) {
+  const prefix = `${name}\u0000`;
+  for (const key of profileSyncReadsPending.keys()) {
+    if (key.startsWith(prefix)) profileSyncReadsPending.delete(key);
+  }
+}
+function readProfileSyncSectionShared(name, type) {
+  return readProfileSyncShared(name, `section:${type}`, () => getUserDataPayloadFromDb(name, type));
+}
+function readSmallProfileSectionsShared(name, keys) {
+  const fields = [...new Set(keys)].filter(key => PROFILE_LIGHT_BATCH_KEYS.has(key)).sort();
+  return readProfileSyncShared(name, `light:${fields.join(',')}`, () => readSmallProfileSectionsFromDb(name, fields));
+}
+
+// Remote profile lists: coalesce concurrent requests and keep a small, short-lived
+// in-memory snapshot. Cross-instance profile notifications and successful writes
+// invalidate it; never retain whole profile objects or credentials.
+const publicProfileListReadCache = new Map();
+const PUBLIC_PROFILE_LIST_CACHE_MS = 12000;
+const PUBLIC_PROFILE_LIST_CACHE_MAX = 24;
+const PUBLIC_PROFILE_LIST_MAX_BYTES = 384 * 1024;
+const PUBLIC_PROFILE_LIST_TOTAL_BYTES = 2 * 1024 * 1024;
+const PUBLIC_PROFILE_LIST_TYPES = new Set(['favs', 'favorites', 'wishlist', 'downloads', 'library', 'trophies']);
+let publicProfileListReadCacheBytes = 0;
+
+function evictPublicProfileListRead(key) {
+  const entry = publicProfileListReadCache.get(key);
+  if (!entry) return;
+  publicProfileListReadCache.delete(key);
+  publicProfileListReadCacheBytes -= entry.bytes || 0;
+}
+
+function invalidatePublicProfileListReads(name, changedKeys = null) {
+  const safeName = normalizeText(name, '');
+  if (!safeName) return;
+  // A write or cross-instance update must not join a read started before it.
+  invalidateProfileSyncReads(safeName);
+  // A Downloads change must not throw away the already-loaded Library/Wishlist.
+  // No keys means an unknown/full-profile change: conservatively clear all.
+  let affected = null;
+  if (Array.isArray(changedKeys) && changedKeys.length) {
+    affected = new Set();
+    for (const key of changedKeys) {
+      if (key === 'favoritesData') affected.add('favs');
+      else if (key === 'wishlistData') affected.add('wishlist');
+      else if (key === 'downloadsData') affected.add('downloads');
+      else if (key === 'libraryData' || key === 'libraryPlayHistoryData') affected.add('library');
+      else if (key === 'trophiesData') affected.add('trophies');
+    }
+    if (!affected.size) return;
+  }
+  const prefix = `${safeName}\u0000`;
+  for (const key of publicProfileListReadCache.keys()) {
+    if (key.startsWith(prefix) && (!affected || affected.has(key.slice(prefix.length)))) evictPublicProfileListRead(key);
+  }
+}
+
+function prunePublicProfileListReadCache(now = Date.now()) {
+  for (const [key, entry] of publicProfileListReadCache) {
+    if (!entry.promise && entry.expires <= now) evictPublicProfileListRead(key);
+  }
+  while (publicProfileListReadCache.size > PUBLIC_PROFILE_LIST_CACHE_MAX || publicProfileListReadCacheBytes > PUBLIC_PROFILE_LIST_TOTAL_BYTES) {
+    evictPublicProfileListRead(publicProfileListReadCache.keys().next().value);
+  }
+}
+
+// Fold different list requests for the same friend in one event-loop turn into
+// one selective PostgreSQL read. Only fetch the requested JSONB fields; do not
+// hydrate a full user profile or delay a single request with a debounce timer.
+const publicProfileListDbBatches = new Map();
+const PUBLIC_PROFILE_LIST_DB_FIELDS = {
+  favs: ['favoritesData'],
+  wishlist: ['wishlistData'],
+  downloads: ['downloadsData'],
+  library: ['libraryData', 'libraryPlayHistoryData'],
+  trophies: ['trophiesData']
+};
+function readPublicProfileListDbBatched(name, type) {
+  return new Promise((resolve, reject) => {
+    let batch = publicProfileListDbBatches.get(name);
+    if (!batch) {
+      batch = { requests:[], types:new Set() };
+      publicProfileListDbBatches.set(name,batch);
+      setImmediate(() => {
+        if (publicProfileListDbBatches.get(name) === batch) publicProfileListDbBatches.delete(name);
+        const columns = [...new Set([...batch.types].flatMap(category => PUBLIC_PROFILE_LIST_DB_FIELDS[category]))];
+        // Field names come exclusively from the static whitelist above.
+        const projection = columns.map(field => `data -> '${field}' AS "${field}"`).join(', ');
+        queryDbWithRetry(`SELECT ${projection} FROM users WHERE name = $1`, [name], { attempts:3, label:'USER PROFILE LIST BATCH READ' })
+          .then(result => {
+            const row = result.rows[0] || null;
+            const library = row && batch.types.has('library')
+              ? (() => {
+                  const raw = Array.isArray(row.libraryData) ? row.libraryData : [];
+                  const rawHistory = Array.isArray(row.libraryPlayHistoryData) ? row.libraryPlayHistoryData : [];
+                  const history = mergeLibraryPlayHistoryRecordsServer(rawHistory, raw);
+                  return applyLibraryPlayHistoryServer(raw, history);
+                })()
+              : null;
+            for (const request of batch.requests) {
+              if (!row) { request.resolve(null); continue; }
+              let payload = request.type === 'library' ? library : row[PUBLIC_PROFILE_LIST_DB_FIELDS[request.type][0]];
+              if (request.type === 'trophies') {
+                if (!payload || typeof payload !== 'object' || Array.isArray(payload)) payload = {};
+              } else {
+                if (!Array.isArray(payload)) payload = [];
+                if (request.type === 'downloads') payload = normalizeDownloadHistoryRecordsServer(payload).history;
+              }
+              request.resolve(payload);
+            }
+          })
+          .catch(error => { for (const request of batch.requests) request.reject(error); });
+      });
+    }
+    batch.types.add(type);
+    batch.requests.push({ type,resolve,reject });
+  });
+}
+
+function readPublicProfileListShared(targetName, type) {
+  const name = normalizeText(targetName, '').slice(0, 120);
+  const category = normalizeText(type, '').toLowerCase();
+  if (!name || !PUBLIC_PROFILE_LIST_TYPES.has(category)) return Promise.reject(new Error('Unsupported profile list.'));
+  const normalizedType = category === 'favorites' ? 'favs' : category;
+  const key = `${name}\u0000${normalizedType}`;
+  const now = Date.now();
+  const cached = publicProfileListReadCache.get(key);
+  if (cached && (cached.promise || cached.expires > now)) {
+    // LRU: keep frequently viewed lists; each promise is shared across viewers.
+    publicProfileListReadCache.delete(key);
+    publicProfileListReadCache.set(key, cached);
+    return cached.promise || Promise.resolve(cached.value);
+  }
+  if (cached) evictPublicProfileListRead(key);
+  const entry = { value:null, promise:null, bytes:0, expires:0 };
+  entry.promise = Promise.resolve().then(() => fullUserCacheNames.has(name)
+    ? getUserDataPayloadFromCache(name, normalizedType)
+    : readPublicProfileListDbBatched(name, normalizedType)
+  ).then(value => {
+    if (publicProfileListReadCache.get(key) === entry) {
+      entry.promise = null;
+      // Cache only bounded payloads, never giant user collections.
+      const bytes = Buffer.byteLength(JSON.stringify(value == null ? null : value), 'utf8');
+      if (value !== null && bytes <= PUBLIC_PROFILE_LIST_MAX_BYTES) {
+        entry.value = value;
+        entry.bytes = bytes;
+        entry.expires = Date.now() + PUBLIC_PROFILE_LIST_CACHE_MS;
+        publicProfileListReadCacheBytes += bytes;
+        prunePublicProfileListReadCache();
+      } else {
+        evictPublicProfileListRead(key);
+      }
+    }
+    return value;
+  }).catch(error => {
+    if (publicProfileListReadCache.get(key) === entry) evictPublicProfileListRead(key);
+    throw error;
+  });
+  publicProfileListReadCache.set(key, entry);
+  prunePublicProfileListReadCache(now);
+  return entry.promise;
 }
 
 function normalizeGamePlayersTitleId(value) {
@@ -6886,13 +7215,13 @@ async function ensureGameOwnershipIndexReady() {
   if (gameOwnershipIndexBuildPromise) return gameOwnershipIndexBuildPromise;
 
   gameOwnershipIndexBuildPromise = (async () => {
-    const countResult = await queryDbWithRetry(
-      'SELECT COUNT(*)::int AS count FROM user_game_ownership',
+    const existingResult = await queryDbWithRetry(
+      'SELECT EXISTS (SELECT 1 FROM user_game_ownership LIMIT 1) AS has_rows',
       [],
       { attempts: 2, label: 'GAME OWNERSHIP INDEX READY CHECK' }
     );
-    const count = Number(countResult.rows[0] && countResult.rows[0].count || 0);
-    if (count <= 0 && Object.keys(userDatabase || {}).length > 0) {
+    const hasRows = existingResult.rows[0] && existingResult.rows[0].has_rows === true;
+    if (!hasRows && Object.keys(userDatabase || {}).length > 0) {
       await rebuildGameOwnershipIndexFromProfiles();
     }
     gameOwnershipIndexReady = true;
@@ -7314,6 +7643,16 @@ function runSerializedProfileHydration(task) {
   return run;
 }
 
+// A delivery slot is acquired BEFORE reading the section, so no extra large
+// JSONB payloads accumulate while another browser is acknowledging a packet.
+// Unlike the DB hydration lanes, delivery slots may wait for network ACKs.
+function runBoundedProfileSectionDelivery(task) {
+  const lane = profileSectionDeliveryNextLane++ % profileSectionDeliveryQueues.length;
+  const run = profileSectionDeliveryQueues[lane].catch(() => null).then(task);
+  profileSectionDeliveryQueues[lane] = run.then(() => null, () => null);
+  return run;
+}
+
 async function loadFullUserRecordTransient(name) {
   const safeName = normalizeText(name, '');
   if (!safeName) return null;
@@ -7344,6 +7683,22 @@ const PROFILE_HEAVY_SECTION_META = {
   friendsData: { type: 'friends', countKey: 'friends', versionKeys: ['friendsUpdatedAt'], publicCount: false }
 };
 
+// Own-profile sync: fetch small related sections together, leaving large
+// Trophies/Downloads/Library in their existing memory-bounded streaming path.
+const PROFILE_LIGHT_BATCH_KEYS = new Set(['wishlistData', 'favoritesData', 'friendsData']);
+async function readSmallProfileSectionsFromDb(name, keys) {
+  const selected = [...new Set(keys)].filter(key => PROFILE_LIGHT_BATCH_KEYS.has(key));
+  if (!selected.length) return {};
+  const fields = selected.map((key, i) => `data -> '${key}' AS section_${i}`).join(', ');
+  const result = await queryDbWithRetry(`SELECT ${fields} FROM users WHERE name = $1`,
+    [name], {attempts:3,label:'PROFILE LIGHT SECTIONS READ'});
+  if (!result.rows.length) return null;
+  const row = result.rows[0];
+  const payloads = {};
+  selected.forEach((key, i) => { payloads[key] = Array.isArray(row[`section_${i}`]) ? row[`section_${i}`] : []; });
+  return payloads;
+}
+
 function incomingTouchesHeavyProfileSection(incoming = {}, dataKey, meta = {}) {
   if (!incoming || typeof incoming !== 'object') return false;
   if (Object.prototype.hasOwnProperty.call(incoming, dataKey)) return true;
@@ -7353,18 +7708,40 @@ function incomingTouchesHeavyProfileSection(incoming = {}, dataKey, meta = {}) {
 
 async function buildWorkingUserForProfileUpdate(name, incoming = {}) {
   const base = { ...(userDatabase[name] || {}) };
-  for (const [dataKey, meta] of Object.entries(PROFILE_HEAVY_SECTION_META)) {
-    if (!incomingTouchesHeavyProfileSection(incoming, dataKey, meta)) continue;
+  const required = Object.entries(PROFILE_HEAVY_SECTION_META)
+    .filter(([dataKey, meta]) => incomingTouchesHeavyProfileSection(incoming, dataKey, meta))
+    .map(([dataKey]) => dataKey);
+  if (!required.length) return base;
+
+  // One consistent snapshot replaces up to six sequential transatlantic DB
+  // round trips on large profile updates. Fetch only the sections being edited.
+  const columns = [...required];
+  if (required.includes('libraryData')) columns.push('libraryPlayHistoryData');
+  const sqlFields = columns.map((key, i) => `data -> $${i + 2} AS section_${i}`).join(', ');
+  const snapshot = await queryDbWithRetry(
+    `SELECT ${sqlFields} FROM users WHERE name = $1`,
+    [name, ...columns],
+    { attempts:3, label:'PROFILE SECTION SNAPSHOT' }
+  );
+  if (!snapshot.rows.length) return base;
+  const row = snapshot.rows[0];
+  const payloads = new Map(columns.map((key, i) => [key, row[`section_${i}`]]));
+
+  for (const dataKey of required) {
+    const raw = payloads.get(dataKey);
     if (dataKey === 'libraryData') {
-      const bundle = await getLibraryDataBundleFromDb(name);
-      if (bundle) {
-        base.libraryData = bundle.libraryData;
-        base.libraryPlayHistoryData = bundle.libraryPlayHistoryData;
-      }
-      continue;
+      const library = Array.isArray(raw) ? raw : [];
+      const savedHistory = payloads.get('libraryPlayHistoryData');
+      const history = mergeLibraryPlayHistoryRecordsServer(Array.isArray(savedHistory) ? savedHistory : [], library);
+      base.libraryData = applyLibraryPlayHistoryServer(library, history);
+      base.libraryPlayHistoryData = history;
+    } else if (dataKey === 'trophiesData') {
+      base[dataKey] = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+    } else if (dataKey === 'downloadsData') {
+      base[dataKey] = normalizeDownloadHistoryRecordsServer(Array.isArray(raw) ? raw : []).history;
+    } else {
+      base[dataKey] = Array.isArray(raw) ? raw : [];
     }
-    const payload = await getUserDataPayloadFromDb(name, meta.type);
-    if (payload !== null) base[dataKey] = payload;
   }
   return base;
 }
@@ -7517,6 +7894,20 @@ async function emitChunkedProfileSyncToSocket(socket, name, options = {}) {
     });
     const requestedLightKeys = requestedKeys ? Array.from(requestedKeys).filter(key => !sectionOwnedKeys.has(key)) : [];
     const shouldSendFullCore = options.includeCore === true || !requestedKeys;
+    const smallSectionKeys = Object.entries(PROFILE_HEAVY_SECTION_META)
+      .filter(([key, meta]) => PROFILE_LIGHT_BATCH_KEYS.has(key) &&
+        (!requestedKeys || requestedKeys.has(key) || requestedKeys.has(meta.countKey) ||
+          (meta.versionKeys || []).some(version => requestedKeys.has(version))))
+      .map(([key]) => key);
+    // Keep the grouped snapshot small on low-RAM Render instances; oversized
+    // collections continue on the existing section-by-section read path.
+    const batchSmallSections = smallSectionKeys.length > 1 &&
+      smallSectionKeys.reduce((total, key) => {
+        const count = Number(compactUser[PROFILE_HEAVY_SECTION_META[key].countKey]);
+        return total + (Number.isFinite(count) && count >= 0 ? count : 999999);
+      }, 0) <= 1200;
+    // Short-lived, per-request snapshot; drop each section immediately after send.
+    let smallSectionSnapshot = null;
 
     let corePayload = null;
     if (shouldSendFullCore) {
@@ -7532,9 +7923,11 @@ async function emitChunkedProfileSyncToSocket(socket, name, options = {}) {
     }
 
     if (corePayload) {
-      const coreSize = estimateValueBytes(corePayload, { maxNodes: 10000, maxBytes: 4 * 1024 * 1024 });
       const coreLabel = shouldSendFullCore ? 'core' : 'core-patch';
-      logMemoryTrace(`profile-sync:${coreLabel}:send`, `user=${name} socket=${socket.id} approx=${formatApproxBytes(coreSize.bytes)}${coreSize.truncated ? '+' : ''} buffer=${getSocketWriteBufferLength(socket)}`);
+      if (MEMORY_TRACE_ENABLED) {
+        const coreSize = estimateValueBytes(corePayload, { maxNodes: 10000, maxBytes: 4 * 1024 * 1024 });
+        logMemoryTrace(`profile-sync:${coreLabel}:send`, `user=${name} socket=${socket.id} approx=${formatApproxBytes(coreSize.bytes)}${coreSize.truncated ? '+' : ''} buffer=${getSocketWriteBufferLength(socket)}`);
+      }
       const result = await emitProfileSyncPacket(socket, corePayload, { label: coreLabel, timeoutMs: 8000 });
       if (result && result.cancelled) { logMemoryTrace('profile-sync:cancel', `user=${name} socket=${socket.id} stage=${coreLabel}`); return; }
       if (result && result.ackTimeout) {
@@ -7551,23 +7944,47 @@ async function emitChunkedProfileSyncToSocket(socket, name, options = {}) {
       if (!socket.connected) { logMemoryTrace('profile-sync:cancel', `user=${name} socket=${socket.id} stage=${dataKey}`); return; }
 
       let sectionCancelled = false;
-      await runSerializedProfileHydration(async () => {
+      await runBoundedProfileSectionDelivery(async () => {
         if (!socket.connected) { sectionCancelled = true; return; }
-        logMemoryTrace('profile-sync:section:load', `user=${name} socket=${socket.id} section=${dataKey}`);
-        const rawData = await getUserDataPayloadFromDb(name, type);
-        if (rawData === null) throw new Error(`Could not load ${dataKey}.`);
-        if (!socket.connected) { sectionCancelled = true; return; }
-        const estimate = estimateValueBytes(rawData);
-        const itemCount = getPayloadItemCount(rawData);
-        logMemoryTrace('profile-sync:section:loaded', `user=${name} socket=${socket.id} section=${dataKey} items=${itemCount} approx=${formatApproxBytes(estimate.bytes)}${estimate.truncated ? '+' : ''}`);
-
-        const userData = { profileUpdatedAt, [dataKey]: rawData };
-        if (dataKey === 'trophiesData') userData.trophies = countUnlockedTrophiesPayload(rawData || {});
-        else if (meta.countKey) userData[meta.countKey] = Array.isArray(rawData) ? rawData.length : 0;
-        (meta.versionKeys || []).forEach(key => { userData[key] = normalizeTimestampValue(compactUser[key]); });
-
-        const packet = { name, sourceSocketId: options.sourceSocketId || null, profileUpdatedAt, userData };
-        logMemoryTrace('profile-sync:section:send', `user=${name} socket=${socket.id} section=${dataKey} items=${itemCount} approx=${formatApproxBytes(estimate.bytes)}${estimate.truncated ? '+' : ''} buffer=${getSocketWriteBufferLength(socket)}`);
+        let packet;
+        let itemCount = 0;
+        let estimate;
+        // Hold the DB/hydration lane only while preparing the payload. Socket
+        // delivery (including slow ACKs) happens outside that lane.
+        await runSerializedProfileHydration(async () => {
+          if (!socket.connected) { sectionCancelled = true; return; }
+          logMemoryTrace('profile-sync:section:load', `user=${name} socket=${socket.id} section=${dataKey}`);
+          let rawData;
+          if (PROFILE_LIGHT_BATCH_KEYS.has(dataKey) && batchSmallSections) {
+            if (!smallSectionSnapshot) {
+              const sharedSections = await readSmallProfileSectionsShared(name, smallSectionKeys);
+              // Each socket owns its shallow snapshot, so sharing the read
+              // never lets another socket delete a delivered section.
+              smallSectionSnapshot = sharedSections ? { ...sharedSections } : null;
+              if (!smallSectionSnapshot) throw new Error('Could not load profile sections.');
+            }
+            rawData = smallSectionSnapshot[dataKey];
+            delete smallSectionSnapshot[dataKey];
+          } else {
+            rawData = await readProfileSyncSectionShared(name, type);
+          }
+          if (rawData === null || rawData === undefined) throw new Error(`Could not load ${dataKey}.`);
+          if (!socket.connected) { sectionCancelled = true; return; }
+          if (MEMORY_TRACE_ENABLED) {
+            estimate = estimateValueBytes(rawData);
+            itemCount = getPayloadItemCount(rawData);
+            logMemoryTrace('profile-sync:section:loaded', `user=${name} socket=${socket.id} section=${dataKey} items=${itemCount} approx=${formatApproxBytes(estimate.bytes)}${estimate.truncated ? '+' : ''}`);
+          }
+          const userData = { profileUpdatedAt, [dataKey]: rawData };
+          if (dataKey === 'trophiesData') userData.trophies = countUnlockedTrophiesPayload(rawData || {});
+          else if (meta.countKey) userData[meta.countKey] = Array.isArray(rawData) ? rawData.length : 0;
+          (meta.versionKeys || []).forEach(key => { userData[key] = normalizeTimestampValue(compactUser[key]); });
+          packet = { name, sourceSocketId: options.sourceSocketId || null, profileUpdatedAt, userData };
+        });
+        if (sectionCancelled || !socket.connected || !packet) return;
+        if (MEMORY_TRACE_ENABLED) {
+          logMemoryTrace('profile-sync:section:send', `user=${name} socket=${socket.id} section=${dataKey} items=${itemCount} approx=${formatApproxBytes(estimate.bytes)}${estimate.truncated ? '+' : ''} buffer=${getSocketWriteBufferLength(socket)}`);
+        }
         const result = await emitProfileSyncPacket(socket, packet, { label: dataKey, timeoutMs: 10000 });
         if (result && result.cancelled) { sectionCancelled = true; return; }
         if (result && result.ackTimeout) {
@@ -7575,7 +7992,6 @@ async function emitChunkedProfileSyncToSocket(socket, name, options = {}) {
         } else {
           logMemoryTrace('profile-sync:section:ack', `user=${name} socket=${socket.id} section=${dataKey} ack=${result.acked === true} ms=${result.elapsedMs || 0} buffer=${getSocketWriteBufferLength(socket)}`);
         }
-
         if (dataKey === 'trophiesData' && typeof options.onCriticalReady === 'function') {
           const clientConfirmed = result && (result.acked === true || (result.legacy === true && result.drained === true));
           if (clientConfirmed) {
@@ -7599,10 +8015,16 @@ function emitChatHistoryToSocket(socket) {
   if (!socket) return Promise.resolve();
   if (socket.__chatHistoryInFlight) return socket.__chatHistoryInFlight;
 
-  const lane = chatHistoryNextLane++ % chatHistoryEmitQueues.length;
-  const run = chatHistoryEmitQueues[lane].catch(() => null).then(async () => {
-    if (!socket.connected) return;
+  // Pick the shorter send queue so a busy transport lane does not stall a
+  // request while the other lane is free. Equal queues alternate fairly.
+  const lane = chatHistoryQueueDepth[0] === chatHistoryQueueDepth[1]
+    ? chatHistoryNextLane++ % chatHistoryEmitQueues.length
+    : (chatHistoryQueueDepth[0] < chatHistoryQueueDepth[1] ? 0 : 1);
+  chatHistoryQueueDepth[lane] += 1;
+  const delivery = chatHistoryEmitQueues[lane].catch(() => null).then(async () => {
+    if (!socket.connected) return { completion: Promise.resolve({ cancelled: true }) };
     const history = await getPublicChatHistoryWithSeenForUser(socket.userName || '');
+    if (!socket.connected) return { completion: Promise.resolve({ cancelled: true }) };
     const requiresAck = socket.chatHistoryAckV1 === true;
     if (MEMORY_TRACE_ENABLED) {
       const estimate = estimateValueBytes(history, { maxNodes: 100000, maxBytes: 64 * 1024 * 1024 });
@@ -7612,7 +8034,11 @@ function emitChatHistoryToSocket(socket) {
     const startedAt = Date.now();
     socket.emit('chat_config', { maxHistory: MAX_CHAT_HISTORY });
     if (requiresAck) {
-      const result = await new Promise((resolve, reject) => {
+      // Browser ACKs report that the snapshot was processed, not merely sent.
+      // Keep a per-socket completion promise to reject duplicate requests, but
+      // release the shared send lane once the transport buffer has drained.
+      // This prevents one slow browser's UI from delaying other users' history.
+      const completion = new Promise(resolve => {
         let settled = false;
         const finish = value => {
           if (settled) return;
@@ -7622,54 +8048,55 @@ function emitChatHistoryToSocket(socket) {
           resolve(value);
         };
         const onDisconnect = () => finish({ cancelled: true });
-        const timer = setTimeout(() => {
-          finish({ cancelled: false, ackTimeout: true, response: null });
-        }, 8000);
+        const timer = setTimeout(() => finish({ ackTimeout: true }), 8000);
         try { socket.once('disconnect', onDisconnect); } catch (e) {}
         try {
           socket.emit('chat_history', history, response => {
             if (settled) return;
             if (response && response.ok === false) {
-              settled = true;
-              clearTimeout(timer);
-              try { socket.off('disconnect', onDisconnect); } catch (e) {}
-              reject(new Error(response.error || 'Chat history rejected by client.'));
+              finish({ error: new Error(response.error || 'Chat history rejected by client.') });
               return;
             }
-            finish({ cancelled: false, response: response || null });
+            finish({ response: response || null });
           });
-        } catch (err) {
-          if (!settled) {
-            settled = true;
-            clearTimeout(timer);
-            try { socket.off('disconnect', onDisconnect); } catch (e) {}
-          }
-          reject(err);
+        } catch (err) { finish({ error: err }); }
+      }).then(result => {
+        if (result.cancelled) {
+          logMemoryTrace('chat-history:cancel', `user=${socket.userName || '-'} socket=${socket.id} ms=${Date.now() - startedAt}`);
+        } else if (result.ackTimeout) {
+          logMemoryTrace('chat-history:ack-timeout', `user=${socket.userName || '-'} socket=${socket.id} ms=${Date.now() - startedAt} buffer=${getSocketWriteBufferLength(socket)}`);
+        } else if (!result.error) {
+          const rendered = !(result.response && result.response.rendered === false);
+          const received = result.response && Number.isFinite(Number(result.response.received)) ? Number(result.response.received) : -1;
+          logMemoryTrace('chat-history:ack', `user=${socket.userName || '-'} socket=${socket.id} ms=${Date.now() - startedAt} rendered=${rendered} received=${received} buffer=${getSocketWriteBufferLength(socket)}`);
         }
+        return result;
       });
-      if (result && result.cancelled) {
-        logMemoryTrace('chat-history:cancel', `user=${socket.userName || '-'} socket=${socket.id} ms=${Date.now() - startedAt}`);
-        return;
-      }
-      if (result && result.ackTimeout) {
-        logMemoryTrace('chat-history:ack-timeout', `user=${socket.userName || '-'} socket=${socket.id} ms=${Date.now() - startedAt} buffer=${getSocketWriteBufferLength(socket)}`);
-        return;
-      }
-      const rendered = !(result && result.response && result.response.rendered === false);
-      const received = result && result.response && Number.isFinite(Number(result.response.received)) ? Number(result.response.received) : -1;
-      logMemoryTrace('chat-history:ack', `user=${socket.userName || '-'} socket=${socket.id} ms=${Date.now() - startedAt} rendered=${rendered} received=${received} buffer=${getSocketWriteBufferLength(socket)}`);
-      return;
+
+      // Do not release the lane while the network still holds the heavy packet.
+      // If it cannot drain promptly, retain the original ACK backpressure.
+      const drain = await waitForSocketWriteBufferDrain(socket, { maxPending: 0, timeoutMs: 1500 });
+      if (!drain.drained && socket.connected) await completion;
+      return { completion };
     }
 
     socket.emit('chat_history', history);
-    const drain = await waitForSocketWriteBufferDrain(socket, { maxPending: 1, timeoutMs: 20000 });
+    const drain = await waitForSocketWriteBufferDrain(socket, { maxPending: 0, timeoutMs: 20000 });
     logMemoryTrace('chat-history:drain', `user=${socket.userName || '-'} socket=${socket.id} drained=${drain.drained === true} ms=${drain.elapsedMs || 0} buffer=${getSocketWriteBufferLength(socket)}`);
+    return { completion: Promise.resolve({ cancelled: !socket.connected }) };
   });
 
-  socket.__chatHistoryInFlight = run.finally(() => {
+  // Only the network delivery/backpressure occupies the shared lane. The ACK
+  // still controls the per-socket in-flight guard and error propagation.
+  const releaseLane = () => { chatHistoryQueueDepth[lane] = Math.max(0, chatHistoryQueueDepth[lane] - 1); };
+  chatHistoryEmitQueues[lane] = delivery.then(releaseLane, releaseLane);
+  socket.__chatHistoryInFlight = delivery.then(async result => {
+    if (!result) return;
+    const outcome = await result.completion;
+    if (outcome && outcome.error) throw outcome.error;
+  }).finally(() => {
     socket.__chatHistoryInFlight = null;
   });
-  chatHistoryEmitQueues[lane] = socket.__chatHistoryInFlight.then(() => null, () => null);
   return socket.__chatHistoryInFlight;
 }
 
@@ -7708,6 +8135,7 @@ async function updateUserDataPreservingCredentials(name, userData, label = 'USER
   userDatabase[name] = saved;
   userCacheMeta[name] = Date.now();
   fullUserCacheNames.add(name);
+  invalidatePublicProfileListReads(name);
   return saved;
 }
 
@@ -7729,6 +8157,7 @@ async function patchUserData(name, patch = {}, label = 'USER DATA PATCH') {
   if (!result.rows.length) return false;
   userCacheMeta[name] = Date.now();
   fullUserCacheNames.delete(name);
+  invalidatePublicProfileListReads(name, keys);
   return true;
 }
 
@@ -7884,25 +8313,43 @@ async function getPublicChatHistoryWithSeenForUser(userName = '') {
 async function getChatSeenSyncForUser(userName = '', cursor = 0) {
   const targetUser = String(userName || '');
   const safeCursor = Math.max(0, Number(cursor) || 0);
-  const maxRes = await queryDbWithRetry('SELECT COALESCE(MAX(id), 0)::bigint AS max_id FROM chat_seen_events', [], { attempts: 2, label: 'CHAT SEEN CURSOR READ' });
-  const maxId = Math.max(0, Number(maxRes.rows[0]?.max_id) || 0);
-
-  if (!safeCursor || safeCursor > maxId) {
+  if (!safeCursor) {
+    const maxRes = await queryDbWithRetry('SELECT COALESCE(MAX(id), 0)::bigint AS max_id FROM chat_seen_events', [], { attempts: 2, label: 'CHAT SEEN CURSOR READ' });
+    const maxId = Math.max(0, Number(maxRes.rows[0]?.max_id) || 0);
     return { mode: 'snapshot', cursor: maxId, events: await getChatSeenSnapshotForUser(targetUser) };
   }
 
+  // One round trip gets the current global cursor and the relevant delta.
+  // LEFT JOIN LATERAL keeps the cursor available even when there are no changes.
   const res = await queryDbWithRetry(
-    'SELECT id, message_id, sender, reader, seen_at FROM chat_seen_events WHERE id > $1 AND (sender = $2 OR reader = $2) ORDER BY id ASC LIMIT 2001',
+    `WITH current_cursor AS (
+       SELECT COALESCE(MAX(id), 0)::bigint AS max_id FROM chat_seen_events
+     )
+     SELECT delta.id, delta.message_id, delta.sender, delta.reader, delta.seen_at,
+            current_cursor.max_id
+     FROM current_cursor
+     LEFT JOIN LATERAL (
+       SELECT id, message_id, sender, reader, seen_at
+       FROM chat_seen_events
+       WHERE id > $1 AND (sender = $2 OR reader = $2)
+       ORDER BY id ASC LIMIT 2001
+     ) delta ON TRUE
+     ORDER BY delta.id ASC`,
     [safeCursor, targetUser],
     { attempts: 2, label: 'CHAT SEEN DELTA READ' }
   );
-  if (res.rows.length > 2000) {
+  const maxId = Math.max(0, Number(res.rows[0]?.max_id) || 0);
+  if (safeCursor > maxId) {
+    return { mode: 'snapshot', cursor: maxId, events: await getChatSeenSnapshotForUser(targetUser) };
+  }
+  const rows = res.rows.filter(row => row.id != null);
+  if (rows.length > 2000) {
     return { mode: 'snapshot', cursor: maxId, events: await getChatSeenSnapshotForUser(targetUser) };
   }
   return {
     mode: 'changes',
     cursor: maxId,
-    events: res.rows.map(row => ({
+    events: rows.map(row => ({
       eventId: Math.max(0, Number(row.id) || 0),
       msgId: String(row.message_id || ''),
       sender: String(row.sender || ''),
@@ -8048,6 +8495,22 @@ async function emitLegacyChatSeenCompat(events = []) {
       });
     }
   }
+}
+
+// Coalesce identical, concurrent chat integrity checks without caching results.
+let chatSyncTailPending = null;
+function readChatSyncTailShared() {
+  if (chatSyncTailPending) return chatSyncTailPending;
+  const pending = queryDbWithRetry(
+    "SELECT message->>'time' AS msg_time, message->>'user' AS msg_user, (SELECT COUNT(*) FROM (SELECT 1 FROM chat ORDER BY id DESC LIMIT $1) AS recent) AS message_count FROM chat ORDER BY id DESC LIMIT 1",
+    [MAX_CHAT_HISTORY],
+    { attempts: 2, label: 'CHAT SYNC TAIL CHECK' }
+  );
+  chatSyncTailPending = pending;
+  pending.finally(() => {
+    if (chatSyncTailPending === pending) chatSyncTailPending = null;
+  }).catch(() => {});
+  return pending;
 }
 
 async function refreshChatSyncStateFromDb() {
@@ -8433,16 +8896,26 @@ async function resetChatSyncEpoch() {
   return chatSyncState;
 }
 
-async function getChatSyncSnapshotForUser(userName = '') {
-  // A single LIMITed query already returns the complete visible window. The
-  // sync epoch/revision checks around this snapshot detect concurrent writes.
-  // COUNT(*) OVER() would scan the entire chat table before LIMIT can apply.
-  const result = await queryDbWithRetry(
+// Share only the active SQL read across concurrent chat logins. Each viewer
+// still receives their own sanitized message objects, never another viewer’s.
+let chatSyncSnapshotRowsPending = null;
+function readChatSyncSnapshotRowsShared() {
+  if (chatSyncSnapshotRowsPending) return chatSyncSnapshotRowsPending;
+  const pending = queryDbWithRetry(
     "SELECT id, message - 'seenBy' - 'seenAt' AS message FROM chat ORDER BY id DESC LIMIT $1",
     [MAX_CHAT_HISTORY],
     { attempts: 2, label: 'CHAT SYNC SNAPSHOT READ' }
   );
-  const rows = result.rows.reverse();
+  chatSyncSnapshotRowsPending = pending;
+  pending.finally(() => {
+    if (chatSyncSnapshotRowsPending === pending) chatSyncSnapshotRowsPending = null;
+  }).catch(() => {});
+  return pending;
+}
+async function getChatSyncSnapshotForUser(userName = '') {
+  const result = await readChatSyncSnapshotRowsShared();
+  // Reverse a copy: the shared result must not be mutated by any caller.
+  const rows = (result.rows || []).slice().reverse();
   return {
     messages: rows.map(row => getPublicChatMessageForUser(attachChatDbId({ ...(row.message || {}) }, row.id), userName)),
     expectedCount: rows.length
@@ -8796,9 +9269,28 @@ async function getDirectGroupMember(groupId,userName,db=pool) {
   const result=await db.query('SELECT gm.joined_at,gm.last_read_id,g.title,g.created_by FROM direct_group_members gm JOIN direct_groups g ON g.id=gm.group_id WHERE gm.group_id=$1 AND gm.user_name=$2',[groupId,userName]);
   return result.rows?.[0] || null;
 }
-async function getDirectGroupMembers(groupId,db=pool) {
-  const result=await db.query('SELECT user_name,joined_at,last_read_id FROM direct_group_members WHERE group_id=$1 ORDER BY joined_at,user_name',[groupId]);
-  return result.rows || [];
+// Group fanout/read events can arrive together. Share only the in-flight
+// roster query; do not cache settled membership or transaction-local reads.
+const directGroupMembersPending=new Map();
+function invalidateDirectGroupMembersPending(groupId){
+  directGroupMembersPending.delete(String(groupId));
+}
+function getDirectGroupMembers(groupId,db=pool) {
+  const load=async()=>{
+    const result=await db.query('SELECT user_name,joined_at,last_read_id FROM direct_group_members WHERE group_id=$1 ORDER BY joined_at,user_name',[groupId]);
+    return result.rows || [];
+  };
+  if(db!==pool)return load();
+  const key=String(groupId);
+  const existing=directGroupMembersPending.get(key);
+  if(existing)return existing;
+  const pending=load();
+  if(directGroupMembersPending.size>=64)return pending;
+  directGroupMembersPending.set(key,pending);
+  pending.finally(()=>{
+    if(directGroupMembersPending.get(key)===pending)directGroupMembersPending.delete(key);
+  }).catch(()=>{});
+  return pending;
 }
 function addDirectGroupReadReceipts(message,members) {
   if(!message)return message;
@@ -8822,6 +9314,9 @@ function invalidateDirectGroupListsForMembers(members) {
   }
 }
 async function emitDirectGroupLocal(groupId,kind,payload,knownMembers=null) {
+  // A roster refresh follows a committed add/leave. Never reuse a read that
+  // began before the membership change committed.
+  if(kind==='refresh')invalidateDirectGroupMembersPending(groupId);
   const members=knownMembers || await getDirectGroupMembers(groupId);
   invalidateDirectGroupListsForMembers(members);
   const messagePayload=(kind==='message'||kind==='update')?addDirectGroupReadReceipts(payload,members):payload;
@@ -8982,7 +9477,25 @@ async function loadDirectGroupHistory(groupId,viewer) {
       deferServerTask('GROUP READ SYNC',()=>notifyDirectGroupChange(groupId,'read',{user:viewer,lastMessageId:lastId}),0);
     }
   }
-  const withReceipts=messages.map(m=>addDirectGroupReadReceipts(m,members));
+  // This roster belongs to the current request. Parse membership timestamps
+  // and read cursors once, rather than once per member per history message.
+  const receiptRoster=members.map(m=>({
+    userName:m.user_name,
+    joinedAt:Date.parse(m.joined_at),
+    readId:Number(m.last_read_id)
+  }));
+  const withReceipts=messages.map(m=>{
+    const postedAt=Date.parse(m.createdAt||'')||0;
+    const messageId=Number(m.id);
+    const recipients=[];
+    const readBy=[];
+    for(const entry of receiptRoster){
+      if(entry.userName===m.from||!(entry.joinedAt<=postedAt))continue;
+      recipients.push(entry.userName);
+      if(entry.readId>=messageId)readBy.push(entry.userName);
+    }
+    return {...m,recipients,readBy};
+  });
   return {success:true,group:{id:groupId,title:member.title,createdBy:member.created_by,members:members.map(m=>m.user_name)},messages:withReceipts,pinnedMessages:withReceipts.filter(m=>m.pinnedAt).slice(-10),lastReadId:String(lastId)};
 }
 
@@ -9570,21 +10083,33 @@ async function getDirectHistoryPayload(userName, peerName, options = {}) {
       FROM users u
       WHERE u.name = $2
       LIMIT 1
-    ), history AS (
-      SELECT id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, pinned_at, edited_at, created_at,
-             COUNT(*) OVER () AS total_count
+    ), history AS MATERIALIZED (
+      -- Limit the message bodies first; no full-history window over JSON payloads.
+      SELECT id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, pinned_at, edited_at, created_at
       FROM direct_messages
       WHERE ((sender_name = $1 AND recipient_name = $2)
          OR (sender_name = $2 AND recipient_name = $1))
         AND id > (SELECT deleted_through_id FROM deletion)
       ORDER BY id DESC
       LIMIT $3
+    ), history_count AS (
+      -- Two index-only-friendly counts preserve the precise visible total.
+      -- Both directions are disjoint because viewer and peer are distinct.
+      SELECT (
+        (SELECT COUNT(*) FROM direct_messages
+         WHERE sender_name = $1 AND recipient_name = $2 AND id > d.deleted_through_id)
+        +
+        (SELECT COUNT(*) FROM direct_messages
+         WHERE sender_name = $2 AND recipient_name = $1 AND id > d.deleted_through_id)
+      ) AS total_count
+      FROM deletion d
     )
     SELECT p.peer_name, p.peer_avatar, p.peer_last_seen, p.peer_message_activity_at, p.peer_online,
            p.my_last_read_id, p.peer_last_read_id, p.viewer_blocked, p.blocked_by_peer,
            h.id, h.sender_name, h.recipient_name, h.text, h.message_type, h.content,
-           h.reply_to, h.reactions, h.pinned_at, h.edited_at, h.created_at, h.total_count
+           h.reply_to, h.reactions, h.pinned_at, h.edited_at, h.created_at, counts.total_count
     FROM peer p
+    CROSS JOIN history_count counts
     LEFT JOIN history h ON TRUE
     ORDER BY h.id DESC NULLS LAST
   `, [viewer, peer, DIRECT_MESSAGE_HISTORY_MAX, DEFAULT_AVATAR], { attempts:2, label:'DIRECT HISTORY READ' });
@@ -9600,6 +10125,22 @@ async function getDirectHistoryPayload(userName, peerName, options = {}) {
   let readStateChanged = false;
   let readAt = '';
 
+  // Pins are independent of marking this conversation read. Fetch them in
+  // parallel with the read cursor/seen ticks to save a network round trip.
+  const pinnedMessagesPromise = queryDbWithRetry(`
+      SELECT id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, pinned_at, edited_at, created_at
+      FROM direct_messages
+      WHERE pinned_at IS NOT NULL
+        AND ((sender_name = $1 AND recipient_name = $2) OR (sender_name = $2 AND recipient_name = $1))
+        AND id > COALESCE((SELECT deleted_through_id FROM direct_conversation_delete_state WHERE user_name = $1 AND peer_name = $2), 0)
+      ORDER BY pinned_at DESC LIMIT 10
+    `, [viewer, peer], { attempts:2, label:'DIRECT PINNED HISTORY' })
+    .then(pinnedResult => (pinnedResult.rows || []).map(serializeDirectMessage).filter(Boolean))
+    .catch(err => {
+      console.warn('[DIRECT PINNED HISTORY]:', err && err.message || err);
+      return [];
+    });
+
   if (options.markRead !== false && messages.length) {
     const readState = await markDirectConversationRead(viewer, peer, messages[messages.length - 1].id);
     myLastReadId = Math.max(myLastReadId, readState.lastReadId);
@@ -9608,20 +10149,7 @@ async function getDirectHistoryPayload(userName, peerName, options = {}) {
   }
 
   await attachDirectSeenEvents(messages, viewer, peerLastReadId);
-  let pinnedMessages = [];
-  try {
-    const pinnedResult = await queryDbWithRetry(`
-      SELECT id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, pinned_at, edited_at, created_at
-      FROM direct_messages
-      WHERE pinned_at IS NOT NULL
-        AND ((sender_name = $1 AND recipient_name = $2) OR (sender_name = $2 AND recipient_name = $1))
-        AND id > COALESCE((SELECT deleted_through_id FROM direct_conversation_delete_state WHERE user_name = $1 AND peer_name = $2), 0)
-      ORDER BY pinned_at DESC LIMIT 10
-    `, [viewer, peer], { attempts:2, label:'DIRECT PINNED HISTORY' });
-    pinnedMessages = (pinnedResult.rows || []).map(serializeDirectMessage).filter(Boolean);
-  } catch (err) {
-    console.warn('[DIRECT PINNED HISTORY]:', err && err.message || err);
-  }
+  const pinnedMessages = await pinnedMessagesPromise;
 
   return {
     success:true,
@@ -10202,12 +10730,11 @@ async function initProfileSyncNotifications() {
       if (data.instanceId === INSTANCE_ID) return;
 
       if (message.channel === 'social_feed_sync') {
-        socialFeedPending.clear();
-        if(data.kind==='post'||data.kind==='delete')socialFeedCountCache.clear();
+        invalidateSocialFeedPageReads(data.kind, data.id);
+        if(data.kind==='post'||data.kind==='delete')invalidateSocialPostCountReads();
         invalidateSocialReactorsForChange(data.kind,String(data.id || ''),data);
-        if (data.kind === 'comment' || data.kind === 'comment-delete' || (data.kind === 'react' && data.commentId)) {
-          const segment = `\u0000${String(data.id || '')}\u0000`;
-          for (const key of socialCommentsPending.keys()) if (key.includes(segment)) socialCommentsPending.delete(key);
+        if (data.kind === 'comment' || data.kind === 'comment-delete' || data.kind === 'delete' || (data.kind === 'react' && data.commentId)) {
+          invalidateSocialCommentReads(data.id);
         }
         io.emit('social_feed_changed', {
           kind:data.kind,id:String(data.id || ''),commentId:data.commentId ? String(data.commentId) : null,
@@ -10218,6 +10745,7 @@ async function initProfileSyncNotifications() {
       if (message.channel === 'direct_group_sync') {
         const gid=directGroupId(data.groupId);
         if (!gid) return;
+        if(data.kind==='refresh'||data.kind==='left')invalidateDirectGroupMembersPending(gid);
         // A departing member must receive its leave event even if it is no
         // longer in the group's membership table.
         if (data.kind==='left') {
@@ -10538,6 +11066,9 @@ async function initProfileSyncNotifications() {
       const name = normalizeText(data.name, '');
       if (!name) return;
 
+      if (message.channel === 'profile_sync' && !(data.changes && data.changes.roleNoticeOnly === true)) {
+        invalidatePublicProfileListReads(name, data.changes && data.changes.keys);
+      }
       /* A role-notice acknowledgement only needs to close the same notice on other
          sessions/instances. Do not refresh the profile or rebroadcast role metadata. */
       if (message.channel === 'profile_sync' && data.changes && data.changes.roleNoticeOnly === true) {
@@ -10978,52 +11509,94 @@ async function notifyFriendActivityClearedAcrossInstances(userName, throughId = 
   }
 }
 
-const FRIEND_ACTIVITY_RETENTION_DELAY_MS = 1800;
-const pendingFriendActivityRetention = new Map();
+// Coalesce history cleanup for busy accounts and busy posts. Both tables have
+// (owner, id DESC) indexes; cleaning once per short burst prevents one DELETE
+// roundtrip per reaction/mention/activity event on a small Aiven instance.
+const HISTORY_RETENTION_DELAY_MS = 1800;
+const HISTORY_RETENTION_BATCH_MAX = 80;
+const HISTORY_RETENTION_PENDING_MAX = 4096;
+const historyRetentionPending = { activity:new Set(), notification:new Set() };
+let historyRetentionTimer = null;
+let historyRetentionRunning = false;
+let historyRetentionQueuedAt = 0;
+
+function scheduleHistoryRetentionDrain(delayMs = HISTORY_RETENTION_DELAY_MS) {
+  if (historyRetentionTimer !== null || historyRetentionRunning) return;
+  historyRetentionTimer = setTimeout(() => {
+    historyRetentionTimer = null;
+    drainHistoryRetentionQueue().catch(err => console.error('[HISTORY RETENTION DRAIN ERROR]:', err && err.message || err));
+  }, delayMs);
+  if (typeof historyRetentionTimer.unref === 'function') historyRetentionTimer.unref();
+}
+
+function queueHistoryRetention(kind, names) {
+  const pending = historyRetentionPending[kind];
+  if (!pending) return;
+  const list = Array.isArray(names) ? names : [names];
+  for (const value of list) {
+    const name = normalizeSocialUserName(value);
+    if (!name) continue;
+    if (pending.size < HISTORY_RETENTION_PENDING_MAX || pending.has(name)) pending.add(name);
+  }
+  if (!historyRetentionPending.activity.size && !historyRetentionPending.notification.size) return;
+  if (!historyRetentionQueuedAt) historyRetentionQueuedAt = Date.now();
+  scheduleHistoryRetentionDrain();
+}
 
 function scheduleFriendActivityRetention(actorName) {
-  const actor = normalizeSocialUserName(actorName);
-  if (!actor) return;
-  let state = pendingFriendActivityRetention.get(actor);
-  if (!state) {
-    state = { version:0, timer:null, running:false };
-    pendingFriendActivityRetention.set(actor, state);
+  queueHistoryRetention('activity', actorName);
+}
+function scheduleUserNotificationRetention(userNames) {
+  queueHistoryRetention('notification', userNames);
+}
+
+async function drainHistoryRetentionQueue() {
+  if (historyRetentionRunning) return;
+  if (!historyRetentionPending.activity.size && !historyRetentionPending.notification.size) {
+    historyRetentionQueuedAt = 0;
+    return;
   }
-  state.version++;
-  if (state.timer || state.running) return;
-  const schedule = () => {
-    state.timer = setTimeout(async () => {
-      state.timer = null;
-      state.running = true;
-      const version = state.version;
+  // Give live reads the connection first, but do not starve maintenance forever.
+  if (pool.waitingCount > 0 && Date.now() - historyRetentionQueuedAt < 6000) {
+    scheduleHistoryRetentionDrain(700);
+    return;
+  }
+  historyRetentionRunning = true;
+  const jobs = [
+    ['activity', 'friend_activity', 'actor_name', 'FRIEND ACTIVITY RETENTION BATCH'],
+    ['notification', 'user_notifications', 'user_name', 'USER NOTIFICATION RETENTION BATCH']
+  ];
+  try {
+    for (const [kind, table, owner, label] of jobs) {
+      const pending = historyRetentionPending[kind];
+      if (!pending.size) continue;
+      const names = Array.from(pending).slice(0, HISTORY_RETENTION_BATCH_MAX);
+      names.forEach(name => pending.delete(name));
+      // All identifiers are hard-coded above; only user names are SQL params.
+      // New events while this query runs are queued for the next batch.
       try {
-        await queryDbWithRetry(
-          `DELETE FROM friend_activity
-           WHERE actor_name = $1
-             AND id < COALESCE((
-               SELECT id
-               FROM friend_activity
-               WHERE actor_name = $1
-               ORDER BY id DESC
-               OFFSET $2
-               LIMIT 1
-             ), 0)`,
-          [actor, SOCIAL_HISTORY_MAX - 1],
-          { attempts:2, label:'FRIEND ACTIVITY RETENTION' }
-        );
+        await queryDbWithRetry(`
+          WITH cutoffs AS MATERIALIZED (
+            SELECT target.name,
+              (SELECT item.id FROM ${table} item
+               WHERE item.${owner}=target.name
+               ORDER BY item.id DESC OFFSET $2 LIMIT 1) AS cutoff
+            FROM unnest($1::text[]) AS target(name)
+          )
+          DELETE FROM ${table} item USING cutoffs c
+          WHERE item.${owner}=c.name AND c.cutoff IS NOT NULL AND item.id<c.cutoff
+        `, [names, SOCIAL_HISTORY_MAX - 1], { attempts:1, label });
       } catch (err) {
-        console.error('[FRIEND ACTIVITY RETENTION DEFERRED ERROR]:', err && err.message ? err.message : err);
-        state.running = false;
-        pendingFriendActivityRetention.delete(actor);
-        return;
+        console.error(`[${label} ERROR]:`, err && err.message || err);
       }
-      state.running = false;
-      if (state.version > version) schedule();
-      else pendingFriendActivityRetention.delete(actor);
-    }, FRIEND_ACTIVITY_RETENTION_DELAY_MS);
-    if (typeof state.timer.unref === 'function') state.timer.unref();
-  };
-  schedule();
+    }
+  } finally {
+    historyRetentionRunning = false;
+    if (historyRetentionPending.activity.size || historyRetentionPending.notification.size) {
+      historyRetentionQueuedAt = Date.now();
+      scheduleHistoryRetentionDrain();
+    } else historyRetentionQueuedAt = 0;
+  }
 }
 
 async function recordFriendActivity(actorName, type, rawData = {}, options = {}) {
@@ -11203,26 +11776,77 @@ async function clearFriendActivityForUser(userName, throughId = 0) {
     const state = await getFriendActivityState(name);
     return { throughId: safeThroughId, lastReadId: state.lastReadId, dismissedThroughId: state.dismissedThroughId };
   }
-  return runDbTransactionWithRetry('FRIEND ACTIVITY CLEAR', async client => {
-    const stateResult = await client.query(
-      `INSERT INTO friend_activity_read_state (user_name, last_read_id, dismissed_through_id, updated_at)
-       VALUES ($1, $2, $2, NOW())
-       ON CONFLICT (user_name)
-       DO UPDATE SET
-         last_read_id = GREATEST(friend_activity_read_state.last_read_id, EXCLUDED.last_read_id),
-         dismissed_through_id = GREATEST(friend_activity_read_state.dismissed_through_id, EXCLUDED.dismissed_through_id),
-         updated_at = NOW()
-       RETURNING last_read_id, dismissed_through_id`,
-      [name, safeThroughId]
-    );
-    await client.query('DELETE FROM friend_activity_dismissed WHERE user_name = $1 AND activity_id <= $2::bigint', [name, safeThroughId]);
-    const row = stateResult.rows[0] || {};
-    return {
-      throughId: safeThroughId,
-      lastReadId: Math.max(0, Number(row.last_read_id) || safeThroughId),
-      dismissedThroughId: Math.max(0, Number(row.dismissed_through_id) || safeThroughId)
-    };
-  }, { attempts: 3, lockTimeoutMs: 1200, advisoryLockKey: `friend-activity-clear:${name.toLowerCase()}` });
+  // Clearing is idempotent and the cursors are monotonic. Keep both writes
+  // atomic in one statement rather than holding a free-tier connection through
+  // BEGIN, advisory lock, two queries and COMMIT.
+  const result = await queryDbWithRetry(`
+    WITH state AS (
+      INSERT INTO friend_activity_read_state (user_name, last_read_id, dismissed_through_id, updated_at)
+      VALUES ($1, $2, $2, NOW())
+      ON CONFLICT (user_name)
+      DO UPDATE SET
+        last_read_id = GREATEST(friend_activity_read_state.last_read_id, EXCLUDED.last_read_id),
+        dismissed_through_id = GREATEST(friend_activity_read_state.dismissed_through_id, EXCLUDED.dismissed_through_id),
+        updated_at = NOW()
+      RETURNING last_read_id, dismissed_through_id
+    ), removed AS (
+      DELETE FROM friend_activity_dismissed
+      WHERE user_name = $1 AND activity_id <= $2::bigint
+      RETURNING activity_id
+    )
+    SELECT state.last_read_id, state.dismissed_through_id FROM state
+  `, [name, safeThroughId], { attempts:2, label:'FRIEND ACTIVITY CLEAR' });
+  const row = result.rows[0] || {};
+  return {
+    throughId: safeThroughId,
+    lastReadId: Math.max(0, Number(row.last_read_id) || safeThroughId),
+    dismissedThroughId: Math.max(0, Number(row.dismissed_through_id) || safeThroughId)
+  };
+}
+
+// Only share active friend/activity reads; new friendships, read cursors,
+// dismissals and posts are fetched freshly once the previous read settles.
+const friendActivityRecordsPending = new Map();
+const friendActivityHistoryPending = new Map();
+const friendActivitySnapshotIds = new WeakMap();
+let nextFriendActivitySnapshotId = 0;
+const FRIEND_ACTIVITY_READ_PENDING_MAX = 64;
+function readFriendActivityRecordsShared(name) {
+  const key = normalizeSocialUserName(name);
+  if (!key) return Promise.resolve([]);
+  const existing = friendActivityRecordsPending.get(key);
+  if (existing) return existing;
+  const pending = getUserDataPayloadFromDb(key, 'friends');
+  if (friendActivityRecordsPending.size >= FRIEND_ACTIVITY_READ_PENDING_MAX) return pending;
+  friendActivityRecordsPending.set(key, pending);
+  pending.finally(() => {
+    if (friendActivityRecordsPending.get(key) === pending) friendActivityRecordsPending.delete(key);
+  }).catch(() => {});
+  return pending;
+}
+function readFriendActivityHistoryShared(name, afterId, friends) {
+  const viewer = normalizeSocialUserName(name);
+  const cursor = Math.max(0, Math.floor(Number(afterId) || 0));
+  // Friend relationship snapshots from different database reads cannot
+  // share an older result when a friendship changes mid-request.
+  let snapshotId = 0;
+  if (Array.isArray(friends)) {
+    snapshotId = friendActivitySnapshotIds.get(friends) || 0;
+    if (!snapshotId) {
+      snapshotId = ++nextFriendActivitySnapshotId;
+      friendActivitySnapshotIds.set(friends, snapshotId);
+    }
+  }
+  const key = `${viewer}\u0000${cursor}\u0000${snapshotId}`;
+  const existing = friendActivityHistoryPending.get(key);
+  if (existing) return existing;
+  const pending = getFriendActivityHistoryForUser(viewer, cursor, friends);
+  if (friendActivityHistoryPending.size >= FRIEND_ACTIVITY_READ_PENDING_MAX) return pending;
+  friendActivityHistoryPending.set(key, pending);
+  pending.finally(() => {
+    if (friendActivityHistoryPending.get(key) === pending) friendActivityHistoryPending.delete(key);
+  }).catch(() => {});
+  return pending;
 }
 
 async function getFriendActivityHistoryForUser(userName, afterId = 0, resolvedFriends = null) {
@@ -11239,6 +11863,8 @@ async function getFriendActivityHistoryForUser(userName, afterId = 0, resolvedFr
 
   // Read the cursor and the visible activity page in one database round trip.
   // LEFT JOIN LATERAL returns the cursor even if the filtered page is empty.
+  const activityCursorClause = safeAfterId ? 'AND fa.id > $4::bigint' : '';
+  const activityLimitParam = safeAfterId ? '$5' : '$4';
   const result = await queryDbWithRetry(
     `WITH friend_since(name, added_at_ms) AS (
        SELECT * FROM unnest($1::text[], $2::bigint[])
@@ -11255,18 +11881,18 @@ async function getFriendActivityHistoryForUser(userName, afterId = 0, resolvedFr
        SELECT fa.id, fa.actor_name, fa.event_type, fa.data, fa.created_at
        FROM friend_activity fa
        JOIN friend_since fs ON fs.name = fa.actor_name
-       WHERE ($4::bigint = 0 OR fa.id > $4::bigint)
-         AND fa.id > cursor.dismissed_through_id
+       WHERE fa.id > cursor.dismissed_through_id
+         ${activityCursorClause}
          AND NOT EXISTS (
            SELECT 1 FROM friend_activity_dismissed fad
            WHERE fad.user_name = $3 AND fad.activity_id = fa.id
          )
          AND (fs.added_at_ms <= 0 OR fa.created_at >= to_timestamp(fs.added_at_ms::double precision / 1000.0))
        ORDER BY fa.id DESC
-       LIMIT $5
+       LIMIT ${activityLimitParam}
      ) fa ON TRUE
      ORDER BY fa.id DESC`,
-    [friendNames, friendAddedAt, name, safeAfterId, SOCIAL_HISTORY_MAX],
+    safeAfterId ? [friendNames, friendAddedAt, name, safeAfterId, SOCIAL_HISTORY_MAX] : [friendNames, friendAddedAt, name, SOCIAL_HISTORY_MAX],
     { attempts: 2, label: safeAfterId > 0 ? 'FRIEND ACTIVITY DELTA' : 'FRIEND ACTIVITY READ' }
   );
   const rows = result.rows || [];
@@ -11611,16 +12237,7 @@ function publishStoredUserNotificationsBatch(rows) {
   if (!events.length) return [];
   const users = [...new Set(events.map(event => normalizeSocialUserName(event.user)).filter(Boolean))];
   for (const event of events) emitUserNotificationToLocalUser(event);
-  if (users.length) deferServerTask('USER NOTIFICATION BATCH RETENTION', () => queryDbWithRetry(`
-    WITH cutoffs AS MATERIALIZED (
-      SELECT target.user_name,
-        (SELECT n.id FROM user_notifications n WHERE n.user_name=target.user_name
-         ORDER BY n.id DESC OFFSET $2 LIMIT 1) AS cutoff
-      FROM unnest($1::text[]) AS target(user_name)
-    )
-    DELETE FROM user_notifications n USING cutoffs c
-    WHERE n.user_name=c.user_name AND c.cutoff IS NOT NULL AND n.id<c.cutoff
-  `, [users, SOCIAL_HISTORY_MAX - 1], {attempts:2,label:'USER NOTIFICATION BATCH RETENTION'}), 0);
+  if (users.length) scheduleUserNotificationRetention(users);
   deferServerTask('USER NOTIFICATION BATCH SYNC', () => notifyUserNotificationsCreatedAcrossInstances(events), 0);
   return events;
 }
@@ -11631,22 +12248,7 @@ async function publishStoredUserNotification(row) {
   const user = normalizeSocialUserName(event.user);
   if (!user) return null;
 
-  deferServerTask('USER NOTIFICATION RETENTION', async () => {
-    await queryDbWithRetry(
-      `DELETE FROM user_notifications
-       WHERE user_name = $1
-         AND id < COALESCE((
-           SELECT id
-           FROM user_notifications
-           WHERE user_name = $1
-           ORDER BY id DESC
-           OFFSET $2
-           LIMIT 1
-         ), 0)`,
-      [user, SOCIAL_HISTORY_MAX - 1],
-      { attempts: 2, label: 'USER NOTIFICATION RETENTION' }
-    );
-  }, 0);
+  scheduleUserNotificationRetention(user);
   emitUserNotificationToLocalUser(event);
   deferServerTask('USER NOTIFICATION SYNC', () => notifyUserNotificationAcrossInstances(event), 0);
   return event;
@@ -11709,17 +12311,10 @@ async function removeChatReactionNotification(messageOwner, messageId, actor, em
   const dedupeKey = getChatReactionNotificationDedupeKey(messageId, owner, actor, emoji);
   if (!owner || !dedupeKey) return false;
   try {
-    const result = await queryDbWithRetry(
-      `DELETE FROM user_notifications
-       WHERE user_name = $1 AND event_type = 'reaction' AND dedupe_key = $2
-       RETURNING id`,
-      [owner, dedupeKey],
-      { attempts: 2, label: 'REACTION NOTIFICATION REMOVE' }
-    );
-    const row = result.rows[0];
-    if (!row) return false;
-    const notificationId = String(row.id || '');
-    const unreadCount = await getUserNotificationUnreadCount(owner);
+    const result = await deleteUserNotificationsWithCount(owner,"event_type = 'reaction' AND dedupe_key = $2",[dedupeKey],'REACTION NOTIFICATION REMOVE');
+    const notificationId = result.ids[0] || '';
+    if (!notificationId) return false;
+    const unreadCount = result.unreadCount;
     emitUserNotificationDeletedToLocalUser(owner, notificationId, unreadCount);
     deferServerTask('REACTION NOTIFICATION REMOVE SYNC', () => notifyUserNotificationDeletedAcrossInstances(owner, notificationId, unreadCount), 0);
     return true;
@@ -11743,17 +12338,10 @@ async function removeDirectReactionNotification(messageOwner, messageId, actor, 
   const dedupeKey = getDirectReactionNotificationDedupeKey(messageId, owner, actor, emoji);
   if (!owner || !dedupeKey) return false;
   try {
-    const result = await queryDbWithRetry(
-      `DELETE FROM user_notifications
-       WHERE user_name = $1 AND event_type = 'private_message' AND dedupe_key = $2
-       RETURNING id`,
-      [owner, dedupeKey],
-      { attempts: 2, label: 'DIRECT REACTION NOTIFICATION REMOVE' }
-    );
-    const row = result.rows[0];
-    if (!row) return false;
-    const notificationId = String(row.id || '');
-    const unreadCount = await getUserNotificationUnreadCount(owner);
+    const result = await deleteUserNotificationsWithCount(owner,"event_type = 'private_message' AND dedupe_key = $2",[dedupeKey],'DIRECT REACTION NOTIFICATION REMOVE');
+    const notificationId = result.ids[0] || '';
+    if (!notificationId) return false;
+    const unreadCount = result.unreadCount;
     emitUserNotificationDeletedToLocalUser(owner, notificationId, unreadCount);
     deferServerTask('DIRECT REACTION NOTIFICATION REMOVE SYNC', () => notifyUserNotificationDeletedAcrossInstances(owner, notificationId, unreadCount), 0);
     return true;
@@ -11850,20 +12438,32 @@ async function getUserNotificationReadId(userName) {
   return Math.max(0, Number(result.rows[0] && result.rows[0].last_read_id) || 0);
 }
 
-async function setUserNotificationReadId(userName, lastReadId) {
+// Mark read and obtain the authoritative unread count in one PostgreSQL trip.
+// The count uses the cursor returned by the UPSERT, including a concurrent
+// session's newer cursor, instead of issuing a second round trip.
+async function setUserNotificationReadIdAndCount(userName, lastReadId) {
   const name = normalizeSocialUserName(userName);
   const safeId = Math.max(0, Math.floor(Number(lastReadId) || 0));
-  if (!name || !safeId) return 0;
-  const result = await queryDbWithRetry(
-    `INSERT INTO user_notification_read_state (user_name, last_read_id, updated_at)
-     VALUES ($1, $2, NOW())
-     ON CONFLICT (user_name)
-     DO UPDATE SET last_read_id = GREATEST(user_notification_read_state.last_read_id, EXCLUDED.last_read_id), updated_at = NOW()
-     RETURNING last_read_id`,
-    [name, safeId],
-    { attempts: 2, label: 'USER NOTIFICATION MARK READ' }
-  );
-  return Math.max(0, Number(result.rows[0] && result.rows[0].last_read_id) || safeId);
+  if (!name) return { lastReadId:0, unreadCount:0 };
+  if (!safeId) return { lastReadId:0, unreadCount:await getUserNotificationUnreadCount(name, 0) };
+  const result = await queryDbWithRetry(`
+    WITH updated AS (
+      INSERT INTO user_notification_read_state (user_name, last_read_id, updated_at)
+      VALUES ($1, $2, NOW())
+      ON CONFLICT (user_name)
+      DO UPDATE SET last_read_id = GREATEST(user_notification_read_state.last_read_id, EXCLUDED.last_read_id), updated_at = NOW()
+      RETURNING last_read_id
+    )
+    SELECT updated.last_read_id,
+      (SELECT COUNT(*)::int FROM user_notifications n
+       WHERE n.user_name = $1 AND n.id > updated.last_read_id) AS unread_count
+    FROM updated
+  `, [name,safeId], { attempts:2, label:'USER NOTIFICATION MARK READ' });
+  const row = result.rows[0] || {};
+  return {
+    lastReadId:Math.max(0, Number(row.last_read_id) || safeId),
+    unreadCount:Math.max(0, Number(row.unread_count) || 0)
+  };
 }
 
 async function getUserNotificationUnreadCount(userName, lastReadId = null) {
@@ -11883,17 +12483,44 @@ async function getUserNotificationUnreadCount(userName, lastReadId = null) {
   return Math.max(0, Number(result.rows[0] && result.rows[0].count) || 0);
 }
 
+// PostgreSQL data-changing CTEs use the statement snapshot for the outer
+// SELECT. Explicitly exclude removed IDs from that snapshot to compute the
+// post-delete unread count without a second round trip. Conditions here are
+// server-owned SQL constants; user input is always bound as query parameters.
+async function deleteUserNotificationsWithCount(name, condition, params, label, includeIds = true) {
+  // Clearing a long history needs only the affected count, never thousands of IDs.
+  const removedIdsSql = includeIds
+    ? "COALESCE((SELECT array_agg(id::text ORDER BY id) FROM removed), ARRAY[]::text[])"
+    : 'ARRAY[]::text[]';
+  const result = await queryDbWithRetry(`
+    WITH removed AS (
+      DELETE FROM user_notifications
+      WHERE user_name = $1 AND ${condition}
+      RETURNING id
+    ), read_cursor AS (
+      SELECT COALESCE((SELECT last_read_id FROM user_notification_read_state
+                       WHERE user_name = $1), 0) AS last_read_id
+    ), remaining AS (
+      SELECT COUNT(*)::int AS unread_count
+      FROM user_notifications n CROSS JOIN read_cursor c
+      WHERE n.user_name = $1 AND n.id > c.last_read_id
+        AND NOT EXISTS (SELECT 1 FROM removed d WHERE d.id = n.id)
+    )
+    SELECT (SELECT COUNT(*)::int FROM removed) AS deleted_count,
+           ${removedIdsSql} AS removed_ids,
+           (SELECT unread_count FROM remaining) AS unread_count
+  `, [name,...params], { attempts:2, label });
+  const row = result.rows[0] || {};
+  const ids = Array.isArray(row.removed_ids) ? row.removed_ids.map(String) : [];
+  return { ids, deletedCount:Math.max(0,Number(row.deleted_count) || ids.length), unreadCount:Math.max(0,Number(row.unread_count) || 0) };
+}
+
 async function deleteUserNotification(userName, notificationId) {
   const name = normalizeSocialUserName(userName);
   const id = String(notificationId || '').trim();
-  if (!name || !/^\d+$/.test(id)) return { deleted: false, notificationId: '', unreadCount: 0 };
-  const result = await queryDbWithRetry(
-    'DELETE FROM user_notifications WHERE user_name = $1 AND id = $2::bigint RETURNING id',
-    [name, id],
-    { attempts: 2, label: 'USER NOTIFICATION DELETE' }
-  );
-  const unreadCount = await getUserNotificationUnreadCount(name);
-  return { deleted: !!result.rows[0], notificationId: id, unreadCount };
+  if (!name || !/^\d+$/.test(id)) return { deleted:false, notificationId:'', unreadCount:0 };
+  const result = await deleteUserNotificationsWithCount(name,'id = $2::bigint',[id],'USER NOTIFICATION DELETE');
+  return { deleted:result.deletedCount > 0, notificationId:id, unreadCount:result.unreadCount };
 }
 
 async function consumeUserChatNotifications(userName, scope, messageIds = []) {
@@ -11904,33 +12531,19 @@ async function consumeUserChatNotifications(userName, scope, messageIds = []) {
     .filter(Boolean))).slice(0, 40);
   if (!name || !ids.length || !['global', 'private'].includes(safeScope)) return { notificationIds:[], unreadCount:await getUserNotificationUnreadCount(name) };
   const typeClause = safeScope === 'private'
-    ? `event_type = 'private_message'`
-    : `event_type IN ('mention', 'reply', 'reaction')`;
-  const result = await queryDbWithRetry(
-    `DELETE FROM user_notifications
-     WHERE user_name = $1
-       AND ${typeClause}
-       AND data->>'messageId' = ANY($2::text[])
-     RETURNING id`,
-    [name, ids],
-    { attempts:2, label:'CHAT NOTIFICATION CONSUME' }
-  );
-  const notificationIds = (result.rows || []).map(row => String(row && row.id || '')).filter(Boolean);
-  const unreadCount = await getUserNotificationUnreadCount(name);
-  return { notificationIds, unreadCount };
+    ? "event_type = 'private_message'"
+    : "event_type IN ('mention', 'reply', 'reaction')";
+  const result = await deleteUserNotificationsWithCount(name,
+    `${typeClause} AND data->>'messageId' = ANY($2::text[])`,[ids],'CHAT NOTIFICATION CONSUME');
+  return { notificationIds:result.ids, unreadCount:result.unreadCount };
 }
 
 async function clearUserNotifications(userName, throughId = 0) {
   const name = normalizeSocialUserName(userName);
   const safeThroughId = Math.max(0, Math.floor(Number(throughId) || 0));
-  if (!name || !safeThroughId) return { deletedCount: 0, throughId: safeThroughId, unreadCount: await getUserNotificationUnreadCount(name) };
-  const result = await queryDbWithRetry(
-    'DELETE FROM user_notifications WHERE user_name = $1 AND id <= $2::bigint',
-    [name, safeThroughId],
-    { attempts: 2, label: 'USER NOTIFICATIONS CLEAR' }
-  );
-  const unreadCount = await getUserNotificationUnreadCount(name);
-  return { deletedCount: Math.max(0, Number(result.rowCount) || 0), throughId: safeThroughId, unreadCount };
+  if (!name || !safeThroughId) return { deletedCount:0, throughId:safeThroughId, unreadCount:await getUserNotificationUnreadCount(name) };
+  const result = await deleteUserNotificationsWithCount(name,'id <= $2::bigint',[safeThroughId],'USER NOTIFICATIONS CLEAR',false);
+  return { deletedCount:result.deletedCount, throughId:safeThroughId, unreadCount:result.unreadCount };
 }
 
 async function getUserNotificationHistory(userName, afterId = 0) {
@@ -11940,6 +12553,7 @@ async function getUserNotificationHistory(userName, afterId = 0) {
   // A single round trip reads the history, read cursor and unread count.
   // Both the list and unread counter continue to use the (user_name,id) index.
   const deltaClause = safeAfterId > 0 ? 'AND n.id > $2::bigint' : '';
+  const limitParam = safeAfterId > 0 ? '$3::int' : '$2::int';
   const result = await queryDbWithRetry(`
     WITH read_cursor AS MATERIALIZED (
       SELECT COALESCE((SELECT last_read_id FROM user_notification_read_state
@@ -11955,10 +12569,10 @@ async function getUserNotificationHistory(userName, afterId = 0) {
     LEFT JOIN LATERAL (
       SELECT n.id,n.user_name,n.event_type,n.data,n.created_at
       FROM user_notifications n WHERE n.user_name=$1 ${deltaClause}
-      ORDER BY n.id DESC
+      ORDER BY n.id DESC LIMIT ${limitParam}
     ) n ON TRUE
     ORDER BY n.id DESC
-  `, safeAfterId > 0 ? [name,safeAfterId] : [name],
+  `, safeAfterId > 0 ? [name,safeAfterId,SOCIAL_HISTORY_MAX] : [name,SOCIAL_HISTORY_MAX],
     { attempts:2, label: safeAfterId > 0 ? 'USER NOTIFICATION DELTA' : 'USER NOTIFICATION READ' });
   const rows = result.rows || [];
   const meta = rows[0] || {};
@@ -11968,6 +12582,26 @@ async function getUserNotificationHistory(userName, afterId = 0) {
     unreadCount: Math.max(0, Number(meta.unread_count) || 0),
     delta: safeAfterId > 0
   };
+}
+
+// Concurrent tabs/devices may request the same notification snapshot together.
+// Share only the in-flight read; never cache a completed personal notification
+// list, so new events/read-state changes are visible on the very next request.
+const userNotificationHistoryPending=new Map();
+const USER_NOTIFICATION_READ_PENDING_MAX=64;
+function getUserNotificationHistoryShared(userName, afterId=0){
+  const name=normalizeSocialUserName(userName);
+  const cursor=Math.max(0,Math.floor(Number(afterId)||0));
+  const key=`${name}\u0000${cursor}`;
+  const existing=userNotificationHistoryPending.get(key);
+  if(existing)return existing;
+  const request=getUserNotificationHistory(name,cursor);
+  if(userNotificationHistoryPending.size>=USER_NOTIFICATION_READ_PENDING_MAX)return request;
+  userNotificationHistoryPending.set(key,request);
+  request.finally(()=>{
+    if(userNotificationHistoryPending.get(key)===request)userNotificationHistoryPending.delete(key);
+  }).catch(()=>{});
+  return request;
 }
 
 function serializeUserRewardNoticeRow(row) {
@@ -11982,13 +12616,29 @@ function serializeUserRewardNoticeRow(row) {
   };
 }
 
-async function getUserRewardNotices(userName) {
-  const result = await queryDbWithRetry(
+// Initial logins from multiple tabs can share the same reward-notice read.
+// Release settled data immediately, and detach old reads after mutations or
+// cross-instance updates so a new request never joins a stale snapshot.
+const rewardNoticeReadsPending = new Map();
+const REWARD_NOTICE_PENDING_MAX = 64;
+function invalidateRewardNoticeRead(userName) {
+  rewardNoticeReadsPending.delete(String(userName || ''));
+}
+function getUserRewardNotices(userName) {
+  const name = String(userName || '');
+  const existing = rewardNoticeReadsPending.get(name);
+  if (existing) return existing;
+  const pending = queryDbWithRetry(
     `SELECT user_name, reward_id, trophy_id, title, kind, image_url, created_at, seen, visited
      FROM user_reward_notices WHERE user_name = $1 AND dismissed = FALSE ORDER BY created_at DESC LIMIT 100`,
-    [userName], { attempts: 2, label: 'REWARD NOTICE READ' }
-  );
-  return result.rows.map(serializeUserRewardNoticeRow);
+    [name], { attempts: 2, label: 'REWARD NOTICE READ' }
+  ).then(result => result.rows.map(serializeUserRewardNoticeRow));
+  if (rewardNoticeReadsPending.size >= REWARD_NOTICE_PENDING_MAX) return pending;
+  rewardNoticeReadsPending.set(name, pending);
+  pending.finally(() => {
+    if (rewardNoticeReadsPending.get(name) === pending) rewardNoticeReadsPending.delete(name);
+  }).catch(() => {});
+  return pending;
 }
 
 async function mutateUserRewardNotices(userName, raw = {}) {
@@ -12063,6 +12713,7 @@ async function mutateUserRewardNotices(userName, raw = {}) {
 }
 
 function emitRewardNoticeChange(userName, excludeSocketId = '') {
+  invalidateRewardNoticeRead(userName);
   getSocketsByUserName(userName).forEach(client => {
     if (client && client.connected && client.id !== excludeSocketId) client.emit('reward_notices_changed');
   });
@@ -12126,31 +12777,36 @@ function chatNotificationTextMentionsUser(text, userName) {
 function extractChatMentionTargets(text, senderName) {
   const source = String(text || '');
   if (!source.includes('@')) return [];
+  ensureUserNameIndexes();
+  if (!userNameLookupLower.size) return [];
   const lowerSource = source.toLowerCase();
   const senderLower = String(senderName || '').toLowerCase();
+  const isBoundary = ch => !ch || /[\s.,!?;:()\[\]{}<>"'`]/.test(ch);
+  const matches = [];
+  // Inspect actual @ positions, not every registered username. Include spaces
+  // in names and preserve longest-name precedence for overlapping mentions.
+  for (let at = lowerSource.indexOf('@'); at >= 0; at = lowerSource.indexOf('@', at + 1)) {
+    if (!isBoundary(at ? lowerSource[at - 1] : '')) continue;
+    let candidate = '';
+    const limit = Math.min(lowerSource.length, at + 1 + userNameMaxLowerLength);
+    for (let end = at + 2; end <= limit; end++) {
+      candidate += lowerSource[end - 1];
+      if (!isBoundary(lowerSource[end] || '')) continue;
+      const name = userNameLookupLower.get(candidate);
+      if (name && candidate !== senderLower) matches.push({ name, start: at, end });
+    }
+  }
+  matches.sort((a, b) => (b.name.length - a.name.length) || a.name.toLowerCase().localeCompare(b.name.toLowerCase()) || a.start - b.start);
   const occupied = [];
   const found = [];
-  ensureUserNameIndexes();
-  const isBoundary = ch => !ch || /[\s.,!?;:()\[\]{}<>"'`]/.test(ch);
-
-  userNameIndexByLength.forEach(entry => {
-    if (!entry.name || entry.lower === senderLower) return;
-    const name = entry.name;
-    const needle = `@${entry.lower}`;
-    let from = 0;
-    while (from < lowerSource.length) {
-      const index = lowerSource.indexOf(needle, from);
-      if (index < 0) break;
-      const end = index + needle.length;
-      from = index + 1;
-      if (!isBoundary(index > 0 ? lowerSource[index - 1] : '') || !isBoundary(lowerSource[end] || '')) continue;
-      if (occupied.some(range => index < range[1] && end > range[0])) continue;
-      occupied.push([index, end]);
-      found.push(name);
-      break;
-    }
-  });
-
+  const selected = new Set();
+  for (const match of matches) {
+    if (selected.has(match.name)) continue;
+    if (occupied.some(range => match.start < range[1] && match.end > range[0])) continue;
+    occupied.push([match.start, match.end]);
+    selected.add(match.name);
+    found.push(match.name);
+  }
   return found;
 }
 
@@ -12541,23 +13197,28 @@ async function syncPresenceOnlineFromDb() {
     userDatabase[username].lastSeen = row.last_seen ? new Date(row.last_seen).getTime() : Date.now();
   });
 
-  for (const row of expiredRes.rows) {
-    const username = row && row.name;
-    if (!username || activeByName.has(username)) continue;
-    const expiredLastSeen = row.last_seen ? new Date(row.last_seen).getTime() : Date.now();
-    const result = await markPresenceOfflineIfNoActiveSessions(username, expiredLastSeen);
-    if (!userDatabase[username]) continue;
-    if (result.online === true && result.row) {
-      userDatabase[username].online = true;
-      userDatabase[username].id = result.row.socket_id || userDatabase[username].id;
-      userDatabase[username].lastSeen = result.row.last_seen ? new Date(result.row.last_seen).getTime() : Date.now();
-      continue;
-    }
-    userDatabase[username].online = false;
-    userDatabase[username].lastSeen = Math.max(Number(userDatabase[username].lastSeen || 0), Number(result.lastSeen || expiredLastSeen));
-    userDatabase[username].presenceRevision = Math.max(Number(userDatabase[username].presenceRevision) || 0, Number(result.revision) || 0);
-    userCacheMeta[username] = Date.now();
-    if (result.changed) scheduleFriendActivityOffline(username, result.lastSeen, 'ttl-expire');
+  // Process distinct expired accounts in tiny batches after outages. This
+  // shortens recovery without flooding the shared Aiven connection pool.
+  const expireBatchSize = pool.waitingCount > 0 ? 1 : 2;
+  for (let offset = 0; offset < expiredRes.rows.length; offset += expireBatchSize) {
+    await Promise.all(expiredRes.rows.slice(offset, offset + expireBatchSize).map(async row => {
+      const username = row && row.name;
+      if (!username || activeByName.has(username)) return;
+      const expiredLastSeen = row.last_seen ? new Date(row.last_seen).getTime() : Date.now();
+      const result = await markPresenceOfflineIfNoActiveSessions(username, expiredLastSeen);
+      if (!userDatabase[username]) return;
+      if (result.online === true && result.row) {
+        userDatabase[username].online = true;
+        userDatabase[username].id = result.row.socket_id || userDatabase[username].id;
+        userDatabase[username].lastSeen = result.row.last_seen ? new Date(result.row.last_seen).getTime() : Date.now();
+        return;
+      }
+      userDatabase[username].online = false;
+      userDatabase[username].lastSeen = Math.max(Number(userDatabase[username].lastSeen || 0), Number(result.lastSeen || expiredLastSeen));
+      userDatabase[username].presenceRevision = Math.max(Number(userDatabase[username].presenceRevision) || 0, Number(result.revision) || 0);
+      userCacheMeta[username] = Date.now();
+      if (result.changed) scheduleFriendActivityOffline(username, result.lastSeen, 'ttl-expire');
+    }));
   }
 
   let presenceChanged = false;
@@ -13167,10 +13828,23 @@ async function createContentShareTokenForUser(userName, rawDescriptor) {
   return { success:true, token };
 }
 
+// Several chat viewers can resolve the same legacy link at once. Coalesce only
+// requests still in flight; do not cache user profiles or authorization results.
+const contentShareResolveInFlight = new Map();
 async function resolveContentShareTokenForUser(token) {
   const safeToken = normalizeContentShareTokenServer(token);
   if (!safeToken) return { success:false, message:'Invalid shared link.' };
+  const active = contentShareResolveInFlight.get(safeToken);
+  if (active) return active;
+  const pending = readContentShareTokenForUser(safeToken).finally(() => {
+    if (contentShareResolveInFlight.get(safeToken) === pending) contentShareResolveInFlight.delete(safeToken);
+  });
+  // Avoid retaining arbitrarily many unique in-flight tokens under heavy load.
+  if (contentShareResolveInFlight.size < 128) contentShareResolveInFlight.set(safeToken, pending);
+  return pending;
+}
 
+async function readContentShareTokenForUser(safeToken) {
   const result = await queryDbWithRetry(
     `SELECT descriptor, shared_by
        FROM content_shares
@@ -13317,14 +13991,15 @@ async function socialReadFeed(actor, filter, before, focusId = null) {
   const audienceCondition=audience==='mine'?'AND p.author_name=$1':
     audience==='friends'?'AND p.author_name IN (SELECT name FROM friend_names)':'';
   // The requested post ID bypasses the filter for reports, notifications and shared links.
-  const scope=focusId?'':audienceCondition;
+  const scope=focusId?'':audienceCondition.replace(/^AND\s+/, '');
+  // Construct only the predicates actually needed, avoiding nullable OR tests
+  // in the hot pagination query and preserving the existing focus semantics.
+  const pageFilters=[before?'p.id < $2::bigint':'',focusId?'p.id = $4::bigint':'',scope].filter(Boolean).join('\n        AND ');
   const result=await queryDbWithRetry(`
     WITH ${friendNames}page AS MATERIALIZED (
       SELECT p.id,p.author_name,p.body,p.images,p.playing,p.created_at,p.edited_at
       FROM social_posts p
-      WHERE ($2::bigint IS NULL OR p.id < $2::bigint)
-        AND ($4::bigint IS NULL OR p.id = $4::bigint)
-        ${scope}
+      ${pageFilters ? `WHERE ${pageFilters}` : ''}
       ORDER BY p.id DESC LIMIT ${SOCIAL_POST_LIMIT + 1}
     ), reaction_counts AS (
       SELECT r.post_id,jsonb_agg(jsonb_build_object('emoji',r.emoji,'count',r.cnt)) AS reactions
@@ -13353,8 +14028,20 @@ async function socialReadFeed(actor, filter, before, focusId = null) {
 }
 
 const socialFeedCountCache=new Map();
-async function socialReadPostCounts(actor){
-  const result=await queryDbWithRetry(`
+let socialGlobalPostCount = null;
+let socialGlobalPostCountPending = null;
+let socialPostCountRevision = 0;
+const SOCIAL_POST_COUNT_CACHE_MS = 15000;
+function invalidateSocialPostCountReads() {
+  socialPostCountRevision++;
+  socialGlobalPostCount = null;
+  socialGlobalPostCountPending = null;
+  socialFeedCountCache.clear();
+}
+// Reuse the author index for viewers joining an in-flight global COUNT.
+// Never run an extra COUNT(*) across the complete posts table here.
+function socialReadIndexedPostCounts(actor) {
+  return queryDbWithRetry(`
     WITH friend_names AS MATERIALIZED (
       SELECT CASE WHEN jsonb_typeof(friend.value)='object' THEN friend.value->>'name'
                   WHEN jsonb_typeof(friend.value)='string' THEN friend.value#>>'{}' ELSE NULL END AS name
@@ -13364,18 +14051,96 @@ async function socialReadPostCounts(actor){
       ) friend(value)
       WHERE viewer.name=$1
     )
-    SELECT COUNT(*)::int AS all_count,
-      COUNT(*) FILTER (WHERE p.author_name=$1)::int AS mine_count,
-      COUNT(*) FILTER (WHERE p.author_name IN (SELECT name FROM friend_names))::int AS friends_count
-    FROM social_posts p
-  `,[actor],{attempts:2,label:'SOCIAL POST COUNTS'});
+    SELECT
+      (SELECT COUNT(*)::int FROM social_posts WHERE author_name=$1) AS mine_count,
+      (SELECT COUNT(*)::int FROM social_posts
+       WHERE author_name IN (SELECT name FROM friend_names)) AS friends_count
+  `,[actor],{attempts:2,label:'SOCIAL POST COUNTS INDEXED'});
+}
+
+let socialPostCountParallelFollowers = 0;
+async function socialReadPostCounts(actor){
+  const now = Date.now();
+  const cachedGlobal = socialGlobalPostCount && socialGlobalPostCount.expires > now
+    ? socialGlobalPostCount.value : null;
+  // Let one viewer compute the exact global total while other viewers wait
+  // briefly, then use the author index instead of starting a second full scan.
+  if (cachedGlobal === null && socialGlobalPostCountPending) {
+    // A second viewer needs only index-backed personal/friend counts. Start
+    // those while the shared global COUNT is running, unless the pool is
+    // already queued. This removes one cross-region RTT on a healthy pool.
+    // A failed global COUNT still fails every follower, not a DB stampede.
+    const globalRead = socialGlobalPostCountPending;
+    const revision = socialPostCountRevision;
+    if (pool.waitingCount > 0 || socialPostCountParallelFollowers >= 2) {
+      await globalRead;
+      return socialReadPostCounts(actor);
+    }
+    socialPostCountParallelFollowers++;
+    let globalResult, personalResult;
+    try {
+      [globalResult, personalResult] = await Promise.all([globalRead, socialReadIndexedPostCounts(actor)]);
+    } finally {
+      socialPostCountParallelFollowers--;
+    }
+    if (revision !== socialPostCountRevision) return socialReadPostCounts(actor);
+    const globalRow = globalResult.rows[0] || {};
+    const personalRow = personalResult.rows[0] || {};
+    return {
+      all: Math.max(0, Number(globalRow.all_count) || 0),
+      friends: Number(personalRow.friends_count) || 0,
+      mine: Number(personalRow.mine_count) || 0
+    };
+  }
+  const revision = socialPostCountRevision;
+  // Keep the global COUNT separate from index-assisted author/friends counts.
+  // With a cached global count, PostgreSQL only reads the relevant authors.
+  const dbQuery = cachedGlobal === null
+    ? queryDbWithRetry(`
+        WITH friend_names AS MATERIALIZED (
+          SELECT CASE WHEN jsonb_typeof(friend.value)='object' THEN friend.value->>'name'
+                      WHEN jsonb_typeof(friend.value)='string' THEN friend.value#>>'{}' ELSE NULL END AS name
+          FROM users viewer
+          CROSS JOIN LATERAL jsonb_array_elements(
+            CASE WHEN jsonb_typeof(viewer.data->'friendsData')='array' THEN viewer.data->'friendsData' ELSE '[]'::jsonb END
+          ) friend(value)
+          WHERE viewer.name=$1
+        )
+        SELECT (SELECT COUNT(*)::int FROM social_posts) AS all_count,
+          (SELECT COUNT(*)::int FROM social_posts WHERE author_name=$1) AS mine_count,
+          (SELECT COUNT(*)::int FROM social_posts
+           WHERE author_name IN (SELECT name FROM friend_names)) AS friends_count
+      `,[actor],{attempts:2,label:'SOCIAL POST COUNTS'})
+    : socialReadIndexedPostCounts(actor);
+  let pending = dbQuery;
+  if (cachedGlobal === null) {
+    pending = dbQuery.then(result => {
+      if (revision === socialPostCountRevision) {
+        socialGlobalPostCount = {
+          value:Math.max(0,Number(result.rows[0] && result.rows[0].all_count)||0),
+          expires:Date.now()+SOCIAL_POST_COUNT_CACHE_MS
+        };
+      }
+      return result;
+    });
+    socialGlobalPostCountPending = pending;
+    pending.finally(() => {
+      if (socialGlobalPostCountPending === pending) socialGlobalPostCountPending = null;
+    }).catch(() => {});
+  }
+  const result = await pending;
   const row=result.rows[0]||{};
-  return {all:Number(row.all_count)||0,friends:Number(row.friends_count)||0,mine:Number(row.mine_count)||0};
+  const all = cachedGlobal === null ? Math.max(0,Number(row.all_count)||0) : cachedGlobal;
+  return {all,friends:Number(row.friends_count)||0,mine:Number(row.mine_count)||0};
 }
 function readSocialPostCountsShared(actor){
   const now=Date.now();
   const cached=socialFeedCountCache.get(actor);
-  if(cached&&(cached.promise||cached.expires>now))return cached.promise||Promise.resolve(cached.value);
+  if(cached&&(cached.promise||cached.expires>now)){
+    socialFeedCountCache.delete(actor);
+    socialFeedCountCache.set(actor,cached);
+    return cached.promise||Promise.resolve(cached.value);
+  }
   const entry={promise:null,value:null,expires:0};
   entry.promise=socialReadPostCounts(actor).then(value=>{
     if(socialFeedCountCache.get(actor)===entry){entry.value=value;entry.promise=null;entry.expires=Date.now()+15000;}
@@ -13388,20 +14153,88 @@ function readSocialPostCountsShared(actor){
   while(socialFeedCountCache.size>120)socialFeedCountCache.delete(socialFeedCountCache.keys().next().value);
   return entry.promise;
 }
+// Small cache only for the first Feed page. Every post/comment/reaction update
+// immediately invalidates it locally and via LISTEN/NOTIFY. Actor stays in the
+// key because each page contains their own reaction state.
+function peekSocialPostCounts(actor){
+  const entry=socialFeedCountCache.get(actor);
+  return entry&&entry.value&&entry.expires>Date.now()?entry.value:null;
+}
 const socialFeedPending=new Map();
+const socialFeedFirstPageCache=new Map();
+const SOCIAL_FEED_PAGE_CACHE_MS=3500;
+const SOCIAL_FEED_PAGE_CACHE_MAX=24;
+const SOCIAL_FEED_PAGE_CACHE_MAX_BYTES=128*1024;
+const SOCIAL_FEED_PAGE_CACHE_TOTAL_BYTES=1536*1024;
+let socialFeedFirstPageBytes=0;
+let socialFeedCacheRevision=0;
+function evictSocialFeedPage(key){
+  const entry=socialFeedFirstPageCache.get(key);
+  if(!entry)return;
+  socialFeedFirstPageCache.delete(key);
+  socialFeedFirstPageBytes-=entry.bytes;
+}
+function invalidateSocialFeedPageReads(kind = '', postId = '') {
+  socialFeedCacheRevision++;
+  // An in-flight page can contain the changed post even before its rows are
+  // known. Cancel shared pending references so a late result cannot be cached.
+  socialFeedPending.clear();
+  const id = String(postId || '');
+  const targeted = ['edit','react','comment','comment-delete'].includes(kind) && /^\d{1,18}$/.test(id);
+  if (targeted) {
+    for (const [key, entry] of socialFeedFirstPageCache) {
+      const posts = entry.value && entry.value.posts;
+      if (Array.isArray(posts) && posts.some(post => String(post.id) === id)) evictSocialFeedPage(key);
+    }
+    return;
+  }
+  // Insertion/deletion changes pagination, so all first pages must refresh.
+  socialFeedFirstPageCache.clear();
+  socialFeedFirstPageBytes=0;
+}
 function readSocialFeedShared(actor, filter, before, focusId){
   const key=JSON.stringify([actor,filter,before,focusId]);
-  let pending=socialFeedPending.get(key);
-  if(pending)return pending;
-  pending=socialReadFeed(actor,filter,before,focusId);
+  const cacheable=!before&&!focusId;
+  if(cacheable){
+    const cached=socialFeedFirstPageCache.get(key);
+    if(cached){
+      if(cached.expires>Date.now()){
+        socialFeedFirstPageCache.delete(key);
+        socialFeedFirstPageCache.set(key,cached);
+        return Promise.resolve(cached.value);
+      }
+      evictSocialFeedPage(key);
+    }
+  }
+  const existing=socialFeedPending.get(key);
+  if(existing)return existing;
+  const revision=socialFeedCacheRevision;
+  const pending=socialReadFeed(actor,filter,before,focusId).then(value=>{
+    if(cacheable&&revision===socialFeedCacheRevision&&socialFeedPending.get(key)===pending){
+      const bytes=Buffer.byteLength(JSON.stringify(value),'utf8');
+      if(bytes<=SOCIAL_FEED_PAGE_CACHE_MAX_BYTES){
+        socialFeedFirstPageCache.set(key,{value,bytes,expires:Date.now()+SOCIAL_FEED_PAGE_CACHE_MS});
+        socialFeedFirstPageBytes+=bytes;
+        for(const [oldKey,entry] of socialFeedFirstPageCache){
+          if(entry.expires<=Date.now())evictSocialFeedPage(oldKey);
+        }
+        while(socialFeedFirstPageCache.size>SOCIAL_FEED_PAGE_CACHE_MAX||
+              socialFeedFirstPageBytes>SOCIAL_FEED_PAGE_CACHE_TOTAL_BYTES){
+          evictSocialFeedPage(socialFeedFirstPageCache.keys().next().value);
+        }
+      }
+    }
+    return value;
+  });
   socialFeedPending.set(key,pending);
   pending.finally(()=>{if(socialFeedPending.get(key)===pending)socialFeedPending.delete(key);}).catch(()=>{});
   return pending;
 }
 
 async function socialReadComments(actor, postId, focusCommentId = '') {
-  const result = await queryDbWithRetry(`
-    WITH RECURSIVE recent_roots AS MATERIALIZED (
+  // Ordinary openings need only the 30 newest roots. Do not build a recursive
+  // ancestor path or deduplicate UNION rows unless a specific reply is targeted.
+  const pageQuery = focusCommentId ? `WITH RECURSIVE recent_roots AS MATERIALIZED (
       SELECT id,post_id,author_name,body,parent_id,images,created_at
       FROM social_comments WHERE post_id=$2 AND parent_id IS NULL
       ORDER BY id DESC LIMIT 30
@@ -13413,7 +14246,13 @@ async function socialReadComments(actor, postId, focusCommentId = '') {
       FROM social_comments parent JOIN focus_path child ON child.parent_id=parent.id AND child.post_id=parent.post_id
     ), comment_page AS MATERIALIZED (
       SELECT * FROM recent_roots UNION SELECT * FROM focus_path
-    ), reaction_counts AS (
+    )` : `WITH comment_page AS MATERIALIZED (
+      SELECT id,post_id,author_name,body,parent_id,images,created_at
+      FROM social_comments WHERE post_id=$2 AND parent_id IS NULL
+      ORDER BY id DESC LIMIT 30
+    )`;
+  const result = await queryDbWithRetry(`
+    ${pageQuery}, reaction_counts AS (
       SELECT r.comment_id,jsonb_agg(jsonb_build_object('emoji',r.emoji,'count',r.cnt)) AS reactions
       FROM (
         SELECT comment_id,emoji,COUNT(*)::int AS cnt
@@ -13455,16 +14294,21 @@ async function socialReadCommentReplies(actor, postId, parentId, after = '') {
       FROM (SELECT comment_id,emoji,COUNT(*)::int AS cnt FROM social_comment_reactions
             WHERE comment_id IN (SELECT id FROM page) GROUP BY comment_id,emoji) counts
       GROUP BY comment_id
+    ), reply_counts AS (
+      SELECT nested.parent_id,COUNT(*)::int AS cnt FROM social_comments nested
+      WHERE nested.parent_id IN (SELECT id FROM page)
+      GROUP BY nested.parent_id
     )
     SELECT c.id,c.post_id,c.author_name,c.body,c.parent_id,c.images,c.created_at,
       parent.author_name AS parent_author,
       COALESCE(NULLIF(u.data->>'avatar',''),$3) AS author_avatar,
       COALESCE(rc.reactions,'[]'::jsonb) AS reactions,
-      (SELECT COUNT(*)::int FROM social_comments nested WHERE nested.parent_id=c.id) AS reply_count,
+      COALESCE(reply_counts.cnt,0) AS reply_count,
       mine.emoji AS my_reaction
     FROM page c JOIN users u ON u.name=c.author_name
     JOIN social_comments parent ON parent.id=c.parent_id AND parent.post_id=c.post_id
     LEFT JOIN reaction_counts rc ON rc.comment_id=c.id
+    LEFT JOIN reply_counts ON reply_counts.parent_id=c.id
     LEFT JOIN social_comment_reactions mine ON mine.comment_id=c.id AND mine.user_name=$1
     ORDER BY c.id ASC
   `,[actor,postId,DEFAULT_AVATAR,parentId,after],{attempts:2,label:'SOCIAL COMMENT REPLIES'});
@@ -13473,20 +14317,82 @@ async function socialReadCommentReplies(actor, postId, parentId, after = '') {
   return {success:true,comments:page.map(serializeSocialComment),after:rows.length>20?String(page[page.length-1].id):null};
 }
 
-// Several tabs or a burst of realtime events can ask for the same modal
-// contents at once. Share only in-flight reads: a confirmed mutation always
-// invalidates them so the next request can see the newest comments/reactions.
+// Short cache for comments/replies. Per-viewer keys keep "my reaction" correct.
+// Live mutations and cross-instance NOTIFY invalidate the affected post immediately.
 const socialCommentsPending = new Map();
+const socialCommentRepliesCache = new Map();
+const SOCIAL_COMMENT_READ_CACHE_MS = 5000;
+const SOCIAL_COMMENT_READ_CACHE_MAX = 60;
+const SOCIAL_REPLIES_READ_CACHE_MAX = 80;
+const SOCIAL_COMMENT_CACHE_MAX_ITEM_BYTES = 128 * 1024;
+const SOCIAL_COMMENT_CACHE_MAX_BYTES = 1024 * 1024;
+
+function invalidateSocialCommentReads(postId) {
+  const segment = `\u0000${String(postId || '')}\u0000`;
+  if (!postId) return;
+  for (const cache of [socialCommentsPending, socialCommentRepliesCache]) {
+    for (const key of cache.keys()) if (key.includes(segment)) cache.delete(key);
+  }
+}
+
+function readSocialCached(cache, key, limit, getValue) {
+  const now = Date.now();
+  const existing = cache.get(key);
+  if (existing && (existing.promise || existing.expires > now)) {
+    cache.delete(key);
+    cache.set(key, existing);
+    return existing.promise || Promise.resolve(existing.value);
+  }
+  if (existing) cache.delete(key);
+  const entry = { promise:null, value:null, expires:0 };
+  entry.promise = Promise.resolve().then(getValue).then(value => {
+    if (cache.get(key) === entry) {
+      // A page with many image captions/replies must not grow the server cache
+      // just because the entry-count limit has not been reached.
+      const bytes = Buffer.byteLength(JSON.stringify(value), 'utf8');
+      if (bytes <= SOCIAL_COMMENT_CACHE_MAX_ITEM_BYTES) {
+        entry.value = value;
+        entry.bytes = bytes;
+        entry.expires = Date.now() + SOCIAL_COMMENT_READ_CACHE_MS;
+        entry.promise = null;
+        let totalBytes = 0;
+        for (const [cacheKey, cached] of cache) {
+          if (cached !== entry && !cached.promise && cached.expires <= Date.now()) {
+            cache.delete(cacheKey);
+          } else if (!cached.promise) {
+            totalBytes += cached.bytes || 0;
+          }
+        }
+        while (totalBytes > SOCIAL_COMMENT_CACHE_MAX_BYTES) {
+          let oldestKey;
+          for (const [cacheKey, cached] of cache) {
+            if (!cached.promise) { oldestKey = cacheKey; break; }
+          }
+          if (oldestKey === undefined) break;
+          totalBytes -= cache.get(oldestKey).bytes || 0;
+          cache.delete(oldestKey);
+        }
+      } else cache.delete(key);
+    }
+    return value;
+  }).catch(error => {
+    if (cache.get(key) === entry) cache.delete(key);
+    throw error;
+  });
+  cache.set(key, entry);
+  for (const [cacheKey, cached] of cache) if (!cached.promise && cached.expires <= now) cache.delete(cacheKey);
+  while (cache.size > limit) cache.delete(cache.keys().next().value);
+  return entry.promise;
+}
+
 function readSocialCommentsShared(actor, postId, focusCommentId = '') {
   const key = `${actor}\u0000${postId}\u0000${focusCommentId}`;
-  let pending = socialCommentsPending.get(key);
-  if (pending) return pending;
-  pending = socialReadComments(actor, postId, focusCommentId);
-  socialCommentsPending.set(key, pending);
-  pending.finally(() => {
-    if (socialCommentsPending.get(key) === pending) socialCommentsPending.delete(key);
-  }).catch(() => {});
-  return pending;
+  return readSocialCached(socialCommentsPending,key,SOCIAL_COMMENT_READ_CACHE_MAX,() => socialReadComments(actor,postId,focusCommentId));
+}
+
+function readSocialCommentRepliesShared(actor,postId,parentId,after='') {
+  const key = `${actor}\u0000${postId}\u0000${parentId}\u0000${after}`;
+  return readSocialCached(socialCommentRepliesCache,key,SOCIAL_REPLIES_READ_CACHE_MAX,() => socialReadCommentReplies(actor,postId,parentId,after));
 }
 
 // Small, short-lived per-instance cache for public reactor pages. A concurrent
@@ -13505,7 +14411,11 @@ async function readSocialReactorsShared(kind, id, emoji, after) {
   const key = `${kind}:${id}:${emoji}:${after}`;
   const now = Date.now();
   const cached = socialReactorsCache.get(key);
-  if (cached && (cached.promise || cached.expires > now)) return cached.promise || cached.value;
+  if (cached && (cached.promise || cached.expires > now)) {
+    socialReactorsCache.delete(key);
+    socialReactorsCache.set(key,cached);
+    return cached.promise || cached.value;
+  }
   if (cached) socialReactorsCache.delete(key);
   // The existing reaction PK (target_id, user_name) supports this ordering;
   // selecting only 31 users before looking up avatars avoids a large join.
@@ -13558,14 +14468,11 @@ function invalidateSocialReactorsForChange(kind, id, extra = null) {
 }
 
 function socialPublish(kind, id, extra = null) {
-  socialFeedPending.clear();
-  if(kind==='post'||kind==='delete')socialFeedCountCache.clear();
+  invalidateSocialFeedPageReads(kind, id);
+  if(kind==='post'||kind==='delete')invalidateSocialPostCountReads();
   invalidateSocialReactorsForChange(kind,id,extra);
-  if (kind === 'comment' || kind === 'comment-delete' || (kind === 'react' && extra && extra.commentId)) {
-    const segment = `\u0000${String(id || '')}\u0000`;
-    for (const key of socialCommentsPending.keys()) {
-      if (key.includes(segment)) socialCommentsPending.delete(key);
-    }
+  if (kind === 'comment' || kind === 'comment-delete' || kind === 'delete' || (kind === 'react' && extra && extra.commentId)) {
+    invalidateSocialCommentReads(id);
   }
   const payload = { kind, id: String(id || ''), ...(extra && typeof extra === 'object' ? extra : {}), at: Date.now() };
   io.emit('social_feed_changed', payload);
@@ -13606,6 +14513,37 @@ function socialNotifyAuthor(author, actor, postId, activity, commentId = '') {
   }
 }
 
+// The Social sidebar checks its unread marker on each session. Read an existing
+// marker without attempting a conflicting INSERT on every login. Only first-
+// time users get an inserted marker, initialized to the current newest post.
+// Concurrent tabs share the active read; settled results are never cached.
+const socialUnseenReadsPending = new Map();
+const SOCIAL_UNSEEN_PENDING_MAX = 64;
+function readSocialUnseenStateShared(actor) {
+  const existing = socialUnseenReadsPending.get(actor);
+  if (existing) return existing;
+  const pending = queryDbWithRetry(`
+    WITH latest AS (SELECT COALESCE(MAX(id),0)::bigint AS id FROM social_posts),
+    saved AS MATERIALIZED (
+      SELECT last_seen_post_id FROM social_feed_read_state WHERE user_name=$1
+    ), initialized AS (
+      INSERT INTO social_feed_read_state(user_name,last_seen_post_id)
+      SELECT $1,latest.id FROM latest WHERE NOT EXISTS (SELECT 1 FROM saved)
+      ON CONFLICT (user_name) DO NOTHING RETURNING last_seen_post_id
+    )
+    SELECT latest.id AS newest,
+      COALESCE((SELECT last_seen_post_id FROM saved),
+        (SELECT last_seen_post_id FROM initialized),0) AS last_seen
+    FROM latest
+  `,[actor],{attempts:2,label:'SOCIAL UNSEEN READ'}).then(result => result.rows[0] || {});
+  if (socialUnseenReadsPending.size >= SOCIAL_UNSEEN_PENDING_MAX) return pending;
+  socialUnseenReadsPending.set(actor,pending);
+  pending.finally(() => {
+    if (socialUnseenReadsPending.get(actor) === pending) socialUnseenReadsPending.delete(actor);
+  }).catch(() => {});
+  return pending;
+}
+
 // ============================================================================
 // Client connection & event handlers
 // ============================================================================
@@ -13626,18 +14564,7 @@ io.on('connection', (socket) => {
     const actor = normalizeSocialUserName(socket.userName);
     if (!actor) return reply({success:false});
     try {
-      const result = await queryDbWithRetry(`
-        WITH latest AS (SELECT COALESCE(MAX(id),0)::bigint AS id FROM social_posts),
-        saved AS (
-          INSERT INTO social_feed_read_state(user_name,last_seen_post_id)
-          SELECT $1,latest.id FROM latest
-          ON CONFLICT (user_name) DO NOTHING RETURNING last_seen_post_id
-        )
-        SELECT latest.id AS newest, COALESCE((SELECT last_seen_post_id FROM saved),
-          (SELECT last_seen_post_id FROM social_feed_read_state WHERE user_name=$1),0) AS last_seen
-        FROM latest
-      `,[actor],{attempts:2,label:'SOCIAL UNSEEN READ'});
-      const row = result.rows[0] || {};
+      const row = await readSocialUnseenStateShared(actor);
       reply({success:true,newest:String(row.newest||0),lastSeen:String(row.last_seen||0),unseen:Number(row.newest||0)>Number(row.last_seen||0)});
     } catch(err){console.error('[SOCIAL UNSEEN ERROR]',err && err.message||err);reply({success:false});}
   });
@@ -13648,6 +14575,7 @@ io.on('connection', (socket) => {
     const upTo = String(data.upTo||'');
     if(!actor||!/^\d{1,18}$/.test(upTo))return reply({success:false});
     try {
+      socialUnseenReadsPending.delete(actor);
       const result = await queryDbWithRetry(`
         INSERT INTO social_feed_read_state(user_name,last_seen_post_id,updated_at)
         VALUES ($1,LEAST($2::bigint,COALESCE((SELECT MAX(id) FROM social_posts),0)),NOW())
@@ -13668,10 +14596,10 @@ io.on('connection', (socket) => {
       const focusId = /^\d{1,18}$/.test(String(data.focusId || '')) ? String(data.focusId) : null;
       const startedAt = Date.now();
       const filter = ['all','friends','mine'].includes(data.filter) ? data.filter : (data.friendsOnly===true?'friends':'all');
-      const [feed,counts] = await Promise.all([
-        readSocialFeedShared(actor,filter,before,focusId),
-        !before&&!focusId?readSocialPostCountsShared(actor).catch(()=>null):Promise.resolve(null)
-      ]);
+      // Do not hold back the first Feed page while COUNT(*) scans posts.
+      // The client refreshes missing counts asynchronously after rendering.
+      const feed = await readSocialFeedShared(actor,filter,before,focusId);
+      const counts = !before&&!focusId ? peekSocialPostCounts(actor) : null;
       const elapsedMs = Date.now() - startedAt;
       if (elapsedMs > 1200) console.warn(`[SOCIAL FEED SLOW] ${elapsedMs}ms, ${feed.posts.length} posts, filter=${filter}`);
       reply({ success:true, ...feed, ...(counts?{counts}:{}) });
@@ -13767,12 +14695,11 @@ io.on('connection', (socket) => {
     const id = String(data.id || '');
     if (!actor || !/^\d{1,18}$/.test(id)) return reply({ success:false });
     try {
-      const found = await queryDbWithRetry('SELECT author_name FROM social_posts WHERE id=$1',[id],{attempts:2,label:'SOCIAL POST OWNER'});
-      const owner = found.rows[0]?.author_name;
-      if (!owner || (owner !== actor && !(canModerateSocket(socket) && canModerateTarget(socket,owner)))) return reply({ success:false, message:'Not allowed.' });
-      // A deleted publication must not leave linked Social notifications or friend activity.
-      // Keep all three deletions in one database statement, so retries cannot leave ghosts.
-      const deleted = await queryDbWithRetry(`
+      // Owner deletion is the hot path. The author predicate verifies
+      // permission and deletes the post plus related records in one SQL round
+      // trip. Moderators use the original role-aware owner lookup only when
+      // their own-author deletion did not match.
+      const removePost = owner => queryDbWithRetry(`
         WITH removed_post AS (
           DELETE FROM social_posts WHERE id=$1 AND author_name=$2 RETURNING id
         ), removed_notifications AS (
@@ -13789,8 +14716,16 @@ io.on('connection', (socket) => {
         SELECT (SELECT COUNT(*)::int FROM removed_post) AS removed,
           COALESCE((SELECT jsonb_agg(DISTINCT user_name) FROM removed_notifications),'[]'::jsonb) AS recipients
       `,[id,owner],{attempts:2,label:'SOCIAL POST DELETE + RELATED ITEMS'});
-      const deletedRow = deleted.rows[0] || {};
-      if (!deletedRow.removed) return reply({success:false,message:'Post no longer exists.'});
+      let owner = actor;
+      let deletedRow = (await removePost(actor)).rows[0] || {};
+      if (!deletedRow.removed) {
+        if (!canModerateSocket(socket)) return reply({success:false,message:'Not allowed.'});
+        const found = await queryDbWithRetry('SELECT author_name FROM social_posts WHERE id=$1',[id],{attempts:2,label:'SOCIAL POST OWNER'});
+        owner = found.rows[0]?.author_name;
+        if (!owner || !canModerateTarget(socket,owner)) return reply({success:false,message:'Not allowed.'});
+        deletedRow = (await removePost(owner)).rows[0] || {};
+        if (!deletedRow.removed) return reply({success:false,message:'Post no longer exists.'});
+      }
       socialPublish('delete',id);
       const recipients = Array.isArray(deletedRow.recipients) ? deletedRow.recipients.filter(Boolean) : [];
       if (recipients.length) deferServerTask('SOCIAL POST NOTIFICATION CLEANUP SYNC', async () => {
@@ -13924,7 +14859,7 @@ io.on('connection', (socket) => {
     const after = data.after == null ? '' : String(data.after);
     if (!actor || !/^\d{1,18}$/.test(id) || !/^\d{1,18}$/.test(parentId) || (after && !/^\d{1,18}$/.test(after)))
       return reply({success:false,message:'Invalid reply request.'});
-    try { reply(await socialReadCommentReplies(actor,id,parentId,after)); }
+    try { reply(await readSocialCommentRepliesShared(actor,id,parentId,after)); }
     catch (err) { console.error('[SOCIAL COMMENT REPLIES ERROR]:',err && err.message || err); reply({success:false,message:'Could not load replies.'}); }
   });
 
@@ -13984,11 +14919,23 @@ io.on('connection', (socket) => {
     const id = String(data.id || '');
     if (!actor || !/^\d{1,18}$/.test(id)) return reply({success:false});
     try {
-      const found = await queryDbWithRetry('SELECT post_id,author_name,parent_id FROM social_comments WHERE id=$1',[id],{attempts:2,label:'SOCIAL COMMENT OWNER'});
-      const row = found.rows[0];
-      if (!row || (row.author_name !== actor && !(canModerateSocket(socket) && canModerateTarget(socket,row.author_name)))) return reply({success:false,message:'Not allowed.'});
-      const deleted = await queryDbWithRetry('DELETE FROM social_comments WHERE id=$1 RETURNING id',[id],{attempts:2,label:'SOCIAL COMMENT DELETE'});
-      if (!deleted.rowCount) return reply({success:false,message:'Comment not found.'});
+      // Most deletions are by the comment author: delete + read metadata in one
+      // indexed statement. Moderation retains the existing target-role checks.
+      let deleted = await queryDbWithRetry(
+        'DELETE FROM social_comments WHERE id=$1 AND author_name=$2 RETURNING post_id,author_name,parent_id',
+        [id,actor],{attempts:2,label:'SOCIAL COMMENT SELF DELETE'});
+      let row = deleted.rows[0];
+      if (!row) {
+        if (!canModerateSocket(socket)) return reply({success:false,message:'Not allowed.'});
+        const found = await queryDbWithRetry('SELECT post_id,author_name,parent_id FROM social_comments WHERE id=$1',[id],{attempts:2,label:'SOCIAL COMMENT OWNER'});
+        const owner = found.rows[0]?.author_name;
+        if (!owner || !canModerateTarget(socket,owner)) return reply({success:false,message:'Not allowed.'});
+        deleted = await queryDbWithRetry(
+          'DELETE FROM social_comments WHERE id=$1 AND author_name=$2 RETURNING post_id,author_name,parent_id',
+          [id,owner],{attempts:2,label:'SOCIAL COMMENT MOD DELETE'});
+        row = deleted.rows[0];
+        if (!row) return reply({success:false,message:'Comment not found.'});
+      }
       socialPublish('comment-delete',row.post_id,{commentId:id,parentId:row.parent_id?String(row.parent_id):null});
       if(row.author_name!==actor)deferServerTask('SOCIAL COMMENT MODERATION LOG',()=>addModerationLog('social_comment_delete',`Deleted Social comment #${id} by ${row.author_name}`,{commentId:id,postId:String(row.post_id),targetUser:row.author_name},actor),0);
       reply({success:true});
@@ -14062,7 +15009,7 @@ io.on('connection', (socket) => {
       const supportsChatSeenBatchV1 = data && data.chatSeenBatchV1 === true;
       logMemoryTrace('auth:start', `user=${name || ''} socket=${socket.id} new=${isNewAccount === true} v2=${supportsProfileSyncV2} ack=${supportsProfileSyncAckV1} chatAck=${supportsChatHistoryAckV1} chatPull=${supportsChatHistoryPullV1} chatBatch=${supportsChatBatchDeleteV2} seenBatch=${supportsChatSeenBatchV1}`);
       let dbUser = await getAuthUserRecordFromDb(name);
-      if (dbUser) {
+      if (dbUser && MEMORY_TRACE_ENABLED) {
         const authEstimate = estimateValueBytes(dbUser, { maxNodes: 10000, maxBytes: 8 * 1024 * 1024 });
         logMemoryTrace('auth:record', `user=${name} socket=${socket.id} keys=${Object.keys(dbUser).length} approx=${formatApproxBytes(authEstimate.bytes)}${authEstimate.truncated ? '+' : ''}`);
       }
@@ -15057,7 +16004,7 @@ io.on('connection', (socket) => {
     const name = socket.userName;
     if (!name || !userDatabase[name]) { respond({ ok: false, items: [], unreadCount: 0, error: 'Profile is not available.' }); return; }
     try {
-      const result = await getUserNotificationHistory(name, data && data.afterId);
+      const result = await getUserNotificationHistoryShared(name, data && data.afterId);
       respond({
         ok: true,
         items: result.items,
@@ -15127,8 +16074,7 @@ io.on('connection', (socket) => {
     const name = socket.userName;
     if (!name || !userDatabase[name]) { respond({ ok: false, lastReadId: 0, unreadCount: 0 }); return; }
     try {
-      const lastReadId = await setUserNotificationReadId(name, data && data.lastReadId);
-      const unreadCount = await getUserNotificationUnreadCount(name, lastReadId);
+      const { lastReadId, unreadCount } = await setUserNotificationReadIdAndCount(name, data && data.lastReadId);
       emitUserNotificationReadStateToLocalUser(name, lastReadId, unreadCount);
       deferServerTask('USER NOTIFICATION READ SYNC', () => notifyUserNotificationReadStateAcrossInstances(name, lastReadId, unreadCount), 0);
       respond({ ok: true, lastReadId, unreadCount });
@@ -15227,11 +16173,11 @@ io.on('connection', (socket) => {
     const requestToken = (Number(socket.__friendActivityRequestToken) || 0) + 1;
     socket.__friendActivityRequestToken = requestToken;
     try {
-      const friendRecords = await getUserDataPayloadFromDb(name, 'friends');
+      const friendRecords = await readFriendActivityRecordsShared(name);
       const friendNames = extractFriendActivityNames(friendRecords);
       if (!socket.connected || socket.__friendActivityRequestToken !== requestToken) return;
       setFriendActivitySubscription(socket, friendNames);
-      const result = await getFriendActivityHistoryForUser(name, data && data.afterId, friendRecords);
+      const result = await readFriendActivityHistoryShared(name, data && data.afterId, friendRecords);
       if (!socket.connected || socket.__friendActivityRequestToken !== requestToken) return;
       respond({
         ok: true,
@@ -15396,18 +16342,15 @@ io.on('connection', (socket) => {
   socket.on('request_user_data', async (data = {}) => {
     const { targetName, type, requestId } = data;
     try {
-      let rawData = fullUserCacheNames.has(targetName) ? getUserDataPayloadFromCache(targetName, type) : null;
-
-      if (rawData === null) {
-        rawData = await withTimeout(
-          getUserDataPayloadFromDb(targetName, type),
-          4500,
-          null
-        );
-        if (rawData === null) rawData = getEmptyUserDataPayload(type);
+      // A slow PostgreSQL read must not masquerade as an empty collection.
+      // Keep below the client's 12-second request timeout.
+      const readTimedOut = Symbol('profile-list-timeout');
+      const result = await withTimeout(readPublicProfileListShared(targetName, type), 8000, readTimedOut);
+      if (result === readTimedOut) {
+        socket.emit('user_data_response', { targetName, type, requestId, rawData: getEmptyUserDataPayload(type), error: 'The server is taking too long to load this list. Please try again.' });
+        return;
       }
-
-      socket.emit('user_data_response', { targetName, type, requestId, rawData });
+      socket.emit('user_data_response', { targetName, type, requestId, rawData: result === null ? getEmptyUserDataPayload(type) : result });
     } catch (err) {
       console.error('[REQUEST USER DATA CACHE ERROR]:', err);
       socket.emit('user_data_response', {
@@ -15643,11 +16586,7 @@ io.on('connection', (socket) => {
           if (request && Object.prototype.hasOwnProperty.call(request, 'lastMessageTime')) {
             const clientTail = normalizeText(request.lastMessageTime, '').slice(0, 80);
             const clientTailUser = normalizeText(request.lastMessageUser, '').slice(0, 120);
-            const tailResult = await queryDbWithRetry(
-              "SELECT message->>'time' AS msg_time, message->>'user' AS msg_user, (SELECT COUNT(*) FROM (SELECT 1 FROM chat ORDER BY id DESC LIMIT $1) AS recent) AS message_count FROM chat ORDER BY id DESC LIMIT 1",
-              [MAX_CHAT_HISTORY],
-              { attempts: 2, label: 'CHAT SYNC TAIL CHECK' }
-            );
+            const tailResult = await readChatSyncTailShared();
             const serverTail = tailResult.rows[0] || null;
             const serverTailTime = normalizeText(serverTail && serverTail.msg_time, '');
             const serverTailUser = normalizeText(serverTail && serverTail.msg_user, '');
@@ -15753,7 +16692,7 @@ io.on('connection', (socket) => {
       }
       if (purpose === 'profile') {
         const targetName = normalizeText(request && request.targetName || query, '');
-        const refreshedUser = targetName ? await refreshSingleUserSummaryFromDb(targetName, { invalidateOnlineList: false }) : null;
+        const refreshedUser = targetName ? await readPublicProfileSummaryShared(targetName) : null;
         socket.emit('global_search_results', refreshedUser ? [getPublicUserData(targetName, refreshedUser, false)] : []);
         return;
       }
@@ -15819,18 +16758,7 @@ io.on('connection', (socket) => {
         // one DB query so a stale Render-process cache cannot return an old/default avatar. Keep
         // live presence fields from memory; the DB read is only authoritative for profile data.
         const requestedKeys = uniqueNames.map(item => item.key);
-        const result = requestedKeys.length ? await queryDbWithRetry(`
-          SELECT
-            name,
-            data - ARRAY['downloadsData','libraryData','libraryPlayHistoryData','wishlistData','favoritesData','trophiesData','friendsData','passwordHash','password']::text[] AS data,
-            CASE WHEN jsonb_typeof(data->'downloadsData') = 'array' THEN jsonb_array_length(data->'downloadsData') ELSE NULL END AS downloads_count,
-            CASE WHEN jsonb_typeof(data->'wishlistData') = 'array' THEN jsonb_array_length(data->'wishlistData') ELSE NULL END AS wishlist_count,
-            CASE WHEN jsonb_typeof(data->'favoritesData') = 'array' THEN jsonb_array_length(data->'favoritesData') ELSE NULL END AS favorites_count,
-            CASE WHEN jsonb_typeof(data->'libraryData') = 'array' THEN jsonb_array_length(data->'libraryData') ELSE NULL END AS library_count,
-            CASE WHEN jsonb_typeof(data->'friendsData') = 'array' THEN jsonb_array_length(data->'friendsData') ELSE NULL END AS friends_count
-          FROM users
-          WHERE LOWER(name) = ANY($1::text[])
-        `, [requestedKeys], { attempts: 2, label: 'AUTHORITATIVE FRIENDS PRESENCE READ' }) : { rows: [] };
+        const result = requestedKeys.length ? await readAuthoritativeFriendsPresenceShared(requestedKeys) : { rows: [] };
 
         const byLower = new Map();
         for (const row of result.rows || []) {
@@ -15951,14 +16879,22 @@ io.on('connection', (socket) => {
       const listPromise = readDirectGroupListShared(viewer);
       let fullListReady = false;
       listPromise.then(() => { fullListReady = true; }, () => { fullListReady = true; });
+      let previewTimer = null;
       if (_data && _data.preview === true && requestId > 0) {
-        readDirectGroupPreviewShared(viewer).then(preview => {
-          if (!fullListReady && socket.connected && socket.userName === viewer) {
-            socket.emit('direct_group_list_preview', { requestId, groups:preview });
-          }
-        }).catch(previewError => {
-          console.warn('[GROUP PREVIEW] Using complete list:', previewError && previewError.message || previewError);
-        });
+        // Avoid a second PostgreSQL query for normally fast group lists.
+        // A slow list may still show the lightweight preview first.
+        previewTimer = setTimeout(() => {
+          previewTimer = null;
+          if (fullListReady || !socket.connected || socket.userName !== viewer || pool.waitingCount > 0) return;
+          readDirectGroupPreviewShared(viewer).then(preview => {
+            if (!fullListReady && socket.connected && socket.userName === viewer) {
+              socket.emit('direct_group_list_preview', { requestId, groups:preview });
+            }
+          }).catch(previewError => {
+            console.warn('[GROUP PREVIEW] Using complete list:', previewError && previewError.message || previewError);
+          });
+        }, 350);
+        listPromise.finally(() => { if (previewTimer) clearTimeout(previewTimer); }).catch(() => {});
       }
       const groups = await listPromise;
       const durationMs = Date.now() - startedAt;
@@ -18841,6 +19777,7 @@ async function startServer() {
     server.listen(PORT, () => {
       console.log(`PSN Database Server running on port ${PORT} (pg pool max ${PG_POOL_MAX}, connect timeout ${PG_CONNECTION_TIMEOUT_MS}ms, idle timeout ${PG_IDLE_TIMEOUT_MS}ms, online cache ${ONLINE_LIST_CACHE_MS}ms, chat sync ${CHAT_SYNC_INTERVAL_MS}ms, instance ${INSTANCE_ID})`);
       startKeepAlivePings();
+      scheduleStartupGlobalRetention();
     });
   } catch (err) {
     console.error('[STARTUP ERROR]:', err);
