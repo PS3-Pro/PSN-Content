@@ -14258,7 +14258,7 @@ async function socialReadComments(actor, postId, focusCommentId = '') {
       ORDER BY id DESC LIMIT 30
     ), focus_path AS (
       SELECT id,post_id,author_name,body,parent_id,images,created_at
-      FROM social_comments WHERE post_id=$2 AND id=NULLIF($4,'')::bigint
+      FROM social_comments WHERE post_id=$2 AND id=NULLIF($4::text,'')::bigint
       UNION ALL
       SELECT parent.id,parent.post_id,parent.author_name,parent.body,parent.parent_id,parent.images,parent.created_at
       FROM social_comments parent JOIN focus_path child ON child.parent_id=parent.id AND child.post_id=parent.post_id
@@ -14296,7 +14296,7 @@ async function socialReadComments(actor, postId, focusCommentId = '') {
     LEFT JOIN reply_counts ON reply_counts.parent_id=c.id
     LEFT JOIN social_comment_reactions mine ON mine.comment_id=c.id AND mine.user_name=$1
     ORDER BY c.id ASC
-  `,[actor,postId,DEFAULT_AVATAR,focusCommentId],{attempts:2,label:'SOCIAL COMMENTS'});
+  `,focusCommentId ? [actor,postId,DEFAULT_AVATAR,focusCommentId] : [actor,postId,DEFAULT_AVATAR],{attempts:2,label:'SOCIAL COMMENTS'});
   return (result.rows||[]).map(serializeSocialComment);
 }
 
@@ -14305,7 +14305,7 @@ async function socialReadCommentReplies(actor, postId, parentId, after = '') {
     WITH page AS MATERIALIZED (
       SELECT id,post_id,author_name,body,parent_id,images,created_at
       FROM social_comments
-      WHERE post_id=$2 AND parent_id=$4::bigint AND id>COALESCE(NULLIF($5,'')::bigint,0)
+      WHERE post_id=$2 AND parent_id=$4::bigint AND id>COALESCE(NULLIF($5::text,'')::bigint,0)
       ORDER BY id ASC LIMIT 21
     ), reaction_counts AS (
       SELECT comment_id,jsonb_agg(jsonb_build_object('emoji',emoji,'count',cnt)) AS reactions
