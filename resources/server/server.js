@@ -487,10 +487,9 @@ const ADMIN_STATE_KEYS = {
 // ============================================================================
 // Aiven PostgreSQL Free defaults to 20 connections; some are reserved by Aiven.
 // This pool is per server instance, and each instance also holds one dedicated
-// LISTEN/NOTIFY connection. Default 10 is intended for ONE running app instance.
-// If running several instances or other DB clients, lower PG_POOL_MAX to fit the
-// shared PostgreSQL connection budget (e.g. keep 5 with two instances).
-const PG_POOL_MAX = Math.max(1, Math.min(10, parseInt(process.env.PG_POOL_MAX || process.env.DB_POOL_MAX || "10", 10) || 10));
+// LISTEN/NOTIFY connection. Keep headroom during zero-downtime deploys when
+// old and new instances overlap; PG_POOL_MAX/DB_POOL_MAX can override this.
+const PG_POOL_MAX = Math.max(1, Math.min(10, parseInt(process.env.PG_POOL_MAX || process.env.DB_POOL_MAX || "4", 10) || 4));
 const PG_CONNECTION_TIMEOUT_MS = Math.max(3000, parseInt(process.env.PG_CONNECTION_TIMEOUT_MS || "10000", 10) || 10000);
 const PG_IDLE_TIMEOUT_MS = Math.max(30000, parseInt(process.env.PG_IDLE_TIMEOUT_MS || "120000", 10) || 120000);
 const PG_QUERY_TIMEOUT_MS = Math.max(5000, parseInt(process.env.PG_QUERY_TIMEOUT_MS || "25000", 10) || 25000);
@@ -878,7 +877,7 @@ function isPgConnectionLimitError(err) {
 }
 
 function isPgTransientConnectionError(err) {
-  if (!err) return false;
+  if (!err || isPgConnectionLimitError(err)) return false; // Retrying 53300 worsens free-tier connection exhaustion.
   const code = String(err.code || '').toUpperCase();
   const message = String(err.message || err).toLowerCase();
   if (['08000','08001','08003','08004','08006','08007','08P01','57P01','57P02','57P03','53300','55P03','40001','40P01'].includes(code)) return true;
@@ -2585,6 +2584,18 @@ function scheduleStartupGlobalRetention() {
   deferServerTask('STARTUP GLOBAL RETENTION', runStartupGlobalRetention, 60000);
 }
 
+function scheduleLegacyChatSeenBackfill() {
+  // Opt-in maintenance only: the legacy migration repeatedly timed out on free Aiven.
+  if (process.env.CHAT_SEEN_LEGACY_BACKFILL !== '1') return;
+  deferServerTask('CHAT SEEN LEGACY BACKFILL', () => {
+    if (pool.waitingCount > 0) {
+      console.log('[CHAT SEEN LEGACY BACKFILL] Deferred until next startup: database busy.');
+      return;
+    }
+    return backfillRecentChatSeenEventsFromLegacyMessages();
+  }, 120000);
+}
+
 async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -3002,7 +3013,7 @@ async function initDb() {
     }
   }
 
-  await backfillRecentChatSeenEventsFromLegacyMessages();
+  // Legacy Seen migration is maintenance, not a startup requirement.
   await refreshChatHistoryFromDb();
 
   const pinnedRes = await pool.query('SELECT data FROM pinned_messages ORDER BY id ASC');
@@ -13994,7 +14005,14 @@ async function socialReadFeed(actor, filter, before, focusId = null) {
   const scope=focusId?'':audienceCondition.replace(/^AND\s+/, '');
   // Construct only the predicates actually needed, avoiding nullable OR tests
   // in the hot pagination query and preserving the existing focus semantics.
-  const pageFilters=[before?'p.id < $2::bigint':'',focusId?'p.id = $4::bigint':'',scope].filter(Boolean).join('\n        AND ');
+  // Keep placeholders contiguous across unfiltered, paginated and focused reads.
+  // Sending unused $2/$4 makes PostgreSQL reject the initial Feed page with 42P18.
+  const params = [actor, DEFAULT_AVATAR];
+  const predicates = [];
+  if (before) { params.push(before); predicates.push(`p.id < $${params.length}::bigint`); }
+  if (focusId) { params.push(focusId); predicates.push(`p.id = $${params.length}::bigint`); }
+  if (scope) predicates.push(scope);
+  const pageFilters = predicates.join('\n        AND ');
   const result=await queryDbWithRetry(`
     WITH ${friendNames}page AS MATERIALIZED (
       SELECT p.id,p.author_name,p.body,p.images,p.playing,p.created_at,p.edited_at
@@ -14010,7 +14028,7 @@ async function socialReadFeed(actor, filter, before, focusId = null) {
       WHERE post_id IN (SELECT id FROM page) GROUP BY post_id
     )
     SELECT p.id,p.author_name,p.body,p.images,p.playing,p.created_at,p.edited_at,
-      COALESCE(NULLIF(author.data->>'avatar',''),$3) AS author_avatar,
+      COALESCE(NULLIF(author.data->>'avatar',''),$2::text) AS author_avatar,
       COALESCE(rc.reactions,'[]'::jsonb) AS reactions,
       mine.emoji AS my_reaction,COALESCE(cc.cnt,0) AS comment_count
     FROM page p
@@ -14019,7 +14037,7 @@ async function socialReadFeed(actor, filter, before, focusId = null) {
     LEFT JOIN comment_counts cc ON cc.post_id=p.id
     LEFT JOIN social_post_reactions mine ON mine.post_id=p.id AND mine.user_name=$1
     ORDER BY p.id DESC
-  `,[actor,before,DEFAULT_AVATAR,focusId],{attempts:2,label:'SOCIAL FEED'});
+  `,params,{attempts:2,label:'SOCIAL FEED'});
   const rows=result.rows||[];
   return {
     posts:rows.slice(0,SOCIAL_POST_LIMIT).map(serializeSocialPost),
@@ -19778,6 +19796,7 @@ async function startServer() {
       console.log(`PSN Database Server running on port ${PORT} (pg pool max ${PG_POOL_MAX}, connect timeout ${PG_CONNECTION_TIMEOUT_MS}ms, idle timeout ${PG_IDLE_TIMEOUT_MS}ms, online cache ${ONLINE_LIST_CACHE_MS}ms, chat sync ${CHAT_SYNC_INTERVAL_MS}ms, instance ${INSTANCE_ID})`);
       startKeepAlivePings();
       scheduleStartupGlobalRetention();
+      scheduleLegacyChatSeenBackfill();
     });
   } catch (err) {
     console.error('[STARTUP ERROR]:', err);
