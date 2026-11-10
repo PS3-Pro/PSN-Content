@@ -56255,7 +56255,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 	async function repairPsnCachedData() {
 		const button = document.getElementById('btn-repair-cached-data');
 		if (!button || window.__psnCacheRepairInProgress) return false;
-		if (!confirm('Repair locally cached data on this device?\n\nThe chat history, covers, game details and languages will be downloaded again. Your account, messages on the server, lists, downloads and settings will be kept.\n\nThe site will reload when the repair finishes.')) return false;
+		if (!confirm('Repair locally cached data on this device?\n\nCovers, game details and languages will be downloaded again. Chat history is refreshed from the server while keeping locally known Seen by confirmations as a safety net. Your account, lists, downloads and settings will be kept.\n\nThe site will reload when the repair finishes.')) return false;
 
 		window.__psnCacheRepairInProgress = true;
 		const original = button.innerHTML;
@@ -56278,10 +56278,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 			const results = await Promise.all([
 				clearPsnRepairCacheStore(
 					() => openGameModalResolvedMetadataDb(), GAME_MODAL_RESOLVED_IDB_STORE
-				),
-				getChatCacheUserName()
-					? clearPsnRepairCacheStore(() => openChatPersistentCacheDb(), CHAT_CACHE_STORE, getChatCacheUserName())
-					: Promise.resolve(true)
+				)
 			]);
 			if (results.some(ok => !ok)) throw new Error('Could not clear one or more local cache databases.');
 
@@ -74137,6 +74134,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         const comparable = [
             getChatMessageRenderSignature(msg),
             Array.isArray(msg.seenBy) ? msg.seenBy : [],
+            Math.max(0,Number(msg.seenCount)||0),
             msg.seenAt && typeof msg.seenAt === 'object' && !Array.isArray(msg.seenAt) ? msg.seenAt : {}
         ];
         const signature = typeof window.getLiveRenderSignature === 'function' ? window.getLiveRenderSignature(comparable) : JSON.stringify(comparable);
@@ -74262,6 +74260,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 
     window.resetChatSessionForAccountChange = function() {
         window.__chatCacheSessionToken = Number(window.__chatCacheSessionToken || 0) + 1;
+        clearTimeout(window.__chatSeenRehydrationTimer);
+        window.__chatSeenRehydrationAttempts = 0;
         clearTimeout(window.__chatCacheWriteTimer);
         clearTimeout(window.__chatHistoryRequestWatchdog);
         clearTimeout(window.__chatRenderRetryTimer);
@@ -74894,6 +74894,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             const latestMessage = currentHistory.length ? currentHistory[currentHistory.length - 1] : null;
             const request = {
                 syncV1: true,
+                chatSeenSummaryV2: true,
                 epoch: needsStableFullSnapshot ? '' : String(window.__chatCacheEpoch || ''),
                 revision: needsStableFullSnapshot ? 0 : Math.max(0, Number(window.__chatCacheRevision) || 0),
                 seenCursor: Math.max(0, Number(window.__chatSeenCursor) || 0),
@@ -75127,6 +75128,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             epoch: String(window.__chatCacheEpoch || ''),
             revision: Math.max(0, Number(window.__chatCacheRevision) || 0),
             seenCursor: Math.max(0, Number(window.__chatSeenCursor) || 0),
+            seenSummaryVersion: 1,
             complete: true,
             messages: normalizeChatHistoryPayload(window.messageHistory || []).slice(-getChatHistoryLimit()),
             savedAt: Date.now()
@@ -75224,7 +75226,12 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             if (!msg) return;
             let semanticChanged = false;
             if (!Array.isArray(msg.seenBy)) msg.seenBy = [];
-            if (!msg.seenBy.includes(reader)) { msg.seenBy.push(reader); semanticChanged = true; }
+            if (!msg.seenBy.includes(reader)) {
+                const priorCount = Math.max(Number(msg.seenCount)||0,msg.seenBy.length);
+                msg.seenBy.push(reader);
+                if (String(msg.user||'') === getChatCacheUserName()) msg.seenCount = Math.max(priorCount+1,msg.seenBy.length);
+                semanticChanged = true;
+            }
             if (!msg.seenAt || typeof msg.seenAt !== 'object' || Array.isArray(msg.seenAt)) msg.seenAt = {};
             if (event.seenAt) {
                 const nextSeenAt = String(event.seenAt);
@@ -75242,6 +75249,37 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         return target;
     }
     window.applyChatSeenEventsToHistory = applyChatSeenEventsToHistory;
+    function applyChatSeenSummaryToHistory(history = [], summary = [], changeState = null) {
+        if (!Array.isArray(history) || !Array.isArray(summary)) return;
+        const byId = new Map();
+        for (const msg of history) { const id = getChatIndexedMessageKey(msg); if (id) byId.set(id,msg); }
+        const owner = getChatCacheUserName();
+        for (const item of summary) {
+            const msgId = String(item && item.msgId || '');
+            const msg = byId.get(msgId);
+            if (!msg) continue;
+            const oldCount = Math.max(Number(msg.seenCount)||0,Array.isArray(msg.seenBy)?msg.seenBy.length:0);
+            let changed = false;
+            if (item.seenCount != null && String(msg.user||'') === owner) {
+                const count = Math.max(oldCount,Number(item.seenCount)||0);
+                if (Number(msg.seenCount||0) < count) { msg.seenCount=count; changed=true; }
+            } else if (item.seenByMe === true && String(msg.user||'') !== owner) {
+                if (!Array.isArray(msg.seenBy)) msg.seenBy=[];
+                if (!msg.seenBy.includes(owner)) { msg.seenBy.push(owner); changed = true; }
+                if (item.seenAt) {
+                    if (!msg.seenAt || typeof msg.seenAt !== 'object') msg.seenAt={};
+                    const date = new Date(item.seenAt).toISOString();
+                    if (msg.seenAt[owner]!==date) { msg.seenAt[owner]=date; changed=true; }
+                }
+            }
+            if (changed) {
+                markChatMessageSeenDataDirty(msg);
+                if (changeState) { changeState.changed=true;changeState.ids.add(msgId); }
+            }
+        }
+    }
+    window.applyChatSeenSummaryToHistory = applyChatSeenSummaryToHistory;
+
 
     function refreshChatSeenDomForMessage(msgId) {
         const id = String(msgId || '');
@@ -75255,7 +75293,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         const seenList = Array.isArray(msg.seenBy) ? msg.seenBy : [];
         const seenAtMap = msg.seenAt && typeof msg.seenAt === 'object' && !Array.isArray(msg.seenAt) ? msg.seenAt : {};
         const nextSeenList = seenList.join(', ');
-        const nextSeenCount = String(seenList.length);
+        const seenCount = Math.max(seenList.length,Number(msg.seenCount)||0);
+        const nextSeenCount = String(seenCount);
         const nextSeenAt = encodeURIComponent(JSON.stringify(seenAtMap));
         if (checkCont.getAttribute('data-seen-list') === nextSeenList && checkCont.getAttribute('data-seen-count') === nextSeenCount && checkCont.getAttribute('data-seen-at') === nextSeenAt) return false;
         const seenIcons = renderedEntry && typeof getChatRenderedSeenIcons === 'function' ? getChatRenderedSeenIcons(id, renderedEntry, checkCont) : null;
@@ -75264,19 +75303,21 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             for (let i = 0; i < icons.length; i++) {
                 const c = icons[i];
                 if (!c) continue;
-                if (c.style.color !== '#4caf50') c.style.color = '#4caf50';
-                if (seenList.length && c.style.display !== 'block') c.style.display = 'block';
+                const color = seenCount ? '#4caf50' : 'rgba(255, 255, 255, 0.3)';
+                if (c.style.color !== color) c.style.color = color;
+                if (i===1 && seenCount && c.style.display !== 'block') c.style.display = 'block';
             }
         } else {
             checkCont.querySelectorAll('i').forEach(c => {
-                if (c.style.color !== '#4caf50') c.style.color = '#4caf50';
-                if (seenList.length && c.style.display !== 'block') c.style.display = 'block';
+                const color = seenCount ? '#4caf50' : 'rgba(255, 255, 255, 0.3)';
+                if (c.style.color !== color) c.style.color = color;
+                if (seenCount && c.style.display !== 'block') c.style.display = 'block';
             });
         }
         checkCont.setAttribute('data-seen-list', nextSeenList);
         checkCont.setAttribute('data-seen-count', nextSeenCount);
         checkCont.setAttribute('data-seen-at', nextSeenAt);
-        checkCont.setAttribute('title', `Seen by: ${seenList.length}`);
+        checkCont.setAttribute('title', `Seen by: ${seenCount}`);
         return true;
     }
     window.refreshChatSeenDomForMessage = refreshChatSeenDomForMessage;
@@ -75298,7 +75339,12 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         let semanticDataChanged = false;
         if (msg && reader) {
             if (!Array.isArray(msg.seenBy)) msg.seenBy = [];
-            if (!msg.seenBy.includes(reader)) { msg.seenBy.push(reader); changed = true; semanticDataChanged = true; }
+            if (!msg.seenBy.includes(reader)) {
+                const priorCount = Math.max(Number(msg.seenCount)||0,msg.seenBy.length);
+                msg.seenBy.push(reader);
+                if (String(msg.user||'') === getChatCacheUserName()) msg.seenCount = Math.max(priorCount+1,msg.seenBy.length);
+                changed = true; semanticDataChanged = true;
+            }
             if (!msg.seenAt || typeof msg.seenAt !== 'object' || Array.isArray(msg.seenAt)) { msg.seenAt = {}; changed = true; }
             if (event.seenAt) {
                 const nextSeenAt = String(event.seenAt);
@@ -75359,7 +75405,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             const cachedHistory = normalizeChatHistoryPayload(record.messages).slice(-getChatHistoryLimit());
             window.__chatCacheEpoch = String(record.epoch || '');
             window.__chatCacheRevision = Math.max(0, Number(record.revision) || 0);
-            window.__chatSeenCursor = Math.max(0, Number(record.seenCursor) || 0);
+            window.__chatSeenCursor = record.seenSummaryVersion===1 ? Math.max(0,Number(record.seenCursor)||0) : 0;
             window.__chatPersistentCacheAvailable = true;
             window.__chatCacheReadyForWrite = false;
             window.__chatInitialSnapshotPending = holdForServer;
@@ -75400,6 +75446,58 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
     }
     window.hydrateChatHistoryFromPersistentCache = hydrateChatHistoryFromPersistentCache;
 
+    function preserveKnownChatSeen(previousHistory, nextHistory) {
+        const byId = new Map();
+        for (const message of previousHistory || []) {
+            const id = getChatIndexedMessageKey(message);
+            if (id && ((Array.isArray(message.seenBy)&&message.seenBy.length)||Number(message.seenCount)>0)) byId.set(id,message);
+        }
+        for (const message of nextHistory || []) {
+            const prior = byId.get(getChatIndexedMessageKey(message));
+            if (!prior || prior.user !== message.user) continue;
+            const existing = Array.isArray(message.seenBy) ? message.seenBy : [];
+            message.seenBy = Array.from(new Set([...(Array.isArray(prior.seenBy)?prior.seenBy:[]), ...existing]));
+            message.seenCount = Math.max(Number(prior.seenCount)||0,Number(message.seenCount)||0,message.seenBy.length);
+            message.seenAt = { ...(prior.seenAt && typeof prior.seenAt === 'object' ? prior.seenAt : {}),
+                ...(message.seenAt && typeof message.seenAt === 'object' ? message.seenAt : {}) };
+        }
+    }
+
+    function scheduleChatSeenServerRehydration() {
+        clearTimeout(window.__chatSeenRehydrationTimer);
+        const token = Number(window.__chatCacheSessionToken || 0);
+        const owner = getChatCacheUserName();
+        const epoch = String(window.__chatCacheEpoch || '');
+        const socket = typeof socketChat !== 'undefined' ? socketChat : null;
+        if (!owner || !socket || !socket.connected) return;
+        const attempts = Math.max(0, Number(window.__chatSeenRehydrationAttempts || 0));
+        if (attempts >= 5) return;
+        window.__chatSeenRehydrationTimer = setTimeout(() => {
+            if (token !== Number(window.__chatCacheSessionToken || 0) || owner !== getChatCacheUserName() ||
+                socket !== socketChat || !socket.connected || epoch !== String(window.__chatCacheEpoch || '')) return;
+            window.__chatSeenRehydrationAttempts = attempts + 1;
+            socket.timeout(8500).emit('request_chat_seen_snapshot', { chatSeenSummaryV2:true }, (err, response) => {
+                if (token !== Number(window.__chatCacheSessionToken || 0) || owner !== getChatCacheUserName() ||
+                    socket !== socketChat || epoch !== String(window.__chatCacheEpoch || '')) return;
+                if (err || !response?.success || response.seenDegraded === true) {
+                    scheduleChatSeenServerRehydration();
+                    return;
+                }
+                window.__chatSeenRehydrationAttempts = 0;
+                const state = { changed:false, ids:new Set() };
+                applyChatSeenSummaryToHistory(window.messageHistory || [], response.seenSummary || [], state);
+                applyChatSeenEventsToHistory(window.messageHistory || [], response.seenEvents || [], state);
+                window.__chatSeenCursor = Math.max(Math.max(0, Number(window.__chatSeenCursor) || 0),
+                    Math.max(0, Number(response.seenCursor) || 0));
+                if (state.changed) {
+                    for (const id of state.ids) refreshChatSeenDomForMessage(id);
+                    if (typeof updateChatHistoryRenderSignature === 'function') updateChatHistoryRenderSignature();
+                }
+                scheduleChatPersistentCacheWrite();
+            });
+        }, [1800, 5500, 12000, 24000, 45000][attempts]);
+    }
+
     function applyChatSyncResponse(response = {}) {
         if (!response || response.syncV1 !== true || response.success === false) return false;
         setChatHistoryLimitFromServer(response.maxHistory);
@@ -75428,8 +75526,11 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             ? normalizeChatHistoryPayload(response.messages || []).slice(-getChatHistoryLimit())
             : mergeChatSyncChanges(previousHistory, responseChanges);
         if (pendingSyncChanges.length) nextHistory = mergeChatSyncChanges(nextHistory, pendingSyncChanges);
+        // Retain previously verified local Seen for the same chat epoch when the server sends sanitized messages.
+        if (previousEpoch && previousEpoch === responseEpoch) preserveKnownChatSeen(previousHistory, nextHistory);
         const combinedSeenEvents = (Array.isArray(response.seenEvents) ? response.seenEvents : []).concat(pendingSeenEvents);
         const seenChangeState = { changed:false, ids:new Set() };
+        applyChatSeenSummaryToHistory(nextHistory, response.seenSummary || [], seenChangeState);
         applyChatSeenEventsToHistory(nextHistory, combinedSeenEvents, seenChangeState);
         let historyDataChanged = false;
         let historyRenderChanged = false;
@@ -75445,9 +75546,14 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         window.__chatCacheEpoch = responseEpoch;
         const pendingRevision = pendingSyncChanges.reduce((max, change) => Math.max(max, Math.max(0, Number(change && change.revision) || 0)), 0);
         window.__chatCacheRevision = Math.max(responseRevision, pendingRevision);
-        if (response.seenSyncV1 === true || pendingSeenEvents.length) {
+        if (response.seenDegraded === true) scheduleChatSeenServerRehydration();
+        else if (response.seenSyncV1 === true) {
+            clearTimeout(window.__chatSeenRehydrationTimer);
+            window.__chatSeenRehydrationAttempts = 0;
+        }
+        if ((response.seenSyncV1 === true && response.seenDegraded !== true) || pendingSeenEvents.length) {
             const pendingSeenCursor = pendingSeenEvents.reduce((max, event) => Math.max(max, Math.max(0, Number(event && event.cursor) || 0)), 0);
-            window.__chatSeenCursor = Math.max(responseSeenCursor, pendingSeenCursor);
+            window.__chatSeenCursor = Math.max(Math.max(0,Number(window.__chatSeenCursor)||0),responseSeenCursor,pendingSeenCursor);
         }
         if (wasInitialSyncPending || mode === 'snapshot') {
             window.__chatInitialPendingSyncChanges = [];
@@ -75483,6 +75589,9 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             Promise.resolve(renderDeferredChatHistory({ reason: 'chat-sync-ready', force: true, forceBottom: false, showLoading: false })).catch(() => {});
         }
         window.__chatCacheReadyForWrite = true;
+        if (Array.isArray(response.seenSummary) && response.seenSummary.length) {
+            for (const item of response.seenSummary) if (item && item.msgId) refreshChatSeenDomForMessage(String(item.msgId));
+        }
         const syncMetaChanged = previousEpoch !== String(window.__chatCacheEpoch || '') || previousRevision !== Math.max(0, Number(window.__chatCacheRevision) || 0) || previousSeenCursor !== Math.max(0, Number(window.__chatSeenCursor) || 0);
         if (historyDataChanged || syncMetaChanged || wasInitialSyncPending || cacheWasUnverified) scheduleChatPersistentCacheWrite(0);
         return true;
@@ -75526,6 +75635,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         const hadPersistentCache = window.__chatPersistentCacheAvailable === true;
         const previousHistory = Array.isArray(window.messageHistory) ? window.messageHistory : [];
         const normalizedHistory = typeof normalizeChatHistoryPayload === 'function' ? normalizeChatHistoryPayload(history) : (Array.isArray(history) ? history : []);
+        preserveKnownChatSeen(previousHistory, normalizedHistory);
         const hasKnownDataChange = typeof options.knownDataChanged === 'boolean';
         const historyDataChanged = hasKnownDataChange ? options.knownDataChanged : !areChatHistoriesDataEquivalent(previousHistory, normalizedHistory);
         window.__lastChatHistorySnapshotChanged = historyDataChanged || !hadPersistentCache;
@@ -84080,9 +84190,9 @@ function getVisibleChatStackEl(id) {
 		let seenAtData = '';
 		let seenColor = 'rgba(255, 255, 255, 0.3)';
 		if (isAuthor) {
-			hasBeenSeen = !!(msg.seenBy && msg.seenBy.length > 0);
-			seenByCount = hasBeenSeen ? msg.seenBy.length : 0;
-			seenByList = hasBeenSeen ? msg.seenBy.join(', ') : '';
+			seenByCount = Math.max(Array.isArray(msg.seenBy)?msg.seenBy.length:0,Number(msg.seenCount)||0);
+			hasBeenSeen = seenByCount > 0;
+			seenByList = Array.isArray(msg.seenBy) ? msg.seenBy.join(', ') : '';
 			const seenAtMap = (msg.seenAt && typeof msg.seenAt === 'object') ? msg.seenAt : {};
 			seenAtData = encodeURIComponent(JSON.stringify(seenAtMap));
 			seenColor = hasBeenSeen ? '#4caf50' : 'rgba(255, 255, 255, 0.3)';
@@ -93582,6 +93692,8 @@ function getVisibleChatStackEl(id) {
         socketChat.on('chat_history', function(history, respond) {
             const result = handleChatHistorySnapshot(history, respond);
             if (window.__lastChatHistorySnapshotChanged !== false) scheduleChatPersistentCacheWrite();
+            if (!Number(window.__chatSeenCursor || 0) && Array.isArray(window.messageHistory) && window.messageHistory.length)
+                scheduleChatSeenServerRehydration();
             return result;
         });
 
@@ -99356,9 +99468,9 @@ function getVisibleChatStackEl(id) {
 		if (typeof openProfileModal === 'function') openProfileModal(user, freshMeta);
 	};
 
-	function openSeenByPopup(event, msgId) {
+	function openSeenByPopup(event, msgId, fromDetails = false) {
 		event.stopPropagation();
-		if (typeof playUiClick === 'function') playUiClick();
+		if (!fromDetails && typeof playUiClick === 'function') playUiClick();
 
 		closeSeenByPopovers();
 
@@ -99371,7 +99483,10 @@ function getVisibleChatStackEl(id) {
 
 		const seenByRaw = checkContainer.getAttribute('data-seen-list') || "";
 		const users = seenByRaw.split(', ').filter(u => u.trim() !== "");
-		if (users.length === 0) return;
+		const seenTotal = Math.max(users.length,Number(checkContainer.getAttribute('data-seen-count'))||0);
+		if (!seenTotal) return;
+		const messageForDetails = typeof getChatMessageByIdFast==='function' ? getChatMessageByIdFast(String(msgId)) : null;
+		const needsDetails = users.length < seenTotal && !(messageForDetails && messageForDetails.__seenDetailsLoaded === true);
 
 		let seenAtMap = {};
 		try {
@@ -99389,7 +99504,8 @@ function getVisibleChatStackEl(id) {
 		popover.style.bottom = 'auto';
 		popover.style.zIndex = '2147483647';
 
-		let itemsHtml = `<div class="seen-by-title">Seen by: ${users.length}</div>`;
+		let itemsHtml = `<div class="seen-by-title">Seen by: ${seenTotal}</div>`;
+		if (needsDetails) itemsHtml += `<div class="seen-user-item" style="color:var(--text-muted)">Loading viewers…</div>`;
 		users.forEach(user => {
 			const freshMeta = typeof window.getFreshPsnUserMeta === 'function' ? window.getFreshPsnUserMeta(user) : null;
 			const freshAvatar = String(freshMeta && freshMeta.avatar || '').trim();
@@ -99433,8 +99549,8 @@ function getVisibleChatStackEl(id) {
 		   presence/cache snapshot. Revalidate after the images exist so the shared DOM patcher
 		   can update this popover in place. The authoritative flag is intentionally scoped to
 		   this explicit action; normal Friends/Online refreshes keep the fast cached path. */
-		if (typeof window.refreshPsnUserMetaBatch === 'function') {
-			window.refreshPsnUserMetaBatch(users, { maxAge:0, force:true, authoritative:true });
+		if (users.length && typeof window.refreshPsnUserMetaBatch === 'function') {
+			window.refreshPsnUserMetaBatch(users.slice(0,40), { maxAge:0, force:true, authoritative:true });
 		}
 
 		popover.addEventListener('click', e => e.stopPropagation());
@@ -99487,6 +99603,33 @@ function getVisibleChatStackEl(id) {
 
 		popover.style.left = `${Math.round(left)}px`;
 		popover.style.top = `${Math.round(top)}px`;
+
+		if (needsDetails && typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
+            const requestedUser = getChatCacheUserName();
+            const requestedSocket = socketChat;
+            const requestedSession = Number(window.__chatCacheSessionToken||0);
+            requestedSocket.timeout(10000).emit('request_chat_seen_details',{msgId:String(msgId)},(error,response)=>{
+                if (!popover.isConnected || requestedSocket!==socketChat || requestedUser!==getChatCacheUserName() ||
+                    requestedSession!==Number(window.__chatCacheSessionToken||0)) return;
+                const loading = popover.querySelector('.seen-user-item:not([data-seen-user])');
+                if (error || !response?.success || String(response.msgId||'')!==String(msgId)) {
+                    if (loading) loading.textContent='Could not load viewers';
+                    return;
+                }
+                const msg = typeof getChatMessageByIdFast==='function' ? getChatMessageByIdFast(String(msgId)) : null;
+                if (!msg || String(msg.user||'')!==requestedUser) return;
+                const details = Array.isArray(response.readers)?response.readers:[];
+                msg.__seenDetailsLoaded = true;
+                msg.seenBy = Array.from(new Set([...(Array.isArray(msg.seenBy)?msg.seenBy:[]),...details.map(item=>String(item&&item.reader||'')).filter(Boolean)]));
+                msg.seenAt = {...(msg.seenAt&&typeof msg.seenAt==='object'?msg.seenAt:{}),...Object.fromEntries(details.filter(item=>item&&item.reader&&item.seenAt).map(item=>[String(item.reader),String(item.seenAt)]))};
+                msg.seenCount = Math.max(Number(msg.seenCount)||0,msg.seenBy.length);
+                markChatMessageSeenDataDirty(msg);
+                refreshChatSeenDomForMessage(String(msgId));
+                scheduleChatPersistentCacheWrite();
+                closeSeenByPopovers();
+                openSeenByPopup({stopPropagation(){}},String(msgId),true);
+            });
+        }
 
 		popover.__seenOutsideBindTimer = setTimeout(() => {
 			popover.__seenOutsideBindTimer = null;

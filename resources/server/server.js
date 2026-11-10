@@ -2659,15 +2659,30 @@ function scheduleStartupGlobalRetention() {
 }
 
 function scheduleLegacyChatSeenBackfill() {
-  // Opt-in maintenance only: the legacy migration repeatedly timed out on free Aiven.
-  if (process.env.CHAT_SEEN_LEGACY_BACKFILL !== '1') return;
-  deferServerTask('CHAT SEEN LEGACY BACKFILL', () => {
-    if (pool.waitingCount > 0) {
-      console.log('[CHAT SEEN LEGACY BACKFILL] Deferred until next startup: database busy.');
+  if (process.env.CHAT_SEEN_RECOVER_RECENT === '0') return;
+  const ids = Array.from(new Set(messageHistory.map(message => Number(message && message._dbId) || 0).filter(Number.isSafeInteger).filter(id => id > 0)));
+  if (!ids.length) return;
+  let offset = 0, restored = 0, legacy = 0, retries = 0;
+  const run = async () => {
+    if (pool.waitingCount > 0 || chatSeenSnapshotActive > 0) {
+      deferServerTask('CHAT SEEN RECOVERY', run, 10000);
       return;
     }
-    return backfillRecentChatSeenEventsFromLegacyMessages();
-  }, 120000);
+    try {
+      const result = await backfillRecentChatSeenEventsFromLegacyMessages(ids.slice(offset, offset + 25));
+      restored += result.inserted.length;
+      legacy += result.legacy;
+      if (result.inserted.length) emitChatSeenSyncEvents(result.inserted);
+      offset += 25;
+      retries = 0;
+      if (offset < ids.length) deferServerTask('CHAT SEEN RECOVERY', run, 1200);
+      else console.log(`[CHAT SEEN RECOVERY] Scanned ${ids.length} recent messages; legacy confirmations=${legacy}, restored=${restored}.`);
+    } catch (err) {
+      console.warn('[CHAT SEEN RECOVERY] Batch deferred:', err && err.message ? err.message : err);
+      if (++retries <= 5) deferServerTask('CHAT SEEN RECOVERY', run, 15000);
+    }
+  };
+  deferServerTask('CHAT SEEN RECOVERY', run, 120000);
 }
 
 async function initDb() {
@@ -8718,40 +8733,47 @@ function getCurrentChatMessageIds() {
   return ids;
 }
 
-async function backfillRecentChatSeenEventsFromLegacyMessages() {
-  try {
-    await queryDbWithRetry(
-      `WITH recent AS (
-         SELECT message
-         FROM chat
-         WHERE jsonb_typeof(message->'seenBy') = 'array'
-           AND COALESCE(message->>'time', '') <> ''
-           AND COALESCE(message->>'user', '') <> ''
-         ORDER BY id DESC
-         LIMIT $1
-       ),
-       legacy AS (
-         SELECT
-           (ROUND(EXTRACT(EPOCH FROM (recent.message->>'time')::timestamptz) * 1000)::bigint)::text AS message_id,
-           recent.message->>'user' AS sender,
-           seen.reader,
-           COALESCE(NULLIF(recent.message->'seenAt'->>seen.reader, '')::timestamptz, NOW()) AS seen_at
-         FROM recent
-         CROSS JOIN LATERAL jsonb_array_elements_text(recent.message->'seenBy') AS seen(reader)
-         WHERE COALESCE(seen.reader, '') <> ''
-       )
-       INSERT INTO chat_seen_events (message_id, sender, reader, seen_at)
-       SELECT message_id, sender, reader, seen_at
-       FROM legacy
-       ON CONFLICT (message_id, reader) DO NOTHING`,
-      [MAX_CHAT_HISTORY],
-      { attempts: 2, label: 'CHAT SEEN LEGACY BACKFILL' }
-    );
-  } catch (err) {
-    console.warn('[CHAT SEEN LEGACY BACKFILL] Skipped:', err && err.message ? err.message : err);
+async function backfillRecentChatSeenEventsFromLegacyMessages(dbIds = []) {
+  if (!dbIds.length) return { legacy:0, inserted:[] };
+  const rows = await queryDbWithRetry(
+    `SELECT message->>'time' AS msg_time, message->>'user' AS sender,
+            message->'seenBy' AS readers, message->'seenAt' AS seen_dates
+     FROM chat
+     WHERE id = ANY($1::integer[]) AND jsonb_typeof(message->'seenBy') = 'array'`,
+    [dbIds], { attempts:1, label:'CHAT SEEN RECOVERY READ', queryTimeoutMs:5000 }
+  );
+  const ids = [], senders = [], readers = [], dates = [];
+  for (const row of rows.rows || []) {
+    const stamp = Date.parse(row.msg_time || '');
+    const sender = String(row.sender || '');
+    if (!Number.isFinite(stamp) || !sender || !Array.isArray(row.readers)) continue;
+    for (const name of row.readers) {
+      const reader = String(name || '');
+      if (!reader || reader === sender) continue;
+      const date = row.seen_dates && row.seen_dates[reader];
+      const parsed = Date.parse(date || '');
+      ids.push(String(stamp));senders.push(sender);readers.push(reader);
+      dates.push(Number.isFinite(parsed) ? new Date(parsed).toISOString() : new Date(stamp).toISOString());
+    }
   }
+  if (!ids.length) return { legacy:0, inserted:[] };
+  const saved = await queryDbWithRetry(
+    `INSERT INTO chat_seen_events (message_id, sender, reader, seen_at)
+     SELECT x.msg_id, x.sender, x.reader, x.seen_at
+     FROM unnest($1::text[], $2::text[], $3::text[], $4::timestamptz[])
+       AS x(msg_id, sender, reader, seen_at)
+     ON CONFLICT (message_id, reader) DO NOTHING
+     RETURNING id, message_id, sender, reader, seen_at`,
+    [ids, senders, readers, dates],
+    { attempts:1, label:'CHAT SEEN RECOVERY SAVE', queryTimeoutMs:5000 }
+  );
+  const inserted = (saved.rows || []).map(row => ({
+    eventId:Math.max(0, Number(row.id) || 0),
+    msgId:String(row.message_id || ''),sender:String(row.sender || ''),
+    reader:String(row.reader || ''),seenAt:row.seen_at ? new Date(row.seen_at).toISOString() : ''
+  })).filter(event => event.eventId && event.msgId && event.reader);
+  return { legacy:ids.length, inserted };
 }
-
 // Optional Seen snapshots must never monopolize the small Aiven connection
 // pool. Coalesce identical viewer requests; defer others and retry via normal
 // Seen sync without advancing their cursor.
@@ -8765,28 +8787,28 @@ async function getChatSeenSnapshotForUser(userName = '') {
   if (chatSeenSnapshotActive >= 1 || pool.waitingCount >= 3) {
     throw new Error('Seen snapshot deferred while PostgreSQL is busy');
   }
-  const messageIds = getCurrentChatMessageIds();
+  const authoredIds = [], otherIds = [], messageIds = [], uniqueIds = new Set();
+  for (const message of messageHistory) {
+    if (!message || !message.time) continue;
+    const id = String(new Date(message.time).getTime());
+    if (!id || id === 'NaN' || uniqueIds.has(id)) continue;
+    uniqueIds.add(id);messageIds.push(id);
+    (String(message.user || '') === targetUser ? authoredIds : otherIds).push(id);
+  }
   if (!messageIds.length) return [];
   chatSeenSnapshotActive++;
-  // Use the existing sender/reader indexes and join only the current chat IDs.
-  // The disjoint branches avoid duplicate events for a sender reading their own
-  // message. CHAT_SEEN_INDEX_LOOKUP=0 keeps the original query as a fallback.
+  // The unique (message_id, reader) index bounds both branches to recent messages.
   const useIndexedLookup = process.env.CHAT_SEEN_INDEX_LOOKUP !== '0';
   const query = useIndexedLookup
-    ? `WITH wanted AS MATERIALIZED (
-         SELECT DISTINCT unnest($1::text[]) AS message_id
-       )
-       SELECT seen.id, seen.message_id, seen.sender, seen.reader, seen.seen_at
+    ? `SELECT seen.id, seen.message_id, seen.sender, seen.reader, seen.seen_at
        FROM (
-         SELECT e.id, e.message_id, e.sender, e.reader, e.seen_at
-         FROM chat_seen_events e
-         JOIN wanted w ON w.message_id = e.message_id
-         WHERE e.sender = $2::text
+         SELECT id, message_id, sender, reader, seen_at
+         FROM chat_seen_events
+         WHERE message_id = ANY($1::text[])
          UNION ALL
-         SELECT e.id, e.message_id, e.sender, e.reader, e.seen_at
-         FROM chat_seen_events e
-         JOIN wanted w ON w.message_id = e.message_id
-         WHERE e.reader = $2::text AND e.sender IS DISTINCT FROM $2::text
+         SELECT id, message_id, sender, reader, seen_at
+         FROM chat_seen_events
+         WHERE message_id = ANY($2::text[]) AND reader = $3::text
        ) seen
        ORDER BY seen.id ASC`
     : `SELECT id, message_id, sender, reader, seen_at
@@ -8797,7 +8819,7 @@ async function getChatSeenSnapshotForUser(userName = '') {
   const pending = (async () => {
     const res = await queryDbWithRetry(
       query,
-      [messageIds, targetUser],
+      useIndexedLookup ? [authoredIds, otherIds, targetUser] : [messageIds, targetUser],
       { attempts:1, label:'CHAT SEEN SNAPSHOT READ',
         queryTimeoutMs:Math.max(2000,Math.min(15000,Number(process.env.CHAT_SEEN_QUERY_TIMEOUT_MS)||6000)) }
     );
@@ -8815,6 +8837,52 @@ async function getChatSeenSnapshotForUser(userName = '') {
     if (chatSeenSnapshotPendingByUser.get(targetUser) === pending) chatSeenSnapshotPendingByUser.delete(targetUser);
     chatSeenSnapshotActive--;
   }
+}
+
+// Compact Seen hydration: one indexed aggregate per current message; the full reader
+// list is fetched only for a user-requested popup. Realtime changes still stream instantly.
+const compactChatSeenPendingByUser = new Map();
+async function getCompactChatSeenSnapshotForUser(userName = '') {
+  const targetUser = String(userName || '');
+  if (!targetUser) return { mode:'summary', cursor:0, events:[], summary:[] };
+  const pendingRead = compactChatSeenPendingByUser.get(targetUser);
+  if (pendingRead) return pendingRead;
+  const authoredIds = [], otherIds = [], uniqueIds = new Set();
+  for (const message of messageHistory) {
+    const stamp = message && message.time ? new Date(message.time).getTime() : NaN;
+    if (!Number.isFinite(stamp)) continue;
+    const id = String(stamp);
+    if (uniqueIds.has(id)) continue;
+    uniqueIds.add(id);
+    (String(message.user || '') === targetUser ? authoredIds : otherIds).push(id);
+  }
+  const work = (async () => {
+    const res = await queryDbWithRetry(
+      `WITH authored AS (
+         SELECT e.message_id, COUNT(*)::integer AS seen_count
+         FROM chat_seen_events e
+         WHERE e.message_id = ANY($1::text[])
+         GROUP BY e.message_id
+       ), read_by_me AS (
+         SELECT e.message_id, e.seen_at
+         FROM chat_seen_events e
+         WHERE e.message_id = ANY($2::text[]) AND e.reader = $3
+       )
+       SELECT
+         (SELECT COALESCE(MAX(id),0)::bigint FROM chat_seen_events) AS cursor,
+         COALESCE((SELECT jsonb_agg(jsonb_build_object('msgId',message_id,'seenCount',seen_count)) FROM authored),'[]'::jsonb) AS authored,
+         COALESCE((SELECT jsonb_agg(jsonb_build_object('msgId',message_id,'seenByMe',true,'seenAt',seen_at)) FROM read_by_me),'[]'::jsonb) AS read_by_me`,
+      [authoredIds, otherIds, targetUser],
+      { attempts:1, label:'CHAT SEEN SUMMARY READ', queryTimeoutMs:8000 }
+    );
+    const row = res.rows[0] || {};
+    const authored = Array.isArray(row.authored) ? row.authored : [];
+    const readByMe = Array.isArray(row.read_by_me) ? row.read_by_me : [];
+    return { mode:'summary', cursor:Math.max(0,Number(row.cursor)||0), events:[], summary:authored.concat(readByMe) };
+  })();
+  compactChatSeenPendingByUser.set(targetUser,work);
+  try { return await work; }
+  finally { if (compactChatSeenPendingByUser.get(targetUser)===work) compactChatSeenPendingByUser.delete(targetUser); }
 }
 
 let chatSeenLegacyDegradedLastLogAt = 0;
@@ -8852,9 +8920,10 @@ async function getPublicChatHistoryWithSeenForUser(userName = '') {
   return history;
 }
 
-async function getChatSeenSyncForUser(userName = '', cursor = 0) {
+async function getChatSeenSyncForUser(userName = '', cursor = 0, compact = false) {
   const targetUser = String(userName || '');
   const safeCursor = Math.max(0, Number(cursor) || 0);
+  if (!safeCursor && compact) return getCompactChatSeenSnapshotForUser(targetUser);
   if (!safeCursor) {
     const maxRes = await queryDbWithRetry('SELECT COALESCE(MAX(id), 0)::bigint AS max_id FROM chat_seen_events', [], { attempts: 2, label: 'CHAT SEEN CURSOR READ' });
     const maxId = Math.max(0, Number(maxRes.rows[0]?.max_id) || 0);
@@ -8882,11 +8951,11 @@ async function getChatSeenSyncForUser(userName = '', cursor = 0) {
   );
   const maxId = Math.max(0, Number(res.rows[0]?.max_id) || 0);
   if (safeCursor > maxId) {
-    return { mode: 'snapshot', cursor: maxId, events: await getChatSeenSnapshotForUser(targetUser) };
+    return compact ? getCompactChatSeenSnapshotForUser(targetUser) : { mode:'snapshot', cursor:maxId, events:await getChatSeenSnapshotForUser(targetUser) };
   }
   const rows = res.rows.filter(row => row.id != null);
   if (rows.length > 2000) {
-    return { mode: 'snapshot', cursor: maxId, events: await getChatSeenSnapshotForUser(targetUser) };
+    return compact ? getCompactChatSeenSnapshotForUser(targetUser) : { mode:'snapshot', cursor:maxId, events:await getChatSeenSnapshotForUser(targetUser) };
   }
   return {
     mode: 'changes',
@@ -8905,9 +8974,9 @@ async function getChatSeenSyncForUser(userName = '', cursor = 0) {
 // Global Chat messages from opening. Keep the client's cursor unchanged so
 // the next sync can retry without silently marking missing events as seen.
 let chatSeenSyncErrorLastLogAt = 0;
-async function getChatSeenSyncSafely(userName = '', cursor = 0) {
+async function getChatSeenSyncSafely(userName = '', cursor = 0, compact = false) {
   try {
-    return await getChatSeenSyncForUser(userName, cursor);
+    return await getChatSeenSyncForUser(userName, cursor, compact);
   } catch (err) {
     if (Date.now() - chatSeenSyncErrorLastLogAt > 30000) {
       chatSeenSyncErrorLastLogAt = Date.now();
@@ -9480,7 +9549,7 @@ async function getChatSyncSnapshotForUser(userName = '') {
   };
 }
 
-async function getStableInitialChatSyncForUser(userName = '', clientSeenCursor = 0) {
+async function getStableInitialChatSyncForUser(userName = '', clientSeenCursor = 0, compact = false) {
   const deadline = Date.now() + 28000;
   let attempts = 0;
 
@@ -9502,7 +9571,7 @@ async function getStableInitialChatSyncForUser(userName = '', clientSeenCursor =
         && Math.max(0, Number(stateAfter.revision) || 0) === Math.max(0, Number(confirmedState.revision) || 0);
 
       if (stillStable) {
-        const seenSync = await getChatSeenSyncSafely(userName, clientSeenCursor);
+        const seenSync = await getChatSeenSyncSafely(userName, 0, compact);
         return {
           success: true,
           syncV1: true,
@@ -9518,6 +9587,8 @@ async function getStableInitialChatSyncForUser(userName = '', clientSeenCursor =
           seenMode: seenSync.mode,
           seenCursor: seenSync.cursor,
           seenEvents: seenSync.events,
+          seenSummary: seenSync.summary || [],
+          seenDegraded: seenSync.degraded === true,
           maxHistory: MAX_CHAT_HISTORY,
           initialStableSync: true,
           attempts
@@ -17091,26 +17162,29 @@ io.on('connection', (socket) => {
       const clientEpoch = normalizeText(request && request.epoch, '').slice(0, 160);
       const clientRevision = Math.max(0, Number(request && request.revision) || 0);
       const clientSeenCursor = Math.max(0, Number(request && request.seenCursor) || 0);
+      const compactSeen = request && request.chatSeenSummaryV2 === true;
       const initialFullSync = request && request.initialFullSync === true && !clientEpoch && clientRevision === 0;
       if (initialFullSync) socket.__chatInitialFullSyncInFlight = true;
 
       socket.__chatSyncRequestInFlight = (async () => {
         if (initialFullSync) {
-          const stableSnapshot = await getStableInitialChatSyncForUser(socket.userName, clientSeenCursor);
+          const stableSnapshot = await getStableInitialChatSyncForUser(socket.userName, clientSeenCursor, compactSeen);
           if (!stableSnapshot) return { success: false, syncV1: true, retry: true, error: 'Initial chat snapshot did not reach a stable revision.' };
           return stableSnapshot;
         }
 
         const state = await refreshChatSyncStateFromDb();
         const forceSnapshot = request && request.forceSnapshot === true;
-        const seenSync = await getChatSeenSyncSafely(socket.userName, clientSeenCursor);
+        const seenSync = await getChatSeenSyncSafely(socket.userName, forceSnapshot || !clientEpoch || clientEpoch !== state.epoch || clientRevision > state.revision ? 0 : clientSeenCursor, compactSeen);
 
         const withSeenSync = payload => ({
           ...payload,
           seenSyncV1: true,
           seenMode: seenSync.mode,
           seenCursor: seenSync.cursor,
-          seenEvents: seenSync.events
+          seenEvents: seenSync.events,
+          seenSummary: seenSync.summary || [],
+          seenDegraded: seenSync.degraded === true
         });
 
         const sendSnapshot = async reason => {
@@ -17197,6 +17271,41 @@ io.on('connection', (socket) => {
     } finally {
       socket.__chatSyncRequestInFlight = null;
       socket.__chatInitialFullSyncInFlight = false;
+    }
+  });
+
+  socket.on('request_chat_seen_snapshot', async (_request = {}, respond) => {
+    if (typeof respond !== 'function') return;
+    if (!socket.userName) return respond({ success:false, seenDegraded:true });
+    const now = Date.now();
+    if (now - Number(socket.__lastChatSeenSnapshotRequestAt || 0) < 4000) return respond({ success:false, busy:true, seenDegraded:true });
+    socket.__lastChatSeenSnapshotRequestAt = now;
+    const userName = socket.userName;
+    const seen = await getChatSeenSyncSafely(userName, 0, _request && _request.chatSeenSummaryV2 === true);
+    if (userName !== socket.userName || !socket.connected) return;
+    respond({ success:true, seenSyncV1:true, seenDegraded:seen.degraded === true,
+      seenCursor:seen.cursor, seenEvents:seen.events, seenSummary:seen.summary || [] });
+  });
+
+  socket.on('request_chat_seen_details', async (request = {}, respond) => {
+    if (typeof respond !== 'function') return;
+    const owner = String(socket.userName || '');
+    const msgId = String(request && request.msgId || '');
+    const message = messageHistory.find(m => m && m.time && String(new Date(m.time).getTime()) === msgId);
+    if (!owner || !message || String(message.user || '') !== owner) return respond({ success:false, error:'Not authorized.' });
+    try {
+      const rows = await queryDbWithRetry(
+        `SELECT reader, seen_at FROM chat_seen_events
+         WHERE message_id = $1::text
+         ORDER BY id ASC LIMIT 10000`,
+        [msgId], { attempts:2, label:'CHAT SEEN DETAILS READ', queryTimeoutMs:10000 }
+      );
+      if (socket.userName !== owner || !socket.connected) return;
+      respond({ success:true, msgId, readers:(rows.rows || []).map(row => ({
+        reader:String(row.reader || ''), seenAt:row.seen_at ? new Date(row.seen_at).toISOString() : ''
+      })).filter(entry => entry.reader) });
+    } catch (err) {
+      if (socket.connected && socket.userName === owner) respond({ success:false, error:'Could not load Seen by.' });
     }
   });
 
