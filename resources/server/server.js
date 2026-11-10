@@ -677,8 +677,7 @@ const ROLE_NOTICE_RANK = Object.freeze({ user: 0, trusted: 1, mod: 2, admin: 3 }
 
 function normalizeRoleNoticeRole(value, fallback = 'user') {
   const raw = normalizeText(value, fallback).toLowerCase();
-  const role = raw === 'moderator' ? 'mod' : raw;
-  return VALID_USER_ROLES.has(role) ? role : fallback;
+  return VALID_USER_ROLES.has(raw) ? raw : fallback;
 }
 
 function buildRoleChangeNotice(targetName, role, previousRole, changedBy, options = {}) {
@@ -708,7 +707,7 @@ function buildRoleChangeNotice(targetName, role, previousRole, changedBy, option
     role: nextRole,
     previousRole: priorRole,
     changedBy: by,
-    changedAt: Math.max(0, Number(options.changedAt || options.promotedAt) || Date.now())
+    changedAt: Math.max(0, Number(options.changedAt) || Date.now())
   };
 }
 
@@ -718,11 +717,11 @@ function normalizeStoredRoleChangeNotice(value, targetName = '') {
     targetName || value.targetName,
     value.role,
     value.previousRole,
-    value.changedBy || value.promotedBy,
+    value.changedBy,
     {
       noticeId: value.noticeId,
       kind: value.kind,
-      changedAt: value.changedAt || value.promotedAt
+      changedAt: value.changedAt
     }
   );
 }
@@ -730,7 +729,7 @@ function normalizeStoredRoleChangeNotice(value, targetName = '') {
 function getPendingRoleChangeNotice(user = null, targetName = '') {
   if (!user || typeof user !== 'object') return null;
   return normalizeStoredRoleChangeNotice(
-    user.pendingRoleChangeNotice || user.pendingRolePromotionNotice,
+    user.pendingRoleChangeNotice,
     targetName || user.name || ''
   );
 }
@@ -818,12 +817,10 @@ async function acknowledgeRoleChangeNotice(name, noticeId) {
     `UPDATE users
      SET data = jsonb_set(
        jsonb_set(
-         jsonb_set(
            COALESCE(data, '{}'::jsonb),
            '{roleNoticeAcknowledgedRole}',
            to_jsonb(COALESCE(
              data->'pendingRoleChangeNotice'->>'role',
-             data->'pendingRolePromotionNotice'->>'role',
              'user'
            )::text),
            true
@@ -831,16 +828,9 @@ async function acknowledgeRoleChangeNotice(name, noticeId) {
          '{pendingRoleChangeNotice}',
          'null'::jsonb,
          true
-       ),
-       '{pendingRolePromotionNotice}',
-       'null'::jsonb,
-       true
-     )
-     WHERE name = $1
-       AND (
-         COALESCE(data->'pendingRoleChangeNotice'->>'noticeId', '') = $2
-         OR COALESCE(data->'pendingRolePromotionNotice'->>'noticeId', '') = $2
        )
+     WHERE name = $1
+       AND COALESCE(data->'pendingRoleChangeNotice'->>'noticeId', '') = $2
      RETURNING data->>'roleNoticeAcknowledgedRole' AS acknowledged_role`,
     [safeName, safeNoticeId],
     { attempts: 2, label: 'ROLE CHANGE NOTICE ACK' }
@@ -855,7 +845,6 @@ async function acknowledgeRoleChangeNotice(name, noticeId) {
     );
     currentUser.roleNoticeAcknowledgedRole = acknowledgedRole;
     currentUser.pendingRoleChangeNotice = null;
-    currentUser.pendingRolePromotionNotice = null;
   }
   return result.rows.length > 0;
 }
@@ -2658,33 +2647,6 @@ function scheduleStartupGlobalRetention() {
   deferServerTask('STARTUP GLOBAL RETENTION', runStartupGlobalRetention, 60000);
 }
 
-function scheduleLegacyChatSeenBackfill() {
-  if (process.env.CHAT_SEEN_RECOVER_RECENT === '0') return;
-  const ids = Array.from(new Set(messageHistory.map(message => Number(message && message._dbId) || 0).filter(Number.isSafeInteger).filter(id => id > 0)));
-  if (!ids.length) return;
-  let offset = 0, restored = 0, legacy = 0, retries = 0;
-  const run = async () => {
-    if (pool.waitingCount > 0 || chatSeenSnapshotActive > 0) {
-      deferServerTask('CHAT SEEN RECOVERY', run, 10000);
-      return;
-    }
-    try {
-      const result = await backfillRecentChatSeenEventsFromLegacyMessages(ids.slice(offset, offset + 25));
-      restored += result.inserted.length;
-      legacy += result.legacy;
-      if (result.inserted.length) emitChatSeenSyncEvents(result.inserted);
-      offset += 25;
-      retries = 0;
-      if (offset < ids.length) deferServerTask('CHAT SEEN RECOVERY', run, 1200);
-      else console.log(`[CHAT SEEN RECOVERY] Scanned ${ids.length} recent messages; legacy confirmations=${legacy}, restored=${restored}.`);
-    } catch (err) {
-      console.warn('[CHAT SEEN RECOVERY] Batch deferred:', err && err.message ? err.message : err);
-      if (++retries <= 5) deferServerTask('CHAT SEEN RECOVERY', run, 15000);
-    }
-  };
-  deferServerTask('CHAT SEEN RECOVERY', run, 120000);
-}
-
 async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -2805,7 +2767,6 @@ async function initDb() {
     );
     ALTER TABLE social_posts ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ;
     ALTER TABLE social_posts ADD COLUMN IF NOT EXISTS playing JSONB;
-    CREATE INDEX IF NOT EXISTS idx_social_posts_newest ON social_posts(id DESC);
     CREATE INDEX IF NOT EXISTS idx_social_posts_author_newest ON social_posts(author_name, id DESC);
     CREATE TABLE IF NOT EXISTS social_feed_read_state (
       user_name TEXT PRIMARY KEY REFERENCES users(name) ON DELETE CASCADE,
@@ -3103,7 +3064,6 @@ async function initDb() {
     }
   }
 
-  // Legacy Seen migration is maintenance, not a startup requirement.
   await refreshChatHistoryFromDb();
 
   const pinnedRes = await pool.query('SELECT data FROM pinned_messages ORDER BY id ASC');
@@ -3760,15 +3720,9 @@ function getMaintenanceScheduleStatus(schedule = {}, now = new Date()) {
   return { active: true, activeUntil: new Date(now.getTime() + msLeft).toISOString() };
 }
 
-function getRawUserRole(userData = null) {
-  return normalizeText(userData && userData.role, "").toLowerCase();
-}
-
 function getUserRole(name, userData = null) {
   const fallbackRole = ADMIN_USERS.includes(name) ? "admin" : "user";
   const rawRole = normalizeText(userData && userData.role, fallbackRole).toLowerCase();
-  if (rawRole === "moderator") return "mod";
-  if (rawRole === "banned") return fallbackRole;
   return VALID_USER_ROLES.has(rawRole) ? rawRole : fallbackRole;
 }
 
@@ -3801,7 +3755,7 @@ function getActorRole(socket) {
 }
 
 function isUserBanned(userData = null) {
-  return !!(userData && (userData.banned === true || getRawUserRole(userData) === "banned"));
+  return !!(userData && userData.banned === true);
 }
 
 const RECENTLY_VISITED_MAX_ITEMS = 10;
@@ -3838,12 +3792,11 @@ function normalizeRecentlyVisitedRecordsServer(records = []) {
 }
 
 function normalizeUserRecord(name, userData = {}) {
-  const legacyBannedRole = getRawUserRole(userData) === "banned";
   const normalized = {
     ...userData,
     name,
     role: getUserRole(name, userData),
-    banned: userData.banned === true || legacyBannedRole
+    banned: userData.banned === true
   };
 
   const countryCode = getUserCountryCode(userData);
@@ -4508,9 +4461,6 @@ function reconcileIncomingProfileArrays(currentUser = {}, incomingUser = {}) {
 
     if (incomingVersion && (!currentVersion || incomingVersion >= currentVersion)) {
       acceptIncoming = hasIncomingArray;
-    } else if (!currentVersion && !currentHasItems && incomingHasItems && hasIncomingArray) {
-      // One-time migration/recovery path: old localStorage can seed an empty DB.
-      acceptIncoming = true;
     } else if (!currentVersion && !incomingVersion && !currentHasItems && hasIncomingArray) {
       acceptIncoming = true;
     }
@@ -8125,7 +8075,7 @@ async function getAuthUserRecordFromDb(name) {
   if (row.friends_count !== null) data.friends = Number(row.friends_count) || 0;
 
   const compact = buildCompactUserSummary(safeName, data);
-  ['passwordHash', 'password', 'passwordMigratedAt'].forEach(key => {
+  ['passwordHash'].forEach(key => {
     if (Object.prototype.hasOwnProperty.call(data, key)) compact[key] = data[key];
   });
   return compact;
@@ -8527,7 +8477,7 @@ function emitChatHistoryToSocket(socket) {
   chatHistoryQueueDepth[lane] += 1;
   const delivery = chatHistoryEmitQueues[lane].catch(() => null).then(async () => {
     if (!socket.connected) return { completion: Promise.resolve({ cancelled: true }) };
-    const history = await getPublicChatHistoryWithSeenForUser(socket.userName || '');
+    const history = getPublicChatHistoryForUser(socket.userName || '');
     if (!socket.connected) return { completion: Promise.resolve({ cancelled: true }) };
     const requiresAck = socket.chatHistoryAckV1 === true;
     if (MEMORY_TRACE_ENABLED) {
@@ -8614,14 +8564,12 @@ async function ensureFullUserCacheForWrite(name) {
 
 async function updateUserDataPreservingCredentials(name, userData, label = 'USER DATA SAVE') {
   const outgoing = normalizeUserRecord(name, userData || {});
+  for (const field of ['password','passwordMigratedAt','passwordRecoveredAt','passwordRecoverySource','pendingRolePromotionNotice','migratedFromLocalProfile','migratedAt']) delete outgoing[field];
   const outgoingHasPasswordHash = Object.prototype.hasOwnProperty.call(outgoing, 'passwordHash') && !!outgoing.passwordHash;
-  const outgoingHasLegacyPassword = Object.prototype.hasOwnProperty.call(outgoing, 'password') && typeof outgoing.password === 'string' && outgoing.password.length > 0;
   const result = await queryDbWithRetry(`
     UPDATE users
     SET data = $1::jsonb
       || CASE WHEN NOT ($1::jsonb ? 'passwordHash') AND data ? 'passwordHash' THEN jsonb_build_object('passwordHash', data->'passwordHash') ELSE '{}'::jsonb END
-      || CASE WHEN NOT ($1::jsonb ? 'password') AND data ? 'password' THEN jsonb_build_object('password', data->'password') ELSE '{}'::jsonb END
-      || CASE WHEN NOT ($1::jsonb ? 'passwordMigratedAt') AND data ? 'passwordMigratedAt' THEN jsonb_build_object('passwordMigratedAt', data->'passwordMigratedAt') ELSE '{}'::jsonb END
       || CASE WHEN NOT ($1::jsonb ? 'passwordResetAt') AND data ? 'passwordResetAt' THEN jsonb_build_object('passwordResetAt', data->'passwordResetAt') ELSE '{}'::jsonb END
       || CASE WHEN NOT ($1::jsonb ? 'passwordResetBy') AND data ? 'passwordResetBy' THEN jsonb_build_object('passwordResetBy', data->'passwordResetBy') ELSE '{}'::jsonb END
       || CASE WHEN NOT ($1::jsonb ? 'passwordResetRequired') AND data ? 'passwordResetRequired' THEN jsonb_build_object('passwordResetRequired', data->'passwordResetRequired') ELSE '{}'::jsonb END
@@ -8633,7 +8581,7 @@ async function updateUserDataPreservingCredentials(name, userData, label = 'USER
 
   if (!result.rows.length) return null;
   const saved = normalizeUserRecord(name, result.rows[0].data || {});
-  if ((!outgoingHasPasswordHash && saved.passwordHash) || (!outgoingHasLegacyPassword && saved.password)) {
+  if (!outgoingHasPasswordHash && saved.passwordHash) {
     console.warn(`[CREDENTIAL GUARD] ${label} preserved existing credentials for ${name}. Outgoing cache was missing credential fields.`);
   }
   userDatabase[name] = saved;
@@ -8723,122 +8671,6 @@ function getPublicChatHistoryForUser(userName = '') {
   return messageHistory.map(message => getPublicChatMessageForUser(message, userName));
 }
 
-function getCurrentChatMessageIds() {
-  const ids = [];
-  for (const message of messageHistory) {
-    if (!message || !message.time) continue;
-    const msgId = String(new Date(message.time).getTime());
-    if (msgId && msgId !== 'NaN') ids.push(msgId);
-  }
-  return ids;
-}
-
-async function backfillRecentChatSeenEventsFromLegacyMessages(dbIds = []) {
-  if (!dbIds.length) return { legacy:0, inserted:[] };
-  const rows = await queryDbWithRetry(
-    `SELECT message->>'time' AS msg_time, message->>'user' AS sender,
-            message->'seenBy' AS readers, message->'seenAt' AS seen_dates
-     FROM chat
-     WHERE id = ANY($1::integer[]) AND jsonb_typeof(message->'seenBy') = 'array'`,
-    [dbIds], { attempts:1, label:'CHAT SEEN RECOVERY READ', queryTimeoutMs:5000 }
-  );
-  const ids = [], senders = [], readers = [], dates = [];
-  for (const row of rows.rows || []) {
-    const stamp = Date.parse(row.msg_time || '');
-    const sender = String(row.sender || '');
-    if (!Number.isFinite(stamp) || !sender || !Array.isArray(row.readers)) continue;
-    for (const name of row.readers) {
-      const reader = String(name || '');
-      if (!reader || reader === sender) continue;
-      const date = row.seen_dates && row.seen_dates[reader];
-      const parsed = Date.parse(date || '');
-      ids.push(String(stamp));senders.push(sender);readers.push(reader);
-      dates.push(Number.isFinite(parsed) ? new Date(parsed).toISOString() : new Date(stamp).toISOString());
-    }
-  }
-  if (!ids.length) return { legacy:0, inserted:[] };
-  const saved = await queryDbWithRetry(
-    `INSERT INTO chat_seen_events (message_id, sender, reader, seen_at)
-     SELECT x.msg_id, x.sender, x.reader, x.seen_at
-     FROM unnest($1::text[], $2::text[], $3::text[], $4::timestamptz[])
-       AS x(msg_id, sender, reader, seen_at)
-     ON CONFLICT (message_id, reader) DO NOTHING
-     RETURNING id, message_id, sender, reader, seen_at`,
-    [ids, senders, readers, dates],
-    { attempts:1, label:'CHAT SEEN RECOVERY SAVE', queryTimeoutMs:5000 }
-  );
-  const inserted = (saved.rows || []).map(row => ({
-    eventId:Math.max(0, Number(row.id) || 0),
-    msgId:String(row.message_id || ''),sender:String(row.sender || ''),
-    reader:String(row.reader || ''),seenAt:row.seen_at ? new Date(row.seen_at).toISOString() : ''
-  })).filter(event => event.eventId && event.msgId && event.reader);
-  return { legacy:ids.length, inserted };
-}
-// Optional Seen snapshots must never monopolize the small Aiven connection
-// pool. Coalesce identical viewer requests; defer others and retry via normal
-// Seen sync without advancing their cursor.
-const chatSeenSnapshotPendingByUser = new Map();
-let chatSeenSnapshotActive = 0;
-async function getChatSeenSnapshotForUser(userName = '') {
-  const targetUser = String(userName || '');
-  if (!targetUser) return [];
-  const existing = chatSeenSnapshotPendingByUser.get(targetUser);
-  if (existing) return existing;
-  if (chatSeenSnapshotActive >= 1 || pool.waitingCount >= 3) {
-    throw new Error('Seen snapshot deferred while PostgreSQL is busy');
-  }
-  const authoredIds = [], otherIds = [], messageIds = [], uniqueIds = new Set();
-  for (const message of messageHistory) {
-    if (!message || !message.time) continue;
-    const id = String(new Date(message.time).getTime());
-    if (!id || id === 'NaN' || uniqueIds.has(id)) continue;
-    uniqueIds.add(id);messageIds.push(id);
-    (String(message.user || '') === targetUser ? authoredIds : otherIds).push(id);
-  }
-  if (!messageIds.length) return [];
-  chatSeenSnapshotActive++;
-  // The unique (message_id, reader) index bounds both branches to recent messages.
-  const useIndexedLookup = process.env.CHAT_SEEN_INDEX_LOOKUP !== '0';
-  const query = useIndexedLookup
-    ? `SELECT seen.id, seen.message_id, seen.sender, seen.reader, seen.seen_at
-       FROM (
-         SELECT id, message_id, sender, reader, seen_at
-         FROM chat_seen_events
-         WHERE message_id = ANY($1::text[])
-         UNION ALL
-         SELECT id, message_id, sender, reader, seen_at
-         FROM chat_seen_events
-         WHERE message_id = ANY($2::text[]) AND reader = $3::text
-       ) seen
-       ORDER BY seen.id ASC`
-    : `SELECT id, message_id, sender, reader, seen_at
-       FROM chat_seen_events
-       WHERE message_id = ANY($1::text[])
-         AND (sender = $2 OR reader = $2)
-       ORDER BY id ASC`;
-  const pending = (async () => {
-    const res = await queryDbWithRetry(
-      query,
-      useIndexedLookup ? [authoredIds, otherIds, targetUser] : [messageIds, targetUser],
-      { attempts:1, label:'CHAT SEEN SNAPSHOT READ',
-        queryTimeoutMs:Math.max(2000,Math.min(15000,Number(process.env.CHAT_SEEN_QUERY_TIMEOUT_MS)||6000)) }
-    );
-    return (res.rows || []).map(row => ({
-      eventId: Math.max(0, Number(row.id) || 0),
-      msgId: String(row.message_id || ''),
-      sender: String(row.sender || ''),
-      reader: String(row.reader || ''),
-      seenAt: row.seen_at ? new Date(row.seen_at).toISOString() : ''
-    })).filter(event => event.eventId && event.msgId && event.reader);
-  })();
-  chatSeenSnapshotPendingByUser.set(targetUser, pending);
-  try { return await pending; }
-  finally {
-    if (chatSeenSnapshotPendingByUser.get(targetUser) === pending) chatSeenSnapshotPendingByUser.delete(targetUser);
-    chatSeenSnapshotActive--;
-  }
-}
-
 // Compact Seen hydration: one indexed aggregate per current message; the full reader
 // list is fetched only for a user-requested popup. Realtime changes still stream instantly.
 const compactChatSeenPendingByUser = new Map();
@@ -8885,50 +8717,10 @@ async function getCompactChatSeenSnapshotForUser(userName = '') {
   finally { if (compactChatSeenPendingByUser.get(targetUser)===work) compactChatSeenPendingByUser.delete(targetUser); }
 }
 
-let chatSeenLegacyDegradedLastLogAt = 0;
-async function getPublicChatHistoryWithSeenForUser(userName = '') {
-  const targetUser = String(userName || '');
-  const history = getPublicChatHistoryForUser(targetUser);
-  if (!targetUser || !history.length) return history;
-  let events;
-  try { events = await getChatSeenSnapshotForUser(targetUser); }
-  catch (err) {
-    // Seen is optional metadata. Do not block legacy Global Chat history
-    // or hold a scarce PostgreSQL connection for an unavailable snapshot.
-    if (Date.now() - chatSeenLegacyDegradedLastLogAt > 30000) {
-      chatSeenLegacyDegradedLastLogAt = Date.now();
-      console.warn('[CHAT SEEN LEGACY DEGRADED] History sent without Seen:',err && err.message ? err.message : err);
-    }
-    return history;
-  }
-  if (!events.length) return history;
-
-  const byId = new Map();
-  for (const message of history) {
-    if (!message || !message.time) continue;
-    const id = String(new Date(message.time).getTime());
-    if (id && id !== 'NaN') byId.set(id, message);
-  }
-  for (const event of events) {
-    const message = byId.get(String(event.msgId || ''));
-    if (!message) continue;
-    if (!Array.isArray(message.seenBy)) message.seenBy = [];
-    if (!message.seenAt || typeof message.seenAt !== 'object' || Array.isArray(message.seenAt)) message.seenAt = {};
-    if (!message.seenBy.includes(event.reader)) message.seenBy.push(event.reader);
-    if (event.seenAt) message.seenAt[event.reader] = event.seenAt;
-  }
-  return history;
-}
-
-async function getChatSeenSyncForUser(userName = '', cursor = 0, compact = false) {
+async function getChatSeenSyncForUser(userName = '', cursor = 0) {
   const targetUser = String(userName || '');
   const safeCursor = Math.max(0, Number(cursor) || 0);
-  if (!safeCursor && compact) return getCompactChatSeenSnapshotForUser(targetUser);
-  if (!safeCursor) {
-    const maxRes = await queryDbWithRetry('SELECT COALESCE(MAX(id), 0)::bigint AS max_id FROM chat_seen_events', [], { attempts: 2, label: 'CHAT SEEN CURSOR READ' });
-    const maxId = Math.max(0, Number(maxRes.rows[0]?.max_id) || 0);
-    return { mode: 'snapshot', cursor: maxId, events: await getChatSeenSnapshotForUser(targetUser) };
-  }
+  if (!safeCursor) return getCompactChatSeenSnapshotForUser(targetUser);
 
   // One round trip gets the current global cursor and the relevant delta.
   // LEFT JOIN LATERAL keeps the cursor available even when there are no changes.
@@ -8951,11 +8743,11 @@ async function getChatSeenSyncForUser(userName = '', cursor = 0, compact = false
   );
   const maxId = Math.max(0, Number(res.rows[0]?.max_id) || 0);
   if (safeCursor > maxId) {
-    return compact ? getCompactChatSeenSnapshotForUser(targetUser) : { mode:'snapshot', cursor:maxId, events:await getChatSeenSnapshotForUser(targetUser) };
+    return getCompactChatSeenSnapshotForUser(targetUser);
   }
   const rows = res.rows.filter(row => row.id != null);
   if (rows.length > 2000) {
-    return compact ? getCompactChatSeenSnapshotForUser(targetUser) : { mode:'snapshot', cursor:maxId, events:await getChatSeenSnapshotForUser(targetUser) };
+    return getCompactChatSeenSnapshotForUser(targetUser);
   }
   return {
     mode: 'changes',
@@ -8974,9 +8766,9 @@ async function getChatSeenSyncForUser(userName = '', cursor = 0, compact = false
 // Global Chat messages from opening. Keep the client's cursor unchanged so
 // the next sync can retry without silently marking missing events as seen.
 let chatSeenSyncErrorLastLogAt = 0;
-async function getChatSeenSyncSafely(userName = '', cursor = 0, compact = false) {
+async function getChatSeenSyncSafely(userName = '', cursor = 0) {
   try {
-    return await getChatSeenSyncForUser(userName, cursor, compact);
+    return await getChatSeenSyncForUser(userName, cursor);
   } catch (err) {
     if (Date.now() - chatSeenSyncErrorLastLogAt > 30000) {
       chatSeenSyncErrorLastLogAt = Date.now();
@@ -9057,7 +8849,7 @@ function emitChatSeenSyncEvents(events = []) {
     const sockets = getSocketsByUserName(name);
     for (const client of sockets) {
       if (!client || !client.connected) continue;
-      if (client.chatSeenBatchV1 === true && payloads.length > 1) {
+      if (payloads.length > 1) {
         client.emit('chat_seen_sync_batch', {
           seenSyncV1: true,
           cursor: payloads[payloads.length - 1].cursor,
@@ -9066,60 +8858,6 @@ function emitChatSeenSyncEvents(events = []) {
       } else {
         payloads.forEach(payload => client.emit('chat_seen_sync_change', payload));
       }
-    }
-  }
-}
-
-async function emitLegacyChatSeenCompat(events = []) {
-  const cleanEvents = (Array.isArray(events) ? events : [events]).filter(event => event && event.msgId && event.reader);
-  if (!cleanEvents.length) return;
-
-  const senderIds = new Set();
-  for (const event of cleanEvents) {
-    const senderSockets = getSocketsByUserName(String(event.sender || '')).filter(client => client && client.connected && client.chatBatchDeleteV2 !== true);
-    if (senderSockets.length) senderIds.add(String(event.msgId || ''));
-  }
-
-  let fullByMessage = new Map();
-  if (senderIds.size) {
-    const res = await queryDbWithRetry(
-      `SELECT message_id, reader, seen_at
-       FROM chat_seen_events
-       WHERE message_id = ANY($1::text[])
-       ORDER BY id ASC`,
-      [Array.from(senderIds)],
-      { attempts: 2, label: 'CHAT SEEN LEGACY READ' }
-    );
-    for (const row of res.rows || []) {
-      const msgId = String(row.message_id || '');
-      const reader = String(row.reader || '');
-      if (!msgId || !reader) continue;
-      if (!fullByMessage.has(msgId)) fullByMessage.set(msgId, { seenBy: [], seenAt: {} });
-      const state = fullByMessage.get(msgId);
-      if (!state.seenBy.includes(reader)) state.seenBy.push(reader);
-      if (row.seen_at) state.seenAt[reader] = new Date(row.seen_at).toISOString();
-    }
-  }
-
-  for (const event of cleanEvents) {
-    const msgId = String(event.msgId || '');
-    const sender = String(event.sender || '');
-    const reader = String(event.reader || '');
-    const seenAt = String(event.seenAt || '');
-
-    if (sender && senderIds.has(msgId)) {
-      const state = fullByMessage.get(msgId) || { seenBy: [reader], seenAt: seenAt ? { [reader]: seenAt } : {} };
-      getSocketsByUserName(sender).forEach(client => {
-        if (client && client.connected && client.chatBatchDeleteV2 !== true) client.emit('message_seen', { msgId, seenBy: state.seenBy, seenAt: state.seenAt });
-      });
-    }
-
-    if (reader && reader !== sender) {
-      getSocketsByUserName(reader).forEach(client => {
-        if (client && client.connected && client.chatBatchDeleteV2 !== true) {
-          client.emit('message_seen', { msgId, seenBy: [reader], seenAt: seenAt ? { [reader]: seenAt } : {} });
-        }
-      });
     }
   }
 }
@@ -9469,24 +9207,14 @@ function emitChatBatchDeleteRealtime(batch = {}) {
     msgIds
   };
 
-  let v2Clients = 0;
-  let legacyClients = 0;
+  let recipients = 0;
   io.sockets.sockets.forEach(client => {
     if (!client || !client.connected || !client.userName) return;
-    if (client.chatBatchDeleteV2 === true) {
-      v2Clients++;
-      trackBandwidthPayload('chat_messages_deleted', compactPayload, 1);
-      client.emit('chat_messages_deleted', compactPayload);
-      return;
-    }
-
-    legacyClients++;
-    // Legacy clients do not understand the compact event. Keep their visible chat correct
-    // without also sending N sync packets; their existing gap repair will reconcile revisions
-    // on the next sync-sensitive mutation or reconnect.
-    for (const msgId of msgIds) client.emit('message_deleted', msgId);
+    recipients++;
+    trackBandwidthPayload('chat_messages_deleted', compactPayload, 1);
+    client.emit('chat_messages_deleted', compactPayload);
   });
-  trace.finish({ v2Clients, legacyClients, legacyPackets:legacyClients * msgIds.length });
+  trace.finish({ recipients });
 }
 
 function removeChatMessagesFromMemory(msgIds = []) {
@@ -9549,7 +9277,7 @@ async function getChatSyncSnapshotForUser(userName = '') {
   };
 }
 
-async function getStableInitialChatSyncForUser(userName = '', clientSeenCursor = 0, compact = false) {
+async function getStableInitialChatSyncForUser(userName = '') {
   const deadline = Date.now() + 28000;
   let attempts = 0;
 
@@ -9571,7 +9299,7 @@ async function getStableInitialChatSyncForUser(userName = '', clientSeenCursor =
         && Math.max(0, Number(stateAfter.revision) || 0) === Math.max(0, Number(confirmedState.revision) || 0);
 
       if (stillStable) {
-        const seenSync = await getChatSeenSyncSafely(userName, 0, compact);
+        const seenSync = await getChatSeenSyncSafely(userName, 0);
         return {
           success: true,
           syncV1: true,
@@ -11526,9 +11254,6 @@ async function initProfileSyncNotifications() {
         if (data.deleted && data.deleted.userName) {
           emitUserNotificationDeletedToLocalUser(data.deleted.userName, data.deleted.notificationId, data.deleted.unreadCount);
         }
-        if (data.consumed && data.consumed.userName) {
-          emitUserNotificationsConsumedToLocalUser(data.consumed.userName, data.consumed.notificationIds, data.consumed.unreadCount);
-        }
         if (data.cleared && data.cleared.userName) {
           emitUserNotificationsClearedToLocalUser(data.cleared.userName, data.cleared.throughId, data.cleared.unreadCount);
         }
@@ -12700,19 +12425,6 @@ function emitUserNotificationDeletedToLocalUser(userName, notificationId, unread
   });
 }
 
-function emitUserNotificationsConsumedToLocalUser(userName, notificationIds, unreadCount = 0, excludeSocketId = '') {
-  const name = normalizeSocialUserName(userName);
-  const ids = Array.from(new Set((Array.isArray(notificationIds) ? notificationIds : [notificationIds])
-    .map(id => String(id || '').trim())
-    .filter(id => /^\d+$/.test(id))));
-  const excluded = String(excludeSocketId || '').trim();
-  if (!name || !ids.length) return;
-  const payload = { userName:name, notificationIds:ids, unreadCount:Math.max(0, Math.floor(Number(unreadCount) || 0)) };
-  getSocketsByUserName(name).forEach(client => {
-    if (client && client.connected && (!excluded || client.id !== excluded)) client.emit('user_notifications_consumed', payload);
-  });
-}
-
 function emitUserNotificationsClearedToLocalUser(userName, throughId = 0, unreadCount = 0, excludeSocketId = '') {
   const name = normalizeSocialUserName(userName);
   const excluded = String(excludeSocketId || '').trim();
@@ -12803,22 +12515,6 @@ async function notifyUserNotificationsDeletedAcrossInstances(userName, notificat
       await pool.query('SELECT pg_notify($1,payload) FROM unnest($2::text[]) AS changes(payload)',
         ['user_notification_sync',payloads]);
     } catch(err) { console.error('[NOTIFICATION BATCH DELETE SYNC ERROR]:',err); }
-  }
-}
-
-async function notifyUserNotificationsConsumedAcrossInstances(userName, notificationIds, unreadCount = 0) {
-  const name = normalizeSocialUserName(userName);
-  const ids = Array.from(new Set((Array.isArray(notificationIds) ? notificationIds : [notificationIds])
-    .map(id => String(id || '').trim())
-    .filter(id => /^\d+$/.test(id))));
-  if (!name || !ids.length) return;
-  try {
-    await pool.query('SELECT pg_notify($1, $2)', ['user_notification_sync', JSON.stringify({
-      consumed: { userName:name, notificationIds:ids, unreadCount:Math.max(0, Number(unreadCount) || 0) },
-      instanceId: INSTANCE_ID
-    })]);
-  } catch (err) {
-    console.error('[NOTIFICATION CONSUME SYNC ERROR]:', err);
   }
 }
 
@@ -13058,17 +12754,6 @@ async function recordCatalogNotification(userName, rawData = {}) {
   }
 }
 
-async function getUserNotificationReadId(userName) {
-  const name = normalizeSocialUserName(userName);
-  if (!name) return 0;
-  const result = await queryDbWithRetry(
-    'SELECT last_read_id FROM user_notification_read_state WHERE user_name = $1 LIMIT 1',
-    [name],
-    { attempts: 2, label: 'USER NOTIFICATION READ STATE' }
-  );
-  return Math.max(0, Number(result.rows[0] && result.rows[0].last_read_id) || 0);
-}
-
 // Mark read and obtain the authoritative unread count in one PostgreSQL trip.
 // The count uses the cursor returned by the UPSERT, including a concurrent
 // session's newer cursor, instead of issuing a second round trip.
@@ -13152,21 +12837,6 @@ async function deleteUserNotification(userName, notificationId) {
   if (!name || !/^\d+$/.test(id)) return { deleted:false, notificationId:'', unreadCount:0 };
   const result = await deleteUserNotificationsWithCount(name,'id = $2::bigint',[id],'USER NOTIFICATION DELETE');
   return { deleted:result.deletedCount > 0, notificationId:id, unreadCount:result.unreadCount };
-}
-
-async function consumeUserChatNotifications(userName, scope, messageIds = []) {
-  const name = normalizeSocialUserName(userName);
-  const safeScope = normalizeText(scope, '').toLowerCase();
-  const ids = Array.from(new Set((Array.isArray(messageIds) ? messageIds : [messageIds])
-    .map(id => normalizeText(id, '').slice(0, 100))
-    .filter(Boolean))).slice(0, 40);
-  if (!name || !ids.length || !['global', 'private'].includes(safeScope)) return { notificationIds:[], unreadCount:await getUserNotificationUnreadCount(name) };
-  const typeClause = safeScope === 'private'
-    ? "event_type = 'private_message'"
-    : "event_type IN ('mention', 'reply', 'reaction')";
-  const result = await deleteUserNotificationsWithCount(name,
-    `${typeClause} AND data->>'messageId' = ANY($2::text[])`,[ids],'CHAT NOTIFICATION CONSUME');
-  return { notificationIds:result.ids, unreadCount:result.unreadCount };
 }
 
 async function clearUserNotifications(userName, throughId = 0) {
@@ -13968,9 +13638,6 @@ async function setUserRole(targetName, role, adminName) {
 
   if (roleChanged) {
     targetUser.pendingRoleChangeNotice = roleChangeNotice;
-    /* Clean up the old one-purpose field from earlier builds. The normalizer still reads it
-       during migration, but every new write uses the generic role-change state. */
-    targetUser.pendingRolePromotionNotice = null;
   }
 
   /* Role changes only need a tiny cross-instance patch. Avoid the broad profile sync that
@@ -14114,20 +13781,9 @@ async function verifyUserPasswordForSensitiveAction(name, rawPassword) {
   const dbUser = await getAuthUserRecordFromDb(userName);
   if (!dbUser) return false;
 
-  if (dbUser.passwordHash) {
-    try {
-      return await bcrypt.compare(password, String(dbUser.passwordHash));
-    } catch (err) {
-      return false;
-    }
-  }
-
-  const legacyPassword = typeof dbUser.password === 'string' ? dbUser.password : '';
-  if (!legacyPassword) return false;
+  if (!dbUser.passwordHash) return false;
   try {
-    const left = Buffer.from(password);
-    const right = Buffer.from(legacyPassword);
-    return left.length === right.length && crypto.timingSafeEqual(left, right);
+    return await bcrypt.compare(password, String(dbUser.passwordHash));
   } catch (err) {
     return false;
   }
@@ -15627,15 +15283,14 @@ io.on('connection', (socket) => {
   socket.on('authenticate_user', async (data = {}) => {
     try {
       const { name, password, isNewAccount, adminMaintenanceBypass, passwordResetSubmission } = data;
-      const safeUserData = (data.userData && typeof data.userData === 'object') ? data.userData : {};
+      const safeUserData = (data.userData && typeof data.userData === 'object') ? { ...data.userData } : {};
+      for (const field of ['password','passwordMigratedAt','passwordRecoveredAt','passwordRecoverySource','pendingRolePromotionNotice','migratedFromLocalProfile','migratedAt']) delete safeUserData[field];
 
       const supportsProfileSyncV2 = data && data.profileSyncV2 === true;
       const supportsProfileSyncAckV1 = data && data.profileSyncAckV1 === true;
       const supportsChatHistoryAckV1 = data && data.chatHistoryAckV1 === true;
       const supportsChatHistoryPullV1 = data && data.chatHistoryPullV1 === true;
-      const supportsChatBatchDeleteV2 = data && data.chatBatchDeleteV2 === true;
-      const supportsChatSeenBatchV1 = data && data.chatSeenBatchV1 === true;
-      logMemoryTrace('auth:start', `user=${name || ''} socket=${socket.id} new=${isNewAccount === true} v2=${supportsProfileSyncV2} ack=${supportsProfileSyncAckV1} chatAck=${supportsChatHistoryAckV1} chatPull=${supportsChatHistoryPullV1} chatBatch=${supportsChatBatchDeleteV2} seenBatch=${supportsChatSeenBatchV1}`);
+      logMemoryTrace('auth:start', `user=${name || ''} socket=${socket.id} new=${isNewAccount === true} v2=${supportsProfileSyncV2} ack=${supportsProfileSyncAckV1} chatAck=${supportsChatHistoryAckV1} chatPull=${supportsChatHistoryPullV1}`);
       let dbUser = await getAuthUserRecordFromDb(name);
       if (dbUser && MEMORY_TRACE_ENABLED) {
         const authEstimate = estimateValueBytes(dbUser, { maxNodes: 10000, maxBytes: 8 * 1024 * 1024 });
@@ -15659,6 +15314,11 @@ io.on('connection', (socket) => {
             return;
           }
         }
+      }
+
+      if (!dbUser && isNewAccount !== true) {
+        socket.emit('auth_error', 'Account not found. Use Create New Account to register.');
+        return;
       }
 
       if (adminMaintenanceBypass === true && !isAdmin) {
@@ -15720,45 +15380,8 @@ io.on('connection', (socket) => {
         }
 
         if (!dbUser.passwordHash) {
-          if (isNewAccount === true) {
-            socket.emit('auth_error', 'This Online ID is already taken...');
-            return;
-          }
-
-          const legacyPassword = typeof dbUser.password === 'string' ? dbUser.password : '';
-          if (!legacyPassword) {
-            const resetRequestedAt = Date.parse(String(dbUser.passwordResetAt || ''));
-            const resetCompletedAt = Date.parse(String(dbUser.passwordResetCompletedAt || ''));
-            const hasUnresolvedAdminReset = Number.isFinite(resetRequestedAt)
-              && (!Number.isFinite(resetCompletedAt) || resetCompletedAt < resetRequestedAt);
-            if (hasUnresolvedAdminReset) {
-              socket.emit('auth_error', 'Password reset expired. Ask an administrator to authorize another reset.');
-              return;
-            }
-            const recoveryPassword = String(password || '').trim();
-            if (recoveryPassword.length < 4) {
-              socket.emit('auth_error', 'Enter a password with at least 4 characters to recover this account.');
-              return;
-            }
-            dbUser.passwordHash = await bcrypt.hash(recoveryPassword, 10);
-            dbUser.passwordRecoveredAt = new Date().toISOString();
-            dbUser.passwordRecoverySource = 'missing_credentials_login';
-            dbUser.profileUpdatedAt = Date.now();
-            await patchUserDataInternal(name, { passwordHash: dbUser.passwordHash, passwordRecoveredAt: dbUser.passwordRecoveredAt, passwordRecoverySource: dbUser.passwordRecoverySource, profileUpdatedAt: dbUser.profileUpdatedAt }, [], 'MISSING CREDENTIAL RECOVERY');
-            console.warn(`[AUTH] Rebuilt missing credentials for ${name} from a login password.`);
-          } else {
-            if (String(password || '') !== legacyPassword) {
-              socket.emit('auth_error', 'Incorrect password. Access denied.');
-              return;
-            }
-
-            dbUser.passwordHash = await bcrypt.hash(password, 10);
-            delete dbUser.password;
-            dbUser.passwordMigratedAt = new Date().toISOString();
-            dbUser.profileUpdatedAt = Date.now();
-            await patchUserDataInternal(name, { passwordHash: dbUser.passwordHash, passwordMigratedAt: dbUser.passwordMigratedAt, profileUpdatedAt: dbUser.profileUpdatedAt }, ['password'], 'LEGACY PASSWORD MIGRATION');
-            console.log(`[AUTH] Migrated legacy password for ${name} to bcrypt.`);
-          }
+          socket.emit('auth_error', 'This account has no password hash. Ask an administrator to reset the password.');
+          return;
         }
 
         const match = await bcrypt.compare(password, dbUser.passwordHash);
@@ -15791,8 +15414,6 @@ io.on('connection', (socket) => {
           socket.profileSyncAckV1 = supportsProfileSyncAckV1;
           socket.chatHistoryAckV1 = supportsChatHistoryAckV1;
           socket.chatHistoryPullV1 = supportsChatHistoryPullV1;
-          socket.chatBatchDeleteV2 = supportsChatBatchDeleteV2;
-          socket.chatSeenBatchV1 = supportsChatSeenBatchV1;
 
           markSocketAuthenticated(socket);
           invalidateOnlineListCache('auth-existing-db');
@@ -15884,8 +15505,6 @@ io.on('connection', (socket) => {
           themeColor: safeUserData.themeColor || '#0070cc',
           role: isAdmin ? "admin" : "user",
           banned: false,
-          migratedFromLocalProfile: isNewAccount !== true,
-          migratedAt: new Date().toISOString(),
           profileUpdatedAt: Date.now()
         });
         markUserNameIndexDirty();
@@ -15894,8 +15513,6 @@ io.on('connection', (socket) => {
         socket.profileSyncAckV1 = supportsProfileSyncAckV1;
         socket.chatHistoryAckV1 = supportsChatHistoryAckV1;
         socket.chatHistoryPullV1 = supportsChatHistoryPullV1;
-        socket.chatBatchDeleteV2 = supportsChatBatchDeleteV2;
-        socket.chatSeenBatchV1 = supportsChatSeenBatchV1;
         normalizeProfileArrayPayloads(userDatabase[name]);
         userCacheMeta[name] = Date.now();
         fullUserCacheNames.delete(name);
@@ -16331,8 +15948,6 @@ io.on('connection', (socket) => {
             delete userData.passwordResetRequired;
             delete userData.passwordResetExpiresAt;
             delete userData.passwordResetCompletedAt;
-            delete userData.passwordRecoveredAt;
-            delete userData.passwordRecoverySource;
         }
 
         if (isUserBanned(workingUser) && !ADMIN_USERS.includes(name)) {
@@ -16660,23 +16275,6 @@ io.on('connection', (socket) => {
     } catch (err) {
       console.error('[USER NOTIFICATION DELETE ERROR]:', err && err.message ? err.message : err);
       respond({ ok: false, unreadCount: 0, error: 'Could not delete the notification.' });
-    }
-  });
-
-  socket.on('user_notifications_consume_chat', async (data = {}, ack) => {
-    const respond = payload => { if (typeof ack === 'function' && socket.connected) { try { ack(payload); } catch (err) {} } };
-    const name = socket.userName;
-    if (!name || !userDatabase[name]) { respond({ ok:false, notificationIds:[], unreadCount:0 }); return; }
-    try {
-      const result = await consumeUserChatNotifications(name, data && data.scope, data && data.messageIds);
-      if (result.notificationIds.length) {
-        emitUserNotificationsConsumedToLocalUser(name, result.notificationIds, result.unreadCount, socket.id);
-        deferServerTask('CHAT NOTIFICATION CONSUME SYNC', () => notifyUserNotificationsConsumedAcrossInstances(name, result.notificationIds, result.unreadCount), 0);
-      }
-      respond({ ok:true, scope:String(data && data.scope || '').toLowerCase(), messageIds:Array.isArray(data && data.messageIds) ? data.messageIds.slice(0, 40) : [], notificationIds:result.notificationIds, unreadCount:result.unreadCount });
-    } catch (err) {
-      console.error('[CHAT NOTIFICATION CONSUME ERROR]:', err && err.message ? err.message : err);
-      respond({ ok:false, notificationIds:[], unreadCount:0 });
     }
   });
 
@@ -17162,20 +16760,19 @@ io.on('connection', (socket) => {
       const clientEpoch = normalizeText(request && request.epoch, '').slice(0, 160);
       const clientRevision = Math.max(0, Number(request && request.revision) || 0);
       const clientSeenCursor = Math.max(0, Number(request && request.seenCursor) || 0);
-      const compactSeen = request && request.chatSeenSummaryV2 === true;
       const initialFullSync = request && request.initialFullSync === true && !clientEpoch && clientRevision === 0;
       if (initialFullSync) socket.__chatInitialFullSyncInFlight = true;
 
       socket.__chatSyncRequestInFlight = (async () => {
         if (initialFullSync) {
-          const stableSnapshot = await getStableInitialChatSyncForUser(socket.userName, clientSeenCursor, compactSeen);
+          const stableSnapshot = await getStableInitialChatSyncForUser(socket.userName);
           if (!stableSnapshot) return { success: false, syncV1: true, retry: true, error: 'Initial chat snapshot did not reach a stable revision.' };
           return stableSnapshot;
         }
 
         const state = await refreshChatSyncStateFromDb();
         const forceSnapshot = request && request.forceSnapshot === true;
-        const seenSync = await getChatSeenSyncSafely(socket.userName, forceSnapshot || !clientEpoch || clientEpoch !== state.epoch || clientRevision > state.revision ? 0 : clientSeenCursor, compactSeen);
+        const seenSync = await getChatSeenSyncSafely(socket.userName, forceSnapshot || !clientEpoch || clientEpoch !== state.epoch || clientRevision > state.revision ? 0 : clientSeenCursor);
 
         const withSeenSync = payload => ({
           ...payload,
@@ -17281,7 +16878,7 @@ io.on('connection', (socket) => {
     if (now - Number(socket.__lastChatSeenSnapshotRequestAt || 0) < 4000) return respond({ success:false, busy:true, seenDegraded:true });
     socket.__lastChatSeenSnapshotRequestAt = now;
     const userName = socket.userName;
-    const seen = await getChatSeenSyncSafely(userName, 0, _request && _request.chatSeenSummaryV2 === true);
+    const seen = await getChatSeenSyncSafely(userName, 0);
     if (userName !== socket.userName || !socket.connected) return;
     respond({ success:true, seenSyncV1:true, seenDegraded:seen.degraded === true,
       seenCursor:seen.cursor, seenEvents:seen.events, seenSummary:seen.summary || [] });
@@ -20043,7 +19640,6 @@ io.on('connection', (socket) => {
     const events = await recordChatSeenEventsBatch(targets, reader);
     if (events.length) {
       emitChatSeenSyncEvents(events);
-      deferServerTask('CHAT SEEN LEGACY COMPAT', () => emitLegacyChatSeenCompat(events), 0);
     }
     return { success: true, seen: targets.length, newSeen: events.length, seenIds: targets.map(target => target.msgId) };
   }
@@ -20067,15 +19663,6 @@ io.on('connection', (socket) => {
       respond({ success: false, seen: 0, seenIds: [] });
     } finally {
       socket.__chatSeenBatchInFlight = false;
-    }
-  });
-
-  socket.on('mark_as_read', async (data = {}) => {
-    recordChatTraceTraffic('legacySeen', 1);
-    try {
-      await processChatSeenBatchForSocket([data && data.msgId]);
-    } catch (err) {
-      console.error('[CHAT SEEN ERROR]:', err && err.message ? err.message : err);
     }
   });
 
@@ -20465,7 +20052,6 @@ async function startServer() {
       console.log(`PSN Database Server running on port ${PORT} (pg pool max ${PG_POOL_MAX}, connect timeout ${PG_CONNECTION_TIMEOUT_MS}ms, idle timeout ${PG_IDLE_TIMEOUT_MS}ms, online cache ${ONLINE_LIST_CACHE_MS}ms, chat sync ${CHAT_SYNC_INTERVAL_MS}ms, instance ${INSTANCE_ID})`);
       startKeepAlivePings();
       scheduleStartupGlobalRetention();
-      scheduleLegacyChatSeenBackfill();
       scheduleContentDownloadIndexMaintenance(30000);
     });
   } catch (err) {
