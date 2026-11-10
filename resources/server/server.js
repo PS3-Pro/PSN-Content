@@ -489,7 +489,7 @@ const ADMIN_STATE_KEYS = {
 // This pool is per server instance, and each instance also holds one dedicated
 // LISTEN/NOTIFY connection. Keep headroom during zero-downtime deploys when
 // old and new instances overlap; PG_POOL_MAX/DB_POOL_MAX can override this.
-const PG_POOL_MAX = Math.max(1, Math.min(10, parseInt(process.env.PG_POOL_MAX || process.env.DB_POOL_MAX || "5", 10) || 5));
+const PG_POOL_MAX = Math.max(1, Math.min(10, parseInt(process.env.PG_POOL_MAX || process.env.DB_POOL_MAX || "4", 10) || 4));
 const PG_CONNECTION_TIMEOUT_MS = Math.max(3000, parseInt(process.env.PG_CONNECTION_TIMEOUT_MS || "10000", 10) || 10000);
 const PG_IDLE_TIMEOUT_MS = Math.max(30000, parseInt(process.env.PG_IDLE_TIMEOUT_MS || "120000", 10) || 120000);
 const PG_QUERY_TIMEOUT_MS = Math.max(5000, parseInt(process.env.PG_QUERY_TIMEOUT_MS || "25000", 10) || 25000);
@@ -953,83 +953,12 @@ function flushDbQueryPerformance() {
     slow:stats.slow, errors:stats.errors, retries:stats.retries, totalMs:stats.total
   })).sort((a,b) => b.totalMs-a.totalMs).slice(0,8);
   dbQueryPerf.clear();
-  console.log('[DB PERF 5MIN]', JSON.stringify({topQueries:summary, pool:{total:pool.totalCount, idle:pool.idleCount, waiting:pool.waitingCount, peakWaiting:dbPerfPeakWaiting, peakConnections:dbPerfPeakConnections}, admission:{enabled:DB_READ_ADMISSION_ENABLED, optionalQueuedPeak:dbAdmissionOptionalPeak, bulkPendingPeak:dbAdmissionBulkPeak, bulkWaits:dbAdmissionBulkWaits}, personalReadReuse:readPersonalCacheStats}));
-  readPersonalCacheStats = { rewards:{fresh:0,shared:0,db:0}, reports:{fresh:0,shared:0,db:0} };
-  dbAdmissionOptionalPeak = 0;
-  dbAdmissionBulkPeak = 0;
-  dbAdmissionBulkWaits = 0;
+  console.log('[DB PERF 5MIN]', JSON.stringify({topQueries:summary, pool:{total:pool.totalCount, idle:pool.idleCount, waiting:pool.waitingCount, peakWaiting:dbPerfPeakWaiting, peakConnections:dbPerfPeakConnections}}));
   dbPerfPeakWaiting = 0;
   dbPerfPeakConnections = 0;
 }
 
-// Keep expensive, nonessential reads from occupying the whole connection
-// pool while new sessions are authenticating. Only read-only labels participate.
-const DB_READ_ADMISSION_ENABLED = process.env.DB_READ_ADMISSION !== '0';
-const DB_OPTIONAL_READ_MAX = Math.max(1, Math.min(2, PG_POOL_MAX - 1));
-const DB_BULK_READ_WAIT_MAX_MS = Math.max(0, Math.min(4000, parseInt(process.env.DB_BULK_READ_WAIT_MAX_MS || '1800', 10) || 1800));
-const DB_OPTIONAL_READ_LABELS = new Set([
-  'SOCIAL UNSEEN READ', 'USER NOTIFICATION READ', 'USER NOTIFICATION DELTA',
-  'USER CONTENT REPORTS READ', 'REWARD NOTICE READ'
-]);
-const DB_BULK_READ_LABELS = new Set([
-  'CONTENT DOWNLOAD COUNTS', 'TRENDING AGGREGATE',
-  'TRENDING AGGREGATE INDEXED', 'TROPHY AGGREGATE'
-]);
-const optionalDbReadQueue = [];
-let optionalDbReadActive = 0;
-let bulkDbReadTail = Promise.resolve();
-let bulkDbReadPending = 0;
-let dbAdmissionOptionalPeak = 0;
-let dbAdmissionBulkPeak = 0;
-let dbAdmissionBulkWaits = 0;
-
-function pumpOptionalDbReads() {
-  while (optionalDbReadActive < DB_OPTIONAL_READ_MAX && optionalDbReadQueue.length) {
-    const job = optionalDbReadQueue.shift();
-    optionalDbReadActive++;
-    Promise.resolve().then(job.task).then(job.resolve, job.reject).finally(() => {
-      optionalDbReadActive--;
-      pumpOptionalDbReads();
-    });
-  }
-}
-
-function runOptionalDbRead(task) {
-  return new Promise((resolve, reject) => {
-    optionalDbReadQueue.push({ task, resolve, reject });
-    dbAdmissionOptionalPeak = Math.max(dbAdmissionOptionalPeak, optionalDbReadQueue.length);
-    pumpOptionalDbReads();
-  });
-}
-
-function runBulkDbRead(task) {
-  bulkDbReadPending++;
-  dbAdmissionBulkPeak = Math.max(dbAdmissionBulkPeak, bulkDbReadPending);
-  const pending = bulkDbReadTail.then(async () => {
-    const started = Date.now();
-    while (Date.now() - started < DB_BULK_READ_WAIT_MAX_MS &&
-      (pool.waitingCount > 0 || (pool.totalCount >= PG_POOL_MAX && pool.idleCount === 0))) {
-      await waitMs(90);
-    }
-    if (Date.now() - started >= 90) dbAdmissionBulkWaits++;
-    return task();
-  });
-  bulkDbReadTail = pending.then(() => null, () => null);
-  return pending.finally(() => { bulkDbReadPending--; });
-}
-
 async function queryDbWithRetry(text, params = [], options = {}) {
-  const label = String(options.label || 'DB QUERY');
-  if (DB_READ_ADMISSION_ENABLED && DB_BULK_READ_LABELS.has(label)) {
-    return runBulkDbRead(() => queryDbWithRetryCore(text, params, options));
-  }
-  if (DB_READ_ADMISSION_ENABLED && DB_OPTIONAL_READ_LABELS.has(label)) {
-    return runOptionalDbRead(() => queryDbWithRetryCore(text, params, options));
-  }
-  return queryDbWithRetryCore(text, params, options);
-}
-
-async function queryDbWithRetryCore(text, params = [], options = {}) {
   const attempts = Math.max(1, Math.min(4, Number(options.attempts) || 2));
   const label = String(options.label || 'DB QUERY');
   let lastError = null;
@@ -2659,20 +2588,15 @@ function scheduleStartupGlobalRetention() {
 }
 
 function scheduleLegacyChatSeenBackfill() {
-  if (process.env.CHAT_SEEN_RECOVER_RECENT === '0') return;
-  let retries = 0;
-  const recover = async () => {
-    if (pool.waitingCount > 0 || chatSeenSnapshotActive > 0) {
-      if (++retries <= 12) deferServerTask('CHAT SEEN RECOVERY', recover, 30000);
+  // Opt-in maintenance only: the legacy migration repeatedly timed out on free Aiven.
+  if (process.env.CHAT_SEEN_LEGACY_BACKFILL !== '1') return;
+  deferServerTask('CHAT SEEN LEGACY BACKFILL', () => {
+    if (pool.waitingCount > 0) {
+      console.log('[CHAT SEEN LEGACY BACKFILL] Deferred until next startup: database busy.');
       return;
     }
-    const recovered = await backfillRecentChatSeenEventsFromLegacyMessages();
-    if (recovered.length) {
-      console.log(`[CHAT SEEN RECOVERY] Restored ${recovered.length} legacy read confirmations.`);
-      emitChatSeenSyncEvents(recovered);
-    }
-  };
-  deferServerTask('CHAT SEEN RECOVERY', recover, 120000);
+    return backfillRecentChatSeenEventsFromLegacyMessages();
+  }, 120000);
 }
 
 async function initDb() {
@@ -3042,7 +2966,6 @@ async function initDb() {
       PRIMARY KEY (user_name, reward_id)
     );
     CREATE INDEX IF NOT EXISTS idx_user_reward_notices_user_date ON user_reward_notices (user_name, created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_user_reward_notices_active ON user_reward_notices (user_name, created_at DESC) WHERE dismissed = FALSE;
     CREATE TABLE IF NOT EXISTS user_catalog_notification_seen (
       user_name TEXT NOT NULL,
       event_key TEXT NOT NULL,
@@ -6548,63 +6471,7 @@ async function refreshBlockedStoreContentFromDb() {
   return blockedStoreContent;
 }
 
-// Short-lived per-user snapshots only; all writes and cross-instance notices invalidate them.
-// In-flight results cannot repopulate a snapshot after invalidation.
-const PERSONAL_READ_TTL_MS = Math.max(0, Math.min(5000, Number(process.env.PERSONAL_READ_TTL_MS ?? 1500) || 0));
-let readPersonalCacheStats = { rewards:{fresh:0,shared:0,db:0}, reports:{fresh:0,shared:0,db:0} };
-function createPersonalReadReuse(group) {
-  const entries = new Map();
-  return {
-    invalidate(name = '') {
-      if (name) entries.delete(name);
-      else entries.clear();
-    },
-    get(name, load) {
-      const now = Date.now();
-      const existing = entries.get(name);
-      if (existing) {
-        if (existing.pending) {
-          readPersonalCacheStats[group].shared++;
-          return existing.pending;
-        }
-        if (PERSONAL_READ_TTL_MS && existing.validUntil > now) {
-          readPersonalCacheStats[group].fresh++;
-          return Promise.resolve(existing.value);
-        }
-        entries.delete(name);
-      }
-      if (entries.size >= 64) entries.delete(entries.keys().next().value);
-      const entry = { pending:null, value:null, validUntil:0 };
-      readPersonalCacheStats[group].db++;
-      entry.pending = Promise.resolve().then(load).then(value => {
-        if (entries.get(name) === entry) {
-          if (PERSONAL_READ_TTL_MS) {
-            entry.value = value;
-            entry.validUntil = Date.now() + PERSONAL_READ_TTL_MS;
-            entry.pending = null;
-          } else entries.delete(name);
-        }
-        return value;
-      }, err => {
-        if (entries.get(name) === entry) entries.delete(name);
-        throw err;
-      });
-      entries.set(name, entry);
-      return entry.pending;
-    }
-  };
-}
-const userContentReportsReadReuse = createPersonalReadReuse('reports');
-function invalidateUserContentReportsRead(reporter = '') {
-  userContentReportsReadReuse.invalidate(reporter);
-}
-function getUserContentReports(userName) {
-  const reporter = normalizeText(userName, '');
-  if (!reporter) return Promise.resolve([]);
-  return userContentReportsReadReuse.get(reporter, () => readUserContentReportsFromDb(reporter));
-}
-
-async function readUserContentReportsFromDb(userName) {
+async function getUserContentReports(userName) {
   const reporter = normalizeText(userName, '');
   if (!reporter) return [];
   const result = await queryDbWithRetry(
@@ -6676,7 +6543,6 @@ async function publishContentReportsChanged(options = {}) {
   const mineReport = options.mineReport && typeof options.mineReport === 'object' ? options.mineReport : null;
   const adminNotice = options.adminNotice && typeof options.adminNotice === 'object' ? options.adminNotice : null;
   const sourceSocketId = normalizeText(options.sourceSocketId, '');
-  invalidateUserContentReportsRead(reporter && !clearedReportKey ? reporter : '');
   let adminDelta = null;
   const adminsConnected = hasAdminSockets();
 
@@ -8725,15 +8591,15 @@ function getCurrentChatMessageIds() {
 
 async function backfillRecentChatSeenEventsFromLegacyMessages() {
   try {
-    const result = await queryDbWithRetry(
-      `WITH most_recent AS MATERIALIZED (
-         SELECT message FROM chat ORDER BY id DESC LIMIT $1
-       ),
-       recent AS MATERIALIZED (
-         SELECT message FROM most_recent
+    await queryDbWithRetry(
+      `WITH recent AS (
+         SELECT message
+         FROM chat
          WHERE jsonb_typeof(message->'seenBy') = 'array'
            AND COALESCE(message->>'time', '') <> ''
            AND COALESCE(message->>'user', '') <> ''
+         ORDER BY id DESC
+         LIMIT $1
        ),
        legacy AS (
          SELECT
@@ -8746,24 +8612,17 @@ async function backfillRecentChatSeenEventsFromLegacyMessages() {
          WHERE COALESCE(seen.reader, '') <> ''
        )
        INSERT INTO chat_seen_events (message_id, sender, reader, seen_at)
-       SELECT message_id, sender, reader, seen_at FROM legacy
-       ON CONFLICT (message_id, reader) DO NOTHING
-       RETURNING id, message_id, sender, reader, seen_at`,
+       SELECT message_id, sender, reader, seen_at
+       FROM legacy
+       ON CONFLICT (message_id, reader) DO NOTHING`,
       [MAX_CHAT_HISTORY],
-      { attempts: 1, label: 'CHAT SEEN RECOVERY', queryTimeoutMs: 6000 }
+      { attempts: 2, label: 'CHAT SEEN LEGACY BACKFILL' }
     );
-    return (result.rows || []).map(row => ({
-      eventId: Math.max(0, Number(row.id) || 0),
-      msgId: String(row.message_id || ''),
-      sender: String(row.sender || ''),
-      reader: String(row.reader || ''),
-      seenAt: row.seen_at ? new Date(row.seen_at).toISOString() : ''
-    })).filter(event => event.eventId && event.msgId && event.reader);
   } catch (err) {
-    console.warn('[CHAT SEEN RECOVERY] Skipped:', err && err.message ? err.message : err);
-    return [];
+    console.warn('[CHAT SEEN LEGACY BACKFILL] Skipped:', err && err.message ? err.message : err);
   }
 }
+
 // Optional Seen snapshots must never monopolize the small Aiven connection
 // pool. Coalesce identical viewer requests; defer others and retry via normal
 // Seen sync without advancing their cursor.
@@ -8780,20 +8639,20 @@ async function getChatSeenSnapshotForUser(userName = '') {
   const messageIds = getCurrentChatMessageIds();
   if (!messageIds.length) return [];
   chatSeenSnapshotActive++;
-  // Keep sender and reader lookups independent; do not join every chat ID.
+  // The UNIQUE(message_id, reader) index already exists. Probe the current
+  // message IDs directly instead of letting the planner scan a growing Seen
+  // event history for OR(sender,reader). Disable with CHAT_SEEN_INDEX_LOOKUP=0.
   const useIndexedLookup = process.env.CHAT_SEEN_INDEX_LOOKUP !== '0';
   const query = useIndexedLookup
     ? `SELECT seen.id, seen.message_id, seen.sender, seen.reader, seen.seen_at
-       FROM (
+       FROM (SELECT DISTINCT unnest($1::text[]) AS message_id) wanted
+       JOIN LATERAL (
          SELECT id, message_id, sender, reader, seen_at
          FROM chat_seen_events
-         WHERE sender = $2::text AND message_id = ANY($1::text[])
-         UNION ALL
-         SELECT id, message_id, sender, reader, seen_at
-         FROM chat_seen_events
-         WHERE reader = $2::text AND sender IS DISTINCT FROM $2::text
-           AND message_id = ANY($1::text[])
-       ) seen
+         WHERE message_id = wanted.message_id
+           AND (sender = $2::text OR reader = $2::text)
+         OFFSET 0
+       ) seen ON TRUE
        ORDER BY seen.id ASC`
     : `SELECT id, message_id, sender, reader, seen_at
        FROM chat_seen_events
@@ -11546,8 +11405,6 @@ async function initProfileSyncNotifications() {
         }
         if (key === ADMIN_STATE_KEYS.contentReports) {
           const state = data && data.state && typeof data.state === 'object' ? data.state : {};
-          const affectedReporter = normalizeText(state.reporter, '');
-          invalidateUserContentReportsRead(affectedReporter && !state.clearedReportKey ? affectedReporter : '');
           const changedReportKey = normalizeText(state.reportKey || state.clearedReportKey, '');
           const clearedReportKey = normalizeText(state.clearedReportKey, '');
           if (hasAdminSockets()) {
@@ -13182,17 +13039,29 @@ function serializeUserRewardNoticeRow(row) {
   };
 }
 
-const rewardNoticeReadReuse = createPersonalReadReuse('rewards');
+// Initial logins from multiple tabs can share the same reward-notice read.
+// Release settled data immediately, and detach old reads after mutations or
+// cross-instance updates so a new request never joins a stale snapshot.
+const rewardNoticeReadsPending = new Map();
+const REWARD_NOTICE_PENDING_MAX = 64;
 function invalidateRewardNoticeRead(userName) {
-  rewardNoticeReadReuse.invalidate(String(userName || ''));
+  rewardNoticeReadsPending.delete(String(userName || ''));
 }
 function getUserRewardNotices(userName) {
   const name = String(userName || '');
-  return rewardNoticeReadReuse.get(name, () => queryDbWithRetry(
+  const existing = rewardNoticeReadsPending.get(name);
+  if (existing) return existing;
+  const pending = queryDbWithRetry(
     `SELECT user_name, reward_id, trophy_id, title, kind, image_url, created_at, seen, visited
      FROM user_reward_notices WHERE user_name = $1 AND dismissed = FALSE ORDER BY created_at DESC LIMIT 100`,
     [name], { attempts: 2, label: 'REWARD NOTICE READ' }
-  ).then(result => result.rows.map(serializeUserRewardNoticeRow)));
+  ).then(result => result.rows.map(serializeUserRewardNoticeRow));
+  if (rewardNoticeReadsPending.size >= REWARD_NOTICE_PENDING_MAX) return pending;
+  rewardNoticeReadsPending.set(name, pending);
+  pending.finally(() => {
+    if (rewardNoticeReadsPending.get(name) === pending) rewardNoticeReadsPending.delete(name);
+  }).catch(() => {});
+  return pending;
 }
 
 async function mutateUserRewardNotices(userName, raw = {}) {
@@ -14115,8 +13984,6 @@ async function deleteUserAccount(targetName, reason, adminName, options = {}) {
   }, { advisoryLockKey: `content-report-user:${targetName.toLowerCase()}` });
 
   if (dbDelete && dbDelete.missing) return { success: false, message: "User not found." };
-  invalidateUserContentReportsRead(targetName);
-  invalidateRewardNoticeRead(targetName);
   // Removing a player changes global rarity even if no trophy was unlocked.
   invalidateGlobalTrophyStatsCache();
   scheduleTrophyStatsRefreshBroadcast(1200);
