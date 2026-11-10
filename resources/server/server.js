@@ -5202,6 +5202,246 @@ function setCachedContentDownloadCount(key, count) {
   }
 }
 
+// An indexed, deduplicated (user, content) projection replaces repeated JSONB
+// scans once populated. All profile writes maintain it in the same transaction.
+const CONTENT_DOWNLOAD_INDEX_VERSION = 1;
+const CONTENT_DOWNLOAD_INDEX_BATCH_SIZE = Math.max(10, Math.min(100, parseInt(process.env.CONTENT_DOWNLOAD_INDEX_BATCH_SIZE || '35', 10) || 35));
+let contentDownloadIndexSchemaReady = false;
+let contentDownloadIndexReady = false;
+let contentDownloadIndexInitializing = false;
+let contentDownloadIndexTimer = null;
+let contentDownloadIndexLastErrorAt = 0;
+let contentDownloadIndexBuiltUsers = 0;
+
+function scheduleContentDownloadIndexMaintenance(delayMs = 30000) {
+  if (process.env.CONTENT_DOWNLOAD_COUNT_INDEX === '0' || contentDownloadIndexReady || contentDownloadIndexTimer !== null || contentDownloadIndexInitializing) return;
+  contentDownloadIndexTimer = setTimeout(() => {
+    contentDownloadIndexTimer = null;
+    maintainContentDownloadIndex().catch(error => {
+      const now = Date.now();
+      if (now - contentDownloadIndexLastErrorAt > 60000) {
+        contentDownloadIndexLastErrorAt = now;
+        console.warn('[CONTENT DOWNLOAD INDEX] Retrying in background:', error && error.message || error);
+      }
+      scheduleContentDownloadIndexMaintenance(60000);
+    });
+  }, Math.max(1000, delayMs));
+}
+
+async function createContentDownloadIndexSchema() {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Two Render instances can overlap during a deploy. Serialize schema changes.
+    await client.query("SELECT pg_advisory_xact_lock(hashtext('psn_content_download_index_schema_v1'))");
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS psn_content_download_memberships (
+        username TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+        content_key TEXT NOT NULL,
+        PRIMARY KEY (username, content_key)
+      );
+      CREATE INDEX IF NOT EXISTS idx_psn_content_download_memberships_key
+        ON psn_content_download_memberships(content_key);
+      CREATE TABLE IF NOT EXISTS psn_content_download_index_users (
+        username TEXT PRIMARY KEY REFERENCES users(name) ON DELETE CASCADE
+      );
+      CREATE TABLE IF NOT EXISTS psn_content_download_index_meta (
+        version INTEGER PRIMARY KEY,
+        ready BOOLEAN NOT NULL DEFAULT FALSE
+      );
+      INSERT INTO psn_content_download_index_meta(version, ready)
+      VALUES (${CONTENT_DOWNLOAD_INDEX_VERSION}, FALSE)
+      ON CONFLICT (version) DO NOTHING;
+    `);
+    await client.query(`
+      CREATE OR REPLACE FUNCTION psn_content_download_keys(downloads JSONB)
+      RETURNS TABLE(content_key TEXT)
+      LANGUAGE SQL IMMUTABLE PARALLEL SAFE AS $psnkeys$
+        WITH download_items AS (
+          SELECT
+            CASE raw_category
+              WHEN 'game' THEN 'games'
+              WHEN 'app' THEN 'apps'
+              WHEN 'demo' THEN 'demos'
+              WHEN 'dlc' THEN 'dlcs'
+              WHEN 'update' THEN 'updates'
+              WHEN 'guide' THEN 'guides'
+              WHEN 'soundtrack' THEN 'soundtracks'
+              WHEN 'video' THEN 'videos'
+              WHEN 'movie' THEN 'videos'
+              WHEN 'movies' THEN 'videos'
+              WHEN 'avatar' THEN 'avatars'
+              WHEN 'theme' THEN 'themes'
+              WHEN 'homebrew' THEN 'homebrew_games'
+              WHEN 'port' THEN 'ports'
+              WHEN 'prototype' THEN 'prototypes'
+              WHEN 'emulator' THEN 'emulators'
+              WHEN 'launcher' THEN 'launchers'
+              WHEN 'tool' THEN 'tools'
+              WHEN 'dev_tool' THEN 'dev_tools'
+              WHEN 'manager' THEN 'backup_manager'
+              ELSE COALESCE(NULLIF(raw_category, ''), 'games')
+            END AS category,
+            CASE WHEN upper(trim(COALESCE(item->>'titleId', item->>'id', ''))) IN ('MISSING','N/A','NONE','NULL','UNDEFINED') THEN '' ELSE upper(trim(COALESCE(item->>'titleId', item->>'id', ''))) END AS title_id,
+            CASE WHEN upper(trim(COALESCE(item->>'contentId', item->>'contentID', ''))) IN ('MISSING','N/A','NONE','NULL','UNDEFINED') THEN '' ELSE upper(trim(COALESCE(item->>'contentId', item->>'contentID', ''))) END AS content_id,
+            regexp_replace(lower(replace(trim(COALESCE(item->>'cleanName', item->>'name', item->>'title', item->>'rawName', '')), '&amp;', '&')), '[^a-z0-9]+', '', 'g') AS normalized_name
+          FROM jsonb_array_elements(
+            CASE WHEN jsonb_typeof(downloads) = 'array' THEN downloads ELSE '[]'::jsonb END
+          ) item
+          CROSS JOIN LATERAL (
+            SELECT regexp_replace(lower(trim(COALESCE(item->>'category', item->>'rawCategory', 'games'))), '[[:space:]-]+', '_', 'g') AS raw_category
+          ) cat
+        ), keyed AS (
+          SELECT CASE
+            WHEN category = 'games' AND title_id <> '' THEN category || '|T:' || title_id
+            WHEN content_id <> '' THEN category || '|C:' || content_id
+            WHEN title_id <> '' AND normalized_name <> '' THEN category || '|T:' || title_id || '|N:' || normalized_name
+            WHEN title_id <> '' THEN category || '|T:' || title_id
+            WHEN normalized_name <> '' THEN category || '|N:' || normalized_name
+            ELSE ''
+          END AS content_key
+          FROM download_items
+        )
+        SELECT DISTINCT keyed.content_key
+        FROM keyed
+        WHERE keyed.content_key <> ''
+          AND length(keyed.content_key) <= 512
+          AND octet_length(keyed.content_key) <= 2048;
+      $psnkeys$;
+    `);
+    await client.query(`
+      CREATE OR REPLACE FUNCTION psn_content_download_memberships_sync()
+      RETURNS TRIGGER LANGUAGE plpgsql AS $psnsync$
+      BEGIN
+        DELETE FROM psn_content_download_memberships WHERE username = NEW.name;
+        INSERT INTO psn_content_download_memberships (username, content_key)
+        SELECT NEW.name, k.content_key
+        FROM psn_content_download_keys(NEW.data->'downloadsData') k;
+        INSERT INTO psn_content_download_index_users(username)
+        VALUES (NEW.name) ON CONFLICT (username) DO NOTHING;
+        RETURN NEW;
+      END;
+      $psnsync$;
+    `);
+    await client.query(`
+      DO $psntriggers$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = 'users'::regclass AND tgname = 'psn_download_index_insert') THEN
+          CREATE TRIGGER psn_download_index_insert AFTER INSERT ON users
+          FOR EACH ROW EXECUTE FUNCTION psn_content_download_memberships_sync();
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = 'users'::regclass AND tgname = 'psn_download_index_update') THEN
+          CREATE TRIGGER psn_download_index_update AFTER UPDATE OF data ON users
+          FOR EACH ROW WHEN (OLD.data->'downloadsData' IS DISTINCT FROM NEW.data->'downloadsData')
+          EXECUTE FUNCTION psn_content_download_memberships_sync();
+        END IF;
+      END $psntriggers$;
+    `);
+    await client.query('COMMIT');
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function backfillContentDownloadIndexBatch() {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query("SET LOCAL lock_timeout = '1500ms'");
+    await client.query("SET LOCAL statement_timeout = '10000ms'");
+    // Lock each source row while indexing it. Concurrent profile updates run
+    // after the backfill and refresh that same row through the trigger.
+    const selected = await client.query(`
+      SELECT u.name FROM users u
+      WHERE NOT EXISTS (
+        SELECT 1 FROM psn_content_download_index_users indexed WHERE indexed.username = u.name
+      )
+      ORDER BY u.name LIMIT $1 FOR UPDATE OF u SKIP LOCKED
+    `, [CONTENT_DOWNLOAD_INDEX_BATCH_SIZE]);
+    const names = selected.rows.map(row => row.name);
+    if (names.length) {
+      await client.query(`
+        INSERT INTO psn_content_download_memberships(username, content_key)
+        SELECT u.name, k.content_key
+        FROM users u
+        CROSS JOIN LATERAL psn_content_download_keys(u.data->'downloadsData') k
+        WHERE u.name = ANY($1::text[])
+        ON CONFLICT (username, content_key) DO NOTHING
+      `, [names]);
+      await client.query(`
+        INSERT INTO psn_content_download_index_users(username)
+        SELECT unnest($1::text[]) ON CONFLICT (username) DO NOTHING
+      `, [names]);
+    }
+    await client.query('COMMIT');
+    return names.length;
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function maintainContentDownloadIndex() {
+  if (process.env.CONTENT_DOWNLOAD_COUNT_INDEX === '0' || contentDownloadIndexReady || contentDownloadIndexInitializing) return;
+  if (pool.waitingCount > 0 || (pool.totalCount > 0 && pool.idleCount === 0)) {
+    scheduleContentDownloadIndexMaintenance(5000);
+    return;
+  }
+  contentDownloadIndexInitializing = true;
+  let nextDelay = 500;
+  try {
+    if (!contentDownloadIndexSchemaReady) {
+      await createContentDownloadIndexSchema();
+      contentDownloadIndexSchemaReady = true;
+    }
+    const status = await pool.query('SELECT ready FROM psn_content_download_index_meta WHERE version = $1', [CONTENT_DOWNLOAD_INDEX_VERSION]);
+    if (status.rows[0] && status.rows[0].ready === true) {
+      contentDownloadIndexReady = true;
+    } else if (pool.waitingCount > 0 || (pool.totalCount > 0 && pool.idleCount === 0)) {
+      nextDelay = 5000;
+    } else {
+      const processed = await backfillContentDownloadIndexBatch();
+      contentDownloadIndexBuiltUsers += processed;
+      if (processed && contentDownloadIndexBuiltUsers % (CONTENT_DOWNLOAD_INDEX_BATCH_SIZE * 20) < processed) {
+        console.log(`[CONTENT DOWNLOAD INDEX] Background build: ${contentDownloadIndexBuiltUsers} user profiles processed in this run.`);
+      }
+      if (!processed) {
+        // SKIP LOCKED may temporarily skip rows being updated by another
+        // connection; never enable indexed reads until every user has a marker.
+        const completion = await pool.query(`
+          UPDATE psn_content_download_index_meta
+          SET ready = TRUE
+          WHERE version = $1 AND NOT EXISTS (
+            SELECT 1 FROM users u WHERE NOT EXISTS (
+              SELECT 1 FROM psn_content_download_index_users marked WHERE marked.username = u.name
+            )
+          ) RETURNING ready
+        `, [CONTENT_DOWNLOAD_INDEX_VERSION]);
+        if (completion.rows.length) contentDownloadIndexReady = true;
+        else nextDelay = 5000;
+      }
+    }
+    if (contentDownloadIndexReady) {
+      clearContentDownloadCountCache();
+      console.log('[CONTENT DOWNLOAD INDEX] Ready. Counts now use indexed unique user/content rows.');
+    }
+  } catch (error) {
+    nextDelay = 60000;
+    const now = Date.now();
+    if (now - contentDownloadIndexLastErrorAt > 60000) {
+      contentDownloadIndexLastErrorAt = now;
+      console.warn('[CONTENT DOWNLOAD INDEX] Staying on original SQL; retrying later:', error && error.message || error);
+    }
+  } finally {
+    contentDownloadIndexInitializing = false;
+    if (!contentDownloadIndexReady) scheduleContentDownloadIndexMaintenance(nextDelay);
+  }
+}
+
 // Filter by the inexpensive raw IDs before normalizing category/name for every
 // download. Name-only and unusual keys keep the original exact-count SQL.
 function getContentDownloadCountCandidateIds(keys = []) {
@@ -5262,14 +5502,23 @@ function scheduleContentDownloadCountBatch() {
         }
       }
       if (queryKeys.length) {
-      const candidateIds = process.env.CONTENT_DOWNLOAD_COUNT_ID_FILTER === '0'
+      const useContentIndex = contentDownloadIndexReady && process.env.CONTENT_DOWNLOAD_COUNT_INDEX !== '0' &&
+        queryKeys.every(key => Buffer.byteLength(key, 'utf8') <= 2048);
+      const candidateIds = useContentIndex || process.env.CONTENT_DOWNLOAD_COUNT_ID_FILTER === '0'
         ? null : getContentDownloadCountCandidateIds(queryKeys);
       const candidateFilter = candidateIds ? `
           WHERE (
             upper(trim(COALESCE(item->>'titleId', item->>'id', ''))) = ANY($2::text[])
             OR upper(trim(COALESCE(item->>'contentId', item->>'contentID', ''))) = ANY($3::text[])
           )` : '';
-      const rows = await queryDbWithRetry(`
+      const rows = useContentIndex
+        ? await queryDbWithRetry(`
+            SELECT content_key AS key, COUNT(*)::int AS count
+            FROM psn_content_download_memberships
+            WHERE content_key = ANY($1::text[])
+            GROUP BY content_key
+          `, [queryKeys], { attempts: 2, label: 'CONTENT DOWNLOAD COUNTS INDEXED' })
+        : await queryDbWithRetry(`
         WITH download_items AS (
           SELECT
             u.name AS username,
@@ -19949,6 +20198,7 @@ async function startServer() {
       startKeepAlivePings();
       scheduleStartupGlobalRetention();
       scheduleLegacyChatSeenBackfill();
+      scheduleContentDownloadIndexMaintenance(30000);
     });
   } catch (err) {
     console.error('[STARTUP ERROR]:', err);

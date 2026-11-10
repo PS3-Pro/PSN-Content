@@ -1388,7 +1388,6 @@ html.ios-webkit #object-particles { contain:strict; }
 #downloads-list .download-swipe-row:is(.is-open,.is-swiping) .download-item.store-download-unavailable::after { background: var(--dl-accent) !important; box-shadow: 0 0 12px var(--dl-accent) !important; opacity: .95 !important; }
 #downloads-list .download-swipe-row:is(.is-open,.is-swiping) .download-item.store-download-unavailable .dl-cover-wrap, #downloads-list .download-swipe-row:is(.is-open,.is-swiping) .download-item.store-download-unavailable .dl-main-info, #downloads-list .download-swipe-row:is(.is-open,.is-swiping) .download-item.store-download-unavailable .dl-size-tag { filter: none; opacity: 1; }
 .game-card.category-remove-effect, .game-card.category-remove-effect:hover { animation: categoryRemoveItem .66s cubic-bezier(.2,.8,.22,1) forwards !important; pointer-events: none !important; z-index: 35 !important; opacity: 1; transform-origin: center center; }
-:is(.game-card,.trophy-card,.online-user-item,.play-together-social-item,.notification-swipe-row,.friend-activity-swipe-row).psn-collection-filter-exit-ghost { position: fixed !important; pointer-events: none !important; margin: 0 !important; transition: none !important; animation: none !important; transform-origin: center center !important; z-index: 9998 !important; contain: layout paint; }
 .game-card.category-remove-effect .game-img { opacity: 1 !important; transition: none !important; }
 .game-card.category-new-highlight { position: relative; opacity: 1 !important; transform: none !important; outline: 2px solid var(--ps-blue) !important; outline-offset: 3px; box-shadow: 0 0 0 2px rgba(255,255,255,.35),0 0 28px var(--ps-neon),0 0 55px rgba(0,112,204,.32) !important; filter: brightness(1.16); animation: categoryNewItemPulse 1.15s ease-in-out 5 !important; z-index: 25; }
 .game-card.category-wishlist-entry, .game-card.category-favorites-entry { opacity: 0; animation: categoryWishlistNewItemReveal .82s cubic-bezier(.2,.8,.2,1) forwards !important; }
@@ -4346,6 +4345,15 @@ body.chat-selection-mode .chat-message-actions .chat-delete-action:not(.chat-del
 .user-notification-item.anim-reveal { opacity:0; animation:friendPopReveal .34s cubic-bezier(.2,.8,.2,1) backwards; animation-delay:calc(var(--tile-idx,0)*.022s); }
 #friends-list-grid .online-user-item.friend-removing { pointer-events: none !important; animation: friendRemoveItem .78s cubic-bezier(.22,.61,.36,1) forwards !important; transform-origin: center center; will-change: transform,opacity,filter; z-index: 20; }
 #friends-list-grid .online-user-item.friend-adding { animation: friendAddItem .78s cubic-bezier(.22,.61,.36,1) both !important; transform-origin: center center; will-change: transform,opacity,filter; z-index: 20; }
+@keyframes psnCollectionFilterExit { 0% { opacity:1; transform:translate3d(0,0,0) scale(1); filter:brightness(1); } 48% { opacity:.78; transform:translate3d(0,2px,0) scale(.988); filter:brightness(1.02); } 100% { opacity:0; transform:translate3d(0,10px,0) scale(.96); filter:brightness(.92); } }
+#friends-list-grid .online-user-item.psn-filter-exiting, #social-play-together-list .play-together-social-item.psn-filter-exiting { position:absolute !important; margin:0 !important; pointer-events:none !important; animation:psnCollectionFilterExit .34s cubic-bezier(.22,.61,.36,1) both !important; transform-origin:center center; }
+@keyframes psnFriendFilterCenterExit { 0% { opacity:1; transform:scale(1); filter:grayscale(0) brightness(1); } 50% { opacity:.82; transform:scale(.96); filter:grayscale(.16) brightness(.99); } 100% { opacity:0; transform:scale(.86); filter:grayscale(.38) brightness(.97); } }
+#friends-list-grid .online-user-item.psn-filter-exiting { animation:psnFriendFilterCenterExit .4s cubic-bezier(.22,.61,.36,1) both !important; transform-origin:50% 50% !important; }
+/* Play Together filter switches are sequential: old rows exit before new rows exist. */
+#social-play-together-list > .play-together-social-item.psn-filter-switch-exiting { pointer-events:none !important; animation:psnCollectionFilterExit .30s cubic-bezier(.22,.61,.36,1) both !important; }
+#social-play-together-list > .play-together-social-item.psn-filter-switch-entering { animation:friendPopReveal .34s cubic-bezier(.2,.8,.2,1) both !important; }
+@media (prefers-reduced-motion:reduce) { #friends-list-grid .online-user-item.psn-filter-exiting, #social-play-together-list .play-together-social-item.psn-filter-exiting, #social-play-together-list > .play-together-social-item.psn-filter-switch-exiting, #social-play-together-list > .play-together-social-item.psn-filter-switch-entering { animation:none !important; } }
+
 .reward-card.no-anim, .online-user-item.no-anim, .setting-item.no-anim, .promo-card-dark.no-anim, .trophy-card.no-anim { opacity: 1 !important; animation: none !important; transform: none !important; }
 .reward-card.no-anim:is(:hover,.psn-hover-stable) { transform: translateY(-3px) !important; }
 .setting-item.no-anim:is(:hover,.psn-hover-stable), .trophy-card.no-anim:is(:hover,.psn-hover-stable) { transform: translateY(-3px) !important; }
@@ -35379,6 +35387,131 @@ P
 		return contentId || titleId ? `item:${contentId || titleId}` : '';
 	}
 
+	const collectionFilterExitLayers = new WeakMap();
+
+	function getCollectionFilterExitIdentity(card, scope) {
+		if (!card) return '';
+		if (scope === 'playTogether') {
+			const titleId = String(card.dataset.playTogetherTitleId || '').trim();
+			return titleId ? `play:${titleId}` : '';
+		}
+		return scope === 'friends' ? getCollectionFilterMotionCardKey(card) : '';
+	}
+
+	function clearCollectionFilterExitLayer(grid) {
+		const active = collectionFilterExitLayers.get(grid);
+		if (!active) return;
+		collectionFilterExitLayers.delete(grid);
+		clearTimeout(active.timer);
+		active.layer.remove();
+		if (active.positionChanged) grid.style.position = active.previousPosition;
+	}
+
+	function animateCollectionFilterRemovedCards(snapshot) {
+		if (!snapshot || !snapshot.exitCandidates || !snapshot.exitCandidates.length ||
+			document.hidden || browseMotionReduced() || typeof Element.prototype.animate !== 'function') return 0;
+		const config = getCollectionFilterMotionConfig(snapshot.scope);
+		const grid = config && document.getElementById(config.gridId);
+		if (!grid) return 0;
+		const remaining = new Set(Array.from(grid.querySelectorAll(config.itemSelector))
+			.map(card => getCollectionFilterExitIdentity(card, snapshot.scope)).filter(Boolean));
+		const departing = snapshot.exitCandidates.filter(entry =>
+			entry.identity && !remaining.has(entry.identity) && !entry.card.isConnected);
+		if (!departing.length) return 0;
+
+		clearCollectionFilterExitLayer(grid);
+		const previousPosition = grid.style.position;
+		const positionChanged = getComputedStyle(grid).position === 'static';
+		if (positionChanged) grid.style.position = 'relative';
+		const layer = document.createElement('div');
+		layer.className = 'psn-collection-filter-exit-layer';
+		layer.setAttribute('aria-hidden', 'true');
+		layer.style.cssText = 'position:absolute;inset:0;height:0;pointer-events:none;z-index:6;overflow:visible;';
+		grid.appendChild(layer);
+		const gridRect = grid.getBoundingClientRect();
+		for (const entry of departing.slice(0, 12)) {
+			const card = entry.card;
+			const rect = entry.rect;
+			card.classList.remove('no-anim', 'anim-reveal', 'friend-adding', 'psn-hover-stable');
+			card.classList.add('psn-filter-exiting');
+			card.style.position = 'absolute';
+			card.style.left = `${rect.left - gridRect.left - grid.clientLeft}px`;
+			card.style.top = `${rect.top - gridRect.top - grid.clientTop}px`;
+			// Keep each Friends card at its own width; the grid forces width:100% !important.
+			if (snapshot.scope === 'friends') card.style.setProperty('width', `${rect.width}px`, 'important');
+			else card.style.width = `${rect.width}px`;
+			card.style.height = `${rect.height}px`;
+			card.style.margin = '0';
+			card.setAttribute('inert', '');
+			layer.appendChild(card);
+		}
+		const exitCleanupMs = snapshot.scope === 'friends' ? 455 : 385;
+		const timer = setTimeout(() => clearCollectionFilterExitLayer(grid), exitCleanupMs);
+		collectionFilterExitLayers.set(grid, { layer, timer, previousPosition, positionChanged });
+		return layer.childElementCount;
+	}
+
+	// Regression guard: finish Play Together exits before rendering the next filter.
+	const playTogetherFilterSwitches = new WeakMap();
+
+	function settlePlayTogetherFilterSwitch(grid, session) {
+		if (!grid || !session || playTogetherFilterSwitches.get(grid) !== session) return;
+		playTogetherFilterSwitches.delete(grid);
+		clearTimeout(session.timer);
+		delete grid.dataset.psnPlayTogetherFilterExit;
+		grid.querySelectorAll(':scope > .psn-filter-switch-exiting').forEach(card => card.classList.remove('psn-filter-switch-exiting'));
+	}
+
+	function startPlayTogetherFilterSwitch(config, options = {}) {
+		const grid = document.getElementById(config.gridId);
+		if (!grid) return false;
+		const requested = String(window.__socialPlayTogetherFilter || 'me') + '|' + String(window.__socialPlayTogetherOwnedFilter || 'all');
+		const current = String(grid.dataset.socialPlayTogetherRenderedFilter || '') + '|' + String(grid.dataset.socialPlayTogetherRenderedOwnedFilter || 'all');
+		const ongoing = playTogetherFilterSwitches.get(grid);
+		if (ongoing) {
+			if (requested === ongoing.previousContext || options.revealNew === false) {
+				settlePlayTogetherFilterSwitch(grid, ongoing);
+				config.render();
+			} else {
+				ongoing.options = options;
+			}
+			return true;
+		}
+		if (options.skipPlayTogetherStaging || options.revealNew === false ||
+			current.startsWith('|') || current === requested || !grid.querySelector(':scope > .play-together-social-item') ||
+			document.hidden || browseMotionReduced() || typeof Element.prototype.animate !== 'function') return false;
+
+		cancelCollectionFilterMotionAnimations(grid);
+		clearCollectionFilterExitLayer(grid);
+		settleCollectionFilterReveals(grid);
+		grid.querySelectorAll(':scope > .psn-filter-switch-entering').forEach(card => card.classList.remove('psn-filter-switch-entering'));
+		const oldCards = Array.from(grid.querySelectorAll(':scope > .play-together-social-item'));
+		grid.dataset.psnPlayTogetherFilterExit = '1';
+		oldCards.forEach(card => card.classList.add('psn-filter-switch-exiting'));
+		const session = { previousContext:current, options, timer:null };
+		playTogetherFilterSwitches.set(grid, session);
+		session.timer = setTimeout(() => {
+			if (playTogetherFilterSwitches.get(grid) !== session) return;
+			settlePlayTogetherFilterSwitch(grid, session);
+			window.applyCollectionToolbarFilterChange('playTogether', {
+				...session.options,
+				skipPlayTogetherStaging:true,
+				skipCollectionExit:true,
+				skipCollectionMove:true,
+				revealNew:false
+			});
+			if (document.hidden || browseMotionReduced()) return;
+			grid.querySelectorAll(':scope > .play-together-social-item').forEach(card => {
+				card.classList.remove('anim-reveal');
+				card.classList.add('psn-filter-switch-entering');
+				const end = () => card.classList.remove('psn-filter-switch-entering');
+				card.addEventListener('animationend', end, {once:true});
+				setTimeout(end, 450);
+			});
+		}, 320);
+		return true;
+	}
+
 	const collectionFilterMotionActiveAnimations = new WeakMap();
 
 	function trackCollectionFilterMotionAnimation(grid, animation) {
@@ -35423,6 +35556,7 @@ P
 		if (!config || !grid) return null;
 
 		cancelCollectionFilterMotionAnimations(grid);
+		clearCollectionFilterExitLayer(grid);
 		settleCollectionFilterReveals(grid);
 		const scrollArea = document.getElementById('scroll-area') || document.querySelector('.content');
 		const boundedOrderFlip = scope === 'trophies' && options.orderFlip === true;
@@ -35436,7 +35570,7 @@ P
 			orderIndexes: (boundedOrderFlip || adaptiveCardMotion) ? new Map() : null,
 			boundedOrderFlip,
 			adaptiveCardMotion,
-			exitingCards: []
+			exitCandidates: (scope === 'friends' || scope === 'playTogether') ? [] : null
 		};
 
 		const canAnimate = !document.hidden && !browseMotionReduced() && typeof Element.prototype.animate === 'function';
@@ -35470,11 +35604,11 @@ P
 					layoutLeft: Number(card.offsetLeft) || 0,
 					layoutTop: Number(card.offsetTop) || 0
 				});
-				if (snapshot.exitingCards) {
+				if (snapshot.exitCandidates && snapshot.exitCandidates.length < 12) {
 					const rect = candidateRange.rectCache.get(card) || card.getBoundingClientRect();
-					if (rect.width && rect.height && browseMotionRectVisible(rect, viewport, 0)) {
-						snapshot.exitingCards.push({ key, card, rect: { left:rect.left, top:rect.top, width:rect.width, height:rect.height } });
-					}
+					const identity = getCollectionFilterExitIdentity(card, scope);
+					if (identity) snapshot.exitCandidates.push({ identity, card,
+						rect: {left:rect.left, top:rect.top, width:rect.width, height:rect.height} });
 				}
 			}
 		}
@@ -35494,35 +35628,6 @@ P
 		scrollArea.style.scrollBehavior = oldBehavior;
 	}
 
-	function animateCollectionFilterExits(snapshot) {
-		if (!snapshot || !snapshot.exitingCards || !snapshot.exitingCards.length) return;
-		const config = getCollectionFilterMotionConfig(snapshot.scope);
-		const grid = config && document.getElementById(config.gridId);
-		if (!grid || document.hidden || browseMotionReduced()) return;
-		const remaining = new Set(Array.from(grid.querySelectorAll(config.itemSelector), getCollectionFilterMotionCardKey));
-		for (const entry of snapshot.exitingCards) {
-			if (remaining.has(entry.key)) continue;
-			const { left, top, width, height } = entry.rect;
-			const ghost = entry.card.cloneNode(true);
-			ghost.classList.add('psn-collection-filter-exit-ghost');
-			ghost.classList.remove('anim-reveal', 'category-wishlist-entry', 'category-new-highlight');
-			ghost.setAttribute('aria-hidden', 'true');
-			ghost.removeAttribute('id');
-			ghost.querySelectorAll('[id]').forEach(node => node.removeAttribute('id'));
-			ghost.style.setProperty('left', `${left}px`, 'important');
-			ghost.style.setProperty('top', `${top}px`, 'important');
-			ghost.style.setProperty('width', `${width}px`, 'important');
-			ghost.style.setProperty('height', `${height}px`, 'important');
-			document.body.appendChild(ghost);
-			const animation = trackCollectionFilterMotionAnimation(grid, ghost.animate([
-				{ opacity: 1, transform: 'translate3d(0,0,0) scale(1)', filter: 'brightness(1)' },
-				{ opacity: .35, transform: 'translate3d(0,-6px,0) scale(.94)', filter: 'brightness(.85)' },
-				{ opacity: 0, transform: 'translate3d(0,-12px,0) scale(.82)', filter: 'brightness(.7) blur(2px)' }
-			], { duration: 330, easing: 'cubic-bezier(.2,.8,.22,1)', fill: 'forwards' }));
-			animation.finished.then(() => ghost.remove(), () => ghost.remove());
-		}
-	}
-
 	function animateCollectionFilterMotion(snapshot) {
 		if (!snapshot || document.hidden || browseMotionReduced() || typeof Element.prototype.animate !== 'function') return 0;
 		const config = getCollectionFilterMotionConfig(snapshot.scope);
@@ -35534,7 +35639,6 @@ P
 		let movedIndex = 0;
 		const cards = Array.from(grid.querySelectorAll(config.itemSelector));
 		const candidateRange = getBrowseMotionViewportCandidateRange(grid, cards, viewport, 48);
-		const pendingMotions = [];
 
 		for (let index = candidateRange.start; index < candidateRange.end; index++) {
 			const card = cards[index];
@@ -35562,11 +35666,7 @@ P
 			}
 
 			if (Math.abs(dx) < .5 && Math.abs(dy) < .5) continue;
-			pendingMotions.push({ card, dx, dy });
-		}
-
-		const useIndependentTranslate = snapshot.scope === 'friends' || snapshot.scope === 'trophies';
-		for (const { card, dx, dy } of pendingMotions) {
+			const useIndependentTranslate = snapshot.scope === 'friends' || snapshot.scope === 'trophies';
 			const motionFrames = useIndependentTranslate
 				? [{ translate: `${dx}px ${dy}px` }, { translate: '0px 0px' }]
 				: [{ transform: `translate3d(${dx}px,${dy}px,0)` }, { transform: 'translate3d(0,0,0)' }];
@@ -35574,7 +35674,7 @@ P
 				duration,
 				delay: Math.min(movedIndex++, 8) * delayStep,
 				easing: 'cubic-bezier(.2,.8,.2,1)',
-				fill: 'backwards'
+				fill: 'none'
 			}));
 			animation.id = 'psn-collection-filter-relayout';
 		}
@@ -35587,41 +35687,14 @@ P
 		const config = getCollectionFilterMotionConfig(snapshot.scope);
 		const grid = document.getElementById(snapshot.gridId);
 		if (!config || !grid) return 0;
-
-		if (!document.hidden && !browseMotionReduced() && typeof Element.prototype.animate === 'function' &&
-			typeof CSS !== 'undefined' && CSS.supports('scale', '0.96')) {
-			const cards = Array.from(grid.querySelectorAll(config.itemSelector));
-			const viewport = snapshot.viewport || getBrowseMotionViewportRect();
-			let revealed = 0;
-			for (const card of cards) {
-				const key = getCollectionFilterMotionCardKey(card);
-				if (!key || snapshot.existingKeys.has(key) || (config.pendingClass && card.classList.contains(config.pendingClass))) continue;
-				const rect = card.getBoundingClientRect();
-				if (!rect.width || !rect.height || !browseMotionRectVisible(rect, viewport, 24)) continue;
-				const target = typeof config.revealTarget === 'function' ? config.revealTarget(card) : card;
-				if (!target) continue;
-				const animation = trackCollectionFilterMotionAnimation(grid, target.animate([
-					{ opacity: 0, scale: '0.96' },
-					{ opacity: 1, scale: '1' }
-				], {
-					duration: 500,
-					delay: Math.min(revealed, 4) * 18,
-					easing: 'cubic-bezier(.2,.8,.2,1)',
-					fill: 'backwards'
-				}));
-				animation.id = 'psn-collection-filter-reentry';
-				revealed++;
-			}
-			return revealed;
-		}
-
 		const markedTargets = [];
 
 		Array.from(grid.querySelectorAll(config.itemSelector)).forEach(card => {
 			const key = getCollectionFilterMotionCardKey(card);
 			if (!key) return;
-			// Regression guard: missing geometry does not make an existing card new.
-			if (snapshot.existingKeys.has(key)) return;
+			const lacksOldGeometry = !snapshot.entries || !snapshot.entries.has(key);
+			const genuinelyNew = !snapshot.existingKeys.has(key);
+			if (snapshot.adaptiveCardMotion ? !lacksOldGeometry : !genuinelyNew) return;
 			if (config.pendingClass && card.classList.contains(config.pendingClass)) return;
 			const revealTarget = typeof config.revealTarget === 'function' ? config.revealTarget(card) : card;
 			if (!revealTarget) return;
@@ -35684,13 +35757,14 @@ P
 	window.applyCollectionToolbarFilterChange = function(scope, options = {}) {
 		const config = getCollectionFilterMotionConfig(scope);
 		if (!config) return;
+		if (scope === 'playTogether' && startPlayTogetherFilterSwitch(config, options)) return;
 		const snapshot = captureCollectionFilterMotion(scope, options);
 		config.render();
 		if (!snapshot) return;
 
 		restoreCollectionFilterScroll(snapshot);
-		animateCollectionFilterExits(snapshot);
-		animateCollectionFilterMotion(snapshot);
+		if (!options.skipCollectionMove) animateCollectionFilterMotion(snapshot);
+		if (!options.skipCollectionExit) animateCollectionFilterRemovedCards(snapshot);
 		if (options.revealNew !== false) revealCollectionFilterNewCards(snapshot);
 		requestAnimationFrame(() => restoreCollectionFilterScroll(snapshot));
 	};
@@ -39435,7 +39509,7 @@ P
         const loading = document.getElementById('social-play-together-loading');
         const empty = document.getElementById('social-play-together-empty');
         const count = document.getElementById('social-play-together-count');
-        if (!list || !loading || !empty || !count) return;
+        if (!list || !loading || !empty || !count || list.dataset.psnPlayTogetherFilterExit === '1') return;
 
         const activeUser = String(localStorage.getItem('psn_username') || '');
         const filter = normalizePlayTogetherSocialFilter(window.__socialPlayTogetherFilter);
@@ -39492,12 +39566,14 @@ P
         if (!ready) {
             if (list.childElementCount) list.replaceChildren();
             list.dataset.socialPlayTogetherRenderedFilter = filter;
+            list.dataset.socialPlayTogetherRenderedOwnedFilter = window.__socialPlayTogetherOwnedFilter || 'all';
             delete list.dataset.socialPlayTogetherRenderSignature;
             return;
         }
         if (!entries.length) {
             list.replaceChildren();
             list.dataset.socialPlayTogetherRenderedFilter = filter;
+            list.dataset.socialPlayTogetherRenderedOwnedFilter = window.__socialPlayTogetherOwnedFilter || 'all';
             delete list.dataset.socialPlayTogetherRenderSignature;
             if (!globallyEmpty && window.__socialPlayTogetherOwnedFilter === 'owned' && rawEntries.length) {
                 if (emptyStrong) emptyStrong.textContent = 'No Owned Games';
@@ -39525,6 +39601,7 @@ P
             delete list.dataset.socialPlayTogetherRenderSignature;
         }
         list.dataset.socialPlayTogetherRenderedFilter = filter;
+        list.dataset.socialPlayTogetherRenderedOwnedFilter = window.__socialPlayTogetherOwnedFilter || 'all';
 
         const existingByTitleId = new Map();
         list.querySelectorAll(':scope > .play-together-social-item[data-play-together-title-id]').forEach(row => {
