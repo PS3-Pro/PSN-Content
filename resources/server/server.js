@@ -5202,6 +5202,35 @@ function setCachedContentDownloadCount(key, count) {
   }
 }
 
+// Filter by the inexpensive raw IDs before normalizing category/name for every
+// download. Name-only and unusual keys keep the original exact-count SQL.
+function getContentDownloadCountCandidateIds(keys = []) {
+  const titleIds = new Set();
+  const contentIds = new Set();
+  for (const rawKey of keys) {
+    const key = String(rawKey || '');
+    const separator = key.indexOf('|');
+    if (separator <= 0) return null;
+    const value = key.slice(separator + 1);
+    if (value.startsWith('C:')) {
+      const id = value.slice(2);
+      if (!id || id.includes('|')) return null;
+      contentIds.add(id);
+    } else if (value.startsWith('T:')) {
+      const id = value.slice(2);
+      // A literal '|N:' may be part of a raw ID, not a name delimiter.
+      // Fall back rather than risk excluding a matching download row.
+      if (!id || id.includes('|')) return null;
+      titleIds.add(id);
+    } else {
+      return null;
+    }
+  }
+  return titleIds.size || contentIds.size
+    ? { titleIds: [...titleIds], contentIds: [...contentIds] }
+    : null;
+}
+
 // Requests arriving together share a single full-table scan. Never retain
 // in-flight promises after completion; durable results use the existing LRU.
 function scheduleContentDownloadCountBatch() {
@@ -5233,6 +5262,13 @@ function scheduleContentDownloadCountBatch() {
         }
       }
       if (queryKeys.length) {
+      const candidateIds = process.env.CONTENT_DOWNLOAD_COUNT_ID_FILTER === '0'
+        ? null : getContentDownloadCountCandidateIds(queryKeys);
+      const candidateFilter = candidateIds ? `
+          WHERE (
+            upper(trim(COALESCE(item->>'titleId', item->>'id', ''))) = ANY($2::text[])
+            OR upper(trim(COALESCE(item->>'contentId', item->>'contentID', ''))) = ANY($3::text[])
+          )` : '';
       const rows = await queryDbWithRetry(`
         WITH download_items AS (
           SELECT
@@ -5270,6 +5306,7 @@ function scheduleContentDownloadCountBatch() {
           CROSS JOIN LATERAL (
             SELECT regexp_replace(lower(trim(COALESCE(item->>'category', item->>'rawCategory', 'games'))), '[[:space:]-]+', '_', 'g') AS raw_category
           ) cat
+          ${candidateFilter}
         ), keyed_downloads AS (
           SELECT
             username,
@@ -5287,7 +5324,8 @@ function scheduleContentDownloadCountBatch() {
         FROM keyed_downloads
         WHERE content_key = ANY($1::text[])
         GROUP BY content_key
-      `, [queryKeys], { attempts: 2, label: 'CONTENT DOWNLOAD COUNTS' });
+      `, candidateIds ? [queryKeys, candidateIds.titleIds, candidateIds.contentIds] : [queryKeys],
+      { attempts: 2, label: 'CONTENT DOWNLOAD COUNTS' });
 
         const found = new Map((rows.rows || []).map(row => [String(row.key || ''), Math.max(0, Number(row.count) || 0)]));
         for (const key of queryKeys) {
