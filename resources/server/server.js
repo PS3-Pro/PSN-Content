@@ -953,12 +953,82 @@ function flushDbQueryPerformance() {
     slow:stats.slow, errors:stats.errors, retries:stats.retries, totalMs:stats.total
   })).sort((a,b) => b.totalMs-a.totalMs).slice(0,8);
   dbQueryPerf.clear();
-  console.log('[DB PERF 5MIN]', JSON.stringify({topQueries:summary, pool:{total:pool.totalCount, idle:pool.idleCount, waiting:pool.waitingCount, peakWaiting:dbPerfPeakWaiting, peakConnections:dbPerfPeakConnections}}));
+  console.log('[DB PERF 5MIN]', JSON.stringify({topQueries:summary, pool:{total:pool.totalCount, idle:pool.idleCount, waiting:pool.waitingCount, peakWaiting:dbPerfPeakWaiting, peakConnections:dbPerfPeakConnections}, admission:{enabled:DB_READ_ADMISSION_ENABLED, optionalQueuedPeak:dbAdmissionOptionalPeak, bulkPendingPeak:dbAdmissionBulkPeak, bulkWaits:dbAdmissionBulkWaits}}));
+  dbAdmissionOptionalPeak = 0;
+  dbAdmissionBulkPeak = 0;
+  dbAdmissionBulkWaits = 0;
   dbPerfPeakWaiting = 0;
   dbPerfPeakConnections = 0;
 }
 
+// Keep expensive, nonessential reads from occupying the whole four-connection
+// pool while new sessions are authenticating. Only read-only labels participate.
+const DB_READ_ADMISSION_ENABLED = process.env.DB_READ_ADMISSION !== '0';
+const DB_OPTIONAL_READ_MAX = Math.max(1, Math.min(2, PG_POOL_MAX - 1));
+const DB_BULK_READ_WAIT_MAX_MS = Math.max(0, Math.min(4000, parseInt(process.env.DB_BULK_READ_WAIT_MAX_MS || '1800', 10) || 1800));
+const DB_OPTIONAL_READ_LABELS = new Set([
+  'SOCIAL UNSEEN READ', 'USER NOTIFICATION READ', 'USER NOTIFICATION DELTA',
+  'USER CONTENT REPORTS READ', 'REWARD NOTICE READ'
+]);
+const DB_BULK_READ_LABELS = new Set([
+  'CONTENT DOWNLOAD COUNTS', 'TRENDING AGGREGATE',
+  'TRENDING AGGREGATE INDEXED', 'TROPHY AGGREGATE'
+]);
+const optionalDbReadQueue = [];
+let optionalDbReadActive = 0;
+let bulkDbReadTail = Promise.resolve();
+let bulkDbReadPending = 0;
+let dbAdmissionOptionalPeak = 0;
+let dbAdmissionBulkPeak = 0;
+let dbAdmissionBulkWaits = 0;
+
+function pumpOptionalDbReads() {
+  while (optionalDbReadActive < DB_OPTIONAL_READ_MAX && optionalDbReadQueue.length) {
+    const job = optionalDbReadQueue.shift();
+    optionalDbReadActive++;
+    Promise.resolve().then(job.task).then(job.resolve, job.reject).finally(() => {
+      optionalDbReadActive--;
+      pumpOptionalDbReads();
+    });
+  }
+}
+
+function runOptionalDbRead(task) {
+  return new Promise((resolve, reject) => {
+    optionalDbReadQueue.push({ task, resolve, reject });
+    dbAdmissionOptionalPeak = Math.max(dbAdmissionOptionalPeak, optionalDbReadQueue.length);
+    pumpOptionalDbReads();
+  });
+}
+
+function runBulkDbRead(task) {
+  bulkDbReadPending++;
+  dbAdmissionBulkPeak = Math.max(dbAdmissionBulkPeak, bulkDbReadPending);
+  const pending = bulkDbReadTail.then(async () => {
+    const started = Date.now();
+    while (Date.now() - started < DB_BULK_READ_WAIT_MAX_MS &&
+      (pool.waitingCount > 0 || (pool.totalCount >= PG_POOL_MAX && pool.idleCount === 0))) {
+      await waitMs(90);
+    }
+    if (Date.now() - started >= 90) dbAdmissionBulkWaits++;
+    return task();
+  });
+  bulkDbReadTail = pending.then(() => null, () => null);
+  return pending.finally(() => { bulkDbReadPending--; });
+}
+
 async function queryDbWithRetry(text, params = [], options = {}) {
+  const label = String(options.label || 'DB QUERY');
+  if (DB_READ_ADMISSION_ENABLED && DB_BULK_READ_LABELS.has(label)) {
+    return runBulkDbRead(() => queryDbWithRetryCore(text, params, options));
+  }
+  if (DB_READ_ADMISSION_ENABLED && DB_OPTIONAL_READ_LABELS.has(label)) {
+    return runOptionalDbRead(() => queryDbWithRetryCore(text, params, options));
+  }
+  return queryDbWithRetryCore(text, params, options);
+}
+
+async function queryDbWithRetryCore(text, params = [], options = {}) {
   const attempts = Math.max(1, Math.min(4, Number(options.attempts) || 2));
   const label = String(options.label || 'DB QUERY');
   let lastError = null;
@@ -6471,7 +6541,23 @@ async function refreshBlockedStoreContentFromDb() {
   return blockedStoreContent;
 }
 
-async function getUserContentReports(userName) {
+const userContentReportsPending = new Map();
+function getUserContentReports(userName) {
+  const reporter = normalizeText(userName, '');
+  if (!reporter) return Promise.resolve([]);
+  const existing = userContentReportsPending.get(reporter);
+  if (existing) return existing;
+  const pending = readUserContentReportsFromDb(reporter);
+  if (userContentReportsPending.size < 64) {
+    userContentReportsPending.set(reporter, pending);
+    pending.finally(() => {
+      if (userContentReportsPending.get(reporter) === pending) userContentReportsPending.delete(reporter);
+    }).catch(() => {});
+  }
+  return pending;
+}
+
+async function readUserContentReportsFromDb(userName) {
   const reporter = normalizeText(userName, '');
   if (!reporter) return [];
   const result = await queryDbWithRetry(
