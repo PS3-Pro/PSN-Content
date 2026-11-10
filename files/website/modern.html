@@ -115690,6 +115690,12 @@ function getVisibleChatStackEl(id) {
       refreshUnseen();
       if(!visible())return;
       observeSocket();
+      // A broken connection can interrupt a read-only comment fetch. On
+      // authentication recovery, refresh the open modal without resending a post.
+      if(state.modalPostId&&state.openComments.has(state.modalPostId)){
+        socialCommentsRecoveryCount=0;
+        scheduleOpenSocialCommentsRefresh(state.modalPostId);
+      }
       if(socialPendingOpenPost){const pending=socialPendingOpenPost;socialPendingOpenPost=null;window.psnSocialOpenPost(pending.id,pending.commentId);return;}
       if(!state.loaded||state.stale||Date.now()-socialFeedFetchedAt>SOCIAL_FILTER_CACHE_MS)loadFeed(false,state.loaded,state.loaded);
     },0);
@@ -116166,7 +116172,8 @@ function getVisibleChatStackEl(id) {
   function call(event,data){
     const socket=typeof socketChat==='undefined'?null:socketChat;
     if(!socialSessionReady())return Promise.resolve({success:false,code:'session_pending'});
-    return emitAcknowledged(socket,event,data,event==='social_feed_list'||event==='social_comments_list'?18000:22000);
+    const readTimeout = event==='social_comments_list'||event==='social_comment_replies_list' ? 48000 : (event==='social_feed_list' ? 18000 : 22000);
+    return emitAcknowledged(socket,event,data,readTimeout);
   }
   function observeSocket(){
     if(typeof socketChat==='undefined'||!socketChat||!socketChat.connected)return;
@@ -116600,8 +116607,14 @@ function getVisibleChatStackEl(id) {
     const serial=thread.serial;
     const after=reset?'':newOnly?String(thread.items.reduce((max,item)=>Math.max(max,Number(item.id)||0),0)):thread.after||'';
     renderSocialCommentThreads(postId);
-    const res=await call('social_comment_replies_list',{postId,parentId,after});
+    let res=await call('social_comment_replies_list',{postId,parentId,after});
     if(thread.serial!==serial||state.modalPostId!==postId)return;
+    if(!res.success&&(res.code==='timeout'||res.code==='session_pending'||res.message==='Could not load replies.')&&socialSessionReady()){
+      await new Promise(resolve=>setTimeout(resolve,1500));
+      if(thread.serial!==serial||state.modalPostId!==postId)return;
+      res=await call('social_comment_replies_list',{postId,parentId,after});
+      if(thread.serial!==serial||state.modalPostId!==postId)return;
+    }
     thread.loading=false;
     const previousHeight=document.getElementById('psn-social-thread-children-'+parentId)?.getBoundingClientRect().height||0;
     if(!res.success){thread.error=res.message||'Could not load replies.';renderSocialCommentThreads(postId);if(thread.expanded)animateSocialThreadContent(postId,parentId,previousHeight);return;}
@@ -116981,6 +116994,9 @@ function getVisibleChatStackEl(id) {
   function openCommentModal(postId,opener){
     const post=state.posts.find(x=>x.id===postId);
     if(!post)return;
+    clearTimeout(socialCommentsRecoveryTimer);socialCommentsRecoveryTimer=0;
+    clearTimeout(socialCommentsBusyTimer);socialCommentsBusyTimer=0;
+    socialCommentsRecoveryCount=0;
     notify('');
     const overlay=ensureCommentModal();
     if(socialInlineReplyId)setSocialCommentReply(null);
@@ -116999,6 +117015,9 @@ function getVisibleChatStackEl(id) {
   function closeCommentModal(){
     const overlay=document.getElementById('psn-social-comments-modal');if(!overlay||overlay.hidden)return;
     clearTimeout(socialCommentsRefreshTimer);socialCommentsRefreshTimer=0;
+    clearTimeout(socialCommentsRecoveryTimer);socialCommentsRecoveryTimer=0;
+    clearTimeout(socialCommentsBusyTimer);socialCommentsBusyTimer=0;
+    socialCommentsRecoveryCount=0;
     closeSocialGifPicker();socialGifCommentForm=null;
     setSocialCommentReply(null);
     clearSocialCommentAttachment(overlay.querySelector('#psn-social-modal-body > .psn-social-comment-form'));
@@ -117291,6 +117310,9 @@ function getVisibleChatStackEl(id) {
     updateInfiniteFeed();
   }
   let socialCommentsInFlight=null;
+  let socialCommentsRecoveryTimer=0;
+  let socialCommentsRecoveryCount=0;
+  let socialCommentsBusyTimer=0;
   async function loadComments(postId){
     if(state.modalPostId!==postId)return;
     const current=socialCommentsInFlight;
@@ -117302,14 +117324,39 @@ function getVisibleChatStackEl(id) {
       return current.promise;
     }
     if(socialCommentsRefreshTimer){clearTimeout(socialCommentsRefreshTimer);socialCommentsRefreshTimer=0;}
+    if(socialCommentsRecoveryTimer){clearTimeout(socialCommentsRecoveryTimer);socialCommentsRecoveryTimer=0;}
     const request=++state.modalRequest;
+    clearTimeout(socialCommentsBusyTimer);
+    socialCommentsBusyTimer=setTimeout(()=>{
+      if(state.modalPostId!==postId||state.modalRequest!==request)return;
+      const status=document.getElementById('psn-social-modal-status');
+      if(status&&!status.textContent){status.style.color='var(--text-muted)';status.textContent='Server busy. Still loading comments…';}
+    },7000);
     const operation=(async()=>{
       const focusCommentId=idOf(state.focusReportedCommentId);
       const res=await call('social_comments_list',{postId,...(focusCommentId?{focusCommentId}:{})});
       if(state.modalPostId!==postId||request!==state.modalRequest)return;
+      clearTimeout(socialCommentsBusyTimer);socialCommentsBusyTimer=0;
       const status=document.getElementById('psn-social-modal-status');
-      if(!res.success){if(status)status.textContent=res.message||'Could not load comments.';return;}
-      if(status)status.textContent='';
+      const recoverable=res.code==='timeout'||res.code==='session_pending'||res.message==='Could not load comments.';
+      if(!res.success){
+        if(status){status.style.removeProperty('color');status.textContent=res.message||'Could not load comments.';}
+        // Only a read can be repeated safely. Server-side pending-read deduplication
+        // ensures the retry will not duplicate the SQL if the first read is still running.
+        if(recoverable&&socialCommentsRecoveryCount<1&&socialSessionReady()) {
+          socialCommentsRecoveryCount++;
+          if(status){status.style.color='var(--text-muted)';status.textContent='Server busy. Retrying comments…';}
+          clearTimeout(socialCommentsRecoveryTimer);
+          socialCommentsRecoveryTimer=setTimeout(()=>{
+            socialCommentsRecoveryTimer=0;
+            if(state.modalPostId===postId&&socialSessionReady())loadComments(postId);
+          },1500);
+        }
+        return;
+      }
+      socialCommentsRecoveryCount=0;
+      clearTimeout(socialCommentsRecoveryTimer);socialCommentsRecoveryTimer=0;
+      if(status){status.style.removeProperty('color');status.textContent='';}
       const comments=Array.isArray(res.comments)?res.comments:[];
       state.comments.set(postId,comments);
       if(focusCommentId){

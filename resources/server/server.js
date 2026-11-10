@@ -979,7 +979,10 @@ async function queryDbWithRetry(text, params = [], options = {}) {
       sampleDbPoolPressure();
       const queryStartedAt = DB_PERF_ENABLED ? Date.now() : 0;
       try {
-        const result = await client.query(text, params);
+        const timeout = Math.max(0, Number(options.queryTimeoutMs) || 0);
+        const result = timeout > 0
+          ? await client.query({text,values:params,query_timeout:timeout})
+          : await client.query(text, params);
         if (DB_PERF_ENABLED) queryMs += Date.now() - queryStartedAt;
         if (DB_PERF_ENABLED) recordDbQueryPerformance(label, Date.now() - startedAt, attempt, false, { acquireMs, queryMs, queued:wasQueued });
         return result;
@@ -8322,11 +8325,22 @@ async function backfillRecentChatSeenEventsFromLegacyMessages() {
   }
 }
 
+// Optional Seen snapshots must never monopolize the small Aiven connection
+// pool. Coalesce identical viewer requests; defer others and retry via normal
+// Seen sync without advancing their cursor.
+const chatSeenSnapshotPendingByUser = new Map();
+let chatSeenSnapshotActive = 0;
 async function getChatSeenSnapshotForUser(userName = '') {
   const targetUser = String(userName || '');
   if (!targetUser) return [];
+  const existing = chatSeenSnapshotPendingByUser.get(targetUser);
+  if (existing) return existing;
+  if (chatSeenSnapshotActive >= 1 || pool.waitingCount >= 3) {
+    throw new Error('Seen snapshot deferred while PostgreSQL is busy');
+  }
   const messageIds = getCurrentChatMessageIds();
   if (!messageIds.length) return [];
+  chatSeenSnapshotActive++;
   // The UNIQUE(message_id, reader) index already exists. Probe the current
   // message IDs directly instead of letting the planner scan a growing Seen
   // event history for OR(sender,reader). Disable with CHAT_SEEN_INDEX_LOOKUP=0.
@@ -8347,25 +8361,45 @@ async function getChatSeenSnapshotForUser(userName = '') {
        WHERE message_id = ANY($1::text[])
          AND (sender = $2 OR reader = $2)
        ORDER BY id ASC`;
-  const res = await queryDbWithRetry(
-    query,
-    [messageIds, targetUser],
-    { attempts: 1, label: 'CHAT SEEN SNAPSHOT READ' }
-  );
-  return (res.rows || []).map(row => ({
-    eventId: Math.max(0, Number(row.id) || 0),
-    msgId: String(row.message_id || ''),
-    sender: String(row.sender || ''),
-    reader: String(row.reader || ''),
-    seenAt: row.seen_at ? new Date(row.seen_at).toISOString() : ''
-  })).filter(event => event.eventId && event.msgId && event.reader);
+  const pending = (async () => {
+    const res = await queryDbWithRetry(
+      query,
+      [messageIds, targetUser],
+      { attempts:1, label:'CHAT SEEN SNAPSHOT READ',
+        queryTimeoutMs:Math.max(2000,Math.min(15000,Number(process.env.CHAT_SEEN_QUERY_TIMEOUT_MS)||6000)) }
+    );
+    return (res.rows || []).map(row => ({
+      eventId: Math.max(0, Number(row.id) || 0),
+      msgId: String(row.message_id || ''),
+      sender: String(row.sender || ''),
+      reader: String(row.reader || ''),
+      seenAt: row.seen_at ? new Date(row.seen_at).toISOString() : ''
+    })).filter(event => event.eventId && event.msgId && event.reader);
+  })();
+  chatSeenSnapshotPendingByUser.set(targetUser, pending);
+  try { return await pending; }
+  finally {
+    if (chatSeenSnapshotPendingByUser.get(targetUser) === pending) chatSeenSnapshotPendingByUser.delete(targetUser);
+    chatSeenSnapshotActive--;
+  }
 }
 
+let chatSeenLegacyDegradedLastLogAt = 0;
 async function getPublicChatHistoryWithSeenForUser(userName = '') {
   const targetUser = String(userName || '');
   const history = getPublicChatHistoryForUser(targetUser);
   if (!targetUser || !history.length) return history;
-  const events = await getChatSeenSnapshotForUser(targetUser);
+  let events;
+  try { events = await getChatSeenSnapshotForUser(targetUser); }
+  catch (err) {
+    // Seen is optional metadata. Do not block legacy Global Chat history
+    // or hold a scarce PostgreSQL connection for an unavailable snapshot.
+    if (Date.now() - chatSeenLegacyDegradedLastLogAt > 30000) {
+      chatSeenLegacyDegradedLastLogAt = Date.now();
+      console.warn('[CHAT SEEN LEGACY DEGRADED] History sent without Seen:',err && err.message ? err.message : err);
+    }
+    return history;
+  }
   if (!events.length) return history;
 
   const byId = new Map();
