@@ -14978,15 +14978,15 @@ io.on('connection', (socket) => {
       // their own-author deletion did not match.
       const removePost = owner => queryDbWithRetry(`
         WITH removed_post AS (
-          DELETE FROM social_posts WHERE id=$1 AND author_name=$2 RETURNING id
+          DELETE FROM social_posts WHERE id=$1::bigint AND author_name=$2 RETURNING id
         ), removed_notifications AS (
           DELETE FROM user_notifications n
-          WHERE n.event_type='social' AND n.data->>'postId'=$1
+          WHERE n.event_type='social' AND n.data->>'postId'=$1::text
             AND EXISTS (SELECT 1 FROM removed_post)
           RETURNING n.user_name
         ), removed_activity AS (
           DELETE FROM friend_activity f
-          WHERE f.event_type='post' AND f.data->>'postId'=$1
+          WHERE f.event_type='post' AND f.data->>'postId'=$1::text
             AND EXISTS (SELECT 1 FROM removed_post)
           RETURNING f.id
         )
