@@ -19880,6 +19880,22 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('request_chat_reaction_details', (data = {}, reply) => {
+    if (typeof reply !== 'function') return;
+    if (!socket.userName) return reply({success:false});
+    const msgId = String(data.msgId || '');
+    const emoji = normalizeText(data.emoji, '').slice(0,24);
+    if (!msgId || !emoji) return reply({success:false});
+    const lastReadAt = Number(socket.__lastGlobalReactionDetailsAt || 0);
+    if (Date.now() - lastReadAt < 200) return reply({success:false,busy:true});
+    socket.__lastGlobalReactionDetailsAt = Date.now();
+    const msg = messageHistory.find(item => item && item.time && String(new Date(item.time).getTime()) === msgId);
+    const reaction = msg && Array.isArray(msg.reactions) ? msg.reactions.find(item => item && item.emoji === emoji) : null;
+    const users = reaction && Array.isArray(reaction.users)
+      ? Array.from(new Set(reaction.users.map(user => String(user || '').trim()).filter(Boolean))) : [];
+    reply({success:true,msgId,emoji,count:users.length,users});
+  });
+
   socket.on('message_reaction', async (data = {}) => {
     const messageId = String(data.msgId || '');
     const emoji = normalizeText(data.emoji, '').slice(0, 24);
@@ -19912,7 +19928,12 @@ io.on('connection', (socket) => {
         }
 
         try {
-            await pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [cleanChatMessage(msg), msg.time]);
+            const cleanReactionMessage = cleanChatMessage(msg);
+            const dbId = Math.max(0, Number(msg._dbId) || 0);
+            if (dbId) {
+                const result = await pool.query('UPDATE chat SET message = $1 WHERE id = $2', [cleanReactionMessage, dbId]);
+                if (!result.rowCount) await pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [cleanReactionMessage, msg.time]);
+            } else await pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [cleanReactionMessage, msg.time]);
             const syncChange = await recordChatSyncChangeSafe('upsert', messageId || String(new Date(msg.time).getTime()), msg);
             const finalReaction = Array.isArray(msg.reactions) ? msg.reactions.find(r => r && r.emoji === emoji) : null;
             const finalUsers = finalReaction && Array.isArray(finalReaction.users) ? Array.from(new Set(finalReaction.users.map(user => String(user || '').trim()).filter(Boolean))) : [];
@@ -19921,9 +19942,9 @@ io.on('connection', (socket) => {
                 emoji,
                 user: actor,
                 action: reactionAdded ? 'add' : (reactionRemoved ? 'remove' : 'sync'),
-                count: finalUsers.length,
-                users: finalUsers
+                count: finalUsers.length
             };
+            if (process.env.CHAT_REACTION_COMPACT_EVENTS === '0') reactionPayload.users = finalUsers;
             io.emit('message_reaction', reactionPayload);
             if (syncChange) emitChatSyncChange(syncChange);
 

@@ -2875,6 +2875,9 @@ div[style*="display: flex"] { transition: opacity 0.3s ease,transform 0.3s ease;
 .seen-by-popover::-webkit-scrollbar-track,.psn-chat-reactors-popover::-webkit-scrollbar-track { background: transparent; }
 .seen-by-popover::-webkit-scrollbar-thumb,.psn-chat-reactors-popover::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.3); border-radius: 10px; }
 .seen-by-title { font-size: 9px; color: var(--ps-blue); font-weight: bold; text-transform: uppercase; margin: 0; padding: 10px 10px 6px 10px; position: sticky; top: 0; background: rgba(15,15,15,0.98); z-index: 2; letter-spacing: 0.5px; border-bottom: 1px solid rgba(255,255,255,0.1); }
+.seen-by-loading { height: 36px; display: flex; align-items: center; justify-content: center; }
+.seen-by-spinner { width: 14px; height: 14px; border: 2px solid rgba(255,255,255,.2); border-top-color: var(--ps-blue); border-radius: 50%; animation: consoleStorageRefreshSpin .75s linear infinite; }
+.seen-by-loading.is-error { height: auto; min-height: 30px; padding: 8px; text-align: center; color: var(--text-muted); font-size: 10px; }
 .seen-user-item { display: flex; align-items: center; gap: 10px; padding: 8px 12px; transition: background 0.2s; box-sizing: border-box; }
 .seen-user-item:hover,.psn-chat-reactors-popover .seen-user-item:focus-visible { background: rgba(255,255,255,0.08); }
 .psn-chat-reactors-popover .seen-user-item:focus-visible { outline:2px solid var(--psn-focus-ring); outline-offset:-2px; }
@@ -74019,6 +74022,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         const emoji = String(pill.dataset.emoji || '');
         const names = Array.from(new Set(String(pill.dataset.users || '').split(', ').map(x => x.trim()).filter(Boolean)));
         const total = Math.max(names.length, Number(pill.dataset.count) || 0);
+        const incomplete = names.length < total && String(pill.dataset.reactionKind || '') === 'global';
         const popup = document.createElement('div');
         popup.id = 'psn-chat-reactors-popover';
         popup.className = 'psn-chat-reactors-popover show';
@@ -74033,7 +74037,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             const avatar = /^(https?:\/\/|data:image\/(?:png|jpeg|webp|gif);base64,)/i.test(String(resolved)) ? resolved : 'https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/images/avatars/default.png';
             return `<div class="seen-user-item" role="button" tabindex="0" data-chat-reactor-user="${index}" aria-label="View ${psnChatReactionEscape(name)} profile"><img src="${psnChatReactionEscape(avatar)}" class="seen-user-avatar" data-user="${psnChatReactionEscape(name)}" alt="" loading="lazy"><span class="seen-user-name" data-no-translate="true" translate="no">${psnChatReactionEscape(name)}</span></div>`;
         }).join('');
-        popup.innerHTML = `<div class="seen-by-title">${psnChatReactionEscape(emoji)} Reactions: ${total}</div>${rows || '<div class="seen-user-item">Names unavailable</div>'}`;
+        popup.innerHTML = `<div class="seen-by-title">${psnChatReactionEscape(emoji)} Reactions: ${total}</div>${incomplete ? '<div class="seen-by-loading" data-reaction-loading role="status" aria-label="Loading reactions"><span class="seen-by-spinner" aria-hidden="true"></span></div>' : (rows || '<div class="seen-user-item">Names unavailable</div>')}`;
         popup.__reactorPill = pill;
         popup.querySelectorAll('[data-chat-reactor-user]').forEach(button => {
             const openProfile = event => {
@@ -74047,8 +74051,45 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             });
         });
         document.body.appendChild(popup);
-        if (names.length && typeof window.refreshPsnUserMetaBatch === 'function') {
-            window.refreshPsnUserMetaBatch(names, {maxAge:0, force:true, authoritative:true});
+        if (!incomplete && names.length && typeof window.refreshPsnUserMetaBatch === 'function') {
+            window.refreshPsnUserMetaBatch(names.slice(0,40), {maxAge:0, force:true, authoritative:true});
+        }
+        if (incomplete) {
+            const messageId = String(pill.dataset.reactionMsg || '');
+            const requestedSocket = typeof socketChat !== 'undefined' ? socketChat : null;
+            const requestedOwner = typeof getChatCacheUserName === 'function' ? getChatCacheUserName() : '';
+            const requestedSession = Number(window.__chatCacheSessionToken || 0);
+            if (requestedSocket && requestedSocket.connected && typeof requestedSocket.timeout === 'function') {
+                requestedSocket.timeout(8500).emit('request_chat_reaction_details',{msgId:messageId,emoji},(error,response)=>{
+                    if (!popup.isConnected || !pill.isConnected || requestedSocket !== socketChat ||
+                        requestedOwner !== getChatCacheUserName() || requestedSession !== Number(window.__chatCacheSessionToken || 0)) return;
+                    if (error || !response?.success || String(response.msgId || '') !== messageId || String(response.emoji || '') !== emoji) {
+                        const loading = popup.querySelector('[data-reaction-loading]');
+                        if (loading) { loading.classList.add('is-error'); loading.textContent = 'Could not load reactions'; }
+                        return;
+                    }
+                    const readers = Array.from(new Set((Array.isArray(response.users)?response.users:[]).map(String).filter(Boolean)));
+                    const currentCount = Math.max(0,Number(pill.dataset.count)||0);
+                    const fetchedCount = Math.max(0,Number(response.count)||0);
+                    if (fetchedCount !== currentCount) {
+                        // Reactions changed while loading; try again on next open.
+                        const loading = popup.querySelector('[data-reaction-loading]');
+                        if (loading) { loading.classList.add('is-error'); loading.textContent = 'Reactions updated. Open again.'; }
+                        return;
+                    }
+                    const msg = typeof getChatMessageByIdFast === 'function' ? getChatMessageByIdFast(messageId) : null;
+                    if (msg && Array.isArray(msg.reactions)) {
+                        const reaction = msg.reactions.find(item=>item && item.emoji===emoji);
+                        if (reaction) { reaction.users=readers;reaction.count=fetchedCount; }
+                    }
+                    closePsnChatReactorsPopover();
+                    window.updatePsnChatReactionPill(pill,readers,fetchedCount);
+                    openPsnChatReactorsPopover(trigger);
+                });
+            } else {
+                const loading = popup.querySelector('[data-reaction-loading]');
+                if (loading) { loading.classList.add('is-error');loading.textContent = 'Could not load reactions'; }
+            }
         }
         const rect = trigger.getBoundingClientRect();
         const bounds = popup.getBoundingClientRect();
@@ -77087,19 +77128,34 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             return true;
         }
         if (!data.user) return false;
+        const actor = String(data.user || '').trim();
+        if (!actor) return false;
+        const previousUsers = reaction && Array.isArray(reaction.users) ? reaction.users.map(String) : [];
+        const users = previousUsers.slice();
+        const index = users.indexOf(actor);
+        if (data.action === 'add') {
+            if (index < 0) users.push(actor);
+        } else if (data.action === 'remove') {
+            if (index >= 0) users.splice(index,1);
+        } else {
+            if (index >= 0) users.splice(index,1);
+            else users.push(actor);
+        }
+        const count = Number.isFinite(Number(data.count)) ? Math.max(0,Number(data.count)) : users.length;
+        if (!count) {
+            if (!reaction) return false;
+            msg.reactions = reactions.filter(r => r !== reaction);
+            return true;
+        }
         if (!reaction) {
-            reactions.push({ emoji: data.emoji, count: 1, users: [data.user] });
+            reactions.push({ emoji:data.emoji, count, users });
             msg.reactions = reactions;
             return true;
         }
-        const users = Array.isArray(reaction.users) ? reaction.users.slice() : [];
-        const index = users.indexOf(data.user);
-        if (index > -1) users.splice(index, 1);
-        else users.push(data.user);
+        if (previousUsers.length === users.length && previousUsers.every((user,i)=>user===users[i]) && Number(reaction.count||0) === count) return false;
         reaction.users = users;
-        reaction.count = users.length;
-        if (reaction.count <= 0) msg.reactions = reactions.filter(r => r !== reaction);
-        else msg.reactions = reactions;
+        reaction.count = count;
+        msg.reactions = reactions;
         return true;
     }
 
@@ -93607,34 +93663,43 @@ function getVisibleChatStackEl(id) {
 					if (typeof setChatRenderedReactionPill === 'function') setChatRenderedReactionPill(data.msgId, data.emoji, newPill, renderedEntry, container);
 					domChanged = true;
 				}
-			} else {
-				if (!data.user) return;
-				if (pill) {
-					let users = String(pill.getAttribute('data-users') || '').split(', ').filter(Boolean);
-					const userIndex = users.indexOf(data.user);
-					if (userIndex > -1) users.splice(userIndex, 1);
-					else {
-						users.push(data.user);
-						pill.classList.remove('reaction-bump');
-						void pill.offsetWidth;
-						pill.classList.add('reaction-bump');
-					}
-					if (users.length <= 0) {
-						if (typeof deleteChatRenderedReactionPill === 'function') deleteChatRenderedReactionPill(data.msgId, data.emoji, pill, renderedEntry, container);
-						pill.dataset.reactionRemoving = '1';
-						pill.style.transform = "scale(0)";
-						pill.style.opacity = "0";
-						setTimeout(() => { if (pill.parentNode) pill.remove(); }, 200);
-					} else {
-						window.updatePsnChatReactionPill(pill, users, users.length);
-					}
-					domChanged = true;
-				} else {
-					const newPill = window.createPsnChatReactionPill('global', data.msgId, data.emoji, [data.user], 1);
-					container.appendChild(newPill);
-					if (typeof setChatRenderedReactionPill === 'function') setChatRenderedReactionPill(data.msgId, data.emoji, newPill, renderedEntry, container);
-					domChanged = true;
-				}
+            } else {
+                if (!data.user) return;
+                const actor = String(data.user || '').trim();
+                if (!actor) return;
+                const users = pill ? String(pill.getAttribute('data-users') || '').split(', ').filter(Boolean) : [];
+                const actorIndex = users.indexOf(actor);
+                if (data.action === 'add') {
+                    if (actorIndex < 0) {
+                        users.push(actor);
+                        if (pill) { pill.classList.remove('reaction-bump'); void pill.offsetWidth; pill.classList.add('reaction-bump'); }
+                    }
+                } else if (data.action === 'remove') {
+                    if (actorIndex >= 0) users.splice(actorIndex,1);
+                } else if (actorIndex >= 0) users.splice(actorIndex,1);
+                else users.push(actor);
+                const total = Number.isFinite(Number(data.count)) ? Math.max(0,Number(data.count)) : users.length;
+                if (!total) {
+                    if (pill && pill.dataset.reactionRemoving !== '1') {
+                        if (typeof deleteChatRenderedReactionPill === 'function') deleteChatRenderedReactionPill(data.msgId, data.emoji, pill, renderedEntry, container);
+                        pill.dataset.reactionRemoving = '1';
+                        pill.style.transform = 'scale(0)'; pill.style.opacity = '0';
+                        setTimeout(() => { if (pill.parentNode) pill.remove(); }, 200);
+                        domChanged = true;
+                    }
+                } else if (pill) {
+                    const oldUsers = String(pill.getAttribute('data-users') || '');
+                    if (oldUsers !== users.join(', ') || pill.getAttribute('data-count') !== String(total)) {
+                        window.updatePsnChatReactionPill(pill, users, total);
+                        domChanged = true;
+                    }
+                } else {
+                    const newPill = window.createPsnChatReactionPill('global', data.msgId, data.emoji, users, total);
+                    container.appendChild(newPill);
+                    if (typeof setChatRenderedReactionPill === 'function') setChatRenderedReactionPill(data.msgId, data.emoji, newPill, renderedEntry, container);
+                    domChanged = true;
+                }
+
 			}
 			if (!domChanged && !storedChanged) return;
 			let storedMsg = null;
@@ -99485,8 +99550,8 @@ function getVisibleChatStackEl(id) {
 		const users = seenByRaw.split(', ').filter(u => u.trim() !== "");
 		const seenTotal = Math.max(users.length,Number(checkContainer.getAttribute('data-seen-count'))||0);
 		if (!seenTotal) return;
-		const messageForDetails = typeof getChatMessageByIdFast==='function' ? getChatMessageByIdFast(String(msgId)) : null;
-		const needsDetails = users.length < seenTotal && !(messageForDetails && messageForDetails.__seenDetailsLoaded === true);
+		const needsDetails = users.length < seenTotal;
+		const pendingDetails = needsDetails && typeof socketChat !== 'undefined' && socketChat && socketChat.connected;
 
 		let seenAtMap = {};
 		try {
@@ -99505,8 +99570,8 @@ function getVisibleChatStackEl(id) {
 		popover.style.zIndex = '2147483647';
 
 		let itemsHtml = `<div class="seen-by-title">Seen by: ${seenTotal}</div>`;
-		if (needsDetails) itemsHtml += `<div class="seen-user-item" style="color:var(--text-muted)">Loading viewers…</div>`;
-		users.forEach(user => {
+		if (pendingDetails) itemsHtml += `<div class="seen-by-loading" data-seen-loading role="status" aria-label="Loading viewers"><span class="seen-by-spinner" aria-hidden="true"></span></div>`;
+		if (!pendingDetails) users.forEach(user => {
 			const freshMeta = typeof window.getFreshPsnUserMeta === 'function' ? window.getFreshPsnUserMeta(user) : null;
 			const freshAvatar = String(freshMeta && freshMeta.avatar || '').trim();
 			const avatar = (typeof getResolvedUserAvatar === 'function') ? getResolvedUserAvatar(user, freshAvatar, { preferredAvatarIsFresh:!!freshAvatar }) : (freshAvatar || localStorage.getItem(`${user}_psn_avatar`) || "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/interface/modern/images/avatars/default.png");
@@ -99604,22 +99669,21 @@ function getVisibleChatStackEl(id) {
 		popover.style.left = `${Math.round(left)}px`;
 		popover.style.top = `${Math.round(top)}px`;
 
-		if (needsDetails && typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
+		if (pendingDetails) {
             const requestedUser = getChatCacheUserName();
             const requestedSocket = socketChat;
             const requestedSession = Number(window.__chatCacheSessionToken||0);
             requestedSocket.timeout(10000).emit('request_chat_seen_details',{msgId:String(msgId)},(error,response)=>{
                 if (!popover.isConnected || requestedSocket!==socketChat || requestedUser!==getChatCacheUserName() ||
                     requestedSession!==Number(window.__chatCacheSessionToken||0)) return;
-                const loading = popover.querySelector('.seen-user-item:not([data-seen-user])');
+                const loading = popover.querySelector('[data-seen-loading]');
                 if (error || !response?.success || String(response.msgId||'')!==String(msgId)) {
-                    if (loading) loading.textContent='Could not load viewers';
+                    if (loading) { loading.classList.add('is-error'); loading.removeAttribute('aria-label'); loading.textContent='Could not load viewers'; }
                     return;
                 }
                 const msg = typeof getChatMessageByIdFast==='function' ? getChatMessageByIdFast(String(msgId)) : null;
                 if (!msg || String(msg.user||'')!==requestedUser) return;
                 const details = Array.isArray(response.readers)?response.readers:[];
-                msg.__seenDetailsLoaded = true;
                 msg.seenBy = Array.from(new Set([...(Array.isArray(msg.seenBy)?msg.seenBy:[]),...details.map(item=>String(item&&item.reader||'')).filter(Boolean)]));
                 msg.seenAt = {...(msg.seenAt&&typeof msg.seenAt==='object'?msg.seenAt:{}),...Object.fromEntries(details.filter(item=>item&&item.reader&&item.seenAt).map(item=>[String(item.reader),String(item.seenAt)]))};
                 msg.seenCount = Math.max(Number(msg.seenCount)||0,msg.seenBy.length);
