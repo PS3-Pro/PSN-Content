@@ -10369,7 +10369,7 @@ html.psn-scroll-nav-active #psn-floating-status-dock {--psn-status-right:82px;}
 				<div class="setting-item" id="repair-cached-data-setting" onmouseenter="playUiHover()">
 					<div>
 						<div style="font-size: 18px; color: #fff; font-weight: 500;">Repair Cached Data</div>
-						<div style="font-size: 13px; color: var(--text-muted); margin-top: 6px;">Rebuild locally cached chat, covers, game details and languages. Keeps your account, collections, downloads and settings.</div>
+						<div style="font-size: 13px; color: var(--text-muted); margin-top: 6px;">Rebuild local caches, including Chat and Seen by. Preserves accounts, personal data, collections and settings.</div>
 					</div>
 					<button type="button" class="ps5-pill-btn ps5-pill-secondary ps5-pill-compact" id="btn-repair-cached-data" onmouseenter="if(typeof playUiHover === 'function') playUiHover()" onclick="if(typeof playUiClick === 'function') playUiClick(); repairPsnCachedData()">
 						<i class="fas fa-tools"></i> REPAIR
@@ -32788,8 +32788,10 @@ P
 	}
 
 	function persistCardCoverSrcCacheSoon() {
+		if (window.__psnCacheRepairInProgress) return;
 		clearTimeout(window.__cardCoverSrcCacheSaveTimer);
 		window.__cardCoverSrcCacheSaveTimer = setTimeout(() => {
+			if (window.__psnCacheRepairInProgress) return;
 			try {
 				const now = Date.now();
 				const entries = Object.entries(window.__cardCoverSrcCache || {})
@@ -34695,9 +34697,10 @@ P
 		}
 	} catch (error) {}
 	function saveContentDownloadCountSnapshot() {
-		if (contentCountPersistTimer) return;
+		if (window.__psnCacheRepairInProgress || contentCountPersistTimer) return;
 		contentCountPersistTimer = setTimeout(() => {
 			contentCountPersistTimer = null;
+			if (window.__psnCacheRepairInProgress) return;
 			try {
 				const entries = Object.entries(window.contentDownloadCounts || {});
 				const counts = Object.fromEntries(entries.slice(-2000));
@@ -41732,7 +41735,7 @@ P
 			const languages = response.ok ? extractGameDbLanguages(await response.text()) : [];
 			const record = { at: Date.now(), languages };
 			rememberGameDbLanguageMemory(key, record);
-			if (languages.length) {
+			if (languages.length && !window.__psnCacheRepairInProgress) {
 				try { localStorage.setItem(GAME_DB_LANGUAGE_CACHE_KEY + key, JSON.stringify(record)); } catch (e) {}
 			}
 			return languages;
@@ -43403,6 +43406,7 @@ P
 	}
 
 	function openGameModalResolvedMetadataDb() {
+		if (window.__psnCacheRepairInProgress) return Promise.resolve(null);
 		if (gameModalResolvedIdbPromise) return gameModalResolvedIdbPromise;
 		if (typeof indexedDB === 'undefined') return Promise.resolve(null);
 		gameModalResolvedIdbPromise = new Promise(resolve => {
@@ -43420,7 +43424,11 @@ P
 				}
 				if (!store.indexNames.contains('at')) store.createIndex('at', 'at', { unique: false });
 			};
-			request.onsuccess = () => resolve(request.result);
+			request.onsuccess = () => {
+				const db = request.result;
+				if (window.__psnCacheRepairInProgress) { db.close(); resolve(null); return; }
+				resolve(db);
+			};
 			request.onerror = () => resolve(null);
 			request.onblocked = () => resolve(null);
 		});
@@ -43472,7 +43480,7 @@ P
 		const entries = Array.from(gameModalResolvedPendingWrites.values());
 		gameModalResolvedPendingWrites.clear();
 		const db = await openGameModalResolvedMetadataDb();
-		if (!db) return;
+		if (!db || window.__psnCacheRepairInProgress) return;
 		try {
 			const tx = db.transaction(GAME_MODAL_RESOLVED_IDB_STORE, 'readwrite');
 			const store = tx.objectStore(GAME_MODAL_RESOLVED_IDB_STORE);
@@ -56216,55 +56224,57 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 	document.addEventListener('visibilitychange', handleHeroVisibilityChange);
 	
 
-	async function clearPsnRepairCacheStore(openDatabase, storeName, key) {
+	async function deletePsnRepairCacheDatabase(dbName, openPromise) {
 		if (typeof indexedDB === 'undefined') return true;
-		let db = null;
 		try {
-			let openTimeout = 0;
-			try {
-				db = await Promise.race([
-					Promise.resolve().then(openDatabase),
-					new Promise(resolve => { openTimeout = setTimeout(() => resolve(null), 3000); })
+			if (openPromise) {
+				const db = await Promise.race([
+					Promise.resolve(openPromise).catch(() => null),
+					new Promise(resolve => setTimeout(() => resolve(null), 2200))
 				]);
-			} finally { clearTimeout(openTimeout); }
-		} catch (error) { return false; }
-		if (!db) return false;
-		if (!db.objectStoreNames.contains(storeName)) return true;
+				if (db) db.close();
+			}
+		} catch (error) {}
 		return new Promise(resolve => {
 			let finished = false;
-			let tx = null;
-			const finish = ok => {
+			const finish = value => {
 				if (finished) return;
 				finished = true;
 				clearTimeout(timeout);
-				resolve(ok);
+				resolve(value);
 			};
-			const timeout = setTimeout(() => {
-				try { if (tx) tx.abort(); } catch (error) {}
-				finish(false);
-			}, 3500);
+			const timeout = setTimeout(() => finish(false), 7000);
 			try {
-				tx = db.transaction(storeName, 'readwrite');
-				const store = tx.objectStore(storeName);
-				if (key) store.delete(key);
-				else store.clear();
-				tx.oncomplete = () => finish(true);
-				tx.onerror = () => finish(false);
-				tx.onabort = () => finish(false);
+				const request = indexedDB.deleteDatabase(dbName);
+				request.onsuccess = () => finish(true);
+				request.onerror = () => finish(false);
+				request.onblocked = () => {
+					console.warn('[CACHE REPAIR] Close other site tabs to release', dbName);
+				};
 			} catch (error) { finish(false); }
 		});
+	}
+
+	function isPsnRepairableStorageKey(key) {
+		return /^(?:psn_card_cover_src_cache_v\d+|psn_gamedb_languages_v\d+_.+|psn_interface_translate_cache_v\d+_.+|psn_global_content_download_counts_v\d+|psn_server_content_limits_v\d+|psn_profile_country_geo_cache|psn_content_reports_v\d+:.+)$/i.test(key)
+			|| /(?:^|_)psn_(?:friend_activity_cache_v\d+|notification_center_cache_v\d+)$/i.test(key);
+	}
+
+	function isPsnRepairableSessionKey(key) {
+		return /^psn_(?:content_count_snapshot_v\d+|direct_groups_session:.+)$/i.test(key);
 	}
 
 	async function repairPsnCachedData() {
 		const button = document.getElementById('btn-repair-cached-data');
 		if (!button || window.__psnCacheRepairInProgress) return false;
-		if (!confirm('Repair locally cached data on this device?\n\nCovers, game details and languages will be downloaded again. Chat history is refreshed from the server while keeping locally known Seen by confirmations as a safety net. Your account, lists, downloads and settings will be kept.\n\nThe site will reload when the repair finishes.')) return false;
+		if (!confirm('Rebuild all local site caches on this device?\n\nThis also clears cached Chat messages and Seen by, which will be downloaded again from the Server. You need an internet connection to restore them.\n\nYour accounts, login, personal lists, downloads, consoles, preferences and pending account synchronization are preserved.\n\nClose other site tabs before repairing. The site will reload when finished.')) return false;
 
 		window.__psnCacheRepairInProgress = true;
 		const original = button.innerHTML;
 		button.disabled = true;
 		button.innerHTML = '<i class="fas fa-sync-alt fa-spin"></i> REPAIRING...';
 		try {
+			// Do not flush a corrupted Chat snapshot back into IndexedDB before deleting it.
 			clearTimeout(window.__chatCacheWriteTimer);
 			window.__chatCacheWriteTimer = null;
 			window.__chatCacheReadyForWrite = false;
@@ -56278,17 +56288,20 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 			clearTimeout(window.__cardCoverSrcCacheSaveTimer);
 			window.__cardCoverSrcCacheSaveTimer = null;
 
+			// These two databases contain only rebuildable metadata and per-user chat snapshots.
 			const results = await Promise.all([
-				clearPsnRepairCacheStore(
-					() => openGameModalResolvedMetadataDb(), GAME_MODAL_RESOLVED_IDB_STORE
-				)
+				deletePsnRepairCacheDatabase(GAME_MODAL_RESOLVED_IDB_NAME, gameModalResolvedIdbPromise),
+				deletePsnRepairCacheDatabase('psn-chat-history-cache-v1', window.__chatCacheDbPromise)
 			]);
-			if (results.some(ok => !ok)) throw new Error('Could not clear one or more local cache databases.');
+			if (results.some(ok => !ok)) throw new Error('Could not rebuild local caches. Close other site tabs and try again.');
 
-			const cacheKeys = /^(?:psn_card_cover_src_cache_v\d+|psn_server_content_limits_v\d+|psn_global_content_download_counts_v\d+)$/i;
 			for (let i = localStorage.length - 1; i >= 0; i--) {
 				const key = localStorage.key(i);
-				if (key && (cacheKeys.test(key) || /^psn_gamedb_languages_v\d+_/i.test(key))) localStorage.removeItem(key);
+				if (key && isPsnRepairableStorageKey(key)) localStorage.removeItem(key);
+			}
+			for (let i = sessionStorage.length - 1; i >= 0; i--) {
+				const key = sessionStorage.key(i);
+				if (key && isPsnRepairableSessionKey(key)) sessionStorage.removeItem(key);
 			}
 			button.innerHTML = '<i class="fas fa-check"></i> REPAIRED';
 			if (typeof playUiSuccess === 'function') playUiSuccess();
@@ -56298,6 +56311,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 			console.error('[CACHE REPAIR]', error);
 			button.innerHTML = '<i class="fas fa-exclamation-triangle"></i> RETRY';
 			if (typeof playUiError === 'function') playUiError();
+			if (typeof showToastNotification === 'function') showToastNotification('Cache Repair', error.message || 'Could not repair local caches.');
 			setTimeout(() => {
 				button.disabled = false;
 				button.innerHTML = original;
@@ -75080,6 +75094,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
     }
 
     function openChatPersistentCacheDb() {
+        if (window.__psnCacheRepairInProgress) return Promise.resolve(null);
         if (!('indexedDB' in window)) return Promise.resolve(null);
         if (window.__chatCacheDbPromise) return window.__chatCacheDbPromise;
 
@@ -75104,6 +75119,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             };
             request.onsuccess = () => {
                 const db = request.result;
+                if (window.__psnCacheRepairInProgress) { db.close(); finish(null); return; }
                 db.onversionchange = () => {
                     try { db.close(); } catch (err) {}
                     if (window.__chatCacheDbPromise === openPromise) window.__chatCacheDbPromise = null;
@@ -75158,8 +75174,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         });
     }
 
-    async function writeChatPersistentCacheNow() {
-        if (window.__psnCacheRepairInProgress) return false;
+    async function writeChatPersistentCacheNow(options = {}) {
+        if (window.__psnCacheRepairInProgress && options.allowDuringRepair !== true) return false;
         const userName = getChatCacheUserName();
         const sessionToken = Number(window.__chatCacheSessionToken || 0);
         if (!userName || window.__chatCacheReadyForWrite !== true || window.__chatCacheHydratedUser !== userName) return false;
@@ -75175,7 +75191,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             savedAt: Date.now()
         };
         const db = await openChatPersistentCacheDb();
-        if (!db || getChatCacheUserName() !== userName || sessionToken !== Number(window.__chatCacheSessionToken || 0)) return false;
+        if (!db || window.__psnCacheRepairInProgress || getChatCacheUserName() !== userName || sessionToken !== Number(window.__chatCacheSessionToken || 0)) return false;
         return new Promise(resolve => {
             try {
                 const tx = db.transaction(CHAT_CACHE_STORE, 'readwrite');
@@ -75195,6 +75211,12 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         }, Math.max(0, Number(delay) || 0));
     }
     window.scheduleChatPersistentCacheWrite = scheduleChatPersistentCacheWrite;
+    window.flushChatPersistentCacheForRepair = function() {
+        if (!window.__chatCacheWriteTimer) return Promise.resolve(false);
+        clearTimeout(window.__chatCacheWriteTimer);
+        window.__chatCacheWriteTimer = null;
+        return writeChatPersistentCacheNow({ allowDuringRepair: true });
+    };
 
     async function deleteChatPersistentCacheForUser(userName = getChatCacheUserName()) {
         if (!userName) return false;
@@ -86947,7 +86969,7 @@ function getVisibleChatStackEl(id) {
     } catch (_) { return null; }
   }
   function saveDirectGroupSnapshot(user, groups) {
-    if (!user || !Array.isArray(groups)) return;
+    if (window.__psnCacheRepairInProgress || !user || !Array.isArray(groups)) return;
     try { sessionStorage.setItem(directGroupSnapshotKey(user), JSON.stringify({at:Date.now(),groups:groups.slice(0,100)})); } catch (_) {}
   }
   const pendingDirectGroupPinDeletes = new Set();
@@ -94635,6 +94657,7 @@ function getVisibleChatStackEl(id) {
 		let realtimeFeedCacheFrame = 0;
 		let realtimeFeedCacheTimer = 0;
 		function persistRealtimeFeedSnapshot(kind, key, data) {
+			if (window.__psnCacheRepairInProgress) return;
 			const owner = String(localStorage.getItem('psn_username') || '').trim();
 			if (!owner) return;
 			const signature = JSON.stringify(data);
@@ -112013,6 +112036,7 @@ function getVisibleChatStackEl(id) {
     }
 
     function saveInterfaceTranslationCache(target) {
+        if (window.__psnCacheRepairInProgress) return;
         try {
             const entries = Object.entries(state.cache || {});
             const trimmed = entries.length > INTERFACE_TRANSLATE_MAX_CACHE_ENTRIES
