@@ -8780,18 +8780,20 @@ async function getChatSeenSnapshotForUser(userName = '') {
   const messageIds = getCurrentChatMessageIds();
   if (!messageIds.length) return [];
   chatSeenSnapshotActive++;
-  // Probe the current messages by their existing UNIQUE(message_id, reader) index.
+  // Keep sender and reader lookups independent; do not join every chat ID.
   const useIndexedLookup = process.env.CHAT_SEEN_INDEX_LOOKUP !== '0';
   const query = useIndexedLookup
     ? `SELECT seen.id, seen.message_id, seen.sender, seen.reader, seen.seen_at
-       FROM (SELECT DISTINCT unnest($1::text[]) AS message_id) wanted
-       JOIN LATERAL (
+       FROM (
          SELECT id, message_id, sender, reader, seen_at
          FROM chat_seen_events
-         WHERE message_id = wanted.message_id
-           AND (sender = $2::text OR reader = $2::text)
-         OFFSET 0
-       ) seen ON TRUE
+         WHERE sender = $2::text AND message_id = ANY($1::text[])
+         UNION ALL
+         SELECT id, message_id, sender, reader, seen_at
+         FROM chat_seen_events
+         WHERE reader = $2::text AND sender IS DISTINCT FROM $2::text
+           AND message_id = ANY($1::text[])
+       ) seen
        ORDER BY seen.id ASC`
     : `SELECT id, message_id, sender, reader, seen_at
        FROM chat_seen_events

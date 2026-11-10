@@ -92646,6 +92646,7 @@ function getVisibleChatStackEl(id) {
 			if (((window.__chatCacheHydratedUser && window.__chatCacheHydratedUser !== name) || (localStorage.getItem('psn_username') && localStorage.getItem('psn_username') !== name)) && typeof window.resetChatSessionForAccountChange === 'function') window.resetChatSessionForAccountChange();
 			safeLocalStorageSet('psn_username', name);
 			socketChat.__psnGlobalAuthenticatedName = name;
+			if (typeof window.psnSocialOnAuthenticatedSession === 'function') window.psnSocialOnAuthenticatedSession();
 			if (typeof window.psnSocialWarmFeed === 'function') window.psnSocialWarmFeed();
 			if (typeof window.restoreContentReportMineCache === 'function') window.restoreContentReportMineCache(name);
 			if (typeof socketChat !== 'undefined' && socketChat && socketChat.connected) {
@@ -95949,6 +95950,25 @@ function getVisibleChatStackEl(id) {
 		window.__initialProfileSyncInProgress = false;
 		window.__postAuthChatGate = null;
 		if (typeof window.resetChatSessionForAccountChange === 'function') window.resetChatSessionForAccountChange();
+		if (typeof window.psnSocialResetSessionState === 'function') window.psnSocialResetSessionState();
+		window.__userNotificationRequestToken = Number(window.__userNotificationRequestToken || 0) + 1;
+		window.__userNotificationSyncInFlight = false;
+		clearTimeout(window.__userNotificationReadSyncTimer);
+		window.__userNotificationReadSyncTimer = null;
+		window.__userNotificationCacheLoaded = false;
+		window.__userNotificationCacheUser = '';
+		window.__userNotificationRemoteReady = false;
+		window.userNotificationItems = [];
+		window.__userNotificationUnreadCount = 0;
+		window.__userNotificationServerUnreadCount = 0;
+		window.__userNotificationLastReadId = 0;
+		window.__userNotificationSeenIds = new Set();
+		window.__userNotificationSurfaceTokens = new Map();
+		['chat-dot','trophy-dot','wish-dot','dl-dot','fav-dot','activity-dot','play-together-dot','notifications-dot','admin-dot'].forEach(id => {
+			const dot = document.getElementById(id);
+			if (dot) dot.style.display = 'none';
+		});
+		document.querySelectorAll('.psn-social-unseen-dot').forEach(dot => { dot.hidden = true; });
 		if (typeof window.resetInterfaceTranslationForLoginScreen === 'function') window.resetInterfaceTranslationForLoginScreen();
 		if (options.clearTrophyTimers === true) {
 			if (window.dailyTrophyTimer) clearTimeout(window.dailyTrophyTimer);
@@ -102289,12 +102309,18 @@ function getVisibleChatStackEl(id) {
 	function pushUserNotificationReadState(lastReadId) {
 		const safeId = Math.max(0, Number(lastReadId) || 0);
 		if (!safeId || !socketChat || !socketChat.connected) return;
+		const owner = String(localStorage.getItem('psn_username') || '').trim();
+		const authSocket = socketChat;
+		const requestToken = window.__userNotificationRequestToken;
+		const stillSameSession = () => authSocket === socketChat && authSocket.connected &&
+			owner && owner === String(localStorage.getItem('psn_username') || '').trim() &&
+			authSocket.__psnGlobalAuthenticatedName === owner && requestToken === window.__userNotificationRequestToken;
 		clearTimeout(window.__userNotificationReadSyncTimer);
 		window.__userNotificationReadSyncTimer = setTimeout(function() {
 			window.__userNotificationReadSyncTimer = null;
-			if (!socketChat || !socketChat.connected) return;
-			socketChat.emit('user_notifications_mark_read', { lastReadId:safeId }, function(response) {
-				if (!response || response.ok !== true) return;
+			if (!stillSameSession()) return;
+			authSocket.emit('user_notifications_mark_read', { lastReadId:safeId }, function(response) {
+				if (!stillSameSession() || !response || response.ok !== true) return;
 				window.__userNotificationLastReadId = Math.max(window.__userNotificationLastReadId, Math.max(0, Number(response.lastReadId) || 0));
 				window.__userNotificationServerUnreadCount = Math.max(0, Number(response.unreadCount) || 0);
 				pruneUserNotificationSeenState();
@@ -115703,7 +115729,7 @@ function getVisibleChatStackEl(id) {
       if(kind==='post'||kind==='delete'||!postId||snapshot.posts.some(post=>post.id===postId))snapshot.dirty=true;
     }
   }
-  const unseen={socket:null,seen:'0',newest:'0',active:false,ready:false};
+  const unseen={socket:null,owner:'',serial:0,seen:'0',newest:'0',active:false,ready:false};
   const warmFeed={owner:'',socket:null,token:0,promise:null,ready:null};
   function invalidateWarmFeed(){
     warmFeed.token++;warmFeed.ready=null;warmFeed.promise=null;
@@ -115740,24 +115766,44 @@ function getVisibleChatStackEl(id) {
     return !!(name&&socket?.connected&&socket.__psnGlobalAuthenticatedName===name);
   }
   const newer=(a,b)=>{try{return BigInt(s(a||'0'))>BigInt(s(b||'0'));}catch(e){return false;}};
-  function paintUnseen(){const hidden=!unseen.active;document.querySelectorAll('.psn-social-unseen-dot').forEach(dot=>{if(dot.hidden!==hidden)dot.hidden=hidden;});}
+  function paintUnseen(){const hidden=!unseen.active||!unseen.ready||unseen.owner!==identity()||!socialSessionReady();document.querySelectorAll('.psn-social-unseen-dot').forEach(dot=>{if(dot.hidden!==hidden)dot.hidden=hidden;});}
+  function resetUnseen(owner='',detach=false){
+    unseen.serial++;
+    unseen.owner=owner;unseen.ready=false;unseen.active=false;unseen.seen='0';unseen.newest='0';
+    if(detach&&unseen.socket){
+      unseen.socket.off('auth_success',onGlobalSocialAuthenticated);
+      unseen.socket.off('social_feed_changed',onUnseenPost);
+      unseen.socket=null;
+    }
+    paintUnseen();
+  }
   function refreshUnseen(){
     const socket=typeof socketChat==='undefined'?null:socketChat;
-    if(!socialSessionReady())return;
+    if(!socialSessionReady()||unseen.socket!==socket)return;
+    const owner=identity();
+    if(unseen.owner!==owner)resetUnseen(owner);
+    const serial=++unseen.serial;
     socket.emit('social_unseen_get',{},res=>{
-      if(!res?.success||unseen.socket!==socket)return;
+      if(serial!==unseen.serial||unseen.socket!==socket||unseen.owner!==owner||identity()!==owner||!socialSessionReady()||!res?.success)return;
       unseen.ready=true;unseen.seen=s(res.lastSeen||'0');unseen.newest=s(res.newest||'0');
       unseen.active=!!res.unseen;paintUnseen();
     });
   }
   function attachUnseen(){
     const socket=typeof socketChat==='undefined'?null:socketChat;
-    if(!socket||unseen.socket===socket)return !!socket;
-    if(unseen.socket){unseen.socket.off('auth_success',onGlobalSocialAuthenticated);unseen.socket.off('social_feed_changed',onUnseenPost);}
-    unseen.socket=socket;socket.on('auth_success',onGlobalSocialAuthenticated);socket.on('social_feed_changed',onUnseenPost);
-    if(socialSessionReady())refreshUnseen();
+    if(!socket)return false;
+    if(unseen.socket!==socket){
+      resetUnseen('',true);
+      unseen.socket=socket;socket.on('auth_success',onGlobalSocialAuthenticated);socket.on('social_feed_changed',onUnseenPost);
+    }
+    if(socialSessionReady()&&unseen.owner!==identity())refreshUnseen();
     return true;
   }
+  window.psnSocialOnAuthenticatedSession=function(){
+    attachUnseen();
+    if(socialSessionReady()&&unseen.owner===identity()&&!unseen.ready)refreshUnseen();
+    observeSocket();
+  };
   function onGlobalSocialAuthenticated(data){
     if(!data?.name)return;
     setTimeout(()=>{
@@ -115778,6 +115824,7 @@ function getVisibleChatStackEl(id) {
     },0);
   }
   function onUnseenPost(data){
+    if(!socialSessionReady()||unseen.socket!==socketChat||unseen.owner!==identity())return;
     if(data?.kind==='post')invalidateWarmFeed();
     if(data?.kind!=='post'||!data.id||data.author===identity())return;
     if(!unseen.ready)return;
@@ -115788,9 +115835,9 @@ function getVisibleChatStackEl(id) {
     if(!unseen.ready||state.filter!=='all'||!state.loaded||!visible())return;
     const newest=state.posts[0]?.id;
     if(!newest||!newer(newest,unseen.seen))return;
-    const socket=unseen.socket;
+    const socket=unseen.socket,owner=identity(),serial=++unseen.serial;
     socket?.emit('social_unseen_mark',{upTo:newest},res=>{
-      if(!res?.success)return;
+      if(serial!==unseen.serial||unseen.socket!==socket||unseen.owner!==owner||identity()!==owner||!socialSessionReady()||!res?.success)return;
       unseen.seen=s(res.lastSeen||newest);
       unseen.active=newer(unseen.newest,unseen.seen);
       paintUnseen();
@@ -118095,13 +118142,38 @@ function getVisibleChatStackEl(id) {
     }
 
   }
+  window.psnSocialResetSessionState=function(){
+    resetUnseen('',true);
+    if(state.socket){
+      state.socket.off('social_feed_changed',onChanged);
+      state.socket.off('social_activity_notice',onNotice);
+      state.socket.off('disconnect',onDisconnect);
+      state.socket=null;
+    }
+    invalidateWarmFeed();warmFeed.owner='';warmFeed.socket=null;
+    if(warmFeedIdleHandle){
+      if(typeof cancelIdleCallback==='function')cancelIdleCallback(warmFeedIdleHandle);
+      clearTimeout(warmFeedIdleHandle);warmFeedIdleHandle=0;
+    }
+    clearTimeout(state.refreshTimer);clearTimeout(state.countRefreshTimer);clearTimeout(socialCommentsRefreshTimer);
+    state.countRefreshSerial++;state.requestSerial++;state.activeRequest++;state.modalRequest++;
+    for(const timer of state.postRefreshTimers.values())clearTimeout(timer);
+    state.postRefreshTimers.clear();state.postRefreshDirty.clear();state.postRefreshInFlight.clear();
+    socialFilterCache.clear();socialFeedFetchedAt=0;socialPendingOpenPost=null;
+    state.owner='';state.loaded=false;state.loading=false;state.stale=true;state.inflightOwner=null;state.inflightMode=null;
+    state.posts=[];state.before=null;state.counts=null;state.comments.clear();state.openComments.clear();
+    state.pendingPlaying=null;state.pendingImages.forEach(photo=>{if(photo.file)URL.revokeObjectURL(photo.preview);});state.pendingImages=[];
+    closeSocialReactors();closeCommentModal();closeSocialGifPicker();
+    const composer=document.getElementById('psn-social-new-text');if(composer)composer.innerHTML='';
+    const list=feed();if(list){list.innerHTML='';list.removeAttribute('aria-busy');}
+  };
   window.psnSocialResetFeedFilter=function(){if(state.filter!=='all')setSocialFeedFilter('all',false);};
   window.psnSocialOpen=function(){
     window.psnSocialResetFeedFilter();
     init();observeSocket();attachUnseen();syncSocialComposerIdentity();renderSocialPlayingDraft();window.updateSocialOnlineCount?.();
     const current=identity();
     if(state.owner!==current){
-      unseen.ready=false;unseen.active=false;unseen.seen='0';paintUnseen();refreshUnseen();
+      resetUnseen(current);refreshUnseen();
       state.requestSerial++;
       state.activeRequest++;
       state.loading=false;
