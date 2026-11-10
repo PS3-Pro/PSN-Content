@@ -2653,6 +2653,8 @@ body:has(#profile-sync-indicator.show) :is(#ps3-queue-presence,#fm-pkg-install-p
 .trophy-notification-container { position: fixed; top: 20px; right: 20px; z-index: 9999; display: flex; flex-direction: column; gap: 10px; pointer-events: none; }
 .trophy-popup { background: rgba(20,20,20,0.95); border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 12px 20px; display: flex; align-items: center; gap: 15px; box-shadow: 0 10px 30px rgba(0,0,0,0.8),0 0 15px rgba(255,255,255,0.05); backdrop-filter: blur(10px); transform: translateX(120%); transition: transform 0.5s cubic-bezier(0.175,0.885,0.32,1.275); }
 .trophy-popup.show { transform: translateX(0); }
+.trophy-popup.psn-top-popup-actionable { pointer-events: auto; cursor: pointer; }
+.trophy-popup.psn-top-popup-actionable:focus-visible { outline: 2px solid var(--psn-focus-ring); outline-offset: 3px; }
 .trophy-popup-icon { font-size: 24px; }
 .trophy-popup-text h4 { margin: 0; font-size: 12px; color: var(--text-muted); font-weight: normal; }
 .trophy-popup-text p { margin: 0; font-size: 15px; color: #fff; font-weight: bold; }
@@ -72217,6 +72219,16 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		}
 		copy.append(title, body);
 		popup.append(icon, copy);
+		if (typeof options.onClick === 'function') {
+			popup.classList.add('psn-top-popup-actionable');
+			popup.setAttribute('role', 'button');
+			popup.setAttribute('tabindex', '0');
+			popup.setAttribute('aria-label', `${String(options.lead || '').trim()} ${String(options.text || options.title || 'Notification')}`.trim());
+			popup.addEventListener('click', options.onClick);
+			popup.addEventListener('keydown', function(event) {
+				if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); options.onClick(); }
+			});
+		}
 		container.appendChild(popup);
 
 		requestAnimationFrame(() => { requestAnimationFrame(() => { popup.classList.add('show'); }); });
@@ -94809,6 +94821,29 @@ function getVisibleChatStackEl(id) {
 						if (isUserNotificationSurfaceActuallyVisible() && typeof window.markUserNotificationsSeen === 'function') window.markUserNotificationsSeen([item.id]);
 					}
 				}
+				// Social uses the same global top popup as Chat, not a separate Social-only toast.
+				if (isFreshUnread && item.type === 'social' && typeof window.showPsnTopPopup === 'function' &&
+					(typeof isChatNotificationSessionReady !== 'function' || isChatNotificationSessionReady())) {
+					const activity = String(item.data && item.data.activity || '').toLowerCase();
+					const notificationsVisible = typeof window.isNotificationCenterVisible === 'function' && window.isNotificationCenterVisible();
+					if (!notificationsVisible && ['reply','comment','reaction','comment_reaction'].includes(activity)) {
+						const presentation = getUserNotificationPresentation(item);
+						const reaction = activity === 'reaction' || activity === 'comment_reaction';
+						window.showPsnTopPopup({
+							iconClass: `fas ${presentation.badgeIcon || 'fa-heart'}`,
+							color: activity === 'reply' ? '#a855f7' : (reaction ? '#ff4fa3' : '#0070cc'),
+							title: activity === 'reply' ? 'SOCIAL REPLY' : (activity === 'comment' ? 'SOCIAL COMMENT' : (['❤️','❤'].includes(String(item.data && item.data.emoji || '')) ? 'SOCIAL LIKE' : 'SOCIAL REACTION')),
+							lead: String(item.data && item.data.actor || 'Someone').trim() || 'Someone',
+							text: presentation.title,
+							onClick: function() {
+								if (typeof window.psnSocialOpenPost === 'function')
+									window.psnSocialOpenPost(item.data.postId, item.data.commentId || null);
+							}
+						});
+						if (isUserNotificationSurfaceActuallyVisible() && typeof window.markUserNotificationsSeen === 'function')
+							window.markUserNotificationsSeen([item.id]);
+					}
+				}
 				if (isFreshUnread && (item.type === 'game_match' || item.type === 'play_together') && typeof window.showPsnTopPopup === 'function') {
 					const notificationsVisible = typeof window.isNotificationCenterVisible === 'function' && window.isNotificationCenterVisible();
 					if (!notificationsVisible) {
@@ -102519,7 +102554,18 @@ function getVisibleChatStackEl(id) {
 			if (privateKind === 'reaction') return { badgeIcon:'fa-smile', cls:'is-private-message is-private-reaction', title:'reacted ' + String(data.emoji || '❤') + ' to your private message', meta:'Private Reaction', preview:data.text || mediaPreview, noTranslate:true };
 			return { badgeIcon:'fa-comment-dots', cls:'is-private-message', title:'sent you a private message', meta:'Private Message', preview:data.text || mediaPreview, noTranslate:true };
 		}
-		if (item.type === 'social') return { badgeIcon:data.activity === 'post' ? 'fa-pen' : (data.activity === 'reply' ? 'fa-reply' : (data.activity === 'comment' ? 'fa-comment' : 'fa-heart')), cls:'is-social', title:data.activity === 'post' ? 'made a post' : (data.activity === 'reply' ? 'replied to your comment' : (data.activity === 'comment' ? 'commented on your post' : 'reacted ' + String(data.emoji || '❤️') + ' to your post')), meta:'Social', preview:String(data.text || (data.activity==='reply'?'View the reply to your comment.':(data.activity==='post'?'View publication.':'See your publication.'))) };
+		if (item.type === 'social') {
+			const activity = String(data.activity || '');
+			const isCommentReaction = activity === 'comment_reaction';
+			const badgeIcon = activity === 'post' ? 'fa-pen' : (activity === 'reply' ? 'fa-reply' : (activity === 'comment' ? 'fa-comment' : 'fa-heart'));
+			const emoji = String(data.emoji || '❤️');
+			const reactionTitle = (emoji === '❤️' || emoji === '❤')
+				? (isCommentReaction ? 'liked your comment' : 'liked your post')
+				: ('reacted ' + emoji + (isCommentReaction ? ' to your comment' : ' to your post'));
+			const title = activity === 'post' ? 'made a post' : (activity === 'reply' ? 'replied to your comment' : (activity === 'comment' ? 'commented on your post' : reactionTitle));
+			const preview = data.text || (activity === 'reply' ? 'View the reply to your comment.' : (activity === 'post' ? 'View publication.' : (isCommentReaction ? 'See your comment.' : 'See your publication.')));
+			return { badgeIcon, cls:'is-social', title, meta:'Social', preview:String(preview) };
+		}
 		if (item.type === 'reply') return { badgeIcon:messageDeleted ? 'fa-comment-slash' : 'fa-comments', cls:'is-reply' + (messageDeleted ? ' is-message-deleted' : ''), title:'replied to your message', meta:'Global Chat', preview:messageDeleted ? 'Message deleted' : (data.text || '') };
 		if (item.type === 'mention') return { badgeIcon:messageDeleted ? 'fa-comment-slash' : 'fa-comments', cls:'is-mention' + (messageDeleted ? ' is-message-deleted' : ''), title:'mentioned you', meta:'Global Chat', preview:messageDeleted ? 'Message deleted' : (data.text || '') };
 		if (item.type === 'reaction') return { badgeIcon:messageDeleted ? 'fa-comment-slash' : 'fa-comments', cls:'is-reaction' + (messageDeleted ? ' is-message-deleted' : ''), title:'reacted ' + String(data.emoji || '❤') + ' to your message', meta:'Global Chat', preview:messageDeleted ? 'Message deleted' : (data.text || '') };
@@ -116456,21 +116502,12 @@ function getVisibleChatStackEl(id) {
   function observeSocket(){
     if(typeof socketChat==='undefined'||!socketChat||!socketChat.connected)return;
     if(state.socket===socketChat)return;
-    if(state.socket){state.socket.off('social_feed_changed',onChanged);state.socket.off('social_activity_notice',onNotice);state.socket.off('disconnect',onDisconnect);}
+    if(state.socket){state.socket.off('social_feed_changed',onChanged);state.socket.off('disconnect',onDisconnect);}
     state.socket=socketChat;
     socketChat.on('disconnect',onDisconnect);
     socketChat.on('social_feed_changed',onChanged);
-    socketChat.on('social_activity_notice',onNotice);
   }
   function onDisconnect(){state.stale=true;invalidateSocialFilterSnapshots();invalidateWarmFeed();socialReactorsPages.clear();socialReactorCacheGeneration++;}
-  function onNotice(data){
-    if(!data||!data.actor||!visible())return;
-    if(typeof showToastNotification==='function'){
-      const isReply=data.activity==='reply';
-      const canJump=idOf(data.postId)&&idOf(data.commentId);
-      showToastNotification('Social',isReply?`${data.actor} replied to your comment.`:`${data.actor} ${data.activity==='comment'?'commented on':'reacted to'} your post.`,isReply&&canJump?{actionLabel:'View',onAction:()=>window.psnSocialOpenPost(data.postId,data.commentId)}:{});
-    }
-  }
   function animateSocialRemoval(element){
     if(!element||!element.isConnected)return Promise.resolve();
     if(element.__psnSocialRemoval)return element.__psnSocialRemoval;
@@ -118300,7 +118337,6 @@ function getVisibleChatStackEl(id) {
     resetUnseen('',true);
     if(state.socket){
       state.socket.off('social_feed_changed',onChanged);
-      state.socket.off('social_activity_notice',onNotice);
       state.socket.off('disconnect',onDisconnect);
       state.socket=null;
     }

@@ -12275,7 +12275,7 @@ function normalizeUserNotificationData(type, rawData = {}) {
       postId: normalizeText(source.postId, '').slice(0, 24),
       commentId: /^\d{1,18}$/.test(String(source.commentId || '')) ? String(source.commentId) : '',
       parentCommentId: /^\d{1,18}$/.test(String(source.parentCommentId || '')) ? String(source.parentCommentId) : '',
-      activity: source.activity === 'reply' ? 'reply' : (source.activity === 'comment' ? 'comment' : (source.activity === 'post' ? 'post' : 'reaction')),
+      activity: source.activity === 'reply' ? 'reply' : (source.activity === 'comment' ? 'comment' : (source.activity === 'post' ? 'post' : (source.activity === 'comment_reaction' ? 'comment_reaction' : 'reaction'))),
       emoji: normalizeText(source.emoji, '').slice(0, 12),
       text: normalizeText(source.text, '').slice(0, 160)
     };
@@ -14790,13 +14790,6 @@ async function socialAnnounceNewPost(actor, id, text, playing = null) {
   publishStoredUserNotificationsBatch(result.rows || []);
 }
 
-function socialNotifyAuthor(author, actor, postId, activity, commentId = '') {
-  if (!author || author === actor) return;
-  for (const client of getSocketsByUserName(author)) {
-    if (client && client.connected) client.emit('social_activity_notice', { actor, postId: String(postId), activity, commentId: String(commentId || '') });
-  }
-}
-
 // The Social sidebar checks its unread marker on each session. Read an existing
 // marker without attempting a conflicting INSERT on every login. Only first-
 // time users get an inserted marker, initialized to the current newest post.
@@ -15093,7 +15086,6 @@ io.on('connection', (socket) => {
       }:{})});
       if (reaction.reacted) {
         const owner=reaction.author_name;
-        socialNotifyAuthor(owner,actor,id,'reaction');
         if (owner!==actor) deferServerTask('SOCIAL REACTION NOTICE', () => recordUserNotification(owner,'social', {
           actor,postId:id,activity:'reaction',emoji
         },{dedupeKey:`social:react:${id}:${actor}`}),0);
@@ -15178,14 +15170,12 @@ io.on('connection', (socket) => {
       const replyAuthor=added.rows[0].reply_author;
       socialPublish('comment',id,{originSocketId:socket.id,commentId:String(added.rows[0].id),...(parentId?{parentId}:{})});
       if (replyAuthor && replyAuthor!==actor) {
-        socialNotifyAuthor(replyAuthor,actor,id,'reply',String(added.rows[0].id));
         deferServerTask('SOCIAL REPLY NOTICE',()=>recordUserNotification(replyAuthor,'social',{
           actor,postId:id,commentId:String(added.rows[0].id),parentCommentId:parentId,
           activity:'reply',text:body.slice(0,160)||(images.length?'Replied with a photo or GIF.':'')
         },{dedupeKey:`social:reply:${added.rows[0].id}:${actor}`}),0);
       }
       if (owner && owner!==actor && owner!==replyAuthor) {
-        socialNotifyAuthor(owner,actor,id,'comment');
         deferServerTask('SOCIAL COMMENT NOTICE',()=>recordUserNotification(owner,'social',{
           actor,postId:id,commentId:String(added.rows[0].id),activity:'comment',text:body.slice(0,160)||(images.length?'Shared a photo or GIF.':'')
         },{dedupeKey:`social:comment:${added.rows[0].id}:${actor}`}),0);
@@ -15237,7 +15227,7 @@ io.on('connection', (socket) => {
     if (!socialRateLimit(actor,'comment-react:'+id,300)) return reply({success:false,message:'Please wait.'});
     try {
       const result = hasDesired ? await queryDbWithRetry(desired ? `
-        WITH target AS MATERIALIZED (SELECT id,post_id FROM social_comments WHERE id=$1),
+        WITH target AS MATERIALIZED (SELECT id,post_id,author_name FROM social_comments WHERE id=$1),
         prior AS MATERIALIZED (SELECT emoji FROM social_comment_reactions WHERE comment_id=$1 AND user_name=$2),
         applied AS (
           INSERT INTO social_comment_reactions (comment_id,user_name,emoji)
@@ -15246,16 +15236,16 @@ io.on('connection', (socket) => {
             WHERE social_comment_reactions.emoji IS DISTINCT FROM EXCLUDED.emoji
           RETURNING comment_id
         )
-        SELECT target.post_id,true AS reacted,EXISTS(SELECT 1 FROM applied) AS changed,
+        SELECT target.post_id,target.author_name,true AS reacted,EXISTS(SELECT 1 FROM applied) AS changed,
           COALESCE((SELECT emoji FROM prior),'') AS previous_emoji FROM target
       ` : `
-        WITH target AS MATERIALIZED (SELECT id,post_id FROM social_comments WHERE id=$1),
+        WITH target AS MATERIALIZED (SELECT id,post_id,author_name FROM social_comments WHERE id=$1),
         prior AS MATERIALIZED (SELECT emoji FROM social_comment_reactions WHERE comment_id=$1 AND user_name=$2),
         removed AS (DELETE FROM social_comment_reactions WHERE comment_id=$1 AND user_name=$2 RETURNING comment_id)
-        SELECT target.post_id,false AS reacted,EXISTS(SELECT 1 FROM removed) AS changed,
+        SELECT target.post_id,target.author_name,false AS reacted,EXISTS(SELECT 1 FROM removed) AS changed,
           COALESCE((SELECT emoji FROM prior),'') AS previous_emoji FROM target
       `,desired?[id,actor,desired]:[id,actor],{attempts:2,label:'SOCIAL COMMENT REACTION SET'}) : await queryDbWithRetry(`
-        WITH target AS MATERIALIZED (SELECT id,post_id FROM social_comments WHERE id=$1),
+        WITH target AS MATERIALIZED (SELECT id,post_id,author_name FROM social_comments WHERE id=$1),
         removed AS (
           DELETE FROM social_comment_reactions WHERE comment_id=$1 AND user_name=$2 AND emoji=$3
           RETURNING comment_id
@@ -15267,7 +15257,7 @@ io.on('connection', (socket) => {
             WHERE social_comment_reactions.emoji IS DISTINCT FROM EXCLUDED.emoji
           RETURNING comment_id
         )
-        SELECT target.post_id,EXISTS(SELECT 1 FROM applied) AS reacted FROM target
+        SELECT target.post_id,target.author_name,EXISTS(SELECT 1 FROM applied) AS reacted FROM target
       `,[id,actor,emoji],{attempts:2,label:'SOCIAL COMMENT REACT'});
       const reaction=result.rows[0];
       if (!reaction) return reply({success:false,message:'Comment not found.'});
@@ -15276,6 +15266,11 @@ io.on('connection', (socket) => {
       socialPublish('react',reaction.post_id,{originSocketId:socket.id,commentId:id,...(hasDesired?{
         actor,oldEmoji:reaction.previous_emoji||'',emoji:desired
       }:{})});
+      if (reaction.reacted && reaction.author_name && reaction.author_name !== actor) {
+        deferServerTask('SOCIAL COMMENT REACTION NOTICE', () => recordUserNotification(reaction.author_name,'social',{
+          actor,postId:String(reaction.post_id),commentId:id,activity:'comment_reaction',emoji:hasDesired?desired:emoji
+        },{dedupeKey:`social:comment-react:${id}:${actor}`}),0);
+      }
     } catch (err) {console.error('[SOCIAL COMMENT REACT ERROR]:',err && err.message || err);reply({success:false,message:'Could not react to comment.'});}
   });
 
