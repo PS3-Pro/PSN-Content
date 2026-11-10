@@ -2659,15 +2659,20 @@ function scheduleStartupGlobalRetention() {
 }
 
 function scheduleLegacyChatSeenBackfill() {
-  // Opt-in maintenance only: the legacy migration repeatedly timed out on free Aiven.
-  if (process.env.CHAT_SEEN_LEGACY_BACKFILL !== '1') return;
-  deferServerTask('CHAT SEEN LEGACY BACKFILL', () => {
-    if (pool.waitingCount > 0) {
-      console.log('[CHAT SEEN LEGACY BACKFILL] Deferred until next startup: database busy.');
+  if (process.env.CHAT_SEEN_RECOVER_RECENT === '0') return;
+  let retries = 0;
+  const recover = async () => {
+    if (pool.waitingCount > 0 || chatSeenSnapshotActive > 0) {
+      if (++retries <= 12) deferServerTask('CHAT SEEN RECOVERY', recover, 30000);
       return;
     }
-    return backfillRecentChatSeenEventsFromLegacyMessages();
-  }, 120000);
+    const recovered = await backfillRecentChatSeenEventsFromLegacyMessages();
+    if (recovered.length) {
+      console.log(`[CHAT SEEN RECOVERY] Restored ${recovered.length} legacy read confirmations.`);
+      emitChatSeenSyncEvents(recovered);
+    }
+  };
+  deferServerTask('CHAT SEEN RECOVERY', recover, 120000);
 }
 
 async function initDb() {
@@ -8720,15 +8725,15 @@ function getCurrentChatMessageIds() {
 
 async function backfillRecentChatSeenEventsFromLegacyMessages() {
   try {
-    await queryDbWithRetry(
-      `WITH recent AS (
-         SELECT message
-         FROM chat
+    const result = await queryDbWithRetry(
+      `WITH most_recent AS MATERIALIZED (
+         SELECT message FROM chat ORDER BY id DESC LIMIT $1
+       ),
+       recent AS MATERIALIZED (
+         SELECT message FROM most_recent
          WHERE jsonb_typeof(message->'seenBy') = 'array'
            AND COALESCE(message->>'time', '') <> ''
            AND COALESCE(message->>'user', '') <> ''
-         ORDER BY id DESC
-         LIMIT $1
        ),
        legacy AS (
          SELECT
@@ -8741,17 +8746,24 @@ async function backfillRecentChatSeenEventsFromLegacyMessages() {
          WHERE COALESCE(seen.reader, '') <> ''
        )
        INSERT INTO chat_seen_events (message_id, sender, reader, seen_at)
-       SELECT message_id, sender, reader, seen_at
-       FROM legacy
-       ON CONFLICT (message_id, reader) DO NOTHING`,
+       SELECT message_id, sender, reader, seen_at FROM legacy
+       ON CONFLICT (message_id, reader) DO NOTHING
+       RETURNING id, message_id, sender, reader, seen_at`,
       [MAX_CHAT_HISTORY],
-      { attempts: 2, label: 'CHAT SEEN LEGACY BACKFILL' }
+      { attempts: 1, label: 'CHAT SEEN RECOVERY', queryTimeoutMs: 6000 }
     );
+    return (result.rows || []).map(row => ({
+      eventId: Math.max(0, Number(row.id) || 0),
+      msgId: String(row.message_id || ''),
+      sender: String(row.sender || ''),
+      reader: String(row.reader || ''),
+      seenAt: row.seen_at ? new Date(row.seen_at).toISOString() : ''
+    })).filter(event => event.eventId && event.msgId && event.reader);
   } catch (err) {
-    console.warn('[CHAT SEEN LEGACY BACKFILL] Skipped:', err && err.message ? err.message : err);
+    console.warn('[CHAT SEEN RECOVERY] Skipped:', err && err.message ? err.message : err);
+    return [];
   }
 }
-
 // Optional Seen snapshots must never monopolize the small Aiven connection
 // pool. Coalesce identical viewer requests; defer others and retry via normal
 // Seen sync without advancing their cursor.
@@ -8768,26 +8780,18 @@ async function getChatSeenSnapshotForUser(userName = '') {
   const messageIds = getCurrentChatMessageIds();
   if (!messageIds.length) return [];
   chatSeenSnapshotActive++;
-  // Use the existing sender/reader indexes and join only the current chat IDs.
-  // The disjoint branches avoid duplicate events for a sender reading their own
-  // message. CHAT_SEEN_INDEX_LOOKUP=0 keeps the original query as a fallback.
+  // Probe the current messages by their existing UNIQUE(message_id, reader) index.
   const useIndexedLookup = process.env.CHAT_SEEN_INDEX_LOOKUP !== '0';
   const query = useIndexedLookup
-    ? `WITH wanted AS MATERIALIZED (
-         SELECT DISTINCT unnest($1::text[]) AS message_id
-       )
-       SELECT seen.id, seen.message_id, seen.sender, seen.reader, seen.seen_at
-       FROM (
-         SELECT e.id, e.message_id, e.sender, e.reader, e.seen_at
-         FROM chat_seen_events e
-         JOIN wanted w ON w.message_id = e.message_id
-         WHERE e.sender = $2::text
-         UNION ALL
-         SELECT e.id, e.message_id, e.sender, e.reader, e.seen_at
-         FROM chat_seen_events e
-         JOIN wanted w ON w.message_id = e.message_id
-         WHERE e.reader = $2::text AND e.sender IS DISTINCT FROM $2::text
-       ) seen
+    ? `SELECT seen.id, seen.message_id, seen.sender, seen.reader, seen.seen_at
+       FROM (SELECT DISTINCT unnest($1::text[]) AS message_id) wanted
+       JOIN LATERAL (
+         SELECT id, message_id, sender, reader, seen_at
+         FROM chat_seen_events
+         WHERE message_id = wanted.message_id
+           AND (sender = $2::text OR reader = $2::text)
+         OFFSET 0
+       ) seen ON TRUE
        ORDER BY seen.id ASC`
     : `SELECT id, message_id, sender, reader, seen_at
        FROM chat_seen_events
