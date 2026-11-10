@@ -5032,8 +5032,16 @@ function searchUsersFromCache(query, includeAdminFields = false, includeAllMatch
 async function calculateTrendingFromDb() {
   const trendingStartedAt = Date.now();
   logMemoryTrace('trending:build:start', `cacheUsers=${Object.keys(userDatabase).length}`);
-  const rows = await queryDbWithRetry(`
-    WITH game_downloads AS (
+  // The ready v39 membership index already contains one row per game/user.
+  // Retain the original JSON query until the backfill is complete or if disabled.
+  const useIndexedGameDownloads = contentDownloadIndexReady &&
+    process.env.CONTENT_DOWNLOAD_COUNT_INDEX !== '0' &&
+    process.env.TRENDING_DOWNLOAD_INDEX !== '0';
+  const gameDownloadsSource = useIndexedGameDownloads ? `
+      SELECT username, substring(content_key FROM 9) AS title_id, 'games' AS raw_category
+      FROM psn_content_download_memberships
+      WHERE content_key LIKE 'games|T:%'
+    ` : `
       SELECT
         u.name AS username,
         CASE WHEN upper(trim(COALESCE(item->>'titleId', item->>'id', ''))) IN ('MISSING','N/A','NONE','NULL','UNDEFINED') THEN '' ELSE upper(trim(COALESCE(item->>'titleId', item->>'id', ''))) END AS title_id,
@@ -5042,6 +5050,9 @@ async function calculateTrendingFromDb() {
       CROSS JOIN LATERAL jsonb_array_elements(
         CASE WHEN jsonb_typeof(u.data->'downloadsData') = 'array' THEN u.data->'downloadsData' ELSE '[]'::jsonb END
       ) item
+    `;
+  const rows = await queryDbWithRetry(`
+    WITH game_downloads AS (${gameDownloadsSource}
     ), wishlist_items AS (
       SELECT
         u.name AS username,
@@ -5068,7 +5079,7 @@ async function calculateTrendingFromDb() {
     SELECT 'game' AS kind, key, count FROM top_games
     UNION ALL
     SELECT 'wishlist' AS kind, key, count FROM top_wishlist
-  `, [], { attempts: 2, label: 'TRENDING AGGREGATE' });
+  `, [], { attempts: 2, label: useIndexedGameDownloads ? 'TRENDING AGGREGATE INDEXED' : 'TRENDING AGGREGATE' });
   logMemoryTrace('trending:query:done', `rows=${rows && Array.isArray(rows.rows) ? rows.rows.length : 0} ms=${Date.now() - trendingStartedAt}`);
 
   const topDownloads = [];
