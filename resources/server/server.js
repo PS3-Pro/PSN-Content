@@ -8,9 +8,40 @@ const { Server } = require("socket.io");
 const { Pool, Client } = require('pg');
 const bcrypt = require('bcrypt');
 const crypto = require('crypto');
+const zlib = require('zlib');
 const { spawn } = require('child_process');
 
 const app = express();
+// Compress public metadata off the event loop; keep HTTP content negotiation intact.
+app.use((req, res, next) => {
+  if (req.method !== 'GET' || !req.path.startsWith('/api/metadata/')) return next();
+  const gzipPreference = String(req.headers['accept-encoding'] || '').split(',')
+    .map(item => item.trim().split(';').map(part => part.trim()))
+    .find(parts => parts[0].toLowerCase() === 'gzip');
+  if (!gzipPreference || gzipPreference.slice(1).some(param => /^q\s*=\s*0(?:\.0*)?$/i.test(param))) return next();
+  res.vary('Accept-Encoding');
+  const originalSend = res.send.bind(res);
+  res.send = function(body) {
+    const type = String(res.getHeader('Content-Type') || '');
+    if (/\bapplication\/json\b/i.test(type) && typeof body === 'string' &&
+        !res.headersSent && !res.getHeader('Content-Encoding')) {
+      const bytes = Buffer.from(body);
+      if (bytes.length >= 2048 && bytes.length <= 512 * 1024) {
+        zlib.gzip(bytes, { level: 1 }, (err, compressed) => {
+          if (res.destroyed || res.writableEnded || req.aborted) return;
+          if (!err && compressed && compressed.length < bytes.length * 0.85) {
+            res.setHeader('Content-Encoding', 'gzip');
+            res.removeHeader('Content-Length');
+            originalSend(compressed);
+          } else originalSend(body);
+        });
+        return res;
+      }
+    }
+    return originalSend(body);
+  };
+  next();
+});
 const server = http.createServer(app);
 
 // ============================================================================
@@ -8260,6 +8291,24 @@ function buildLightProfileUserData(name, user = {}) {
 
 async function emitProfileSyncPacket(socket, payload, options = {}) {
   const requireAck = socket && socket.profileSyncAckV1 === true;
+  let outgoingPayload = payload;
+  if (socket && socket.connected && socket.profileSyncGzipV1 === true && payload && payload.userData) {
+    try {
+      const serialized = Buffer.from(JSON.stringify(payload));
+      if (serialized.length >= 4096 && serialized.length <= 4 * 1024 * 1024) {
+        const compressed = await new Promise((resolve, reject) => zlib.gzip(serialized, { level: 1 },
+          (err, bytes) => err ? reject(err) : resolve(bytes)));
+        if (compressed.length * 4 / 3 < serialized.length * 0.82) {
+          outgoingPayload = {
+            profileSyncGzipV1: 1,
+            name: payload.name,
+            sourceSocketId: payload.sourceSocketId || null,
+            content: compressed.toString('base64')
+          };
+        }
+      }
+    } catch (err) { outgoingPayload = payload; }
+  }
   const timeoutMs = Math.max(3000, Number(options.timeoutMs || 15000));
   const label = String(options.label || 'profile');
   if (!socket || !socket.connected) return Promise.reject(new Error(`Socket disconnected before ${label}.`));
@@ -8302,6 +8351,20 @@ async function emitProfileSyncPacket(socket, payload, options = {}) {
     const done = response => {
       if (settled) return;
       if (response && response.ok === false) {
+        if (outgoingPayload !== payload && socket.connected) {
+          outgoingPayload = payload;
+          socket.profileSyncGzipV1 = false;
+          try {
+            trackBandwidthPayload('profile_sync:fallback', payload, 1);
+            socket.emit('profile_sync', payload, done);
+          } catch (err) {
+            settled = true;
+            clearTimeout(timer);
+            try { socket.off('disconnect', onDisconnect); } catch (e) {}
+            reject(err);
+          }
+          return;
+        }
         settled = true;
         clearTimeout(timer);
         try { socket.off('disconnect', onDisconnect); } catch (e) {}
@@ -8313,8 +8376,8 @@ async function emitProfileSyncPacket(socket, payload, options = {}) {
 
     try { socket.once('disconnect', onDisconnect); } catch (e) {}
     try {
-      trackBandwidthPayload('profile_sync', payload, 1);
-      socket.emit('profile_sync', payload, done);
+      trackBandwidthPayload(outgoingPayload === payload ? 'profile_sync' : 'profile_sync:gzip', outgoingPayload, 1);
+      socket.emit('profile_sync', outgoingPayload, done);
     } catch (err) {
       if (!settled) {
         clearTimeout(timer);
@@ -8439,7 +8502,16 @@ async function emitChunkedProfileSyncToSocket(socket, name, options = {}) {
         if (MEMORY_TRACE_ENABLED) {
           logMemoryTrace('profile-sync:section:send', `user=${name} socket=${socket.id} section=${dataKey} items=${itemCount} approx=${formatApproxBytes(estimate.bytes)}${estimate.truncated ? '+' : ''} buffer=${getSocketWriteBufferLength(socket)}`);
         }
+        // A timestamp or count alone is not a content fingerprint.
+        const signature = packet && packet.userData ?
+          crypto.createHash('sha256').update(JSON.stringify(packet.userData)).digest('hex') : '';
+        const lastSent = socket.__profileSectionLastAck && socket.__profileSectionLastAck.get(dataKey);
+        if (options.allowAckDedupe === true && signature && lastSent === signature) return;
         const result = await emitProfileSyncPacket(socket, packet, { label: dataKey, timeoutMs: 10000 });
+        if (result && result.acked === true && signature) {
+          if (!(socket.__profileSectionLastAck instanceof Map)) socket.__profileSectionLastAck = new Map();
+          socket.__profileSectionLastAck.set(dataKey, signature);
+        }
         if (result && result.cancelled) { sectionCancelled = true; return; }
         if (result && result.ackTimeout) {
           logMemoryTrace('profile-sync:section:ack-timeout', `user=${name} socket=${socket.id} section=${dataKey} drained=${result.drained === true} ms=${result.elapsedMs || 0} pending=${result.pending || 0} buffer=${getSocketWriteBufferLength(socket)}`);
@@ -10914,9 +10986,16 @@ function emitPresenceUpdate(name, user = null) {
   const payload = buildPresenceUpdatePayload(name, user);
   if (!payload) return null;
   const keys = Object.keys(payload);
+  const serializedFields = Object.fromEntries(keys.map(key => [key, JSON.stringify(payload[key])]));
+  const fullSignature = JSON.stringify(payload);
   io.sockets.sockets.forEach(client => {
     if (!client.connected) return;
     if (client.presenceDeltaV1 !== true) {
+      if (!(client.__presenceLegacyLastByName instanceof Map)) client.__presenceLegacyLastByName = new Map();
+      const cache = client.__presenceLegacyLastByName;
+      if (cache.get(name) === fullSignature) return;
+      if (cache.size >= 64 && !cache.has(name)) cache.delete(cache.keys().next().value);
+      cache.set(name, fullSignature);
       trackBandwidthPayload('presence_update', payload, 1);
       client.emit('presence_update', payload);
       return;
@@ -10936,7 +11015,7 @@ function emitPresenceUpdate(name, user = null) {
         if (key === 'name' || key === 'online') continue;
         // Last-seen is meaningful only when offline or when the online state changes.
         if (key === 'lastSeen' && payload.online && previous.online === true) continue;
-        if (JSON.stringify(payload[key]) !== JSON.stringify(previous[key])) {
+        if (serializedFields[key] !== (previous.__fieldSignatures && previous.__fieldSignatures[key])) {
           diff[key] = payload[key];
           changed = true;
         }
@@ -10951,7 +11030,7 @@ function emitPresenceUpdate(name, user = null) {
     // Bounded per-socket cache, reset on authentication/reconnect. A cold name
     // receives a full payload again rather than a patch without a baseline.
     if (cache.size >= 64 && !cache.has(name)) cache.delete(cache.keys().next().value);
-    cache.set(name, payload);
+    cache.set(name, { ...payload, __fieldSignatures: serializedFields });
   });
   return payload;
 }
@@ -11594,7 +11673,7 @@ async function initProfileSyncNotifications() {
         const localSockets = getSocketsByUserName(name).filter(client => !(data.sourceSocketId && client.id === data.sourceSocketId));
         for (const client of localSockets) {
           if (client.profileSyncV2 === true) {
-            await emitChunkedProfileSyncToSocket(client, name, { forceRefresh: false, changedKeys: syncChangedKeys, sourceSocketId: data.sourceSocketId || null });
+            await emitChunkedProfileSyncToSocket(client, name, { forceRefresh: false, changedKeys: syncChangedKeys, sourceSocketId: data.sourceSocketId || null, allowAckDedupe: syncChangedKeys !== null });
           } else {
             const fullUser = await runSerializedProfileHydration(() => loadFullUserRecordTransient(name));
             if (fullUser && client.connected) client.emit('profile_sync', buildFullProfileSyncPayload(name, fullUser, data.sourceSocketId || null, { normalized: true }));
@@ -13581,48 +13660,104 @@ function packOnlineListForSocket(client, list) {
   ]) };
 }
 
+function prepareOnlineListWire(list) {
+  const compact = packOnlineListForSocket({ onlineListCompactV1: true }, list);
+  return {
+    compact,
+    fullBytes: Buffer.byteLength(JSON.stringify(compact)),
+    byName: new Map(compact.rows.map(row => [row[1], JSON.stringify(row)]))
+  };
+}
+
+// Targeted and global sends use the same per-socket protocol. Prepared tuples
+// and signatures are shared, while each socket keeps its own versioned base.
+function sendOnlineListToSocket(client, list, prepared, signature, options = {}) {
+  if (!client || !client.connected) return false;
+  const now = Date.now();
+  if (options.force !== true && options.forceSend !== true &&
+      client.__onlineListLastSignature === signature &&
+      now - (client.__onlineListLastSentAt || 0) < 2500) return false;
+
+  if (MEMORY_TRACE_ENABLED) {
+    const estimate = estimateValueBytes(list, { maxNodes: 20000, maxBytes: 8 * 1024 * 1024 });
+    logMemoryTrace('online-list:send', `user=${client.userName || '-'} socket=${client.id} items=${list.length} approx=${formatApproxBytes(estimate.bytes)}${estimate.truncated ? '+' : ''} buffer=${getSocketWriteBufferLength(client)}`);
+  }
+
+  let wireList = client.onlineListCompactV1 === true ? prepared.compact : list;
+  if (client.onlineListDeltaV1 === true && client.onlineListCompactV1 === true) {
+    const previous = client.__onlineListWireSnapshot;
+    const version = previous ? previous.version + 1 : 1;
+    if (previous && options.force !== true && options.forceSend !== true) {
+      if (previous.signature === signature) return false;
+      const changed = prepared.compact.rows.filter(row => prepared.byName.get(row[1]) !== previous.byName.get(row[1]));
+      const removed = [...previous.byName.keys()].filter(name => !prepared.byName.has(name));
+      const delta = { onlineListDeltaV1: 1, baseVersion: previous.version, version, changed, removed };
+      if (Buffer.byteLength(JSON.stringify(delta)) < prepared.fullBytes * 0.78) wireList = delta;
+    }
+    client.__onlineListWireSnapshot = { version, signature, byName: new Map(prepared.byName) };
+    if (wireList === prepared.compact) wireList = { ...prepared.compact, version };
+  }
+
+  const event = wireList && wireList.onlineListDeltaV1 ? 'online_list:delta' :
+    client.onlineListCompactV1 === true ? 'online_list:compact' : 'online_list:target';
+  trackBandwidthPayload(options.broadcast === true ? `${event}:broadcast` : event, wireList, 1);
+  client.emit('online_list', wireList);
+  client.__onlineListLastSignature = signature;
+  client.__onlineListLastSentAt = now;
+  return true;
+}
+
+let onlineListReadSequence = 0;
+let onlineListLastAppliedReadSequence = 0;
+let onlineListBroadcastSequence = 0;
+let onlineListBroadcastResolvedSequence = 0;
+
 async function emitOnlineList(targetSocket = null, options = {}) {
+  const recipients = targetSocket ? [targetSocket] : [...io.sockets.sockets.values()];
+  const authGenerations = new Map(recipients.map(client => [client, client.__onlineListAuthGeneration || 0]));
+  const recipientNames = new Map(recipients.map(client => [client, client.userName]));
+  const recipientSequences = new Map(recipients.map(client => [client,
+    client.__onlineListRequestSequence = (client.__onlineListRequestSequence || 0) + 1]));
+  const broadcastSequence = targetSocket ? 0 : ++onlineListBroadcastSequence;
+  const readSequence = ++onlineListReadSequence;
   try {
     const list = await getSanitizedOnlineListFromDb(options);
-    if (Array.isArray(list) && list.length > 0) lastKnownOnlineList = list;
-
-    if (targetSocket) {
-      const signature = buildOnlineListSignature(list);
-      const now = Date.now();
-      if (options.force !== true && options.forceSend !== true && targetSocket.__onlineListLastSignature === signature &&
-          now - (targetSocket.__onlineListLastSentAt || 0) < 2500) return list;
-      if (MEMORY_TRACE_ENABLED) {
-        const estimate = estimateValueBytes(list, { maxNodes: 20000, maxBytes: 8 * 1024 * 1024 });
-        logMemoryTrace('online-list:send', `user=${targetSocket.userName || '-'} socket=${targetSocket.id} items=${Array.isArray(list) ? list.length : 0} approx=${formatApproxBytes(estimate.bytes)}${estimate.truncated ? '+' : ''} buffer=${getSocketWriteBufferLength(targetSocket)}`);
-      }
-      const outputList = packOnlineListForSocket(targetSocket, list);
-      trackBandwidthPayload(targetSocket.onlineListCompactV1 === true ? 'online_list:compact' : 'online_list:target', outputList, 1);
-      targetSocket.emit('online_list', outputList);
-      targetSocket.__onlineListLastSignature = signature;
-      targetSocket.__onlineListLastSentAt = now;
-      return list;
+    if (broadcastSequence && broadcastSequence < onlineListBroadcastResolvedSequence) return list;
+    if (broadcastSequence) onlineListBroadcastResolvedSequence = broadcastSequence;
+    if (Array.isArray(list) && list.length > 0 && readSequence >= onlineListLastAppliedReadSequence) {
+      lastKnownOnlineList = list;
+      onlineListLastAppliedReadSequence = readSequence;
     }
-
     const signature = buildOnlineListSignature(list);
-    if (ONLINE_LIST_UNCHANGED_SKIP_ENABLED && options.force !== true && signature === lastBroadcastOnlineListSignature) {
-      return list;
+    if (!targetSocket && ONLINE_LIST_UNCHANGED_SKIP_ENABLED && options.force !== true && signature === lastBroadcastOnlineListSignature) return list;
+    const prepared = prepareOnlineListWire(list);
+    for (const client of recipients) {
+      const sequence = recipientSequences.get(client);
+      if (!client.connected || recipientNames.get(client) !== client.userName ||
+          authGenerations.get(client) !== (client.__onlineListAuthGeneration || 0) ||
+          sequence < (client.__onlineListResolvedSequence || 0)) continue;
+      client.__onlineListResolvedSequence = sequence;
+      sendOnlineListToSocket(client, list, prepared, signature, { ...options, broadcast: !targetSocket });
     }
-
-    lastBroadcastOnlineListSignature = signature;
-    trackBandwidthPayload('online_list:broadcast', list, io.sockets.sockets.size);
-    io.emit('online_list', list);
+    if (!targetSocket) lastBroadcastOnlineListSignature = signature;
     return list;
   } catch (err) {
+    if (broadcastSequence && broadcastSequence < onlineListBroadcastResolvedSequence) return lastKnownOnlineList;
+    if (targetSocket && (recipientSequences.get(targetSocket) < (targetSocket.__onlineListResolvedSequence || 0) ||
+        recipientNames.get(targetSocket) !== targetSocket.userName ||
+        authGenerations.get(targetSocket) !== (targetSocket.__onlineListAuthGeneration || 0))) return lastKnownOnlineList;
     console.error('[PRESENCE SYNC ERROR]:', err);
-    const fallback = Array.isArray(lastKnownOnlineList) ? lastKnownOnlineList : [];
-
-    // Never broadcast a fake empty presence list after a temporary DB/reconnect hiccup.
-    // Mobile browsers can resume before Postgres answers, and replacing everyone with
-    // [] is what made the UI show "0 Online" until the next good refresh.
-    if (targetSocket && fallback.length > 0) {
-      targetSocket.emit('online_list', packOnlineListForSocket(targetSocket, fallback));
+    if (targetSocket && targetSocket.connected &&
+        recipientSequences.get(targetSocket) >= (targetSocket.__onlineListResolvedSequence || 0)) {
+      targetSocket.__onlineListResolvedSequence = recipientSequences.get(targetSocket);
+      const fallback = Array.isArray(lastKnownOnlineList) ? lastKnownOnlineList : [];
+      // On transient DB failure, never replace the user's list with an empty snapshot.
+      if (fallback.length > 0) {
+        sendOnlineListToSocket(targetSocket, fallback, prepareOnlineListWire(fallback),
+          buildOnlineListSignature(fallback), { force: true });
+      }
     }
-    return fallback;
+    return Array.isArray(lastKnownOnlineList) ? lastKnownOnlineList : [];
   }
 }
 
@@ -15345,6 +15480,8 @@ io.on('connection', (socket) => {
       const supportsProfileSyncAckV1 = data && data.profileSyncAckV1 === true;
       const supportsPresenceDeltaV1 = data && data.presenceDeltaV1 === true;
       const supportsOnlineListCompactV1 = data && data.onlineListCompactV1 === true;
+      const supportsOnlineListDeltaV1 = supportsOnlineListCompactV1 && data && data.onlineListDeltaV1 === true;
+      const supportsProfileSyncGzipV1 = supportsProfileSyncAckV1 && data && data.profileSyncGzipV1 === true;
       const supportsChatHistoryAckV1 = data && data.chatHistoryAckV1 === true;
       const supportsChatHistoryPullV1 = data && data.chatHistoryPullV1 === true;
       logMemoryTrace('auth:start', `user=${name || ''} socket=${socket.id} new=${isNewAccount === true} v2=${supportsProfileSyncV2} ack=${supportsProfileSyncAckV1} chatAck=${supportsChatHistoryAckV1} chatPull=${supportsChatHistoryPullV1}`);
@@ -15471,6 +15608,11 @@ io.on('connection', (socket) => {
           socket.profileSyncAckV1 = supportsProfileSyncAckV1;
           socket.presenceDeltaV1 = supportsPresenceDeltaV1;
           socket.onlineListCompactV1 = supportsOnlineListCompactV1;
+          socket.onlineListDeltaV1 = supportsOnlineListDeltaV1;
+          socket.profileSyncGzipV1 = supportsProfileSyncGzipV1;
+          socket.__onlineListWireSnapshot = null;
+          socket.__onlineListAuthGeneration = (socket.__onlineListAuthGeneration || 0) + 1;
+          socket.__profileSectionLastAck = null;
           socket.__presenceSentByName = null;
           socket.__onlineListLastSignature = '';
           socket.__onlineListLastSentAt = 0;
@@ -15575,6 +15717,11 @@ io.on('connection', (socket) => {
         socket.profileSyncAckV1 = supportsProfileSyncAckV1;
         socket.presenceDeltaV1 = supportsPresenceDeltaV1;
         socket.onlineListCompactV1 = supportsOnlineListCompactV1;
+        socket.onlineListDeltaV1 = supportsOnlineListDeltaV1;
+        socket.profileSyncGzipV1 = supportsProfileSyncGzipV1;
+        socket.__onlineListWireSnapshot = null;
+        socket.__onlineListAuthGeneration = (socket.__onlineListAuthGeneration || 0) + 1;
+        socket.__profileSectionLastAck = null;
         socket.__presenceSentByName = null;
         socket.__onlineListLastSignature = '';
         socket.__onlineListLastSentAt = 0;
@@ -16788,7 +16935,8 @@ io.on('connection', (socket) => {
       } catch (err) {
         console.error('[REQUEST ONLINE LIST ERROR]:', err);
         if (socket.connected && Array.isArray(lastKnownOnlineList) && lastKnownOnlineList.length > 0) {
-          socket.emit('online_list', packOnlineListForSocket(socket, lastKnownOnlineList));
+          sendOnlineListToSocket(socket, lastKnownOnlineList,
+            prepareOnlineListWire(lastKnownOnlineList), buildOnlineListSignature(lastKnownOnlineList), { force: true });
         }
       } finally {
         socket.__onlineListRequestPending = false;

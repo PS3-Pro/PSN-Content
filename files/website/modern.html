@@ -561,6 +561,11 @@ select option { background-color: var(--bg-dark); }
 #missing-rap-filter input:checked+span { color: #ffcc00; text-shadow: 0 0 8px rgba(255,204,0,0.45); }
 .letter-filter { display: flex; gap: 6px; overflow-x: auto; padding-top: 8px; padding-bottom: 20px; margin-top: -8px; margin-bottom: 10px; scrollbar-width: none; }
 .letter-filter::-webkit-scrollbar { display: none; }
+.letter-filter > .letter-btn { flex: 0 0 auto; }
+@media (hover: hover) and (pointer: fine) {
+.letter-filter { cursor: grab; }
+.letter-filter.is-drag-scrolling, .letter-filter.is-drag-scrolling .letter-btn { cursor: grabbing !important; user-select: none; }
+}
 .letter-filter.is-locked .letter-btn:not(.active) { opacity: .42; pointer-events: none; filter: grayscale(.35); }
 .letter-filter.is-locked .letter-btn.active { pointer-events: auto; }
 .letter-btn { background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.1); color: var(--text-muted); padding: 6px 12px; border-radius: 6px; font-size: 12px; font-weight: bold; cursor: pointer; transition: 0.2s; white-space: nowrap; }
@@ -18486,6 +18491,8 @@ P
 			profileSyncAckV1: true,
 			presenceDeltaV1: true,
 			onlineListCompactV1: true,
+			profileSyncGzipV1: typeof DecompressionStream === 'function',
+			onlineListDeltaV1: true,
 			chatHistoryAckV1: true,
 			chatHistoryPullV1: true,
 									adminMaintenanceBypass: document.body.classList.contains('admin-maintenance-login-bypass'),
@@ -18717,6 +18724,8 @@ P
 					profileSyncAckV1: true,
 					presenceDeltaV1: true,
 					onlineListCompactV1: true,
+					profileSyncGzipV1: typeof DecompressionStream === 'function',
+					onlineListDeltaV1: true,
 					chatHistoryAckV1: true,
 					chatHistoryPullV1: true,
 															adminMaintenanceBypass: document.body.classList.contains('admin-maintenance-login-bypass')
@@ -18846,6 +18855,8 @@ P
 				profileSyncAckV1: true,
 				presenceDeltaV1: true,
 				onlineListCompactV1: true,
+				profileSyncGzipV1: typeof DecompressionStream === 'function',
+				onlineListDeltaV1: true,
 				chatHistoryAckV1: true,
 				chatHistoryPullV1: true,
 												passwordResetSubmission: isPasswordResetSubmission,
@@ -29907,6 +29918,57 @@ P
 	window.addEventListener('psnStorePrefetchReady', () => {
 		if (typeof window.syncBrowseTypeFilterAvailability === 'function') window.syncBrowseTypeFilterAvailability();
 	});
+
+    // Mouse dragging supplements native touch/trackpad scrolling; normal clicks stay intact.
+    document.addEventListener('pointerdown', event => {
+        if (event.pointerType !== 'mouse' || event.button !== 0) return;
+        const strip = event.target.closest('.letter-filter');
+        if (!strip || strip.scrollWidth <= strip.clientWidth + 1) return;
+        const pointerId = event.pointerId;
+        const startX = event.clientX;
+        const startY = event.clientY;
+        const startScroll = strip.scrollLeft;
+        let dragging = false;
+        const move = next => {
+            if (next.pointerId !== pointerId) return;
+            const dx = next.clientX - startX;
+            if (!dragging) {
+                if (Math.abs(dx) < 7 || Math.abs(dx) <= Math.abs(next.clientY - startY)) return;
+                dragging = true;
+                strip.classList.add('is-drag-scrolling');
+            }
+            if (next.cancelable) next.preventDefault();
+            strip.scrollLeft = startScroll - dx;
+        };
+        const finish = next => {
+            if (next.type !== 'blur' && next.pointerId !== pointerId) return;
+            window.removeEventListener('pointermove', move, true);
+            window.removeEventListener('pointerup', finish, true);
+            window.removeEventListener('pointercancel', finish, true);
+            window.removeEventListener('blur', finish, true);
+            strip.classList.remove('is-drag-scrolling');
+            if (dragging && next.type === 'pointerup') {
+                const blockClick = click => {
+                    if (strip.contains(click.target)) {
+                        click.preventDefault();
+                        click.stopImmediatePropagation();
+                    }
+                };
+                document.addEventListener('click', blockClick, true);
+                setTimeout(() => document.removeEventListener('click', blockClick, true), 0);
+            }
+        };
+        window.addEventListener('pointermove', move, true);
+        window.addEventListener('pointerup', finish, true);
+        window.addEventListener('pointercancel', finish, true);
+        window.addEventListener('blur', finish, true);
+    });
+
+    // Reset only when leaving a section; game modals keep their strip position.
+    function resetLetterFilterScroll(id) {
+        const strip = document.getElementById(id);
+        if (strip && strip.scrollLeft !== 0) strip.scrollLeft = 0;
+    }
 
     function renderLetterFilter() {
         const container = document.getElementById('letter-filter');
@@ -54461,6 +54523,15 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 			return;
 		}
 
+		if (currentViewId !== viewId) {
+			if (currentViewId === 'view-browse') resetLetterFilterScroll('letter-filter');
+			else if (currentViewId === 'view-wishlist') resetLetterFilterScroll('wish-letter-filter');
+			else if (currentViewId === 'view-library') {
+				resetLetterFilterScroll('library-letter-filter');
+				resetLetterFilterScroll('fav-letter-filter');
+			}
+		}
+
 		const preparedNavigation = window.__psnPreparedNavigation;
 		const navigationPrepared = !!(preparedNavigation && preparedNavigation.viewId === viewId);
 		window.__psnPreparedNavigation = null;
@@ -67819,6 +67890,9 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		exitFallbackTimer = setTimeout(finishSubviewExit, 220);
 		return;
 	}
+
+	if (currentSubview === gamesView) resetLetterFilterScroll('library-letter-filter');
+	else if (currentSubview === favsView) resetLetterFilterScroll('fav-letter-filter');
 
 	const searchInput = PSN_STATIC_NAV_DOM.searchInput;
 	const searchBar = PSN_STATIC_NAV_DOM.searchBar;
@@ -86590,6 +86664,8 @@ function getVisibleChatStackEl(id) {
 		payload.profileSyncAckV1 = true;
 		payload.presenceDeltaV1 = true;
 		payload.onlineListCompactV1 = true;
+		payload.profileSyncGzipV1 = typeof DecompressionStream === 'function';
+		payload.onlineListDeltaV1 = true;
 		payload.chatHistoryAckV1 = true;
 		payload.chatHistoryPullV1 = true;
 		window.clearLoginServerAttempt();
@@ -92155,6 +92231,7 @@ function getVisibleChatStackEl(id) {
 		if (typeof adminUpdateChatControlsBanner === 'function') adminUpdateChatControlsBanner();
 		
 		socketChat.on('connect', () => {
+			socketChat.__onlineListWireSnapshot = null;
 			markServerConnectionAvailable();
 			const authenticatedRuntime = window.isProfileLoaded === true || !!loginServerAttempt || window.__psnAutoReauthInProgress === true;
 			if (authenticatedRuntime) {
@@ -92197,6 +92274,8 @@ function getVisibleChatStackEl(id) {
 					profileSyncAckV1: true,
 					presenceDeltaV1: true,
 					onlineListCompactV1: true,
+					profileSyncGzipV1: typeof DecompressionStream === 'function',
+					onlineListDeltaV1: true,
 					chatHistoryAckV1: true,
 					chatHistoryPullV1: true,
 														});
@@ -93278,6 +93357,22 @@ function getVisibleChatStackEl(id) {
 
 		socketChat.on('online_list', function(users) {
 			const countElement = document.getElementById('online-count');
+			if (users && users.onlineListDeltaV1 === 1) {
+				const previous = socketChat.__onlineListWireSnapshot;
+				if (!previous || previous.version !== users.baseVersion) {
+					if (socketChat.connected) socketChat.emit('request_online_list');
+					return;
+				}
+				const next = new Map(previous.byName);
+				(users.removed || []).forEach(name => next.delete(name));
+				(users.changed || []).forEach(row => { if (Array.isArray(row) && row.length === 13) next.set(row[1], JSON.stringify(row)); });
+				socketChat.__onlineListWireSnapshot = { version: users.version, byName: next };
+				users = { onlineListCompactV1: 1, rows: Array.from(next.values(), value => JSON.parse(value)) };
+			} else if (users && users.onlineListCompactV1 === 1 && Array.isArray(users.rows) && Number(users.version) > 0) {
+				socketChat.__onlineListWireSnapshot = { version: users.version, byName: new Map(users.rows.filter(row => Array.isArray(row) && row.length === 13).map(row => [row[1], JSON.stringify(row)])) };
+			} else {
+				socketChat.__onlineListWireSnapshot = null;
+			}
 			if (users && users.onlineListCompactV1 === 1 && Array.isArray(users.rows)) {
 				// Restore the original public user structure before any UI reads it.
 				users = users.rows.map(row => Array.isArray(row) && row.length === 13 ? {
@@ -95428,15 +95523,29 @@ function getVisibleChatStackEl(id) {
 			}
 		});
 
-		socketChat.on('profile_sync', (payload = {}, ack) => {
+		socketChat.on('profile_sync', async (payload = {}, ack) => {
 			const respond = (response) => {
 				if (typeof ack !== 'function') return;
 				try { ack(response); } catch (e) {}
 			};
 			try {
 				const myName = localStorage.getItem('psn_username') || '';
+				const receivingSocketId = socketChat && socketChat.id;
 				if (!payload || payload.name !== myName) { respond({ ok: true, ignored: true }); return; }
 				if (payload.sourceSocketId && socketChat && payload.sourceSocketId === socketChat.id) { respond({ ok: true, ignored: true }); return; }
+				if (payload.profileSyncGzipV1 === 1) {
+					if (typeof DecompressionStream !== 'function') throw new Error('Gzip profile decoder is unavailable.');
+					const encoded = String(payload.content || '');
+					if (!encoded || encoded.length > 6 * 1024 * 1024) throw new Error('Invalid compressed profile payload.');
+					const zipped = Uint8Array.from(atob(encoded), character => character.charCodeAt(0));
+					const stream = new Blob([zipped]).stream().pipeThrough(new DecompressionStream('gzip'));
+					payload = JSON.parse(await new Response(stream).text());
+					if (!payload || payload.name !== myName) throw new Error('Compressed profile payload user mismatch.');
+				}
+				if ((localStorage.getItem('psn_username') || '') !== myName || !socketChat || !socketChat.connected || socketChat.id !== receivingSocketId) {
+					respond({ ok: true, ignored: true });
+					return;
+				}
 				if (typeof window.applyRemoteProfileSync === 'function') window.applyRemoteProfileSync(payload);
 				const userData = payload.userData || payload.data || {};
 				const hydratedSections = [];
@@ -95467,7 +95576,7 @@ function getVisibleChatStackEl(id) {
 			const unchangedProfileSync = payload.unchanged === true;
 			const shouldRunProfileCompletionWork = wasInitialProfileSync || !unchangedProfileSync;
 			window.__initialProfileSyncInProgress = false;
-			if (typeof window.markProfileSectionHydrated === 'function') {
+			if (wasInitialProfileSync && typeof window.markProfileSectionHydrated === 'function') {
 				['downloads','wishlist','favorites','library','friends'].forEach(section => window.markProfileSectionHydrated(section));
 			}
 			const pendingIdentityRepair = window.__pendingNewAccountIdentityRepair;
