@@ -16618,6 +16618,16 @@ P
 	}
 
 	function mergeProfileNotificationStorageChange(category, key, previousValue, nextValue) {
+		// Formatting-only storage changes must not become a database mutation.
+		if (key.endsWith('_dot_items')) {
+			const before = normalizeProfileNotificationPendingValue(previousValue);
+			const after = normalizeProfileNotificationPendingValue(nextValue);
+			if (before.length === after.length && before.every((item, index) => item === after[index])) return false;
+		} else if (key === 'psn_last_trophy_color') {
+			if (String(previousValue || '') === String(nextValue || '')) return false;
+		} else if ((String(previousValue) === 'true') === (String(nextValue) === 'true')) {
+			return false;
+		}
 		const op = ensureProfileNotificationPendingOp(category);
 		if (!op) return false;
 		if (key.endsWith('_dot_items')) {
@@ -18506,6 +18516,7 @@ P
 			legacyUsernameLogin: psnLegacyUsernameUnlock,
 			profileSyncV2: true,
 			profileSyncAckV1: true,
+			profileSyncRevisionOnlyV1: true,
 			presenceDeltaV1: true,
 			onlineListCompactV1: true,
 			profileSyncGzipV1: typeof DecompressionStream === 'function',
@@ -18739,6 +18750,7 @@ P
 					isNewAccount: false,
 					profileSyncV2: true,
 					profileSyncAckV1: true,
+			profileSyncRevisionOnlyV1: true,
 					presenceDeltaV1: true,
 					onlineListCompactV1: true,
 					profileSyncGzipV1: typeof DecompressionStream === 'function',
@@ -18870,6 +18882,7 @@ P
 				isNewAccount: false,
 				profileSyncV2: true,
 				profileSyncAckV1: true,
+			profileSyncRevisionOnlyV1: true,
 				presenceDeltaV1: true,
 				onlineListCompactV1: true,
 				profileSyncGzipV1: typeof DecompressionStream === 'function',
@@ -85680,6 +85693,23 @@ function getVisibleChatStackEl(id) {
 				window.__lastAppliedProfileUpdatedAt = incomingProfileUpdatedAt;
 				safeLocalStorageSet(`${name}_psn_profile_updated_at`, String(incomingProfileUpdatedAt));
 			}
+			// Revision-only packets are sent only after this socket ACKed the identical
+			// section content. Keep local list versions current without repainting lists.
+			if (payload.profileSyncRevisionOnlyV1 === true) {
+				[['wishlist', 'wishlistUpdatedAt'], ['downloads', 'downloadsUpdatedAt'],
+				 ['favorites', 'favoritesUpdatedAt'], ['library', 'libraryUpdatedAt'],
+				 ['friends', 'friendsUpdatedAt']].forEach(([type, key]) => {
+					if (!Object.prototype.hasOwnProperty.call(userData, key)) return;
+					const storedVersion = normalizeProfileListTimestamp(localStorage.getItem(`${name}_${getProfileListTimestampStorageKey(type)}`));
+					const remoteVersion = normalizeProfileListTimestamp(userData[key]);
+					if (remoteVersion >= storedVersion) applyProfileListUpdatedAtFromServer(name, type, remoteVersion);
+				});
+				const clearedAt = normalizeProfileListTimestamp(userData.downloadsClearedAt);
+				if (clearedAt && typeof getDownloadHistoryClearPendingAt === 'function' &&
+					clearedAt >= getDownloadHistoryClearPendingAt(name) && getDownloadHistoryClearPendingAt(name) > 0) {
+					clearDownloadHistoryPendingFlag(name);
+				}
+			}
 			if (userData.trophiesData && typeof userData.trophiesData === 'object' && !Array.isArray(userData.trophiesData)) {
 				if (profileSyncChanges.trophies) {
 					window.userTrophies = userData.trophiesData;
@@ -86723,6 +86753,7 @@ function getVisibleChatStackEl(id) {
 		if (typeof promoteServerConnectionForAuthenticatedUse === 'function') promoteServerConnectionForAuthenticatedUse();
 		payload.profileSyncV2 = true;
 		payload.profileSyncAckV1 = true;
+		payload.profileSyncRevisionOnlyV1 = true;
 		payload.presenceDeltaV1 = true;
 		payload.onlineListCompactV1 = true;
 		payload.profileSyncGzipV1 = typeof DecompressionStream === 'function';
@@ -92334,6 +92365,7 @@ function getVisibleChatStackEl(id) {
 					isNewAccount: false,
 					profileSyncV2: true,
 					profileSyncAckV1: true,
+			profileSyncRevisionOnlyV1: true,
 					presenceDeltaV1: true,
 					onlineListCompactV1: true,
 					profileSyncGzipV1: typeof DecompressionStream === 'function',

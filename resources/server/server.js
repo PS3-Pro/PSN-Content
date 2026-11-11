@@ -10,6 +10,7 @@ const bcrypt = require('bcrypt');
 const crypto = require('crypto');
 const zlib = require('zlib');
 const { spawn } = require('child_process');
+const { isDeepStrictEqual } = require('node:util');
 
 const app = express();
 // Compress public metadata off the event loop; keep HTTP content negotiation intact.
@@ -8704,12 +8705,12 @@ async function emitProfileSyncPacket(socket, payload, options = {}) {
         reject(new Error(response.error || `Client rejected ${label}.`));
         return;
       }
-      finish({ acked: true, cancelled: false, elapsedMs: Date.now() - startedAt });
+      finish({ acked: true, cancelled: false, elapsedMs: Date.now() - startedAt, response: response || null });
     };
 
     try { socket.once('disconnect', onDisconnect); } catch (e) {}
     try {
-      trackBandwidthPayload(outgoingPayload === payload ? 'profile_sync' : 'profile_sync:gzip', outgoingPayload, 1);
+      trackBandwidthPayload(label.endsWith('-revision') ? 'profile_sync:revision' : (outgoingPayload === payload ? 'profile_sync' : 'profile_sync:gzip'), outgoingPayload, 1);
       socket.emit('profile_sync', outgoingPayload, done);
     } catch (err) {
       if (!settled) {
@@ -8835,13 +8836,24 @@ async function emitChunkedProfileSyncToSocket(socket, name, options = {}) {
         if (MEMORY_TRACE_ENABLED) {
           logMemoryTrace('profile-sync:section:send', `user=${name} socket=${socket.id} section=${dataKey} items=${itemCount} approx=${formatApproxBytes(estimate.bytes)}${estimate.truncated ? '+' : ''} buffer=${getSocketWriteBufferLength(socket)}`);
         }
-        // A timestamp or count alone is not a content fingerprint.
-        const signature = packet && packet.userData ?
-          crypto.createHash('sha256').update(JSON.stringify(packet.userData)).digest('hex') : '';
+        // A confirmed section is reusable even if another profile field changed.
+        // Send the new revision/counts as a tiny patch; do not resend the same list.
+        // Only an ACK from this socket qualifies. Explicit hydration never dedupes.
+        const signature = socket.profileSyncAckV1 === true && packet.userData ?
+          crypto.createHash('sha256').update(JSON.stringify(packet.userData[dataKey])).digest('hex') : '';
         const lastSent = socket.__profileSectionLastAck && socket.__profileSectionLastAck.get(dataKey);
-        if (options.allowAckDedupe === true && signature && lastSent === signature) return;
+        if (options.allowAckDedupe === true && socket.profileSyncRevisionOnlyV1 === true && signature && lastSent === signature) {
+          const metadata = { profileUpdatedAt };
+          if (meta.countKey) metadata[meta.countKey] = packet.userData[meta.countKey];
+          (meta.versionKeys || []).forEach(key => { metadata[key] = packet.userData[key]; });
+          const revisionPacket = { name, sourceSocketId: options.sourceSocketId || null, profileUpdatedAt, profileSyncRevisionOnlyV1: true, userData: metadata };
+          const reused = await emitProfileSyncPacket(socket, revisionPacket, { label: `${dataKey}-revision`, timeoutMs: 8000 });
+          if (reused && reused.cancelled) sectionCancelled = true;
+          return;
+        }
         const result = await emitProfileSyncPacket(socket, packet, { label: dataKey, timeoutMs: 10000 });
-        if (result && result.acked === true && signature) {
+        const confirmedSections = result && result.response && result.response.sections;
+        if (result && result.acked === true && signature && Array.isArray(confirmedSections) && confirmedSections.includes(dataKey)) {
           if (!(socket.__profileSectionLastAck instanceof Map)) socket.__profileSectionLastAck = new Map();
           socket.__profileSectionLastAck.set(dataKey, signature);
         }
@@ -11323,15 +11335,17 @@ function emitPresenceUpdate(name, user = null) {
   if (!payload) return null;
   const keys = Object.keys(payload);
   const serializedFields = Object.fromEntries(keys.map(key => [key, JSON.stringify(payload[key])]));
-  const fullSignature = JSON.stringify(payload);
+  // A heartbeat changes lastSeen in memory while online, but online lastSeen
+  // is not a user-visible change. Keep offline timestamps fully observable.
+  const legacySignature = JSON.stringify(payload.online ? { ...payload, lastSeen: null } : payload);
   io.sockets.sockets.forEach(client => {
     if (!client.connected) return;
     if (client.presenceDeltaV1 !== true) {
       if (!(client.__presenceLegacyLastByName instanceof Map)) client.__presenceLegacyLastByName = new Map();
       const cache = client.__presenceLegacyLastByName;
-      if (cache.get(name) === fullSignature) return;
+      if (cache.get(name) === legacySignature) return;
       if (cache.size >= 64 && !cache.has(name)) cache.delete(cache.keys().next().value);
-      cache.set(name, fullSignature);
+      cache.set(name, legacySignature);
       trackBandwidthPayload('presence_update', payload, 1);
       client.emit('presence_update', payload);
       return;
@@ -15871,6 +15885,7 @@ io.on('connection', (socket) => {
       const supportsOnlineListCompactV1 = data && data.onlineListCompactV1 === true;
       const supportsOnlineListDeltaV1 = supportsOnlineListCompactV1 && data && data.onlineListDeltaV1 === true;
       const supportsProfileSyncGzipV1 = supportsProfileSyncAckV1 && data && data.profileSyncGzipV1 === true;
+      const supportsProfileSyncRevisionOnlyV1 = supportsProfileSyncAckV1 && data && data.profileSyncRevisionOnlyV1 === true;
       const supportsChatHistoryAckV1 = data && data.chatHistoryAckV1 === true;
       const supportsChatHistoryPullV1 = data && data.chatHistoryPullV1 === true;
       logMemoryTrace('auth:start', `user=${name || ''} socket=${socket.id} new=${isNewAccount === true} v2=${supportsProfileSyncV2} ack=${supportsProfileSyncAckV1} chatAck=${supportsChatHistoryAckV1} chatPull=${supportsChatHistoryPullV1}`);
@@ -15995,6 +16010,7 @@ io.on('connection', (socket) => {
           fullUserCacheNames.delete(name);
           socket.profileSyncV2 = supportsProfileSyncV2;
           socket.profileSyncAckV1 = supportsProfileSyncAckV1;
+          socket.profileSyncRevisionOnlyV1 = supportsProfileSyncRevisionOnlyV1;
           socket.presenceDeltaV1 = supportsPresenceDeltaV1;
           socket.onlineListCompactV1 = supportsOnlineListCompactV1;
           socket.onlineListDeltaV1 = supportsOnlineListDeltaV1;
@@ -16104,6 +16120,7 @@ io.on('connection', (socket) => {
         socket.role = getUserRole(name, userDatabase[name]);
         socket.profileSyncV2 = supportsProfileSyncV2;
         socket.profileSyncAckV1 = supportsProfileSyncAckV1;
+        socket.profileSyncRevisionOnlyV1 = supportsProfileSyncRevisionOnlyV1;
         socket.presenceDeltaV1 = supportsPresenceDeltaV1;
         socket.onlineListCompactV1 = supportsOnlineListCompactV1;
         socket.onlineListDeltaV1 = supportsOnlineListDeltaV1;
@@ -16619,6 +16636,16 @@ io.on('connection', (socket) => {
         const trophiesChanged = Object.prototype.hasOwnProperty.call(userData, 'trophiesData') &&
           unlockedTrophyIdsChanged(workingUser.trophiesData, userData.trophiesData);
 
+        // A profile patch may repeat a whole list with identical contents. Only
+        // genuine changes should notify every viewer to reload that public list.
+        const changedPublicListKeys = Object.keys(PUBLIC_PROFILE_LIST_CHANGE_KEYS).filter(key =>
+          Object.prototype.hasOwnProperty.call(userData, key) &&
+          !isDeepStrictEqual(workingUser[key], userData[key])
+        );
+        if (nextLibraryPlayHistoryData && !isDeepStrictEqual(workingUser.libraryPlayHistoryData, nextLibraryPlayHistoryData)) {
+          changedPublicListKeys.push('libraryPlayHistoryData');
+        }
+
         Object.assign(workingUser, userData);
         if (nextLibraryPlayHistoryData) workingUser.libraryPlayHistoryData = nextLibraryPlayHistoryData;
         const currentCountryCode = getUserCountryCode(workingUser);
@@ -16677,7 +16704,7 @@ io.on('connection', (socket) => {
         }
 
         updateCompactUserCacheFromPatch(name, workingUser, profileDbPatch);
-        emitPublicProfileListChanged(name, Object.keys(profileDbPatch), workingUser.profileUpdatedAt);
+        emitPublicProfileListChanged(name, changedPublicListKeys, workingUser.profileUpdatedAt);
         const contentDownloadCountChangedKeys = Object.prototype.hasOwnProperty.call(profileDbPatch, 'downloadsData')
           ? getChangedContentDownloadCountKeysServer(previousDownloadsData, profileDbPatch.downloadsData)
           : [];
@@ -16730,6 +16757,9 @@ io.on('connection', (socket) => {
         }
 
         const profileChangedKeys = Object.keys(profileDbPatch);
+        const remoteChangedKeys = profileChangedKeys.filter(key =>
+          !Object.prototype.hasOwnProperty.call(PUBLIC_PROFILE_LIST_CHANGE_KEYS, key) || changedPublicListKeys.includes(key)
+        );
         const publicProfileChanged = shouldBroadcastProfileBanner || profileChangedKeysTouchPublicMeta(profileChangedKeys);
         if (profileChangedKeysTouchOnlineList(profileChangedKeys)) {
           invalidateOnlineListCache('profile-update-save');
@@ -16744,7 +16774,7 @@ io.on('connection', (socket) => {
             name,
             shouldForceProfileSyncToSource ? null : socket.id,
             workingUser.profileUpdatedAt,
-            { trending: shouldEmitTrendingUpdate, trophies: trophiesChanged, counts: publicCountsChanged, publicProfile: publicProfileChanged, keys: profileChangedKeys }
+            { trending: shouldEmitTrendingUpdate, trophies: trophiesChanged, counts: publicCountsChanged, publicProfile: publicProfileChanged, keys: remoteChangedKeys }
         ), 0);
 
         if (trophiesChanged) {
