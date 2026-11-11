@@ -13569,6 +13569,18 @@ async function syncPresenceOnlineFromDb() {
   return presenceChanged;
 }
 
+// Versioned transport optimization: only clients that explicitly support this
+// format receive tuples. Keep the full record semantics, including online and
+// lastSeen, so foreground resume and reconnections always reconstruct a snapshot.
+function packOnlineListForSocket(client, list) {
+  if (!client || client.onlineListCompactV1 !== true || !Array.isArray(list)) return list;
+  return { onlineListCompactV1: 1, rows: list.map(user => [
+    user.id, user.name, user.avatar, user.isAdmin, user.role, user.banned,
+    user.level, user.joined, user.countryCode, user.online, user.lastSeen,
+    user.presenceRevision, user.ps3Status
+  ]) };
+}
+
 async function emitOnlineList(targetSocket = null, options = {}) {
   try {
     const list = await getSanitizedOnlineListFromDb(options);
@@ -13583,8 +13595,9 @@ async function emitOnlineList(targetSocket = null, options = {}) {
         const estimate = estimateValueBytes(list, { maxNodes: 20000, maxBytes: 8 * 1024 * 1024 });
         logMemoryTrace('online-list:send', `user=${targetSocket.userName || '-'} socket=${targetSocket.id} items=${Array.isArray(list) ? list.length : 0} approx=${formatApproxBytes(estimate.bytes)}${estimate.truncated ? '+' : ''} buffer=${getSocketWriteBufferLength(targetSocket)}`);
       }
-      trackBandwidthPayload('online_list:target', list, 1);
-      targetSocket.emit('online_list', list);
+      const outputList = packOnlineListForSocket(targetSocket, list);
+      trackBandwidthPayload(targetSocket.onlineListCompactV1 === true ? 'online_list:compact' : 'online_list:target', outputList, 1);
+      targetSocket.emit('online_list', outputList);
       targetSocket.__onlineListLastSignature = signature;
       targetSocket.__onlineListLastSentAt = now;
       return list;
@@ -13607,7 +13620,7 @@ async function emitOnlineList(targetSocket = null, options = {}) {
     // Mobile browsers can resume before Postgres answers, and replacing everyone with
     // [] is what made the UI show "0 Online" until the next good refresh.
     if (targetSocket && fallback.length > 0) {
-      targetSocket.emit('online_list', fallback);
+      targetSocket.emit('online_list', packOnlineListForSocket(targetSocket, fallback));
     }
     return fallback;
   }
@@ -15331,6 +15344,7 @@ io.on('connection', (socket) => {
       const supportsProfileSyncV2 = data && data.profileSyncV2 === true;
       const supportsProfileSyncAckV1 = data && data.profileSyncAckV1 === true;
       const supportsPresenceDeltaV1 = data && data.presenceDeltaV1 === true;
+      const supportsOnlineListCompactV1 = data && data.onlineListCompactV1 === true;
       const supportsChatHistoryAckV1 = data && data.chatHistoryAckV1 === true;
       const supportsChatHistoryPullV1 = data && data.chatHistoryPullV1 === true;
       logMemoryTrace('auth:start', `user=${name || ''} socket=${socket.id} new=${isNewAccount === true} v2=${supportsProfileSyncV2} ack=${supportsProfileSyncAckV1} chatAck=${supportsChatHistoryAckV1} chatPull=${supportsChatHistoryPullV1}`);
@@ -15456,6 +15470,7 @@ io.on('connection', (socket) => {
           socket.profileSyncV2 = supportsProfileSyncV2;
           socket.profileSyncAckV1 = supportsProfileSyncAckV1;
           socket.presenceDeltaV1 = supportsPresenceDeltaV1;
+          socket.onlineListCompactV1 = supportsOnlineListCompactV1;
           socket.__presenceSentByName = null;
           socket.__onlineListLastSignature = '';
           socket.__onlineListLastSentAt = 0;
@@ -15559,6 +15574,7 @@ io.on('connection', (socket) => {
         socket.profileSyncV2 = supportsProfileSyncV2;
         socket.profileSyncAckV1 = supportsProfileSyncAckV1;
         socket.presenceDeltaV1 = supportsPresenceDeltaV1;
+        socket.onlineListCompactV1 = supportsOnlineListCompactV1;
         socket.__presenceSentByName = null;
         socket.__onlineListLastSignature = '';
         socket.__onlineListLastSentAt = 0;
@@ -16772,7 +16788,7 @@ io.on('connection', (socket) => {
       } catch (err) {
         console.error('[REQUEST ONLINE LIST ERROR]:', err);
         if (socket.connected && Array.isArray(lastKnownOnlineList) && lastKnownOnlineList.length > 0) {
-          socket.emit('online_list', lastKnownOnlineList);
+          socket.emit('online_list', packOnlineListForSocket(socket, lastKnownOnlineList));
         }
       } finally {
         socket.__onlineListRequestPending = false;
