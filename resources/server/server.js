@@ -10925,7 +10925,9 @@ function emitPresenceUpdate(name, user = null) {
     const cache = client.__presenceSentByName;
     const previous = cache.get(name);
     const diff = { name, online: payload.online };
-    if (!previous) {
+    // The browser discards an offline user's baseline. When that user
+    // reconnects, deliver a full record instead of a delta with no base.
+    if (!previous || (previous.online !== true && payload.online === true)) {
       trackBandwidthPayload('presence_update', payload, 1);
       client.emit('presence_update', payload);
     } else {
