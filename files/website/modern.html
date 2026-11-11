@@ -92232,6 +92232,7 @@ function getVisibleChatStackEl(id) {
 		})
 		if (typeof window.installDirectMessageSocketListeners === 'function') window.installDirectMessageSocketListeners(socketChat);
 		if (typeof window.installPsnRewardSocketListeners === 'function') window.installPsnRewardSocketListeners(socketChat);
+		if (typeof window.installProfileListReconnectListener === 'function') window.installProfileListReconnectListener(socketChat);
 		socketChat.on('content_limits', limits => {
 			if (typeof window.applyPsnServerContentLimits === 'function') window.applyPsnServerContentLimits(limits || {});
 		});
@@ -107039,7 +107040,10 @@ function getVisibleChatStackEl(id) {
 		}, 5500);
 	};
 
-	socketChat.on('connect', () => {
+	// The profile module is initialized before login can create socketChat.
+	// Register on the active socket rather than dereferencing an absent one:
+	// otherwise this script stops before openPlayerList is assigned.
+	window.revalidateOpenProfileListAfterSocketConnect = function() {
 		const modal = document.getElementById('modal-sys-list');
 		if (!modal || modal.style.display === 'none') return;
 		const name = String(modal.dataset.profileTarget || '');
@@ -107054,7 +107058,13 @@ function getVisibleChatStackEl(id) {
 		} else {
 			window.requestLiveProfileListRefresh?.(name, type, true);
 		}
-	});
+	};
+	window.installProfileListReconnectListener = function(socket) {
+		if (!socket || typeof socket.on !== 'function' || socket.__psnProfileListReconnectInstalled) return;
+		socket.__psnProfileListReconnectInstalled = true;
+		socket.on('connect', window.revalidateOpenProfileListAfterSocketConnect);
+	};
+	if (typeof socketChat !== 'undefined' && socketChat) window.installProfileListReconnectListener(socketChat);
 
 	window.requestLiveProfileListRefresh = function(targetUser, listType, supersede = false) {
 		const modal = document.getElementById('modal-sys-list');
