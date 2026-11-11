@@ -7166,14 +7166,27 @@ function prunePublicProfileListReadCache(now = Date.now()) {
   for (const [key, entry] of publicProfileListReadCache) {
     if (!entry.promise && entry.expires <= now) evictPublicProfileListRead(key);
   }
-  while (publicProfileListReadCache.size > PUBLIC_PROFILE_LIST_CACHE_MAX || publicProfileListReadCacheBytes > PUBLIC_PROFILE_LIST_TOTAL_BYTES) {
-    evictPublicProfileListRead(publicProfileListReadCache.keys().next().value);
+  // Pending reads have zero cached bytes and should not count against the
+  // settled-result LRU budget. Evicting them destroys single-flight sharing.
+  let settledCount = 0;
+  for (const entry of publicProfileListReadCache.values()) if (!entry.promise) settledCount++;
+  while (settledCount > PUBLIC_PROFILE_LIST_CACHE_MAX || publicProfileListReadCacheBytes > PUBLIC_PROFILE_LIST_TOTAL_BYTES) {
+    let victim = null;
+    for (const [key, entry] of publicProfileListReadCache) {
+      if (!entry.promise) { victim = key; break; }
+    }
+    if (victim === null) break;
+    evictPublicProfileListRead(victim);
+    settledCount--;
   }
 }
 
 // Fold different list requests for the same friend in one event-loop turn into
 // one selective PostgreSQL read. Only fetch the requested JSONB fields; do not
 // hydrate a full user profile or delay a single request with a debounce timer.
+// One event-loop tick gathers independent viewers of the same list fields.
+// SQL batches cap the user count and concurrent reads, leaving pool capacity
+// for authentication, chat and realtime updates.
 const publicProfileListDbBatches = new Map();
 const PUBLIC_PROFILE_LIST_DB_FIELDS = {
   favs: ['favoritesData'],
@@ -7182,45 +7195,104 @@ const PUBLIC_PROFILE_LIST_DB_FIELDS = {
   library: ['libraryData', 'libraryPlayHistoryData'],
   trophies: ['trophiesData']
 };
+const PUBLIC_PROFILE_LIST_DB_BATCH_USERS = 24;
+const PUBLIC_PROFILE_LIST_DB_MAX_ACTIVE = 2;
+const publicProfileListDbQueryQueue = [];
+let publicProfileListDbActive = 0;
+let publicProfileListDbFlushScheduled = false;
+
+function pumpPublicProfileListDbQueries() {
+  while (publicProfileListDbActive < PUBLIC_PROFILE_LIST_DB_MAX_ACTIVE && publicProfileListDbQueryQueue.length) {
+    const job = publicProfileListDbQueryQueue.shift();
+    publicProfileListDbActive++;
+    Promise.resolve().then(job.task).then(job.resolve, job.reject).finally(() => {
+      publicProfileListDbActive--;
+      pumpPublicProfileListDbQueries();
+    });
+  }
+}
+
+function queuePublicProfileListDbQuery(task) {
+  return new Promise((resolve, reject) => {
+    publicProfileListDbQueryQueue.push({ task,resolve,reject });
+    pumpPublicProfileListDbQueries();
+  });
+}
+
+function resolvePublicProfileListBatch(batch, row) {
+  const library = row && batch.types.has('library')
+    ? (() => {
+        const raw = Array.isArray(row.libraryData) ? row.libraryData : [];
+        const rawHistory = Array.isArray(row.libraryPlayHistoryData) ? row.libraryPlayHistoryData : [];
+        const history = mergeLibraryPlayHistoryRecordsServer(rawHistory, raw);
+        return applyLibraryPlayHistoryServer(raw, history);
+      })()
+    : null;
+  for (const request of batch.requests) {
+    if (!row) { request.resolve(null); continue; }
+    let payload = request.type === 'library' ? library : row[PUBLIC_PROFILE_LIST_DB_FIELDS[request.type][0]];
+    if (request.type === 'trophies') {
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) payload = {};
+    } else {
+      if (!Array.isArray(payload)) payload = [];
+      if (request.type === 'downloads') payload = normalizeDownloadHistoryRecordsServer(payload).history;
+    }
+    request.resolve(payload);
+  }
+}
+
+function flushPublicProfileListDbBatches() {
+  publicProfileListDbFlushScheduled = false;
+  const pending = [...publicProfileListDbBatches];
+  publicProfileListDbBatches.clear();
+  if (!pending.length) return;
+  const groups = new Map();
+  for (const [name, batch] of pending) {
+    const columns = [...new Set([...batch.types].flatMap(type => PUBLIC_PROFILE_LIST_DB_FIELDS[type]))].sort();
+    const signature = columns.join('|');
+    if (!groups.has(signature)) groups.set(signature, { columns, entries:[] });
+    groups.get(signature).entries.push({name,batch});
+  }
+  for (const group of groups.values()) {
+    const projection = group.columns.map(field => `data -> '${field}' AS "${field}"`).join(', ');
+    // Large libraries/download histories can be megabytes per user; bound each
+    // DB result independently from the number of waiting browser requests.
+    const batchSize = group.columns.includes('libraryData') ? 3 :
+      group.columns.includes('downloadsData') ? 6 :
+      (group.columns.includes('wishlistData') || group.columns.includes('favoritesData')) ? 8 :
+      PUBLIC_PROFILE_LIST_DB_BATCH_USERS;
+    for (let offset = 0; offset < group.entries.length; offset += batchSize) {
+      const portion = group.entries.slice(offset, offset + batchSize);
+      const names = portion.map(entry => entry.name);
+      queuePublicProfileListDbQuery(() => queryDbWithRetry(
+        `SELECT name, ${projection} FROM users WHERE name = ANY($1::text[])`,
+        [names], { attempts:3, label:'USER PROFILE LIST BATCH READ' }
+      )).then(result => {
+        const rows = new Map((result.rows || []).map(row => [row.name, row]));
+        for (const {name, batch} of portion) {
+          try { resolvePublicProfileListBatch(batch, rows.get(name) || null); }
+          catch (error) { for (const request of batch.requests) request.reject(error); }
+        }
+      }).catch(error => {
+        for (const {batch} of portion) for (const request of batch.requests) request.reject(error);
+      });
+    }
+  }
+}
+
 function readPublicProfileListDbBatched(name, type) {
   return new Promise((resolve, reject) => {
     let batch = publicProfileListDbBatches.get(name);
     if (!batch) {
       batch = { requests:[], types:new Set() };
-      publicProfileListDbBatches.set(name,batch);
-      setImmediate(() => {
-        if (publicProfileListDbBatches.get(name) === batch) publicProfileListDbBatches.delete(name);
-        const columns = [...new Set([...batch.types].flatMap(category => PUBLIC_PROFILE_LIST_DB_FIELDS[category]))];
-        // Field names come exclusively from the static whitelist above.
-        const projection = columns.map(field => `data -> '${field}' AS "${field}"`).join(', ');
-        queryDbWithRetry(`SELECT ${projection} FROM users WHERE name = $1`, [name], { attempts:3, label:'USER PROFILE LIST BATCH READ' })
-          .then(result => {
-            const row = result.rows[0] || null;
-            const library = row && batch.types.has('library')
-              ? (() => {
-                  const raw = Array.isArray(row.libraryData) ? row.libraryData : [];
-                  const rawHistory = Array.isArray(row.libraryPlayHistoryData) ? row.libraryPlayHistoryData : [];
-                  const history = mergeLibraryPlayHistoryRecordsServer(rawHistory, raw);
-                  return applyLibraryPlayHistoryServer(raw, history);
-                })()
-              : null;
-            for (const request of batch.requests) {
-              if (!row) { request.resolve(null); continue; }
-              let payload = request.type === 'library' ? library : row[PUBLIC_PROFILE_LIST_DB_FIELDS[request.type][0]];
-              if (request.type === 'trophies') {
-                if (!payload || typeof payload !== 'object' || Array.isArray(payload)) payload = {};
-              } else {
-                if (!Array.isArray(payload)) payload = [];
-                if (request.type === 'downloads') payload = normalizeDownloadHistoryRecordsServer(payload).history;
-              }
-              request.resolve(payload);
-            }
-          })
-          .catch(error => { for (const request of batch.requests) request.reject(error); });
-      });
+      publicProfileListDbBatches.set(name, batch);
     }
     batch.types.add(type);
-    batch.requests.push({ type,resolve,reject });
+    batch.requests.push({ type, resolve, reject });
+    if (!publicProfileListDbFlushScheduled) {
+      publicProfileListDbFlushScheduled = true;
+      setImmediate(flushPublicProfileListDbBatches);
+    }
   });
 }
 
@@ -7246,8 +7318,15 @@ function readPublicProfileListShared(targetName, type) {
   ).then(value => {
     if (publicProfileListReadCache.get(key) === entry) {
       entry.promise = null;
-      // Cache only bounded payloads, never giant user collections.
-      const bytes = Buffer.byteLength(JSON.stringify(value == null ? null : value), 'utf8');
+      // Never stringify a giant library merely to decide whether it fits in
+      // the tiny shared cache. The bounded estimate counts JS strings as
+      // UTF-16 bytes; allow 2x the JSON limit before exact measurement to
+      // avoid rejecting ordinary ASCII-rich collections.
+      const estimate = value == null ? null : estimateValueBytes(value, {
+        maxNodes: 15000, maxBytes: 1024 * 1024
+      });
+      const likelySmall = estimate && !estimate.truncated && estimate.bytes <= PUBLIC_PROFILE_LIST_MAX_BYTES * 2;
+      const bytes = likelySmall ? Buffer.byteLength(JSON.stringify(value), 'utf8') : PUBLIC_PROFILE_LIST_MAX_BYTES + 1;
       if (value !== null && bytes <= PUBLIC_PROFILE_LIST_MAX_BYTES) {
         entry.value = value;
         entry.bytes = bytes;
@@ -11176,6 +11255,24 @@ function emitProfileSyncPatchFromUser(name, user = {}, changedKeys = [], sourceS
   });
 }
 
+// A count can remain unchanged while the underlying list changes. Broadcast
+// only section names, after the committed write; old clients ignore this event.
+const PUBLIC_PROFILE_LIST_CHANGE_KEYS = {
+  wishlistData: 'wishlist', downloadsData: 'downloads', favoritesData: 'favs',
+  libraryData: 'library', libraryPlayHistoryData: 'library', trophiesData: 'trophies'
+};
+function emitPublicProfileListChanged(name, changedKeys = [], revision = Date.now()) {
+  if (!name || !Array.isArray(changedKeys) || !changedKeys.length) return false;
+  const types = [...new Set(changedKeys.map(key => PUBLIC_PROFILE_LIST_CHANGE_KEYS[key]).filter(Boolean))];
+  if (!types.length) return false;
+  const recipients = io.sockets.sockets.size;
+  if (!recipients) return false;
+  const payload = { name, types, profileUpdatedAt: normalizeTimestampValue(revision) || Date.now() };
+  trackBandwidthPayload('profile_list_changed', payload, recipients);
+  io.emit('profile_list_changed', payload);
+  return true;
+}
+
 function emitProfileCountsUpdate(name, user = null) {
   if (!name) return false;
   const source = user || userDatabase[name];
@@ -11371,7 +11468,7 @@ async function notifyProfileSyncAcrossInstances(name, sourceSocketId = null, pro
       deleted: changes && changes.deleted === true,
       deleteReason: changes && changes.deleted === true ? normalizeText(changes.deleteReason, '').slice(0, 500) : '',
       deletedBy: changes && changes.deleted === true ? normalizeText(changes.deletedBy, '').slice(0, 120) : '',
-      keys: Array.isArray(changes && changes.keys) ? [...new Set(changes.keys.filter(key => PROFILE_SYNC_PATCH_KEYS.has(key)))] : [],
+      keys: Array.isArray(changes && changes.keys) ? [...new Set(changes.keys.filter(key => PROFILE_SYNC_PATCH_KEYS.has(key) || key === 'libraryPlayHistoryData'))] : [],
       ...(changes && changes.roleChangedBy ? { roleChangedBy: normalizeText(changes.roleChangedBy, '').slice(0, 120) } : {}),
       ...(changes && changes.previousRole ? { previousRole: normalizeText(changes.previousRole, '').toLowerCase().slice(0, 24) } : {}),
       roleNoticeChanged: changes && changes.roleNoticeChanged === true,
@@ -11783,7 +11880,9 @@ async function initProfileSyncNotifications() {
       if (!name) return;
 
       if (message.channel === 'profile_sync' && !(data.changes && data.changes.roleNoticeOnly === true)) {
-        invalidatePublicProfileListReads(name, data.changes && data.changes.keys);
+        const sectionKeys = data.changes && data.changes.keys;
+        invalidatePublicProfileListReads(name, sectionKeys);
+        emitPublicProfileListChanged(name, sectionKeys, data.profileUpdatedAt);
       }
       /* A role-notice acknowledgement only needs to close the same notice on other
          sessions/instances. Do not refresh the profile or rebroadcast role metadata. */
@@ -16578,6 +16677,7 @@ io.on('connection', (socket) => {
         }
 
         updateCompactUserCacheFromPatch(name, workingUser, profileDbPatch);
+        emitPublicProfileListChanged(name, Object.keys(profileDbPatch), workingUser.profileUpdatedAt);
         const contentDownloadCountChangedKeys = Object.prototype.hasOwnProperty.call(profileDbPatch, 'downloadsData')
           ? getChangedContentDownloadCountKeysServer(previousDownloadsData, profileDbPatch.downloadsData)
           : [];
@@ -17066,21 +17166,31 @@ io.on('connection', (socket) => {
   // --------------------------------------------------------------------------
   // User data, search, presence & public statistics
   // --------------------------------------------------------------------------
-  socket.on('request_user_data', async (data = {}) => {
+  socket.on('request_user_data', async (data = {}, ack) => {
     const { targetName, type, requestId } = data;
+    const startedAt = Date.now();
+    const respond = payload => {
+      const elapsed = Date.now() - startedAt;
+      if (elapsed >= 1200) {
+        // No target name or other private profile data in performance logs.
+        console.warn(`[PUBLIC PROFILE LIST SLOW] type=${PUBLIC_PROFILE_LIST_TYPES.has(type) ? type : 'other'} total=${elapsed}ms poolWaiting=${pool.waitingCount} failed=${!!payload.error}`);
+      }
+      if (typeof ack === 'function') { ack(payload); return; }
+      socket.emit('user_data_response', payload);
+    };
     try {
       // A slow PostgreSQL read must not masquerade as an empty collection.
       // Keep below the client's 12-second request timeout.
       const readTimedOut = Symbol('profile-list-timeout');
       const result = await withTimeout(readPublicProfileListShared(targetName, type), 8000, readTimedOut);
       if (result === readTimedOut) {
-        socket.emit('user_data_response', { targetName, type, requestId, rawData: getEmptyUserDataPayload(type), error: 'The server is taking too long to load this list. Please try again.' });
+        respond({ targetName, type, requestId, rawData: getEmptyUserDataPayload(type), error: 'The server is taking too long to load this list. Please try again.' });
         return;
       }
-      socket.emit('user_data_response', { targetName, type, requestId, rawData: result === null ? getEmptyUserDataPayload(type) : result });
+      respond({ targetName, type, requestId, rawData: result === null ? getEmptyUserDataPayload(type) : result });
     } catch (err) {
       console.error('[REQUEST USER DATA CACHE ERROR]:', err);
-      socket.emit('user_data_response', {
+      respond({
         targetName,
         type,
         requestId,

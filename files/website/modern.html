@@ -40348,6 +40348,7 @@ P
         if (!snapshot || !modal || !body || !titleEl) return false;
 
         if (window.__activeProfileListRequest && window.__activeProfileListRequest.timeoutId) clearTimeout(window.__activeProfileListRequest.timeoutId);
+        if (window.__activeProfileListRequest?.retryId) clearTimeout(window.__activeProfileListRequest.retryId);
         window.__activeProfileListRequest = null;
         if (typeof window.cancelProfileListResize === 'function') window.cancelProfileListResize(body);
 
@@ -40821,6 +40822,7 @@ P
         const titleEl = document.getElementById('list-modal-title');
         if (!modal || !body || !titleEl) return;
         if (window.__activeProfileListRequest && window.__activeProfileListRequest.timeoutId) clearTimeout(window.__activeProfileListRequest.timeoutId);
+        if (window.__activeProfileListRequest?.retryId) clearTimeout(window.__activeProfileListRequest.retryId);
         window.__activeProfileListRequest = null;
         window.__lastProfileListRender = null;
         modal.classList.remove('profile-list-restoring');
@@ -95359,6 +95361,53 @@ function getVisibleChatStackEl(id) {
 			}
 		});
 
+		// A profile list can change without its item count changing. Invalidate the
+		// matching browser snapshot and refresh only the currently open peer list.
+		window.__profileListChangeRevision = window.__profileListChangeRevision || new Map();
+		socketChat.on('profile_list_changed', function(data = {}) {
+			const name = String(data.name || '').trim();
+			if (!name || !Array.isArray(data.types)) return;
+			const revision = Math.max(0, Number(data.profileUpdatedAt) || 0);
+			const modal = document.getElementById('modal-sys-list');
+			const listType = String(modal?.dataset?.profileListType || '');
+			const target = String(modal?.dataset?.profileTarget || '');
+			const visible = !!(modal && modal.style.display !== 'none' &&
+				(modal.classList.contains('show') || modal.style.display === 'flex' || modal.style.display === 'block'));
+			const normalizedType = listType === 'favorites' ? 'favs' : listType;
+			for (const rawType of data.types) {
+				const type = String(rawType || '') === 'favorites' ? 'favs' : String(rawType || '');
+				if (!['trophies','wishlist','downloads','library','favs'].includes(type)) continue;
+				const key = `${name}|${type}`;
+				const previous = window.__profileListChangeRevision.get(key) || 0;
+				if (revision && previous && revision < previous) continue;
+				if (revision) {
+					if (!window.__profileListChangeRevision.has(key) && window.__profileListChangeRevision.size >= 128) {
+						window.__profileListChangeRevision.delete(window.__profileListChangeRevision.keys().next().value);
+					}
+					window.__profileListChangeRevision.set(key, Math.max(previous, revision));
+				}
+				// The legacy persistent snapshot must never mask a realtime update.
+				try { localStorage.removeItem(`${name}_psn_${type}_data`); } catch (e) {}
+				if (type === 'favs') {
+					try { localStorage.removeItem(`${name}_psn_favorites_data`); } catch (e) {}
+				}
+				if (!visible || target !== name || normalizedType !== type ||
+					name === String(localStorage.getItem('psn_username') || '') || !socketChat?.connected) continue;
+				const pending = window.__activeProfileListRequest;
+				if (pending && pending.targetUser === name && pending.listType === listType) pending.invalidated = true;
+				window.__profileRealtimeListRefreshTimers = window.__profileRealtimeListRefreshTimers || {};
+				const timerKey = `${name}|${listType}`;
+				clearTimeout(window.__profileRealtimeListRefreshTimers[timerKey]);
+				window.__profileRealtimeListRefreshTimers[timerKey] = setTimeout(() => {
+					delete window.__profileRealtimeListRefreshTimers[timerKey];
+					const current = document.getElementById('modal-sys-list');
+					if (!current || current.style.display === 'none' || current.dataset.profileTarget !== name ||
+						current.dataset.profileListType !== listType || !socketChat?.connected) return;
+					window.requestLiveProfileListRefresh?.(name, listType, true);
+				}, 120);
+			}
+		});
+
 		socketChat.on('profile_counts_update', function(data = {}) {
 			try {
 				const name = String(data.name || '').trim();
@@ -95459,7 +95508,9 @@ function getVisibleChatStackEl(id) {
 						window.setLiveCountText(countPill, `${value} ${value === 1 ? 'item' : 'items'}`, value, `profile-list:${name}:${listType}`);
 					}
 				}
-				if (listOpen && hasLiveListCount && name !== myName && socketChat && socketChat.connected) {
+				const listRevision = window.__profileListChangeRevision?.get(`${name}|${listType === 'favorites' ? 'favs' : listType}`) || 0;
+				if (listOpen && hasLiveListCount && name !== myName && socketChat && socketChat.connected &&
+					!(incomingCountsRevision && listRevision && incomingCountsRevision <= listRevision)) {
 					window.__profileRealtimeListRefreshTimers = window.__profileRealtimeListRefreshTimers || {};
 						const timerKey = `${name}|${listType}`;
 						clearTimeout(window.__profileRealtimeListRefreshTimers[timerKey]);
@@ -103014,6 +103065,7 @@ function getVisibleChatStackEl(id) {
 		const titleEl = document.getElementById('list-modal-title');
 		if (!modal || !body || !titleEl) return false;
 		if (window.__activeProfileListRequest && window.__activeProfileListRequest.timeoutId) clearTimeout(window.__activeProfileListRequest.timeoutId);
+		if (window.__activeProfileListRequest?.retryId) clearTimeout(window.__activeProfileListRequest.retryId);
 		window.__activeProfileListRequest = null;
 		window.__lastProfileListRender = null;
 		window.__gamePlayersModalState = null;
@@ -106963,25 +107015,69 @@ function getVisibleChatStackEl(id) {
 
 	window.__activeProfileListRequest = null;
 
-	window.requestLiveProfileListRefresh = function(targetUser, listType) {
+	window.sendProfileListRequest = function(targetUser, listType, requestId) {
+		if (!socketChat || !socketChat.connected) return false;
+		const payload = { targetName:targetUser, type:listType, requestId };
+		if (listType === 'trophies') {
+			// Acknowledgements also survive clients that cannot use a separate response event.
+			// Older servers still use user_data_response, which remains supported below.
+			socketChat.emit('request_user_data', payload, response => {
+				if (response && typeof window.handlePlayerListResponse === 'function') window.handlePlayerListResponse(response);
+			});
+		} else socketChat.emit('request_user_data', payload);
+		return true;
+	};
+
+	window.armTrophyListRecovery = function(active) {
+		if (!active || active.listType !== 'trophies') return;
+		active.retryId = setTimeout(() => {
+			if (window.__activeProfileListRequest !== active || !socketChat || !socketChat.connected) return;
+			const modal = document.getElementById('modal-sys-list');
+			if (!modal || modal.style.display === 'none' || modal.dataset.profileTarget !== active.targetUser || modal.dataset.profileListType !== active.listType) return;
+			active.requestId = `plist-retry-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+			window.sendProfileListRequest(active.targetUser, active.listType, active.requestId);
+		}, 5500);
+	};
+
+	socketChat.on('connect', () => {
+		const modal = document.getElementById('modal-sys-list');
+		if (!modal || modal.style.display === 'none') return;
+		const name = String(modal.dataset.profileTarget || '');
+		const type = String(modal.dataset.profileListType || '');
+		if (!name || !['trophies','wishlist','downloads','library','favs','favorites'].includes(type) ||
+			name === String(localStorage.getItem('psn_username') || '')) return;
+		const active = window.__activeProfileListRequest;
+		if (active && active.targetUser === name && active.listType === type) {
+			if (active.retryId) { clearTimeout(active.retryId); active.retryId = null; }
+			active.requestId = `plist-reconnect-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+			window.sendProfileListRequest(name, type, active.requestId);
+		} else {
+			window.requestLiveProfileListRefresh?.(name, type, true);
+		}
+	});
+
+	window.requestLiveProfileListRefresh = function(targetUser, listType, supersede = false) {
 		const modal = document.getElementById('modal-sys-list');
 		if (!modal || modal.style.display === 'none' ||
 			modal.dataset.profileTarget !== targetUser || modal.dataset.profileListType !== listType ||
 			!socketChat || !socketChat.connected) return false;
 		const active = window.__activeProfileListRequest;
-		if (active && active.targetUser === targetUser && active.listType === listType) {
+		if (!supersede && active && active.targetUser === targetUser && active.listType === listType) {
 			active.refreshAfterResponse = true;
 			return true;
 		}
 		if (active && active.timeoutId) clearTimeout(active.timeoutId);
+		if (active && active.retryId) clearTimeout(active.retryId);
 		const requestId = `plist-live-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-		window.__activeProfileListRequest = {
+		const activeRequest = {
 			requestId, targetUser, listType,
 			timeoutId: setTimeout(() => {
-				if (window.__activeProfileListRequest?.requestId === requestId) window.__activeProfileListRequest = null;
-			}, 12000)
+				if (window.__activeProfileListRequest === activeRequest) window.__activeProfileListRequest = null;
+			}, listType === 'trophies' ? 17000 : 12000)
 		};
-		socketChat.emit('request_user_data', { targetName:targetUser, type:listType, requestId });
+		window.__activeProfileListRequest = activeRequest;
+		window.armTrophyListRecovery(activeRequest);
+		window.sendProfileListRequest(targetUser, listType, requestId);
 		return true;
 	};
 
@@ -106990,6 +107086,7 @@ function getVisibleChatStackEl(id) {
 		if (!active) return;
 		if (requestId && active.requestId !== requestId) return;
 		if (active.timeoutId) clearTimeout(active.timeoutId);
+		if (active.retryId) clearTimeout(active.retryId);
 		window.__activeProfileListRequest = null;
 	};
 
@@ -107017,6 +107114,7 @@ function getVisibleChatStackEl(id) {
 		if (responseRequestId && (!active || active.requestId !== responseRequestId)) return;
 		if (!modalIsOpen || modalCurrentTarget !== responseTarget || modalCurrentType !== responseType) return;
 		if (active && !responseRequestId && (active.targetUser !== responseTarget || active.listType !== responseType)) return;
+		if (active?.invalidated) return;
 		const refreshAfterResponse = !!active?.refreshAfterResponse;
 		if (active) window.clearProfileListRequestTimeout(active.requestId);
 
@@ -107060,6 +107158,7 @@ function getVisibleChatStackEl(id) {
 			previousRequest.targetUser === targetUser && previousRequest.listType === listType;
 		if (!reusePendingRequest) {
 			if (previousRequest?.timeoutId) clearTimeout(previousRequest.timeoutId);
+			if (previousRequest?.retryId) clearTimeout(previousRequest.retryId);
 			window.__activeProfileListRequest = null;
 		}
 
@@ -107118,31 +107217,30 @@ function getVisibleChatStackEl(id) {
 			try { cachedData = cachedDataStr ? JSON.parse(cachedDataStr) : null; } catch(e) { cachedData = null; }
 	
 			if (cachedData && (Array.isArray(cachedData) ? cachedData.length > 0 : Object.keys(cachedData).length > 0)) {
-				console.log(`[Social] Usando cache local para ${targetUser}`);
 				renderFetchedList(targetUser, listType, cachedData);
-			} 
+				// Show the snapshot instantly, then validate it. It may predate an
+				// update received while this tab was offline or disconnected.
+				if (socketChat?.connected) window.requestLiveProfileListRefresh?.(targetUser, listType, true);
+			}
 			else {
 				if (socketChat && socketChat.connected) {
 					if (reusePendingRequest) return;
 					const requestId = `plist-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 					if (window.__activeProfileListRequest && window.__activeProfileListRequest.timeoutId) clearTimeout(window.__activeProfileListRequest.timeoutId);
-					window.__activeProfileListRequest = {
+					const activeRequest = {
 						requestId,
 						targetUser,
 						listType,
 						timeoutId: setTimeout(() => {
-							const active = window.__activeProfileListRequest;
-							if (!active || active.requestId !== requestId) return;
+							if (window.__activeProfileListRequest !== activeRequest) return;
 							window.__activeProfileListRequest = null;
 							window.showProfileListFetchError(targetUser, listType, 'This list took too long to load from the server cache. Try opening it again.');
-						}, 12000)
+						}, listType === 'trophies' ? 17000 : 12000)
 					};
+					window.__activeProfileListRequest = activeRequest;
+					window.armTrophyListRecovery(activeRequest);
 					console.log(`[Social] Fetching ${listType} data from the server...`);
-					socketChat.emit('request_user_data', {
-						targetName: targetUser,
-						type: listType,
-						requestId
-					});
+					window.sendProfileListRequest(targetUser, listType, requestId);
 				} else {
 					body.innerHTML = `<div style="text-align:center; padding:40px; color: #ff4444;">Offline: Cannot fetch remote data.</div>`;
 				}
