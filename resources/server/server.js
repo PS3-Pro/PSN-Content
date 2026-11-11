@@ -10907,11 +10907,50 @@ function buildPresenceUpdatePayload(name, user = null) {
   };
 }
 
+// Presence bandwidth: send the full public record once per socket/user; subsequent
+// updates carry only changed fields. Online heartbeat timestamps are not visible
+// as "last seen", so they alone must not trigger a broadcast.
 function emitPresenceUpdate(name, user = null) {
   const payload = buildPresenceUpdatePayload(name, user);
   if (!payload) return null;
-  trackBandwidthPayload('presence_update', payload, io.sockets.sockets.size);
-  io.emit('presence_update', payload);
+  const keys = Object.keys(payload);
+  io.sockets.sockets.forEach(client => {
+    if (!client.connected) return;
+    if (client.presenceDeltaV1 !== true) {
+      trackBandwidthPayload('presence_update', payload, 1);
+      client.emit('presence_update', payload);
+      return;
+    }
+    if (!(client.__presenceSentByName instanceof Map)) client.__presenceSentByName = new Map();
+    const cache = client.__presenceSentByName;
+    const previous = cache.get(name);
+    const diff = { name, online: payload.online };
+    if (!previous) {
+      trackBandwidthPayload('presence_update', payload, 1);
+      client.emit('presence_update', payload);
+    } else {
+      let changed = false;
+      for (const key of keys) {
+        if (key === 'name' || key === 'online') continue;
+        // Last-seen is meaningful only when offline or when the online state changes.
+        if (key === 'lastSeen' && payload.online && previous.online === true) continue;
+        if (JSON.stringify(payload[key]) !== JSON.stringify(previous[key])) {
+          diff[key] = payload[key];
+          changed = true;
+        }
+      }
+      if (previous.online !== payload.online) changed = true;
+      if (changed) {
+        diff.presenceDeltaV1 = true;
+        trackBandwidthPayload('presence_update:delta', diff, 1);
+        client.emit('presence_update', diff);
+      }
+    }
+    // Bounded per-socket cache, reset on authentication/reconnect. A cold name
+    // receives a full payload again rather than a patch without a baseline.
+    if (cache.size >= 64 && !cache.has(name)) cache.delete(cache.keys().next().value);
+    cache.set(name, payload);
+  });
   return payload;
 }
 
@@ -13534,12 +13573,18 @@ async function emitOnlineList(targetSocket = null, options = {}) {
     if (Array.isArray(list) && list.length > 0) lastKnownOnlineList = list;
 
     if (targetSocket) {
+      const signature = buildOnlineListSignature(list);
+      const now = Date.now();
+      if (options.force !== true && options.forceSend !== true && targetSocket.__onlineListLastSignature === signature &&
+          now - (targetSocket.__onlineListLastSentAt || 0) < 2500) return list;
       if (MEMORY_TRACE_ENABLED) {
         const estimate = estimateValueBytes(list, { maxNodes: 20000, maxBytes: 8 * 1024 * 1024 });
         logMemoryTrace('online-list:send', `user=${targetSocket.userName || '-'} socket=${targetSocket.id} items=${Array.isArray(list) ? list.length : 0} approx=${formatApproxBytes(estimate.bytes)}${estimate.truncated ? '+' : ''} buffer=${getSocketWriteBufferLength(targetSocket)}`);
       }
       trackBandwidthPayload('online_list:target', list, 1);
       targetSocket.emit('online_list', list);
+      targetSocket.__onlineListLastSignature = signature;
+      targetSocket.__onlineListLastSentAt = now;
       return list;
     }
 
@@ -15283,6 +15328,7 @@ io.on('connection', (socket) => {
 
       const supportsProfileSyncV2 = data && data.profileSyncV2 === true;
       const supportsProfileSyncAckV1 = data && data.profileSyncAckV1 === true;
+      const supportsPresenceDeltaV1 = data && data.presenceDeltaV1 === true;
       const supportsChatHistoryAckV1 = data && data.chatHistoryAckV1 === true;
       const supportsChatHistoryPullV1 = data && data.chatHistoryPullV1 === true;
       logMemoryTrace('auth:start', `user=${name || ''} socket=${socket.id} new=${isNewAccount === true} v2=${supportsProfileSyncV2} ack=${supportsProfileSyncAckV1} chatAck=${supportsChatHistoryAckV1} chatPull=${supportsChatHistoryPullV1}`);
@@ -15407,6 +15453,10 @@ io.on('connection', (socket) => {
           fullUserCacheNames.delete(name);
           socket.profileSyncV2 = supportsProfileSyncV2;
           socket.profileSyncAckV1 = supportsProfileSyncAckV1;
+          socket.presenceDeltaV1 = supportsPresenceDeltaV1;
+          socket.__presenceSentByName = null;
+          socket.__onlineListLastSignature = '';
+          socket.__onlineListLastSentAt = 0;
           socket.chatHistoryAckV1 = supportsChatHistoryAckV1;
           socket.chatHistoryPullV1 = supportsChatHistoryPullV1;
 
@@ -15506,6 +15556,10 @@ io.on('connection', (socket) => {
         socket.role = getUserRole(name, userDatabase[name]);
         socket.profileSyncV2 = supportsProfileSyncV2;
         socket.profileSyncAckV1 = supportsProfileSyncAckV1;
+        socket.presenceDeltaV1 = supportsPresenceDeltaV1;
+        socket.__presenceSentByName = null;
+        socket.__onlineListLastSignature = '';
+        socket.__onlineListLastSentAt = 0;
         socket.chatHistoryAckV1 = supportsChatHistoryAckV1;
         socket.chatHistoryPullV1 = supportsChatHistoryPullV1;
         normalizeProfileArrayPayloads(userDatabase[name]);
@@ -16712,7 +16766,7 @@ io.on('connection', (socket) => {
     const sendOnlineList = async () => {
       try {
         if (!socket.connected) return;
-        await emitOnlineList(socket);
+        await emitOnlineList(socket, { force: true });
       } catch (err) {
         console.error('[REQUEST ONLINE LIST ERROR]:', err);
         if (socket.connected && Array.isArray(lastKnownOnlineList) && lastKnownOnlineList.length > 0) {
