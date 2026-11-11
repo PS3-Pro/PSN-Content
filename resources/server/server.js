@@ -993,7 +993,7 @@ const DB_OPTIONAL_READ_LABELS = new Set([
 ]);
 const DB_BULK_READ_LABELS = new Set([
   'CONTENT DOWNLOAD COUNTS', 'TRENDING AGGREGATE',
-  'TRENDING AGGREGATE INDEXED', 'TROPHY AGGREGATE'
+  'TRENDING AGGREGATE INDEXED', 'TROPHY AGGREGATE', 'TROPHY AGGREGATE INDEXED'
 ]);
 const optionalDbReadQueue = [];
 let optionalDbReadActive = 0;
@@ -2821,6 +2821,7 @@ async function initDb() {
     );
     ALTER TABLE social_comments ADD COLUMN IF NOT EXISTS parent_id BIGINT REFERENCES social_comments(id) ON DELETE SET NULL;
     ALTER TABLE social_comments ADD COLUMN IF NOT EXISTS images JSONB NOT NULL DEFAULT '[]'::jsonb;
+    ALTER TABLE social_comments ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ;
     CREATE INDEX IF NOT EXISTS idx_social_comments_post ON social_comments(post_id,id DESC);
     CREATE INDEX IF NOT EXISTS idx_social_comments_parent ON social_comments(parent_id,id);
     CREATE INDEX IF NOT EXISTS idx_social_comments_roots ON social_comments(post_id,id DESC) WHERE parent_id IS NULL;
@@ -3147,9 +3148,180 @@ async function getSanitizedOnlineListFromDb(options = {}) {
   onlineListCacheAt = Date.now();
   return list;
 }
+// Indexed trophy rarity and wishlist trending. Kept separate from the download
+// projection: partial rollout always falls back to the original JSONB queries.
+const PSN_STATS_INDEX_VERSION = 1;
+const PSN_STATS_INDEX_BATCH = Math.max(10,Math.min(50,parseInt(process.env.PSN_STATS_INDEX_BATCH||'20',10)||20));
+let psnStatsIndexReady = false;
+let psnStatsIndexSchemaReady = false;
+let psnStatsIndexBusy = false;
+let psnStatsIndexTimer = null;
+let psnStatsIndexLogAt = 0;
+let psnStatsIndexBuilt = 0;
+
+function schedulePsnStatsIndex(delay=60000) {
+  if(process.env.PSN_STATS_INDEX==='0'||psnStatsIndexReady||psnStatsIndexBusy||psnStatsIndexTimer)return;
+  psnStatsIndexTimer=setTimeout(()=>{
+    psnStatsIndexTimer=null;
+    maintainPsnStatsIndex().catch(error=>{
+      if(Date.now()-psnStatsIndexLogAt>60000){psnStatsIndexLogAt=Date.now();console.warn('[PSN STATS INDEX]',error.message||error);}
+      schedulePsnStatsIndex(60000);
+    });
+  },Math.max(1000,delay));
+}
+
+async function createPsnStatsIndexSchema() {
+  const client=await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query("SET LOCAL lock_timeout = '1500ms'");
+    await client.query("SET LOCAL statement_timeout = '12000ms'");
+    await client.query("SELECT pg_advisory_xact_lock(hashtext('psn_stat_projection_schema_v1'))");
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS psn_stat_projection_entries (
+        kind TEXT NOT NULL,
+        username TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+        item_no INTEGER NOT NULL,
+        title_id TEXT NOT NULL,
+        PRIMARY KEY(kind,username,item_no)
+      );
+      CREATE INDEX IF NOT EXISTS idx_psn_stat_projection_kind_title
+        ON psn_stat_projection_entries(kind,md5(title_id));
+      CREATE TABLE IF NOT EXISTS psn_stat_projection_users (
+        username TEXT PRIMARY KEY REFERENCES users(name) ON DELETE CASCADE
+      );
+      CREATE TABLE IF NOT EXISTS psn_stat_projection_meta (
+        version INTEGER PRIMARY KEY,
+        ready BOOLEAN NOT NULL DEFAULT FALSE
+      );
+      INSERT INTO psn_stat_projection_meta(version,ready) VALUES (${PSN_STATS_INDEX_VERSION},FALSE)
+        ON CONFLICT (version) DO NOTHING;
+    `);
+    await client.query(`
+      CREATE OR REPLACE FUNCTION psn_stat_projection_keys(data JSONB)
+      RETURNS TABLE(kind TEXT,item_no INTEGER,title_id TEXT)
+      LANGUAGE SQL IMMUTABLE PARALLEL SAFE AS $psnstatkeys$
+        SELECT 'wishlist'::text, ord::integer,
+          upper(trim(COALESCE(item->>'titleId',item->>'id',''))) AS title_id
+        FROM jsonb_array_elements(
+          CASE WHEN jsonb_typeof(data->'wishlistData')='array' THEN data->'wishlistData' ELSE '[]'::jsonb END
+        ) WITH ORDINALITY AS w(item,ord)
+        WHERE upper(trim(COALESCE(item->>'titleId',item->>'id',''))) NOT IN ('','MISSING','N/A','NONE','NULL','UNDEFINED')
+        UNION ALL
+        SELECT 'trophies'::text,ord::integer,trophy_id
+        FROM jsonb_each(
+          CASE WHEN jsonb_typeof(data->'trophiesData')='object' THEN data->'trophiesData' ELSE '{}'::jsonb END
+        ) WITH ORDINALITY AS t(trophy_id,details,ord)
+        WHERE lower(COALESCE(details->>'unlocked','false')) IN ('true','1','yes');
+      $psnstatkeys$;
+    `);
+    await client.query(`
+      CREATE OR REPLACE FUNCTION psn_stat_projection_sync()
+      RETURNS TRIGGER LANGUAGE plpgsql AS $psnstatsync$
+      BEGIN
+        DELETE FROM psn_stat_projection_entries WHERE username=NEW.name;
+        INSERT INTO psn_stat_projection_entries(kind,username,item_no,title_id)
+          SELECT k.kind,NEW.name,k.item_no,k.title_id
+          FROM psn_stat_projection_keys(NEW.data) k;
+        INSERT INTO psn_stat_projection_users(username) VALUES(NEW.name)
+          ON CONFLICT(username) DO NOTHING;
+        RETURN NEW;
+      END;
+      $psnstatsync$;
+    `);
+    await client.query(`
+      DO $psnstatstriggers$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid='users'::regclass AND tgname='psn_stats_insert') THEN
+          CREATE TRIGGER psn_stats_insert AFTER INSERT ON users
+          FOR EACH ROW EXECUTE FUNCTION psn_stat_projection_sync();
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid='users'::regclass AND tgname='psn_stats_update') THEN
+          CREATE TRIGGER psn_stats_update AFTER UPDATE OF data ON users
+          FOR EACH ROW WHEN (
+            OLD.data->'wishlistData' IS DISTINCT FROM NEW.data->'wishlistData'
+            OR OLD.data->'trophiesData' IS DISTINCT FROM NEW.data->'trophiesData'
+          ) EXECUTE FUNCTION psn_stat_projection_sync();
+        END IF;
+      END $psnstatstriggers$;
+    `);
+    await client.query('COMMIT');
+  }catch(error){try{await client.query('ROLLBACK');}catch(_){ }throw error;}
+  finally{client.release();}
+}
+
+async function backfillPsnStatsIndex() {
+  const client=await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query("SET LOCAL lock_timeout = '1500ms'");
+    await client.query("SET LOCAL statement_timeout = '10000ms'");
+    const selected=await client.query(`
+      SELECT u.name FROM users u WHERE NOT EXISTS (
+        SELECT 1 FROM psn_stat_projection_users done WHERE done.username=u.name
+      ) ORDER BY u.name LIMIT $1 FOR UPDATE OF u SKIP LOCKED
+    `,[PSN_STATS_INDEX_BATCH]);
+    const names=selected.rows.map(row=>row.name);
+    if(names.length){
+      await client.query(`
+        INSERT INTO psn_stat_projection_entries(kind,username,item_no,title_id)
+        SELECT k.kind,u.name,k.item_no,k.title_id
+        FROM users u CROSS JOIN LATERAL psn_stat_projection_keys(u.data) k
+        WHERE u.name=ANY($1::text[])
+        ON CONFLICT(kind,username,item_no) DO NOTHING
+      `,[names]);
+      await client.query('INSERT INTO psn_stat_projection_users(username) SELECT unnest($1::text[]) ON CONFLICT(username) DO NOTHING',[names]);
+    }
+    await client.query('COMMIT');
+    return names.length;
+  }catch(error){try{await client.query('ROLLBACK');}catch(_){}throw error;}
+  finally{client.release();}
+}
+
+async function maintainPsnStatsIndex() {
+  if(process.env.PSN_STATS_INDEX==='0'||psnStatsIndexReady||psnStatsIndexBusy)return;
+  if(pool.waitingCount>0||(pool.totalCount>0&&pool.idleCount===0)){
+    schedulePsnStatsIndex(5000);return;
+  }
+  psnStatsIndexBusy=true;
+  let delay=1800;
+  try{
+    if(!psnStatsIndexSchemaReady){await createPsnStatsIndexSchema();psnStatsIndexSchemaReady=true;}
+    const status=await pool.query('SELECT ready FROM psn_stat_projection_meta WHERE version=$1',[PSN_STATS_INDEX_VERSION]);
+    if(status.rows[0]?.ready===true){psnStatsIndexReady=true;}
+    else if(pool.waitingCount>0||(pool.totalCount>0&&pool.idleCount===0)){delay=5000;}
+    else {
+      const count=await backfillPsnStatsIndex();psnStatsIndexBuilt+=count;
+      if(count&&psnStatsIndexBuilt%(PSN_STATS_INDEX_BATCH*50)<count)
+        console.log(`[PSN STATS INDEX] Background indexed ${psnStatsIndexBuilt} users in this instance.`);
+      if(!count){
+        const complete=await pool.query(`
+          UPDATE psn_stat_projection_meta SET ready=TRUE
+          WHERE version=$1 AND NOT EXISTS (
+            SELECT 1 FROM users u WHERE NOT EXISTS (
+              SELECT 1 FROM psn_stat_projection_users done WHERE done.username=u.name
+            )
+          ) RETURNING ready
+        `,[PSN_STATS_INDEX_VERSION]);
+        if(complete.rows.length)psnStatsIndexReady=true;else delay=5000;
+      }
+    }
+    if(psnStatsIndexReady){
+      trendingCache=null;globalTrophyStatsCache=null;
+      console.log('[PSN STATS INDEX] Ready. Trophy rarity and Wishlist Trending now use indexed entries.');
+    }
+  }catch(error){
+    delay=60000;
+    if(Date.now()-psnStatsIndexLogAt>60000){psnStatsIndexLogAt=Date.now();console.warn('[PSN STATS INDEX] Using original SQL until ready:',error.message||error);}
+  }finally{
+    psnStatsIndexBusy=false;
+    if(!psnStatsIndexReady)schedulePsnStatsIndex(delay);
+  }
+}
+
 async function calculateGlobalTrophyStatsFromDb() {
   const stats = {};
 
+  const indexed = psnStatsIndexReady && process.env.PSN_STATS_INDEX !== '0';
   const trophyRes = await queryDbWithRetry(`
     WITH total_users AS (
       SELECT COUNT(*)::numeric AS total FROM users
@@ -3157,14 +3329,16 @@ async function calculateGlobalTrophyStatsFromDb() {
       SELECT
         trophy.key AS trophy_id,
         COUNT(*)::numeric AS unlocked_count
-      FROM users u
+      ${indexed ? `FROM psn_stat_projection_entries stat
+      CROSS JOIN LATERAL (SELECT stat.title_id AS key) trophy
+      WHERE stat.kind='trophies'` : `FROM users u
       CROSS JOIN LATERAL jsonb_each(
         CASE
           WHEN jsonb_typeof(u.data->'trophiesData') = 'object' THEN u.data->'trophiesData'
           ELSE '{}'::jsonb
         END
       ) AS trophy(key, value)
-      WHERE LOWER(COALESCE(trophy.value->>'unlocked', 'false')) IN ('true', '1', 'yes')
+      WHERE LOWER(COALESCE(trophy.value->>'unlocked', 'false')) IN ('true', '1', 'yes')`}
       GROUP BY trophy.key
     )
     SELECT
@@ -3174,7 +3348,7 @@ async function calculateGlobalTrophyStatsFromDb() {
         ELSE 0
       END AS percentage
     FROM unlocked_trophies, total_users
-  `, [], { attempts: 2, label: 'TROPHY AGGREGATE' });
+  `, [], { attempts: 2, label: indexed ? 'TROPHY AGGREGATE INDEXED' : 'TROPHY AGGREGATE' });
 
   trophyRes.rows.forEach(row => {
     if (row.trophy_id) stats[row.trophy_id] = Number(row.percentage) || 0;
@@ -3928,6 +4102,22 @@ function getProfileNotificationStatePayloadServer(user = {}) {
 }
 
 const profileNotificationMutationQueues = new Map();
+const profileNotificationPendingMutations = new Map();
+
+function runSharedProfileNotificationMutation(name,category,patch) {
+  const mutationId = normalizeText(patch.mutationId,'');
+  if (!mutationId) return runSerializedProfileNotificationMutation(name,() => updateProfileNotificationCategoryInDb(name,category,patch));
+  const key = JSON.stringify([name,category,mutationId,patch]);
+  const existing = profileNotificationPendingMutations.get(key);
+  if (existing) return existing.then(value => value ? {...value,duplicate:true} : value);
+  const pending = runSerializedProfileNotificationMutation(name,() => updateProfileNotificationCategoryInDb(name,category,patch));
+  profileNotificationPendingMutations.set(key,pending);
+  pending.finally(() => {
+    if (profileNotificationPendingMutations.get(key) === pending) profileNotificationPendingMutations.delete(key);
+  }).catch(() => {});
+  return pending;
+}
+
 
 function runSerializedProfileNotificationMutation(name, task) {
   const safeName = normalizeText(name, '');
@@ -5121,7 +5311,9 @@ async function calculateTrendingFromDb() {
     `;
   const rows = await queryDbWithRetry(`
     WITH game_downloads AS (${gameDownloadsSource}
-    ), wishlist_items AS (
+    ), wishlist_items AS (${psnStatsIndexReady && process.env.PSN_STATS_INDEX !== '0' ? `
+      SELECT username,title_id FROM psn_stat_projection_entries WHERE kind='wishlist'
+    ` : `
       SELECT
         u.name AS username,
         CASE WHEN upper(trim(COALESCE(item->>'titleId', item->>'id', ''))) IN ('MISSING','N/A','NONE','NULL','UNDEFINED') THEN '' ELSE upper(trim(COALESCE(item->>'titleId', item->>'id', ''))) END AS title_id
@@ -5129,7 +5321,7 @@ async function calculateTrendingFromDb() {
       CROSS JOIN LATERAL jsonb_array_elements(
         CASE WHEN jsonb_typeof(u.data->'wishlistData') = 'array' THEN u.data->'wishlistData' ELSE '[]'::jsonb END
       ) item
-    ), top_games AS (
+    `}), top_games AS (
       SELECT title_id AS key, COUNT(DISTINCT username)::int AS count
       FROM game_downloads
       WHERE raw_category IN ('game','games') AND title_id <> ''
@@ -11210,12 +11402,13 @@ async function initProfileSyncNotifications() {
         invalidateSocialFeedPageReads(data.kind, data.id);
         if(data.kind==='post'||data.kind==='delete')invalidateSocialPostCountReads();
         invalidateSocialReactorsForChange(data.kind,String(data.id || ''),data);
-        if (data.kind === 'comment' || data.kind === 'comment-delete' || data.kind === 'delete' || (data.kind === 'react' && data.commentId)) {
+        if (data.kind === 'comment' || data.kind === 'comment-edit' || data.kind === 'comment-delete' || data.kind === 'delete' || (data.kind === 'react' && data.commentId)) {
           invalidateSocialCommentReads(data.id);
         }
         io.emit('social_feed_changed', {
           kind:data.kind,id:String(data.id || ''),commentId:data.commentId ? String(data.commentId) : null,
-          actor:data.actor||'',oldEmoji:data.oldEmoji||'',emoji:data.emoji||'',at:data.at
+          actor:data.actor||'',oldEmoji:data.oldEmoji||'',emoji:data.emoji||'',
+          ...(data.kind==='comment-edit'?{text:typeof data.text==='string'?data.text:'',editedAt:data.editedAt||null,parentId:data.parentId||null}:{}),at:data.at
         });
         return;
       }
@@ -14444,7 +14637,7 @@ function serializeSocialComment(row) {
     parentId: row.parent_id ? String(row.parent_id) : null,
     parentAuthor: row.parent_author || '', replyCount: Number(row.reply_count) || 0,
     images: Array.isArray(row.images) ? row.images : [],
-    createdAt: row.created_at, reactions: socialPublicReactions(row.reactions), myReaction: row.my_reaction || ''
+    createdAt: row.created_at, editedAt: row.edited_at || null, reactions: socialPublicReactions(row.reactions), myReaction: row.my_reaction || ''
   };
 }
 
@@ -14659,7 +14852,7 @@ function invalidateSocialFeedPageReads(kind = '', postId = '') {
   // known. Cancel shared pending references so a late result cannot be cached.
   socialFeedPending.clear();
   const id = String(postId || '');
-  const targeted = ['edit','react','comment','comment-delete'].includes(kind) && /^\d{1,18}$/.test(id);
+  const targeted = ['edit','react','comment','comment-edit','comment-delete'].includes(kind) && /^\d{1,18}$/.test(id);
   if (targeted) {
     for (const [key, entry] of socialFeedFirstPageCache) {
       const posts = entry.value && entry.value.posts;
@@ -14714,19 +14907,19 @@ async function socialReadComments(actor, postId, focusCommentId = '') {
   // Ordinary openings need only the 30 newest roots. Do not build a recursive
   // ancestor path or deduplicate UNION rows unless a specific reply is targeted.
   const pageQuery = focusCommentId ? `WITH RECURSIVE recent_roots AS MATERIALIZED (
-      SELECT id,post_id,author_name,body,parent_id,images,created_at
+      SELECT id,post_id,author_name,body,parent_id,images,created_at,edited_at
       FROM social_comments WHERE post_id=$2 AND parent_id IS NULL
       ORDER BY id DESC LIMIT 30
     ), focus_path AS (
-      SELECT id,post_id,author_name,body,parent_id,images,created_at
+      SELECT id,post_id,author_name,body,parent_id,images,created_at,edited_at
       FROM social_comments WHERE post_id=$2 AND id=NULLIF($4::text,'')::bigint
       UNION ALL
-      SELECT parent.id,parent.post_id,parent.author_name,parent.body,parent.parent_id,parent.images,parent.created_at
+      SELECT parent.id,parent.post_id,parent.author_name,parent.body,parent.parent_id,parent.images,parent.created_at,parent.edited_at
       FROM social_comments parent JOIN focus_path child ON child.parent_id=parent.id AND child.post_id=parent.post_id
     ), comment_page AS MATERIALIZED (
       SELECT * FROM recent_roots UNION SELECT * FROM focus_path
     )` : `WITH comment_page AS MATERIALIZED (
-      SELECT id,post_id,author_name,body,parent_id,images,created_at
+      SELECT id,post_id,author_name,body,parent_id,images,created_at,edited_at
       FROM social_comments WHERE post_id=$2 AND parent_id IS NULL
       ORDER BY id DESC LIMIT 30
     )`;
@@ -14744,7 +14937,7 @@ async function socialReadComments(actor, postId, focusCommentId = '') {
       WHERE post_id=$2 AND parent_id IN (SELECT id FROM comment_page)
       GROUP BY parent_id
     )
-    SELECT c.id,c.post_id,c.author_name,c.body,c.parent_id,c.images,c.created_at,
+    SELECT c.id,c.post_id,c.author_name,c.body,c.parent_id,c.images,c.created_at,c.edited_at,
       parent.author_name AS parent_author,
       COALESCE(NULLIF(u.data->>'avatar',''),$3) AS author_avatar,
       COALESCE(rc.reactions,'[]'::jsonb) AS reactions,
@@ -14764,7 +14957,7 @@ async function socialReadComments(actor, postId, focusCommentId = '') {
 async function socialReadCommentReplies(actor, postId, parentId, after = '') {
   const result = await queryDbWithRetry(`
     WITH page AS MATERIALIZED (
-      SELECT id,post_id,author_name,body,parent_id,images,created_at
+      SELECT id,post_id,author_name,body,parent_id,images,created_at,edited_at
       FROM social_comments
       WHERE post_id=$2 AND parent_id=$4::bigint AND id>COALESCE(NULLIF($5::text,'')::bigint,0)
       ORDER BY id ASC LIMIT 21
@@ -14778,7 +14971,7 @@ async function socialReadCommentReplies(actor, postId, parentId, after = '') {
       WHERE nested.parent_id IN (SELECT id FROM page)
       GROUP BY nested.parent_id
     )
-    SELECT c.id,c.post_id,c.author_name,c.body,c.parent_id,c.images,c.created_at,
+    SELECT c.id,c.post_id,c.author_name,c.body,c.parent_id,c.images,c.created_at,c.edited_at,
       parent.author_name AS parent_author,
       COALESCE(NULLIF(u.data->>'avatar',''),$3) AS author_avatar,
       COALESCE(rc.reactions,'[]'::jsonb) AS reactions,
@@ -14950,7 +15143,7 @@ function socialPublish(kind, id, extra = null) {
   invalidateSocialFeedPageReads(kind, id);
   if(kind==='post'||kind==='delete')invalidateSocialPostCountReads();
   invalidateSocialReactorsForChange(kind,id,extra);
-  if (kind === 'comment' || kind === 'comment-delete' || kind === 'delete' || (kind === 'react' && extra && extra.commentId)) {
+  if (kind === 'comment' || kind === 'comment-edit' || kind === 'comment-delete' || kind === 'delete' || (kind === 'react' && extra && extra.commentId)) {
     invalidateSocialCommentReads(id);
   }
   const payload = { kind, id: String(id || ''), ...(extra && typeof extra === 'object' ? extra : {}), at: Date.now() };
@@ -15379,6 +15572,39 @@ io.on('connection', (socket) => {
     } catch (err) {
       console.error('[SOCIAL COMMENT ERROR]:',err && err.message || err);
       reply({success:false,message:'Could not add comment.'});
+    }
+  });
+
+  socket.on('social_comment_edit', async (data = {}, callback) => {
+    const reply = typeof callback === 'function' ? callback : () => {};
+    const actor = normalizeSocialUserName(socket.userName);
+    const id = String(data.id || ''), postId = String(data.postId || '');
+    const body = typeof data.text === 'string' ? data.text.trim() : null;
+    const original = typeof data.originalText === 'string' ? data.originalText : null;
+    if (!actor || !/^\d{1,18}$/.test(id) || !/^\d{1,18}$/.test(postId) ||
+        body === null || body.length > 1200 || original === null || original.length > 1200)
+      return reply({success:false,message:'Invalid comment edit.'});
+    if (!socialRateLimit(actor,'comment-edit',650))
+      return reply({success:false,message:'Wait a moment before editing again.'});
+    try {
+      const edited = await queryDbWithRetry(`
+        UPDATE social_comments
+        SET body=$4,edited_at=NOW()
+        WHERE id=$1::bigint AND post_id=$2::bigint AND author_name=$3
+          AND body=$5 AND body IS DISTINCT FROM $4
+          AND (length($4)>0 OR jsonb_array_length(images)>0)
+        RETURNING post_id,parent_id,body,edited_at
+      `,[id,postId,actor,body,original],{attempts:2,label:'SOCIAL COMMENT EDIT'});
+      const row=edited.rows[0];
+      if (!row) return reply({success:false,message:'Comment changed, was deleted, or cannot be empty. Refresh the comments and try again.'});
+      reply({success:true,text:row.body,editedAt:row.edited_at});
+      socialPublish('comment-edit',postId,{
+        originSocketId:socket.id,commentId:id,parentId:row.parent_id?String(row.parent_id):null,
+        text:row.body,editedAt:row.edited_at
+      });
+    } catch(err){
+      console.error('[SOCIAL COMMENT EDIT ERROR]:',err&&err.message||err);
+      reply({success:false,message:'Could not edit comment.'});
     }
   });
 
@@ -15833,10 +16059,7 @@ io.on('connection', (socket) => {
 
     let savedState;
     try {
-      savedState = await runSerializedProfileNotificationMutation(
-        name,
-        () => updateProfileNotificationCategoryInDb(name, category, categoryPatch)
-      );
+      savedState = await runSharedProfileNotificationMutation(name,category,categoryPatch);
       if (!savedState) { respond({ ok: false, error: 'Notification state could not be saved.' }); return; }
     } catch (err) {
       console.error(`[PROFILE NOTIFICATION STATE ERROR] ${name}:`, err);
@@ -20268,6 +20491,7 @@ async function startServer() {
       startKeepAlivePings();
       scheduleStartupGlobalRetention();
       scheduleContentDownloadIndexMaintenance(30000);
+      schedulePsnStatsIndex(65000);
     });
   } catch (err) {
     console.error('[STARTUP ERROR]:', err);

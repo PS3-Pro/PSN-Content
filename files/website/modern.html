@@ -8231,6 +8231,12 @@ button.psn-social-playing-title:hover { color:#89caff;text-decoration:underline;
 .psn-social-comment-emoji-picker { position:absolute; z-index:5; bottom:calc(100% + 6px); right:0; display:grid; grid-template-columns:repeat(8,30px); gap:3px; padding:9px; border-radius:12px; border:1px solid var(--psn-surface-border-hover); background:#171e2a; box-shadow:0 12px 32px rgba(0,0,0,.42); }
 .psn-social-comment-emoji-picker button { font-size:19px; width:30px; height:30px; border:0; border-radius:7px; background:transparent; cursor:pointer; }
 .psn-social-comment-emoji-picker button:hover,.psn-social-comment-emoji-picker button:focus-visible { background:rgba(255,255,255,.10); }
+.psn-social-comment-edit-panel { margin:6px 0 0; }
+.psn-social-comment-edit-input { width:100%; min-height:65px; max-height:170px; resize:vertical; box-sizing:border-box; padding:8px 10px; background:rgba(5,13,27,.31); border:1px solid rgba(172,205,244,.23); border-radius:9px; color:#eef5ff; font:inherit; font-size:13px; line-height:1.42; outline:none; }
+.psn-social-comment-edit-input:hover { border-color:rgba(172,205,244,.38); }
+.psn-social-comment-edit-input:focus { border-color:var(--ps-blue); }
+.psn-social-comment-edit-actions { display:flex; justify-content:flex-end; gap:7px; margin-top:7px; }
+.psn-social-comment-edit-actions .psn-social-btn { min-height:29px; padding:5px 10px; }
 .psn-social-comment-reply-btn { background:transparent; border:0; border-radius:6px; padding:2px 5px; font:inherit; font-size:11px; color:var(--text-muted); font-weight:650; cursor:pointer; }
 .psn-social-comment-reply-btn:hover,.psn-social-comment-reply-btn:focus-visible { color:#fff; background:rgba(255,255,255,.075); }
 .psn-social-modal-body .psn-social-comments-list .psn-social-comment-form.is-inline-reply { position:relative; margin:4px 0 8px 40px; padding:2px 0 2px 0; border:0; background:transparent; width:calc(100% - 40px); animation:psnSocialReplyComposerIn .2s ease-out both; }
@@ -116730,6 +116736,17 @@ function getVisibleChatStackEl(id) {
     if(data&&data.kind==='post'&&id&&data.author&&(
       state.filter==='mine'&&data.author!==identity()||
       state.filter==='friends'&&!socialIsFriend(data.author)))return;
+    if(data&&data.kind==='comment-edit'&&id){
+      if(data.originSocketId&&data.originSocketId===state.socket?.id)return;
+      if(state.modalPostId===id){
+        const commentId=idOf(data.commentId),item=socialFindComment(id,commentId);
+        if(item&&typeof data.text==='string'){
+          socialUpdateCachedComment(id,commentId,data.text,data.editedAt||new Date().toISOString());
+          renderSocialCommentThreads(id);
+        }else scheduleOpenSocialCommentsRefresh(id);
+      }
+      return;
+    }
     if(data&&data.kind==='comment-delete'&&id){
       const commentId=idOf(data.commentId);
       if(commentId)removeSocialComment(commentId,id);
@@ -116883,7 +116900,7 @@ function getVisibleChatStackEl(id) {
     const reaction=emojis.includes(comment.myReaction)?comment.myReaction:'';
     return `<div class="psn-social-comment-actions">
       <div class="psn-social-reaction-host"><div class="psn-social-like-group"><button type="button" class="psn-social-action ${reaction?'is-reacted':''}" data-social-action="comment-react" data-social-reaction-trigger data-id="${id}" data-post="${postId}" data-emoji="❤️" aria-label="Like comment; hold for reactions" title="${reaction==='❤️'?'Remove like':'Like comment'} · Hold for reactions" aria-pressed="${!!reaction}" aria-haspopup="true" aria-expanded="false">${socialLikeIcon(reaction)}</button>${total?`<button type="button" class="psn-social-reactors-count" data-social-action="reactors" data-id="${id}" data-kind="comment" data-post="${postId}" aria-label="View ${total} comment reactions" title="View who reacted">${total}</button>`:''}</div><div class="psn-social-reaction-popover" hidden>${cardReactions(comment.reactions,comment.myReaction,postId,id)}</div></div>
-      <button type="button" class="psn-social-comment-reply-btn" data-social-action="comment-reply" data-id="${id}" data-post="${postId}" aria-label="Reply to ${esc(comment.author)}">Reply</button>${comment.text?socialTranslationButton('comment',id,s(comment.text)):''}
+      <button type="button" class="psn-social-comment-reply-btn" data-social-action="comment-reply" data-id="${id}" data-post="${postId}" aria-label="Reply to ${esc(comment.author)}">Reply</button>${comment.author===identity()?`<button type="button" class="psn-social-comment-reply-btn" data-social-action="comment-edit" data-id="${id}" data-post="${postId}" aria-label="Edit your comment">Edit</button>`:''}${comment.text?socialTranslationButton('comment',id,s(comment.text)):''}
     </div>`;
   }
   window.psnIsPlayingShareAvailable=function(){
@@ -116992,6 +117009,15 @@ function getVisibleChatStackEl(id) {
     }
     return null;
   }
+  function socialUpdateCachedComment(postId,id,text,editedAt){
+    const key=String(id);
+    const apply=comment=>{
+      if(String(comment.id)!==key)return;
+      comment.text=text;comment.editedAt=editedAt;
+    };
+    state.comments.get(postId)?.forEach(apply);
+    for(const thread of state.replyThreads.values())if(thread.postId===postId)thread.items.forEach(apply);
+  }
   function socialThreadState(postId,parentId){
     const key=String(parentId);
     let thread=state.replyThreads.get(key);
@@ -117002,6 +117028,7 @@ function getVisibleChatStackEl(id) {
     return thread;
   }
   let socialInlineReplyId='';
+  let socialCommentEditing=null;
   function socialCommentListMarkup(postId){
     const base=state.comments.get(postId);
     if(!Array.isArray(base))return '<p class="psn-social-muted">Loading comments…</p>';
@@ -117044,6 +117071,13 @@ function getVisibleChatStackEl(id) {
     const active=document.activeElement;
     const activeThread=active?.dataset?.socialThreadToggle||active?.dataset?.socialThreadMore;
     const activeMode=active?.dataset?.socialThreadToggle?'toggle':'more';
+    const editingInput=active?.matches?.('.psn-social-comment-edit-input')?active:null;
+    const editingId=editingInput?.dataset.socialCommentEditInput;
+    const editingCursor=editingInput?[editingInput.selectionStart,editingInput.selectionEnd]:null;
+    if(socialCommentEditing&&socialCommentEditing.postId===postId){
+      const draft=list.querySelector(`[data-social-comment-edit-input="${socialCommentEditing.id}"]`);
+      if(draft)socialCommentEditing.value=draft.value;
+    }
     // Preserve the live reply form; rebuilding it discards unsent text and attachments.
     const replyForm=list.querySelector('.psn-social-comment-form.is-inline-reply');
     const focusedReply=replyForm?.contains(active)?active:null;
@@ -117056,6 +117090,10 @@ function getVisibleChatStackEl(id) {
     }
     list.scrollTop=previousScroll;
     if(focusedReply?.isConnected)focusedReply.focus({preventScroll:true});
+    if(editingId){
+      const next=list.querySelector(`[data-social-comment-edit-input="${editingId}"]`);
+      if(next){next.focus({preventScroll:true});if(editingCursor)next.setSelectionRange(...editingCursor);}
+    }
     if(activeThread){
       const focus=list.querySelector(`[data-social-thread-${activeMode}="${activeThread}"]`)||list.querySelector(`[data-social-thread-toggle="${activeThread}"]`);
       focus?.focus({preventScroll:true});
@@ -117132,10 +117170,11 @@ function getVisibleChatStackEl(id) {
     const cid=idOf(c.id);if(!cid)return '';
     const me=renderContext?.me??identity();
     const canDelete=c.author===me||(renderContext?renderContext.staff:(typeof window.canModerateSession==='function'&&window.canModerateSession()));
+    const editing=socialCommentEditing&&socialCommentEditing.id===cid&&socialCommentEditing.postId===postId&&c.author===me;
     const reply=c.parentId&&idOf(c.parentId);
     const media=(Array.isArray(c.images)?c.images:[]).map(safeImage).filter(Boolean).slice(0,1);
     const mediaHtml=media.length?`<div class="psn-social-comment-media">${media.map((url,index)=>`<button type="button" data-social-action="comment-image" data-id="${cid}" data-post="${postId}" data-index="${index}" aria-label="View attached image"><img src="${esc(url)}" loading="lazy" decoding="async" alt="Comment attachment"></button>`).join('')}</div>`:'';
-    return `<div class="psn-social-comment${reply?' is-reply':''}" data-social-comment="${cid}"${socialReactionToneAttr(c.myReaction)}><button type="button" class="psn-social-profile avatar-link" data-social-action="profile" data-user="${esc(c.author)}" aria-label="View ${esc(c.author)} profile" title="${esc(c.author)}">${socialAvatar(c.author,c.avatar,true)}</button><div class="psn-social-comment-content"><div class="psn-social-comment-bubble">${depth>1&&reply&&c.parentAuthor?`<div class="psn-social-comment-reply-target">Replying to <strong>${esc(c.parentAuthor)}</strong></div>`:''}<div class="psn-social-head"><div class="psn-social-comment-byline"><button type="button" class="psn-social-profile" data-social-action="profile" data-user="${esc(c.author)}"><span class="psn-social-author">${esc(c.author)}</span></button><span class="psn-social-comment-separator" aria-hidden="true">·</span><span class="psn-social-age">${esc(timeLabel(c.createdAt))}</span></div><div class="psn-social-actions">${canDelete?`<button type="button" class="psn-social-btn danger" data-social-action="comment-delete" data-id="${cid}" data-post="${postId}" aria-label="Delete comment" title="Delete comment"><i class="fas fa-trash-alt"></i></button>`:''}${c.author!==me?`<button type="button" class="psn-social-btn" data-social-action="comment-report" data-id="${cid}" aria-label="Report comment" title="Report comment"><i class="far fa-flag"></i></button>`:''}</div></div>${c.text?`<p class="psn-social-comment-text">${socialTranslationContent('comment',cid,s(c.text))}</p>`:''}${mediaHtml}</div>${commentActionbar(c,postId)}</div></div>`;
+    return `<div class="psn-social-comment${reply?' is-reply':''}" data-social-comment="${cid}"${socialReactionToneAttr(c.myReaction)}><button type="button" class="psn-social-profile avatar-link" data-social-action="profile" data-user="${esc(c.author)}" aria-label="View ${esc(c.author)} profile" title="${esc(c.author)}">${socialAvatar(c.author,c.avatar,true)}</button><div class="psn-social-comment-content"><div class="psn-social-comment-bubble">${depth>1&&reply&&c.parentAuthor?`<div class="psn-social-comment-reply-target">Replying to <strong>${esc(c.parentAuthor)}</strong></div>`:''}<div class="psn-social-head"><div class="psn-social-comment-byline"><button type="button" class="psn-social-profile" data-social-action="profile" data-user="${esc(c.author)}"><span class="psn-social-author">${esc(c.author)}</span></button><span class="psn-social-comment-separator" aria-hidden="true">·</span><span class="psn-social-age">${esc(timeLabel(c.createdAt))}${c.editedAt?'<span class="psn-social-edited" title="Edited comment">Edited</span>':''}</span></div><div class="psn-social-actions">${canDelete?`<button type="button" class="psn-social-btn danger" data-social-action="comment-delete" data-id="${cid}" data-post="${postId}" aria-label="Delete comment" title="Delete comment"><i class="fas fa-trash-alt"></i></button>`:''}${c.author!==me?`<button type="button" class="psn-social-btn" data-social-action="comment-report" data-id="${cid}" aria-label="Report comment" title="Report comment"><i class="far fa-flag"></i></button>`:''}</div></div>${editing?`<div class="psn-social-comment-edit-panel"><textarea class="psn-social-comment-edit-input" data-social-comment-edit-input="${cid}" maxlength="1200" rows="2" aria-label="Edit comment">${esc(socialCommentEditing.value)}</textarea><div class="psn-social-comment-edit-actions"><button type="button" class="psn-social-btn" data-social-action="comment-edit-cancel" data-id="${cid}" data-post="${postId}" ${socialCommentEditing.saving?'disabled':''}>Cancel</button><button type="button" class="psn-social-btn primary" data-social-action="comment-edit-save" data-id="${cid}" data-post="${postId}" ${socialCommentEditing.saving?'disabled':''}><i class="fas fa-check"></i> Save</button></div></div>`:(c.text?`<p class="psn-social-comment-text">${socialTranslationContent('comment',cid,s(c.text))}</p>`:'')}${mediaHtml}</div>${commentActionbar(c,postId)}</div></div>`;
   }
   function commentAreaMarkup(postId){
     const comments=socialCommentListMarkup(postId);
@@ -117199,6 +117238,9 @@ function getVisibleChatStackEl(id) {
     });
     document.addEventListener('keydown',event=>{
       if(overlay.hidden||document.querySelector('.psn-social-action-overlay')||socialReactors.overlay?.hidden===false)return;
+      if(event.key==='Escape'&&socialCommentEditing&&event.target.closest('.psn-social-comment-edit-panel')&&!socialCommentEditing.saving){
+        event.preventDefault();event.stopImmediatePropagation();socialCommentEditing=null;renderSocialCommentThreads(state.modalPostId);return;
+      }
       if(event.key==='Escape'&&socialInlineReplyId&&event.target.closest('.psn-social-comment-form.is-inline-reply')){
         event.preventDefault();event.stopImmediatePropagation();setSocialCommentReply(null);return;
       }
@@ -117461,7 +117503,7 @@ function getVisibleChatStackEl(id) {
     notify('');
     const overlay=ensureCommentModal();
     if(socialInlineReplyId)setSocialCommentReply(null);
-    socialInlineReplyId='';
+    socialInlineReplyId='';socialCommentEditing=null;
     state.modalPostId=postId;state.modalOpener=opener||null;state.replyThreads.clear();state.openComments.clear();state.openComments.add(postId);
     const name=document.getElementById('psn-social-modal-post');
     if(name){name.textContent='';const strong=document.createElement('strong');strong.textContent=post.author;const separator=document.createElement('span');separator.className='psn-social-modal-post-separator';separator.textContent='·';separator.setAttribute('aria-hidden','true');const preview=document.createElement('span');preview.className='psn-social-modal-post-preview';preview.textContent=(socialPlainText(post.text)||(post.playing?.title?`Playing ${post.playing.title}`:'Photo publication')).slice(0,170);name.append(strong,separator,preview);}
@@ -117482,7 +117524,7 @@ function getVisibleChatStackEl(id) {
     closeSocialGifPicker();socialGifCommentForm=null;
     setSocialCommentReply(null);
     clearSocialCommentAttachment(overlay.querySelector('#psn-social-modal-body > .psn-social-comment-form'));
-    overlay.hidden=true;state.modalRequest++;state.modalPostId=null;state.replyThreads.clear();state.openComments.clear();
+    overlay.hidden=true;socialCommentEditing=null;state.modalRequest++;state.modalPostId=null;state.replyThreads.clear();state.openComments.clear();
     if(state.modalOpener?.isConnected)state.modalOpener.focus({preventScroll:true});
     state.modalOpener=null;
   }
@@ -118125,6 +118167,41 @@ function getVisibleChatStackEl(id) {
     const id=idOf(btn.dataset.id);const postId=idOf(btn.dataset.post||id);
     if(action==='retry'){loadFeed(false);return;}
     if(action==='translate'){toggleSocialTranslation(btn);return;}
+    if(action==='comment-edit'||action==='comment-edit-cancel'){
+      if(state.modalPostId!==postId)return;
+      if(action==='comment-edit-cancel'){
+        if(socialCommentEditing?.saving)return;
+        socialCommentEditing=null;
+      }else{
+        const comment=socialFindComment(postId,id);
+        if(!comment||comment.author!==identity())return;
+        socialCommentEditing={id,postId,value:s(comment.text),original:s(comment.text),saving:false,actor:identity()};
+      }
+      renderSocialCommentThreads(postId);
+      if(socialCommentEditing)document.querySelector(`[data-social-comment-edit-input="${id}"]`)?.focus({preventScroll:true});
+      return;
+    }
+    if(action==='comment-edit-save'){
+      const edit=socialCommentEditing;
+      if(!edit||edit.id!==id||edit.postId!==postId||edit.saving||edit.actor!==identity())return;
+      const comment=socialFindComment(postId,id);
+      const text=document.querySelector(`[data-social-comment-edit-input="${id}"]`)?.value.trim()??edit.value.trim();
+      if(!comment||comment.author!==identity())return;
+      if(!text&&!(Array.isArray(comment.images)&&comment.images.length))return notify('Comment cannot be empty.',true);
+      if(text.length>1200)return notify('Maximum 1200 characters.',true);
+      if(text===edit.original){socialCommentEditing=null;renderSocialCommentThreads(postId);return;}
+      edit.saving=true;edit.value=text;
+      const button=btn;button.disabled=true;
+      const res=await call('social_comment_edit',{id,postId,text,originalText:edit.original});
+      if(socialCommentEditing!==edit||state.modalPostId!==postId||edit.actor!==identity())return;
+      edit.saving=false;
+      if(!res.success){button.disabled=false;notify(res.message||'Could not edit comment.',true);return;}
+      socialUpdateCachedComment(postId,id,res.text??text,res.editedAt||new Date().toISOString());
+      socialCommentEditing=null;
+      renderSocialCommentThreads(postId);
+      notify('Comment updated.');
+      return;
+    }
     if(action==='comment-reply'){
       const comment=socialFindComment(postId,id);
       if(comment&&state.modalPostId===postId)setSocialCommentReply(comment);
