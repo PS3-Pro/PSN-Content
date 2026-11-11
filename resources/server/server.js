@@ -3221,48 +3221,69 @@ async function createPsnStatsIndexSchema() {
       DECLARE
         wishlist_changed BOOLEAN := TRUE;
         trophies_changed BOOLEAN := TRUE;
+        wishlist_ord INTEGER[];
+        wishlist_ids TEXT[];
+        trophies_ord INTEGER[];
+        trophies_ids TEXT[];
       BEGIN
         IF TG_OP = 'UPDATE' THEN
           wishlist_changed := OLD.data->'wishlistData' IS DISTINCT FROM NEW.data->'wishlistData';
           trophies_changed := OLD.data->'trophiesData' IS DISTINCT FROM NEW.data->'trophiesData';
-          IF NOT EXISTS (
-            SELECT 1 FROM psn_stat_projection_users WHERE username=NEW.name
-          ) THEN
+          IF NOT EXISTS (SELECT 1 FROM psn_stat_projection_users WHERE username=NEW.name) THEN
             wishlist_changed := TRUE;
             trophies_changed := TRUE;
           END IF;
         END IF;
-        IF wishlist_changed AND trophies_changed THEN
-          DELETE FROM psn_stat_projection_entries WHERE username=NEW.name;
+        IF wishlist_changed THEN
+          SELECT COALESCE(ARRAY_AGG(k.item_no ORDER BY k.item_no), '{}'::integer[]),
+                 COALESCE(ARRAY_AGG(k.title_id ORDER BY k.item_no), '{}'::text[])
+          INTO wishlist_ord, wishlist_ids
+          FROM jsonb_array_elements(
+            CASE WHEN jsonb_typeof(NEW.data->'wishlistData')='array'
+              THEN NEW.data->'wishlistData' ELSE '[]'::jsonb END
+          ) WITH ORDINALITY AS w(item,ord)
+          CROSS JOIN LATERAL (
+            SELECT ord::integer AS item_no,
+                   upper(trim(COALESCE(item->>'titleId',item->>'id',''))) AS title_id
+          ) k
+          WHERE k.title_id NOT IN ('','MISSING','N/A','NONE','NULL','UNDEFINED');
+          DELETE FROM psn_stat_projection_entries
+          WHERE username=NEW.name AND kind='wishlist'
+            AND NOT (item_no = ANY(wishlist_ord));
           INSERT INTO psn_stat_projection_entries(kind,username,item_no,title_id)
-            SELECT k.kind,NEW.name,k.item_no,k.title_id
-            FROM psn_stat_projection_keys(NEW.data) k;
-        ELSIF wishlist_changed THEN
-          DELETE FROM psn_stat_projection_entries WHERE username=NEW.name AND kind='wishlist';
+          SELECT 'wishlist',NEW.name,v.item_no,v.title_id
+          FROM UNNEST(wishlist_ord,wishlist_ids) AS v(item_no,title_id)
+          LEFT JOIN psn_stat_projection_entries current
+            ON current.kind='wishlist' AND current.username=NEW.name AND current.item_no=v.item_no
+          WHERE current.title_id IS DISTINCT FROM v.title_id
+          ON CONFLICT(kind,username,item_no) DO UPDATE
+            SET title_id=EXCLUDED.title_id
+            WHERE psn_stat_projection_entries.title_id IS DISTINCT FROM EXCLUDED.title_id;
+        END IF;
+        IF trophies_changed THEN
+          SELECT COALESCE(ARRAY_AGG(k.item_no ORDER BY k.item_no), '{}'::integer[]),
+                 COALESCE(ARRAY_AGG(k.title_id ORDER BY k.item_no), '{}'::text[])
+          INTO trophies_ord, trophies_ids
+          FROM jsonb_each(
+            CASE WHEN jsonb_typeof(NEW.data->'trophiesData')='object'
+              THEN NEW.data->'trophiesData' ELSE '{}'::jsonb END
+          ) WITH ORDINALITY AS t(trophy_id,details,ord)
+          CROSS JOIN LATERAL (
+            SELECT ord::integer AS item_no,trophy_id AS title_id
+          ) k
+          WHERE lower(COALESCE(details->>'unlocked','false')) IN ('true','1','yes');
+          DELETE FROM psn_stat_projection_entries
+          WHERE username=NEW.name AND kind='trophies'
+            AND NOT (item_no = ANY(trophies_ord));
           INSERT INTO psn_stat_projection_entries(kind,username,item_no,title_id)
-            SELECT k.kind,NEW.name,k.item_no,k.title_id
-            FROM jsonb_array_elements(
-              CASE WHEN jsonb_typeof(NEW.data->'wishlistData')='array'
-                THEN NEW.data->'wishlistData' ELSE '[]'::jsonb END
-            ) WITH ORDINALITY AS w(item,ord)
-            CROSS JOIN LATERAL (
-              SELECT 'wishlist'::text AS kind, ord::integer AS item_no,
-                upper(trim(COALESCE(item->>'titleId',item->>'id',''))) AS title_id
-            ) k
-            WHERE k.title_id NOT IN ('','MISSING','N/A','NONE','NULL','UNDEFINED');
-        ELSIF trophies_changed THEN
-          DELETE FROM psn_stat_projection_entries WHERE username=NEW.name AND kind='trophies';
-          INSERT INTO psn_stat_projection_entries(kind,username,item_no,title_id)
-            SELECT k.kind,NEW.name,k.item_no,k.title_id
-            FROM jsonb_each(
-              CASE WHEN jsonb_typeof(NEW.data->'trophiesData')='object'
-                THEN NEW.data->'trophiesData' ELSE '{}'::jsonb END
-            ) WITH ORDINALITY AS t(trophy_id,details,ord)
-            CROSS JOIN LATERAL (
-              SELECT 'trophies'::text AS kind, ord::integer AS item_no,
-                trophy_id AS title_id
-            ) k
-            WHERE lower(COALESCE(details->>'unlocked','false')) IN ('true','1','yes');
+          SELECT 'trophies',NEW.name,v.item_no,v.title_id
+          FROM UNNEST(trophies_ord,trophies_ids) AS v(item_no,title_id)
+          LEFT JOIN psn_stat_projection_entries current
+            ON current.kind='trophies' AND current.username=NEW.name AND current.item_no=v.item_no
+          WHERE current.title_id IS DISTINCT FROM v.title_id
+          ON CONFLICT(kind,username,item_no) DO UPDATE
+            SET title_id=EXCLUDED.title_id
+            WHERE psn_stat_projection_entries.title_id IS DISTINCT FROM EXCLUDED.title_id;
         END IF;
         INSERT INTO psn_stat_projection_users(username) VALUES(NEW.name)
           ON CONFLICT(username) DO NOTHING;
@@ -10456,35 +10477,20 @@ async function queryDirectConversationPayload(userName) {
   if (!viewer) return { success:false, conversations:[], unreadTotal:0 };
 
   const result = await queryDbWithRetry(`
-    WITH potential_peers AS (
-      -- Both sides use compact indexed columns, never scan message bodies or JSON.
-      SELECT recipient_name AS peer_name FROM direct_messages
+    WITH directional_latest AS (
+      -- Existing composite indexes supply each direction's maximum in one pass.
+      SELECT recipient_name AS peer_name, MAX(id) AS id FROM direct_messages
       WHERE sender_name = $1 GROUP BY recipient_name
-      UNION
-      SELECT sender_name AS peer_name FROM direct_messages
+      UNION ALL
+      SELECT sender_name AS peer_name, MAX(id) AS id FROM direct_messages
       WHERE recipient_name = $1 GROUP BY sender_name
     ), latest_ids AS (
-      SELECT peers.peer_name, last_visible.id
-      FROM potential_peers peers
+      SELECT d.peer_name, MAX(d.id) AS id
+      FROM directional_latest d
       LEFT JOIN direct_conversation_delete_state ds
-        ON ds.user_name = $1 AND ds.peer_name = peers.peer_name
-      JOIN LATERAL (
-        -- Two index seeks per peer replace sorting every historical message ID.
-        SELECT GREATEST(
-          COALESCE((
-            SELECT id FROM direct_messages
-            WHERE sender_name = $1 AND recipient_name = peers.peer_name
-              AND id > COALESCE(ds.deleted_through_id, 0)
-            ORDER BY id DESC LIMIT 1
-          ), 0),
-          COALESCE((
-            SELECT id FROM direct_messages
-            WHERE sender_name = peers.peer_name AND recipient_name = $1
-              AND id > COALESCE(ds.deleted_through_id, 0)
-            ORDER BY id DESC LIMIT 1
-          ), 0)
-        ) AS id
-      ) last_visible ON last_visible.id > 0
+        ON ds.user_name = $1 AND ds.peer_name = d.peer_name
+      WHERE d.id > COALESCE(ds.deleted_through_id, 0)
+      GROUP BY d.peer_name
     ), latest AS (
       SELECT ids.peer_name, dm.id, dm.sender_name, dm.recipient_name,
              dm.text, dm.message_type, dm.content, dm.reply_to, dm.reactions,
@@ -14026,9 +14032,19 @@ async function heartbeatPresenceSessions() {
     // Session metadata is static enough to write on connect/recovery. Heartbeats only refresh
     // presence timestamps, preserving the existing data JSON instead of resending user-agent data.
     await queryDbWithRetry(
-      `INSERT INTO presence_sessions (socket_id, name, instance_id, connected_at, last_seen, data)
-       SELECT socket_id, name, instance_id, NOW(), NOW(), '{}'::jsonb
-       FROM UNNEST($1::text[], $2::text[], $3::text[]) AS t(socket_id, name, instance_id)
+      `WITH heartbeat AS MATERIALIZED (
+         SELECT socket_id, name, instance_id
+         FROM UNNEST($1::text[], $2::text[], $3::text[]) AS t(socket_id, name, instance_id)
+       ), refreshed AS (
+         UPDATE presence_sessions ps SET last_seen = NOW()
+         FROM heartbeat h
+         WHERE ps.socket_id = h.socket_id AND ps.name = h.name AND ps.instance_id = h.instance_id
+         RETURNING ps.socket_id
+       )
+       INSERT INTO presence_sessions (socket_id, name, instance_id, connected_at, last_seen, data)
+       SELECT h.socket_id, h.name, h.instance_id, NOW(), NOW(), '{}'::jsonb
+       FROM heartbeat h
+       WHERE NOT EXISTS (SELECT 1 FROM refreshed r WHERE r.socket_id = h.socket_id)
        ON CONFLICT (socket_id) DO UPDATE SET
          name = EXCLUDED.name,
          instance_id = EXCLUDED.instance_id,
