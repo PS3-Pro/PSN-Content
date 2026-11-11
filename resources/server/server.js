@@ -3218,11 +3218,52 @@ async function createPsnStatsIndexSchema() {
     await client.query(`
       CREATE OR REPLACE FUNCTION psn_stat_projection_sync()
       RETURNS TRIGGER LANGUAGE plpgsql AS $psnstatsync$
+      DECLARE
+        wishlist_changed BOOLEAN := TRUE;
+        trophies_changed BOOLEAN := TRUE;
       BEGIN
-        DELETE FROM psn_stat_projection_entries WHERE username=NEW.name;
-        INSERT INTO psn_stat_projection_entries(kind,username,item_no,title_id)
-          SELECT k.kind,NEW.name,k.item_no,k.title_id
-          FROM psn_stat_projection_keys(NEW.data) k;
+        IF TG_OP = 'UPDATE' THEN
+          wishlist_changed := OLD.data->'wishlistData' IS DISTINCT FROM NEW.data->'wishlistData';
+          trophies_changed := OLD.data->'trophiesData' IS DISTINCT FROM NEW.data->'trophiesData';
+          IF NOT EXISTS (
+            SELECT 1 FROM psn_stat_projection_users WHERE username=NEW.name
+          ) THEN
+            wishlist_changed := TRUE;
+            trophies_changed := TRUE;
+          END IF;
+        END IF;
+        IF wishlist_changed AND trophies_changed THEN
+          DELETE FROM psn_stat_projection_entries WHERE username=NEW.name;
+          INSERT INTO psn_stat_projection_entries(kind,username,item_no,title_id)
+            SELECT k.kind,NEW.name,k.item_no,k.title_id
+            FROM psn_stat_projection_keys(NEW.data) k;
+        ELSIF wishlist_changed THEN
+          DELETE FROM psn_stat_projection_entries WHERE username=NEW.name AND kind='wishlist';
+          INSERT INTO psn_stat_projection_entries(kind,username,item_no,title_id)
+            SELECT k.kind,NEW.name,k.item_no,k.title_id
+            FROM jsonb_array_elements(
+              CASE WHEN jsonb_typeof(NEW.data->'wishlistData')='array'
+                THEN NEW.data->'wishlistData' ELSE '[]'::jsonb END
+            ) WITH ORDINALITY AS w(item,ord)
+            CROSS JOIN LATERAL (
+              SELECT 'wishlist'::text AS kind, ord::integer AS item_no,
+                upper(trim(COALESCE(item->>'titleId',item->>'id',''))) AS title_id
+            ) k
+            WHERE k.title_id NOT IN ('','MISSING','N/A','NONE','NULL','UNDEFINED');
+        ELSIF trophies_changed THEN
+          DELETE FROM psn_stat_projection_entries WHERE username=NEW.name AND kind='trophies';
+          INSERT INTO psn_stat_projection_entries(kind,username,item_no,title_id)
+            SELECT k.kind,NEW.name,k.item_no,k.title_id
+            FROM jsonb_each(
+              CASE WHEN jsonb_typeof(NEW.data->'trophiesData')='object'
+                THEN NEW.data->'trophiesData' ELSE '{}'::jsonb END
+            ) WITH ORDINALITY AS t(trophy_id,details,ord)
+            CROSS JOIN LATERAL (
+              SELECT 'trophies'::text AS kind, ord::integer AS item_no,
+                trophy_id AS title_id
+            ) k
+            WHERE lower(COALESCE(details->>'unlocked','false')) IN ('true','1','yes');
+        END IF;
         INSERT INTO psn_stat_projection_users(username) VALUES(NEW.name)
           ON CONFLICT(username) DO NOTHING;
         RETURN NEW;
@@ -13756,25 +13797,30 @@ async function markPresenceOfflineIfNoActiveSessions(name, lastSeen = Date.now()
 }
 
 async function syncPresenceOnlineFromDb() {
-  const expiredRes = await queryDbWithRetry(`
+  // One SQL roundtrip for expiry and active presence. Both views share a
+  // database snapshot; the existing per-user offline check handles races.
+  const presenceSnapshot = await queryDbWithRetry(`
     WITH expired AS (
       DELETE FROM presence_sessions
       WHERE last_seen < NOW() - INTERVAL '${PRESENCE_TTL_SECONDS} seconds'
       RETURNING name, last_seen
+    ), expired_names AS (
+      SELECT 'expired'::text AS source, name, MAX(last_seen) AS last_seen,
+             NULL::text AS socket_id
+      FROM expired GROUP BY name
+    ), active_names AS (
+      SELECT 'active'::text AS source, name, MAX(last_seen) AS last_seen,
+             (ARRAY_AGG(socket_id ORDER BY connected_at ASC, socket_id ASC))[1] AS socket_id
+      FROM presence_sessions
+      WHERE last_seen >= NOW() - INTERVAL '${PRESENCE_TTL_SECONDS} seconds'
+      GROUP BY name
     )
-    SELECT name, MAX(last_seen) AS last_seen
-    FROM expired
-    GROUP BY name
-  `, [], { attempts: 2, label: 'PRESENCE EXPIRE' });
-
-  const presenceRes = await queryDbWithRetry(`
-    SELECT name,
-           MAX(last_seen) AS last_seen,
-           (ARRAY_AGG(socket_id ORDER BY connected_at ASC, socket_id ASC))[1] AS socket_id
-    FROM presence_sessions
-    WHERE last_seen >= NOW() - INTERVAL '${PRESENCE_TTL_SECONDS} seconds'
-    GROUP BY name
-  `, [], { attempts: 2, label: 'PRESENCE READ' });
+    SELECT source,name,last_seen,socket_id FROM expired_names
+    UNION ALL
+    SELECT source,name,last_seen,socket_id FROM active_names
+  `, [], { attempts: 2, label: 'PRESENCE SNAPSHOT' });
+  const expiredRes = { rows: presenceSnapshot.rows.filter(row => row.source === 'expired') };
+  const presenceRes = { rows: presenceSnapshot.rows.filter(row => row.source === 'active') };
   const activeByName = new Map(presenceRes.rows.map(row => [row.name, row]));
   const presenceCandidateNames = new Set();
   presenceRes.rows.forEach(row => { if (row && row.name) presenceCandidateNames.add(row.name); });
@@ -14961,14 +15007,16 @@ async function socialReadCommentReplies(actor, postId, parentId, after = '') {
       FROM social_comments
       WHERE post_id=$2 AND parent_id=$4::bigint AND id>COALESCE(NULLIF($5::text,'')::bigint,0)
       ORDER BY id ASC LIMIT 21
+    ), visible_page AS MATERIALIZED (
+      SELECT * FROM page ORDER BY id ASC LIMIT 20
     ), reaction_counts AS (
       SELECT comment_id,jsonb_agg(jsonb_build_object('emoji',emoji,'count',cnt)) AS reactions
       FROM (SELECT comment_id,emoji,COUNT(*)::int AS cnt FROM social_comment_reactions
-            WHERE comment_id IN (SELECT id FROM page) GROUP BY comment_id,emoji) counts
+            WHERE comment_id IN (SELECT id FROM visible_page) GROUP BY comment_id,emoji) counts
       GROUP BY comment_id
     ), reply_counts AS (
       SELECT nested.parent_id,COUNT(*)::int AS cnt FROM social_comments nested
-      WHERE nested.parent_id IN (SELECT id FROM page)
+      WHERE nested.parent_id IN (SELECT id FROM visible_page)
       GROUP BY nested.parent_id
     )
     SELECT c.id,c.post_id,c.author_name,c.body,c.parent_id,c.images,c.created_at,c.edited_at,
@@ -14976,8 +15024,9 @@ async function socialReadCommentReplies(actor, postId, parentId, after = '') {
       COALESCE(NULLIF(u.data->>'avatar',''),$3) AS author_avatar,
       COALESCE(rc.reactions,'[]'::jsonb) AS reactions,
       COALESCE(reply_counts.cnt,0) AS reply_count,
-      mine.emoji AS my_reaction
-    FROM page c JOIN users u ON u.name=c.author_name
+      mine.emoji AS my_reaction,
+      (SELECT COUNT(*) > 20 FROM page) AS has_more
+    FROM visible_page c JOIN users u ON u.name=c.author_name
     JOIN social_comments parent ON parent.id=c.parent_id AND parent.post_id=c.post_id
     LEFT JOIN reaction_counts rc ON rc.comment_id=c.id
     LEFT JOIN reply_counts ON reply_counts.parent_id=c.id
@@ -14985,8 +15034,7 @@ async function socialReadCommentReplies(actor, postId, parentId, after = '') {
     ORDER BY c.id ASC
   `,[actor,postId,DEFAULT_AVATAR,parentId,after],{attempts:2,label:'SOCIAL COMMENT REPLIES'});
   const rows=result.rows||[];
-  const page=rows.slice(0,20);
-  return {success:true,comments:page.map(serializeSocialComment),after:rows.length>20?String(page[page.length-1].id):null};
+  return {success:true,comments:rows.map(serializeSocialComment),after:rows.length&&rows[0].has_more?String(rows[rows.length-1].id):null};
 }
 
 // Short cache for comments/replies. Per-viewer keys keep "my reaction" correct.
