@@ -11,6 +11,7 @@ const crypto = require('crypto');
 const zlib = require('zlib');
 const { spawn } = require('child_process');
 const { isDeepStrictEqual } = require('node:util');
+const { monitorEventLoopDelay, performance } = require('node:perf_hooks');
 
 const app = express();
 // Compress public metadata off the event loop; keep HTTP content negotiation intact.
@@ -918,6 +919,31 @@ const DB_PERF_ENABLED = process.env.DB_PERF_ENABLED !== '0';
 const DB_PERF_SLOW_MS = Math.max(300, Math.min(10000, parseInt(process.env.DB_PERF_SLOW_MS || '1200', 10) || 1200));
 const DB_PERF_INTERVAL_MS = Math.max(60000, Math.min(600000, parseInt(process.env.DB_PERF_INTERVAL_MS || '300000', 10) || 300000));
 const dbQueryPerf = new Map();
+// Low-overhead event loop diagnostics explain correlated query stalls, without
+// attributing time inside client.query() incorrectly to PostgreSQL execution.
+const dbEventLoopDelay = DB_PERF_ENABLED ? monitorEventLoopDelay({ resolution: 20 }) : null;
+if (dbEventLoopDelay) dbEventLoopDelay.enable();
+let dbLastLoopUtilization = DB_PERF_ENABLED ? performance.eventLoopUtilization() : null;
+let dbLastCpuUsage = DB_PERF_ENABLED ? process.cpuUsage() : null;
+let profileNoopSavesAvoided = 0;
+const profileDeliveryMetrics = { full: 0, gzip: 0, revision: 0, revisionAccepted: 0, revisionRejected: 0, gzipFallback: 0, ackTimeout: 0, rawBytes: 0, gzipBytes: 0, gzipBase64Bytes: 0 };
+function readDbEventLoopMetrics() {
+  if (!dbEventLoopDelay) return null;
+  const ms = nanos => Number.isFinite(nanos) ? Math.round(nanos / 1e6) : 0;
+  const usage = performance.eventLoopUtilization(dbLastLoopUtilization);
+  dbLastLoopUtilization = performance.eventLoopUtilization();
+  const cpu = process.cpuUsage(dbLastCpuUsage);
+  dbLastCpuUsage = process.cpuUsage();
+  const result = {
+    p95Ms: ms(dbEventLoopDelay.percentile(95)),
+    maxMs: ms(dbEventLoopDelay.max),
+    utilizationPct: Math.round(usage.utilization * 100),
+    cpuMs: Math.round((cpu.user + cpu.system) / 1000),
+    rssMb: Math.round(process.memoryUsage().rss / 1048576)
+  };
+  dbEventLoopDelay.reset();
+  return result;
+}
 let dbPerfPeakWaiting = 0;
 let dbPerfPeakConnections = 0;
 function sampleDbPoolPressure() {
@@ -974,7 +1000,9 @@ function flushDbQueryPerformance() {
     slow:stats.slow, errors:stats.errors, retries:stats.retries, totalMs:stats.total
   })).sort((a,b) => b.totalMs-a.totalMs).slice(0,8);
   dbQueryPerf.clear();
-  console.log('[DB PERF 5MIN]', JSON.stringify({topQueries:summary, pool:{total:pool.totalCount, idle:pool.idleCount, waiting:pool.waitingCount, peakWaiting:dbPerfPeakWaiting, peakConnections:dbPerfPeakConnections}, admission:{enabled:DB_READ_ADMISSION_ENABLED, optionalQueuedPeak:dbAdmissionOptionalPeak, bulkPendingPeak:dbAdmissionBulkPeak, bulkWaits:dbAdmissionBulkWaits}, personalReadReuse:readPersonalCacheStats}));
+  console.log('[DB PERF 5MIN]', JSON.stringify({topQueries:summary, pool:{total:pool.totalCount, idle:pool.idleCount, waiting:pool.waitingCount, peakWaiting:dbPerfPeakWaiting, peakConnections:dbPerfPeakConnections}, admission:{enabled:DB_READ_ADMISSION_ENABLED, optionalQueuedPeak:dbAdmissionOptionalPeak, bulkPendingPeak:dbAdmissionBulkPeak, bulkWaits:dbAdmissionBulkWaits}, eventLoop:readDbEventLoopMetrics(), profile:{noopSavesAvoided:profileNoopSavesAvoided, delivery:{...profileDeliveryMetrics}}, personalReadReuse:readPersonalCacheStats}));
+  profileNoopSavesAvoided = 0;
+  Object.keys(profileDeliveryMetrics).forEach(key => { profileDeliveryMetrics[key] = 0; });
   readPersonalCacheStats = { rewards:{fresh:0,shared:0,db:0}, reports:{fresh:0,shared:0,db:0} };
   dbAdmissionOptionalPeak = 0;
   dbAdmissionBulkPeak = 0;
@@ -1114,12 +1142,23 @@ async function runDbTransactionWithRetry(label, taskFn, options = {}) {
   const lockTimeoutMs = Math.max(250, Math.min(3000, Number(options.lockTimeoutMs) || 1200));
   const advisoryLockKey = String(options.advisoryLockKey || '').trim();
   let lastError = null;
+  const startedAt = DB_PERF_ENABLED ? Date.now() : 0;
+  let totalAcquireMs = 0;
+  let totalQueryMs = 0;
+  let wasQueued = false;
 
   for (let attempt = 1; attempt <= attempts; attempt++) {
     let client = null;
     let inTransaction = false;
+    let queryStartedAt = 0;
     try {
+      if (DB_PERF_ENABLED && pool.waitingCount > 0) wasQueued = true;
+      const acquireStartedAt = DB_PERF_ENABLED ? Date.now() : 0;
       client = await pool.connect();
+      if (DB_PERF_ENABLED) {
+        totalAcquireMs += Date.now() - acquireStartedAt;
+        queryStartedAt = Date.now();
+      }
       await client.query('BEGIN');
       inTransaction = true;
       await client.query(`SET LOCAL lock_timeout = '${lockTimeoutMs}ms'`);
@@ -1139,6 +1178,12 @@ async function runDbTransactionWithRetry(label, taskFn, options = {}) {
       const result = await taskFn(client);
       await client.query('COMMIT');
       inTransaction = false;
+      if (DB_PERF_ENABLED) {
+        totalQueryMs += Date.now() - queryStartedAt;
+        queryStartedAt = 0;
+        recordDbQueryPerformance(label, Date.now() - startedAt, attempt, false,
+          { acquireMs: totalAcquireMs, queryMs: totalQueryMs, queued: wasQueued });
+      }
       return result;
     } catch (err) {
       lastError = err;
@@ -1146,7 +1191,12 @@ async function runDbTransactionWithRetry(label, taskFn, options = {}) {
         try { await client.query('ROLLBACK'); } catch (rollbackErr) {}
         inTransaction = false;
       }
-      if (!isPgTransientConnectionError(err) || attempt >= attempts) throw err;
+      if (DB_PERF_ENABLED && queryStartedAt) totalQueryMs += Date.now() - queryStartedAt;
+      if (!isPgTransientConnectionError(err) || attempt >= attempts) {
+        if (DB_PERF_ENABLED) recordDbQueryPerformance(label, Date.now() - startedAt, attempt, true,
+          { acquireMs: totalAcquireMs, queryMs: totalQueryMs, queued: wasQueued });
+        throw err;
+      }
       const delayMs = attempt === 1 ? 40 : attempt === 2 ? 100 : attempt === 3 ? 220 : 450;
       console.warn(`[${label}] Temporary PostgreSQL lock/connection contention. Retrying ${attempt + 1}/${attempts} in ${delayMs}ms.`);
       await waitMs(delayMs);
@@ -4229,23 +4279,49 @@ async function updateProfileNotificationCategoryInDb(name, category, patch = {})
 
     const nextState = updateProfileNotificationCategoryServer(currentState, category, { ...patch, mutationId });
     const now = Math.max(Date.now(), normalizeTimestampValue(currentResult.rows[0].profile_updated_at) + 1);
-    const dbPatch = { notificationState: nextState, lastSeen: now, profileUpdatedAt: now };
-
-    // Compare only notificationState. Unrelated profile/presence writes no longer force a long row lock transaction.
+    // Update exactly one notification category in-place. Compare that category,
+    // not the whole state: concurrent changes to a different category must be
+    // preserved and must not cause a spurious optimistic-lock conflict.
+    const rawCategory = Object.prototype.hasOwnProperty.call(rawCurrentState, category) ? rawCurrentState[category] : null;
     const updateResult = await runDbTransactionWithRetry(
       'PROFILE NOTIFICATION STATE SAVE',
       client => client.query(
         `UPDATE users
-         SET data = COALESCE(data, '{}'::jsonb) || $1::jsonb
+         SET data = COALESCE(data, '{}'::jsonb) || jsonb_build_object(
+           'notificationState',
+             jsonb_set(
+               CASE WHEN jsonb_typeof(data->'notificationState') = 'object'
+                 THEN data->'notificationState' ELSE '{}'::jsonb END,
+               ARRAY[$3::text], $1::jsonb, true
+             ) || jsonb_build_object('version', $5::int),
+           'lastSeen', GREATEST(
+             $6::bigint,
+             CASE WHEN (data->>'lastSeen') ~ '^[0-9]{1,18}$'
+               THEN (data->>'lastSeen')::bigint ELSE 0 END
+           ),
+           'profileUpdatedAt', GREATEST(
+             $6::bigint,
+             CASE WHEN (data->>'profileUpdatedAt') ~ '^[0-9]{1,18}$'
+               THEN (data->>'profileUpdatedAt')::bigint + 1 ELSE 0 END
+           )
+         )
          WHERE name = $2
-           AND COALESCE(data->'notificationState', '{}'::jsonb) = $3::jsonb
-         RETURNING data->>'profileUpdatedAt' AS profile_updated_at`,
-        [dbPatch, name, JSON.stringify(rawCurrentState)]
+           AND COALESCE((data->'notificationState')->$3::text, 'null'::jsonb) = $4::jsonb
+         RETURNING data->'notificationState' AS notification_state,
+                   data->>'profileUpdatedAt' AS profile_updated_at`,
+        [nextState[category], name, category, JSON.stringify(rawCategory), PROFILE_NOTIFICATION_STATE_VERSION, now]
       ),
       { attempts: 2, lockTimeoutMs: 1200 }
     );
     if (updateResult.rowCount > 0) {
-      return { notificationState: nextState, profileUpdatedAt: now, duplicate: false };
+      const saved = updateResult.rows[0] || {};
+      return {
+        // Return the authoritative combined state, including categories
+        // updated by other sockets while this write was in flight.
+        notificationState: normalizeProfileNotificationStateServer(saved.notification_state || {}),
+        profileUpdatedAt: normalizeTimestampValue(saved.profile_updated_at) || now,
+        duplicate: false
+      };
     }
 
     // Another notification mutation won the race. Re-read, merge the delta, and try again.
@@ -8626,13 +8702,17 @@ function buildLightProfileUserData(name, user = {}) {
 async function emitProfileSyncPacket(socket, payload, options = {}) {
   const requireAck = socket && socket.profileSyncAckV1 === true;
   let outgoingPayload = payload;
-  if (socket && socket.connected && socket.profileSyncGzipV1 === true && payload && payload.userData) {
+  let compressedBytesInfo = null;
+  // Legacy clients do not acknowledge compressed packets and use the plain
+  // payload path below. Avoid spending CPU on gzip that will be discarded.
+  if (requireAck && socket && socket.connected && socket.profileSyncGzipV1 === true && payload && payload.userData) {
     try {
       const serialized = Buffer.from(JSON.stringify(payload));
       if (serialized.length >= 4096 && serialized.length <= 4 * 1024 * 1024) {
         const compressed = await new Promise((resolve, reject) => zlib.gzip(serialized, { level: 1 },
           (err, bytes) => err ? reject(err) : resolve(bytes)));
         if (compressed.length * 4 / 3 < serialized.length * 0.82) {
+          compressedBytesInfo = { raw: serialized.length, gzip: compressed.length };
           outgoingPayload = {
             profileSyncGzipV1: 1,
             name: payload.name,
@@ -8689,6 +8769,7 @@ async function emitProfileSyncPacket(socket, payload, options = {}) {
           outgoingPayload = payload;
           socket.profileSyncGzipV1 = false;
           try {
+            profileDeliveryMetrics.gzipFallback++;
             trackBandwidthPayload('profile_sync:fallback', payload, 1);
             socket.emit('profile_sync', payload, done);
           } catch (err) {
@@ -8710,6 +8791,16 @@ async function emitProfileSyncPacket(socket, payload, options = {}) {
 
     try { socket.once('disconnect', onDisconnect); } catch (e) {}
     try {
+      if (label.endsWith('-revision')) profileDeliveryMetrics.revision++;
+      else if (outgoingPayload === payload) profileDeliveryMetrics.full++;
+      else {
+        profileDeliveryMetrics.gzip++;
+        if (compressedBytesInfo) {
+          profileDeliveryMetrics.rawBytes += compressedBytesInfo.raw;
+          profileDeliveryMetrics.gzipBytes += compressedBytesInfo.gzip;
+          profileDeliveryMetrics.gzipBase64Bytes += outgoingPayload.content.length;
+        }
+      }
       trackBandwidthPayload(label.endsWith('-revision') ? 'profile_sync:revision' : (outgoingPayload === payload ? 'profile_sync' : 'profile_sync:gzip'), outgoingPayload, 1);
       socket.emit('profile_sync', outgoingPayload, done);
     } catch (err) {
@@ -8851,7 +8942,11 @@ async function emitChunkedProfileSyncToSocket(socket, name, options = {}) {
           if (reused && reused.cancelled) { sectionCancelled = true; return; }
           // The browser must confirm that the previously ACKed list is still
           // hydrated and has no pending local edits. Otherwise resend the data.
-          if (reused && reused.acked === true && reused.response && reused.response.revisionAccepted === true) return;
+          if (reused && reused.acked === true && reused.response && reused.response.revisionAccepted === true) {
+            profileDeliveryMetrics.revisionAccepted++;
+            return;
+          }
+          profileDeliveryMetrics.revisionRejected++;
           // The previous ACK no longer proves the browser kept this section.
           if (socket.__profileSectionLastAck instanceof Map) socket.__profileSectionLastAck.delete(dataKey);
         }
@@ -8863,6 +8958,7 @@ async function emitChunkedProfileSyncToSocket(socket, name, options = {}) {
         }
         if (result && result.cancelled) { sectionCancelled = true; return; }
         if (result && result.ackTimeout) {
+          profileDeliveryMetrics.ackTimeout++;
           logMemoryTrace('profile-sync:section:ack-timeout', `user=${name} socket=${socket.id} section=${dataKey} drained=${result.drained === true} ms=${result.elapsedMs || 0} pending=${result.pending || 0} buffer=${getSocketWriteBufferLength(socket)}`);
         } else {
           logMemoryTrace('profile-sync:section:ack', `user=${name} socket=${socket.id} section=${dataKey} ack=${result.acked === true} ms=${result.elapsedMs || 0} buffer=${getSocketWriteBufferLength(socket)}`);
@@ -16515,6 +16611,9 @@ io.on('connection', (socket) => {
       return;
     }
     if (!workingUser) { respond({ ok: false, requestId: syncRequestId, error: 'Profile could not be prepared.' }); return; }
+    // Snapshot before reconciliation; changes to immutable small fields can be
+    // identified without writing the same JSONB user record again.
+    const originalProfileForNoopCheck = { ...workingUser };
     const previousPs3StatusForActivity = workingUser.ps3Status && typeof workingUser.ps3Status === 'object' ? { ...workingUser.ps3Status } : null;
     const previousLibraryForSharedGameMatch = Array.isArray(workingUser.libraryData) ? workingUser.libraryData.slice() : [];
     const previousDownloadsData = Array.isArray(workingUser.downloadsData) ? workingUser.downloadsData.slice() : [];
@@ -16690,6 +16789,37 @@ io.on('connection', (socket) => {
         }
         profileDbPatch.lastSeen = workingUser.lastSeen;
         profileDbPatch.profileUpdatedAt = workingUser.profileUpdatedAt;
+
+        // Skip only empty, non-replay updates. Equality against an in-memory
+        // profile is insufficient proof of a DB no-op on multi-instance deploys:
+        // another socket may have updated a small field since this cache loaded.
+        // Presence is updated by its own heartbeat, not by an empty patch.
+        const patchKeys = Object.keys(profileDbPatch).filter(key => key !== 'lastSeen' && key !== 'profileUpdatedAt');
+        const safeSmallNoop = patchKeys.length === 0 && !Object.keys(userData).length &&
+          !syncRequestId && !syncReason && !requestedSyncSections.length &&
+          !shouldForceProfileSyncToSource && !friendsSafetyRejected && !incomingSettingsData &&
+          !profileThemeMerge.accepted && !profileThemeMerge.rejected && !shouldBroadcastProfileBanner &&
+          !countryChanged && !incomingPs3StatusForActivity && !shouldEmitTrendingUpdate;
+        if (safeSmallNoop) {
+          profileNoopSavesAvoided++;
+          respond({
+            ok: true,
+            requestId: syncRequestId,
+            acceptedSections: [],
+            rejectedSections: [],
+            profileUpdatedAt: normalizeTimestampValue(originalProfileForNoopCheck.profileUpdatedAt) || Date.now(),
+            versions: {
+              downloads: normalizeTimestampValue(originalProfileForNoopCheck.downloadsUpdatedAt),
+              wishlist: normalizeTimestampValue(originalProfileForNoopCheck.wishlistUpdatedAt),
+              favorites: normalizeTimestampValue(originalProfileForNoopCheck.favoritesUpdatedAt),
+              library: normalizeTimestampValue(originalProfileForNoopCheck.libraryUpdatedAt),
+              friends: normalizeTimestampValue(originalProfileForNoopCheck.friendsUpdatedAt),
+              recentlyVisited: normalizeTimestampValue(originalProfileForNoopCheck.recentlyVisitedUpdatedAt),
+              settings: getProfileSettingsUpdatedAt(originalProfileForNoopCheck.settingsData || {})
+            }
+          });
+          return;
+        }
 
         userProfileWriteInFlight.add(name);
         try {
