@@ -8846,10 +8846,14 @@ async function emitChunkedProfileSyncToSocket(socket, name, options = {}) {
           const metadata = { profileUpdatedAt };
           if (meta.countKey) metadata[meta.countKey] = packet.userData[meta.countKey];
           (meta.versionKeys || []).forEach(key => { metadata[key] = packet.userData[key]; });
-          const revisionPacket = { name, sourceSocketId: options.sourceSocketId || null, profileUpdatedAt, profileSyncRevisionOnlyV1: true, userData: metadata };
+          const revisionPacket = { name, sourceSocketId: options.sourceSocketId || null, profileUpdatedAt, profileSyncRevisionOnlyV1: true, profileSyncRevisionSection: dataKey, userData: metadata };
           const reused = await emitProfileSyncPacket(socket, revisionPacket, { label: `${dataKey}-revision`, timeoutMs: 8000 });
-          if (reused && reused.cancelled) sectionCancelled = true;
-          return;
+          if (reused && reused.cancelled) { sectionCancelled = true; return; }
+          // The browser must confirm that the previously ACKed list is still
+          // hydrated and has no pending local edits. Otherwise resend the data.
+          if (reused && reused.acked === true && reused.response && reused.response.revisionAccepted === true) return;
+          // The previous ACK no longer proves the browser kept this section.
+          if (socket.__profileSectionLastAck instanceof Map) socket.__profileSectionLastAck.delete(dataKey);
         }
         const result = await emitProfileSyncPacket(socket, packet, { label: dataKey, timeoutMs: 10000 });
         const confirmedSections = result && result.response && result.response.sections;

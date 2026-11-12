@@ -8185,6 +8185,10 @@ button.psn-social-playing-title:hover { color:#89caff;text-decoration:underline;
 @media(max-width:768px) { #psn-social-reactors-modal { padding:9px; } .psn-social-reactors-dialog { max-height:calc(100dvh - 22px); } .psn-social-reactors-filters { padding:10px 13px; } .psn-social-reactors-list { padding:5px 13px; } .psn-social-reactors-more { width:calc(100% - 26px); margin:8px 13px 13px; } }
 @media(prefers-reduced-motion:reduce) { .psn-social-reactors-dialog { animation:none; } }
 
+/* Nested Social comment -> profile -> list stack; keep avatar flights above the comment sheet. */
+body.psn-social-comments-stacked #modal-sys-profile { z-index:100080; }
+body.psn-social-comments-stacked #modal-sys-list { z-index:100090; }
+body.psn-social-comments-stacked .psn-profile-avatar-flight { z-index:100100; }
 #psn-social-comments-modal { position:fixed; inset:0; z-index:100030; padding:24px; display:flex; justify-content:center; align-items:center; background:rgba(0,0,0,.66); -webkit-backdrop-filter:blur(10px); backdrop-filter:blur(10px); }
 #psn-social-comments-modal[hidden], #psn-social-comments-modal [hidden] { display:none !important; }
 #psn-social-comments-modal.psn-social-action-overlay, .psn-social-action-overlay { position:fixed; inset:0; z-index:100050; padding:20px; background:rgba(0,0,0,.66); backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px); display:flex; align-items:center; justify-content:center; }
@@ -15737,6 +15741,12 @@ P
 	function protectPendingProfileSectionFromIncoming(username, section, userData = {}, payload = {}, pendingState = null) {
 		const pending = pendingState || readPersistentProfileSyncPending(username);
 		if (!normalizeProfileListTimestamp(pending.sections[section])) return false;
+		// A revision/count-only packet cannot resolve a pending local edit.
+		// Only a real section payload can establish newer server contents.
+		const dataKeys = { trophies:'trophiesData', downloads:'downloadsData', wishlist:'wishlistData',
+			favorites:'favoritesData', library:'libraryData', friends:'friendsData',
+			recentlyvisited:'recentlyVisitedData' };
+		if (dataKeys[section] && !Object.prototype.hasOwnProperty.call(userData, dataKeys[section])) return false;
 		const localVersion = getLocalProfileSectionVersion(username, section, pending);
 		const incomingVersion = getIncomingProfileSectionVersion(section, userData, payload);
 		if (section !== 'trophies' && incomingVersion && incomingVersion > localVersion) {
@@ -31565,6 +31575,7 @@ P
 				autoSyncUI(originView);
 			}
 			
+			if (originView === 'social') window.psnSocialRestoreCommentModalFromNavigation?.();
 			if (originView === 'library_monitor' && typeof showLibrarySection === 'function') showLibrarySection('monitor', true);
 			if (originView === 'library_games' && typeof showLibrarySection === 'function') showLibrarySection('games', true);
 			else if (originView === 'library_favs' && typeof showLibrarySection === 'function') showLibrarySection('favorites', true);
@@ -31629,6 +31640,7 @@ P
 				switchView('view-' + actualView);
 				autoSyncUI(originView);
 			}
+			if (originView === 'social') window.psnSocialRestoreCommentModalFromNavigation?.();
 			
 			if (originView === 'library_games' && typeof showLibrarySection === 'function') showLibrarySection('games', true);
 			else if (originView === 'library_favs' && typeof showLibrarySection === 'function') showLibrarySection('favorites', true);
@@ -61588,6 +61600,10 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 			(stackedGameModal.style.display === 'flex' || stackedGameModal.classList.contains('show'))
 		);
 
+		// Keep the exact Social comment thread for Browse -> list -> profile -> comments Back navigation.
+		if (typeof returnPath === 'string' && (returnPath.startsWith('profilelist|') || returnPath.startsWith('profile|'))) {
+			window.psnSocialSuspendCommentModalForNavigation?.();
+		}
 		if (typeof window.releasePsnModalMotionOriginsForNavigation === 'function') {
 			window.releasePsnModalMotionOriginsForNavigation();
 		}
@@ -85655,7 +85671,7 @@ function getVisibleChatStackEl(id) {
 		const userData = payload.userData || payload.data || {};
 		const myName = localStorage.getItem('psn_username') || '';
 		if (!name || name !== myName || !userData || typeof userData !== 'object') return;
-		if (!window.isProfileLoaded && window.__initialProfileSyncInProgress !== true) return;
+		if (!window.isProfileLoaded && window.__initialProfileSyncInProgress !== true) return false;
 		if (typeof migrateRecentlyVisitedLegacyCache === 'function') migrateRecentlyVisitedLegacyCache(name);
 		if (typeof window.prepareIncomingProfileForPersistentPending === 'function') {
 			window.prepareIncomingProfileForPersistentPending(name, userData, payload || {});
@@ -85663,7 +85679,7 @@ function getVisibleChatStackEl(id) {
 
 		const incomingProfileUpdatedAt = Number(userData.profileUpdatedAt || payload.profileUpdatedAt || 0);
 		const lastAppliedProfileUpdatedAt = Number(window.__lastAppliedProfileUpdatedAt || 0);
-		if (incomingProfileUpdatedAt && lastAppliedProfileUpdatedAt && incomingProfileUpdatedAt < lastAppliedProfileUpdatedAt) return;
+		if (incomingProfileUpdatedAt && lastAppliedProfileUpdatedAt && incomingProfileUpdatedAt < lastAppliedProfileUpdatedAt) return false;
 
 		/* PROFILE SYNC SNAPSHOT: incoming sections replace the live references; keeping the old
 		   references is enough for realtime diffs. Avoid cloning potentially thousands of items. */
@@ -85696,10 +85712,14 @@ function getVisibleChatStackEl(id) {
 			// Revision-only packets are sent only after this socket ACKed the identical
 			// section content. Keep local list versions current without repainting lists.
 			if (payload.profileSyncRevisionOnlyV1 === true) {
+				const pending = readPersistentProfileSyncPending(name);
+				const dirty = window.__profileSyncDirtyState && window.__profileSyncDirtyState.username === name
+					? window.__profileSyncDirtyState.dirty : null;
 				[['wishlist', 'wishlistUpdatedAt'], ['downloads', 'downloadsUpdatedAt'],
 				 ['favorites', 'favoritesUpdatedAt'], ['library', 'libraryUpdatedAt'],
 				 ['friends', 'friendsUpdatedAt']].forEach(([type, key]) => {
 					if (!Object.prototype.hasOwnProperty.call(userData, key)) return;
+					if (normalizeProfileListTimestamp(pending.sections[type]) || (dirty && dirty[type])) return;
 					const storedVersion = normalizeProfileListTimestamp(localStorage.getItem(`${name}_${getProfileListTimestampStorageKey(type)}`));
 					const remoteVersion = normalizeProfileListTimestamp(userData[key]);
 					if (remoteVersion >= storedVersion) applyProfileListUpdatedAtFromServer(name, type, remoteVersion);
@@ -85936,8 +85956,10 @@ function getVisibleChatStackEl(id) {
 					if (rawData !== null) renderFetchedList(name, listType, rawData);
 				}
 			}
+			return true;
 		} catch (err) {
 			console.warn('[PROFILE SYNC] Could not apply remote profile data:', err);
+			return false;
 		} finally {
 			setTimeout(() => {
 				window.__applyingRemoteProfileSync = false;
@@ -95689,7 +95711,35 @@ function getVisibleChatStackEl(id) {
 					respond({ ok: true, ignored: true });
 					return;
 				}
-				if (typeof window.applyRemoteProfileSync === 'function') window.applyRemoteProfileSync(payload);
+				if (payload.profileSyncRevisionOnlyV1 === true) {
+					const sectionMap = { trophiesData:'trophies', downloadsData:'downloads', wishlistData:'wishlist',
+						favoritesData:'favorites', libraryData:'library', friendsData:'friends' };
+					// Earlier v91 servers sent revision-only packets without a section tag.
+					// Infer the section from its unique metadata for rolling deployments.
+					const metadata = payload.userData || {};
+					const inferredKey = Object.keys(sectionMap).find(key => {
+						const stamp = { trophiesData:'trophies', downloadsData:'downloadsUpdatedAt',
+							wishlistData:'wishlistUpdatedAt', favoritesData:'favoritesUpdatedAt',
+							libraryData:'libraryUpdatedAt', friendsData:'friendsUpdatedAt' }[key];
+						return Object.prototype.hasOwnProperty.call(metadata, stamp);
+					});
+					const section = sectionMap[payload.profileSyncRevisionSection || inferredKey];
+					const hydrationKey = section && typeof window.getProfileHydrationKey === 'function' ? window.getProfileHydrationKey(section, myName) : '';
+					const pending = typeof readPersistentProfileSyncPending === 'function' ? readPersistentProfileSyncPending(myName) : null;
+					const dirty = window.__profileSyncDirtyState && window.__profileSyncDirtyState.username === myName
+						? window.__profileSyncDirtyState.dirty : null;
+					if (!section || !hydrationKey || !(window.__profileHydratedSections instanceof Set) ||
+						!window.__profileHydratedSections.has(hydrationKey) ||
+						(pending && pending.sections && pending.sections[section]) || (dirty && dirty[section])) {
+						respond({ ok:true, revisionAccepted:false });
+						return;
+					}
+				}
+				const applied = typeof window.applyRemoteProfileSync === 'function' && window.applyRemoteProfileSync(payload) === true;
+				if (!applied) {
+					respond({ ok:true, ignored:true, revisionAccepted:false, sections:[] });
+					return;
+				}
 				const userData = payload.userData || payload.data || {};
 				const hydratedSections = [];
 				if (userData.trophiesData && typeof userData.trophiesData === 'object') hydratedSections.push('trophiesData');
@@ -95700,7 +95750,8 @@ function getVisibleChatStackEl(id) {
 				if (Array.isArray(userData.friendsData)) hydratedSections.push('friendsData');
 				if (Array.isArray(userData.recentlyVisitedData)) hydratedSections.push('recentlyVisitedData');
 				if (typeof window.markProfileSectionHydrated === 'function') hydratedSections.forEach(section => window.markProfileSectionHydrated(section));
-				respond({ ok: true, section: hydratedSections[0] || 'core', sections: hydratedSections });
+				respond({ ok: true, section: hydratedSections[0] || 'core', sections: hydratedSections,
+					revisionAccepted: payload.profileSyncRevisionOnlyV1 === true });
 			} catch (err) {
 				console.warn('[PROFILE SYNC] Could not acknowledge profile data:', err);
 				respond({ ok: false, error: err && err.message ? err.message : 'Profile data could not be applied.' });
@@ -114580,13 +114631,26 @@ function getVisibleChatStackEl(id) {
 			'.screenshot-item', '.metadata-screenshot-preview img', '.admin-metadata-suggestion-screenshot-strip img',
 			'.avatar-option', '.seen-user-item[data-seen-user]', '.indicator', '.base-game-link', '.modal-base-game-id-link',
 			'.ps5-avatar-arrow', 'label:has(>input[type="checkbox"]:not(:disabled))',
-			'.chat-avatar-clickable', '.modal-cover-wrapper', '.wish-btn', '.fav-btn', '.action-btn', '.btn-mini', '.btn-mini-round', '.admin-action-btn',
+			'.chat-avatar-clickable', '.chat-emoji-nav-item', '.chat-gif-slot', '.direct-gif-item',
+			'.path-breadcrumbs span', '.admin-mention-item', '.online-user-avatar[onclick]',
+			'.modal-cover-wrapper', '.wish-btn', '.fav-btn', '.action-btn', '.btn-mini', '.btn-mini-round', '.admin-action-btn',
 			'button:not([disabled])', 'a[href]', 'select:not([disabled])',
 			'input:not([type="hidden"]):not([disabled])', 'textarea:not([disabled])', '[contenteditable="true"]', '[contenteditable="plaintext-only"]',
 			'[role="button"]', '[onclick]'
 		].join(',');
 
-		var KB_NAV_OVERLAY_SELECTOR = '.sys-modal-overlay,.modal-overlay,.ps5-overlay-screen,.site-disclaimer-overlay,#psn-image-modal,.admin-color-picker-overlay,.direct-group-member-picker.is-open,.reaction-picker.show,.seen-by-popover.show,.ps3-console-popover.show';
+		// Open floating menus must own the arrows before the page or the modal behind them.
+		var KB_NAV_OVERLAY_SELECTOR = [
+			'.sys-modal-overlay', '.modal-overlay', '.ps5-overlay-screen', '.site-disclaimer-overlay',
+			'#psn-image-modal', '.admin-color-picker-overlay', '.direct-group-member-picker.is-open',
+			'.reaction-picker.show', '.seen-by-popover.show', '.ps3-console-popover.show',
+			'#psn-social-comments-modal:not([hidden])', '#psn-social-reactors-modal:not([hidden])',
+			'#psn-social-gif-picker:not([hidden])', '.psn-social-action-overlay',
+			'.profile-dropdown-menu.show', '.fm-context-menu.is-open',
+			'#chat-input-emoji-picker.is-open', '#chat-input-gif-picker', '.direct-picker.is-open',
+			'.psn-social-reaction-popover:not([hidden])', '.psn-social-comment-emoji-picker:not([hidden])',
+			'.admin-broadcast-popover.show', '.chat-search-popover'
+		].join(',');
 		var KB_NAV_EXCLUDED_SELECTOR = '.sidebar-overlay,.sys-modal-overlay,.modal-overlay,.ps5-overlay-screen,.site-disclaimer-overlay,.profile-dropdown-menu,.horizontal-scroll,.browse-toolbar,.toolbar-group,.main-content,.view-section,[data-keyboard-nav="off"]';
 		var keyboardTarget = null;
 		var keyboardEditingTarget = null;
@@ -114742,7 +114806,7 @@ function getVisibleChatStackEl(id) {
 			if (element.matches(':disabled,[aria-disabled="true"],[hidden],input[type="hidden"],input[type="file"]')) return false;
 			if (element.matches('[contenteditable="false"]')) return false;
 			if (element.matches('.filter-checkboxes label,#missing-rap-filter label') && element.querySelector('input:disabled')) return false;
-			if (element.closest('[aria-hidden="true"],[inert],[data-keyboard-nav="off"]')) return false;
+			if (element.closest('[aria-hidden="true"],[inert],[data-keyboard-nav="off"],.setting-unavailable,.haptic-not-supported')) return false;
 			if (element.matches(KB_NAV_EXCLUDED_SELECTOR) || !element.getClientRects().length) return false;
 			var style = window.getComputedStyle(element);
 			if (!style || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || 1) < .04 || style.pointerEvents === 'none') return false;
@@ -114764,31 +114828,44 @@ function getVisibleChatStackEl(id) {
 			return boot;
 		}
 
+		function keyboardOverlayStack(element) {
+			// Compare ancestor stacking levels first: a picker inside a modal is above
+			// that modal, but below another modal with a higher root z-index.
+			var levels = [];
+			for (var node = element; node && node.nodeType === 1 && node !== document.documentElement; node = node.parentElement) {
+				var style = window.getComputedStyle(node);
+				var z = parseInt(style.zIndex, 10);
+				if (isFinite(z) && style.zIndex !== 'auto') levels.unshift(z);
+			}
+			return levels;
+		}
+
 		function getKeyboardOverlayScope() {
 			var boot = getVisibleLoginBoot();
 			if (boot) {
 				var auth = boot.querySelector('.ps5-overlay-screen.is-visible');
 				return auth || boot;
 			}
-			var dropdown = document.getElementById('profile-dropdown');
-			if (dropdown && dropdown.classList.contains('show') && isElementVisibleForKeyboard(dropdown.querySelector('a') || dropdown)) return dropdown;
 			var overlays = Array.prototype.slice.call(document.querySelectorAll(KB_NAV_OVERLAY_SELECTOR)).filter(function(element){
-				if (!element || !element.isConnected) return false;
+				if (!element || !element.isConnected || element.hidden || element.closest('[inert],[aria-hidden="true"]')) return false;
 				var style = window.getComputedStyle(element);
+				if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || 1) <= .04 || style.pointerEvents === 'none') return false;
 				var rect = element.getBoundingClientRect();
-				return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) > .04 && rect.width > 10 && rect.height > 10 && style.pointerEvents !== 'none';
+				return rect.width > 10 && rect.height > 10 && rect.bottom > 0 && rect.top < innerHeight && rect.right > 0 && rect.left < innerWidth;
 			});
 			if (!overlays.length) return null;
-			overlays.sort(function(a,b){
-				var za = parseInt(window.getComputedStyle(a).zIndex,10);
-				var zb = parseInt(window.getComputedStyle(b).zIndex,10);
-				return (isFinite(za) ? za : 0) - (isFinite(zb) ? zb : 0);
-			});
-			return overlays[overlays.length - 1];
+			var stacks = overlays.map(keyboardOverlayStack);
+			var top = 0;
+			for (var i = 1; i < overlays.length; i++) {
+				var a = stacks[top], b = stacks[i], limit = Math.min(a.length, b.length), j = 0;
+				while (j < limit && a[j] === b[j]) j++;
+				if (j < limit ? b[j] > a[j] : b.length >= a.length) top = i;
+			}
+			return overlays[top];
 		}
 
-		function collectKeyboardCandidates() {
-			var scope = getKeyboardOverlayScope() || document;
+		function collectKeyboardCandidates(scope) {
+			scope = scope || document;
 			var nodes = Array.prototype.slice.call(scope.querySelectorAll(KB_NAV_SELECTOR));
 			var seen = new Set();
 			return nodes.filter(function(element){
@@ -114986,14 +115063,22 @@ function getVisibleChatStackEl(id) {
 			if (key === 'Tab') { clearKeyboardTarget(false); return; }
 			if (keyboardEditingTarget && (keyboardEditingTarget !== document.activeElement || !isElementVisibleForKeyboard(keyboardEditingTarget))) keyboardEditingTarget = null;
 			if (key === 'Escape' && keyboardEditingTarget) {
-				event.preventDefault();
-				event.stopImmediatePropagation();
-				var field = keyboardEditingTarget;
-				keyboardEditingTarget = null;
-				field.blur();
-				if (isElementVisibleForKeyboard(field)) setKeyboardTarget(field, false, false);
-				else clearKeyboardTarget(false);
-				return;
+				// The Social comments modal owns Escape (close / cancel edit), even when its composer has keyboard focus.
+				var socialComments = document.getElementById('psn-social-comments-modal');
+				var socialGif = document.getElementById('psn-social-gif-picker');
+				if ((socialComments && !socialComments.hidden && socialComments.contains(keyboardEditingTarget)) ||
+					(socialGif && !socialGif.hidden && socialGif.contains(keyboardEditingTarget))) {
+					keyboardEditingTarget = null;
+				} else {
+					event.preventDefault();
+					event.stopImmediatePropagation();
+					var field = keyboardEditingTarget;
+					keyboardEditingTarget = null;
+					field.blur();
+					if (isElementVisibleForKeyboard(field)) setKeyboardTarget(field, false, false);
+					else clearKeyboardTarget(false);
+					return;
+				}
 			}
 			if (key === 'Escape') {
 				setTimeout(function(){ if (keyboardTarget && !isElementVisibleForKeyboard(keyboardTarget)) clearKeyboardTarget(false); },0);
@@ -115008,17 +115093,33 @@ function getVisibleChatStackEl(id) {
 			}
 			var isArrow = key === 'ArrowLeft' || key === 'ArrowRight' || key === 'ArrowUp' || key === 'ArrowDown';
 			if (!isArrow && key !== 'Enter') return;
-			if (keyboardEditingTarget) return;
+			if (key === 'ArrowDown' && event.target && event.target.closest && event.target.closest('[data-social-reaction-trigger]')) {
+				// The Social reaction picker already owns this shortcut; do not move focus behind it.
+				clearKeyboardTarget(false);
+				return;
+			}
+			if (keyboardEditingTarget) {
+				var currentScope = getKeyboardOverlayScope();
+				if (!currentScope || currentScope.contains(keyboardEditingTarget)) return;
+				keyboardEditingTarget = null;
+			}
+			var scope = getKeyboardOverlayScope();
+			if (scope && keyboardTarget && !scope.contains(keyboardTarget)) clearKeyboardTarget(false);
 			var active = document.activeElement;
+			if (scope && active && !scope.contains(active)) {
+				// A field from the previous screen must not consume the modal's arrows.
+				if (isKeyboardNativeControl(active) && typeof active.blur === 'function') active.blur();
+				active = null;
+			}
 			var navSelect = active && active.matches && active.matches('select') &&
 				keyboardTarget === active && document.body.classList.contains('psn-keyboard-nav-active');
-			if (isKeyboardNativeControl(event.target) || isKeyboardNativeControl(active)) {
+			if (((!scope || scope.contains(event.target)) && isKeyboardNativeControl(event.target)) || isKeyboardNativeControl(active)) {
 				if (!navSelect && !(keyboardTarget && isKeyboardEditableField(keyboardTarget) && document.body.classList.contains('psn-keyboard-nav-active'))) return;
-				try { if (active.matches(':open')) return; } catch (e) { return; }
+				try { if (active && active.matches(':open')) return; } catch (e) { return; }
 			}
 			lastKeyboardAt = Date.now();
 
-			var candidates = collectKeyboardCandidates();
+			var candidates = collectKeyboardCandidates(scope);
 			if (!candidates.length) return;
 			var current = keyboardTarget && candidates.indexOf(keyboardTarget) !== -1 ? keyboardTarget : null;
 			if (!current && active && candidates.indexOf(active) !== -1) current = active;
@@ -117476,6 +117577,14 @@ function getVisibleChatStackEl(id) {
     });
     document.addEventListener('keydown',event=>{
       if(overlay.hidden||document.querySelector('.psn-social-action-overlay')||socialReactors.overlay?.hidden===false)return;
+      // A stacked profile/list or image viewer owns Escape until it closes.
+      if(document.getElementById('modal-sys-list')?.classList.contains('show')||document.getElementById('modal-sys-profile')?.classList.contains('show')||document.getElementById('psn-image-modal')?.getClientRects().length)return;
+      if(event.key==='Escape'){
+        const gif=document.getElementById('psn-social-gif-picker');
+        if(gif&&!gif.hidden){event.preventDefault();event.stopImmediatePropagation();closeSocialGifPicker();return;}
+        const emoji=overlay.querySelector('.psn-social-comment-emoji-picker:not([hidden])');
+        if(emoji){event.preventDefault();event.stopImmediatePropagation();emoji.hidden=true;return;}
+      }
       if(event.key==='Escape'&&socialCommentEditing&&event.target.closest('.psn-social-comment-edit-panel')&&!socialCommentEditing.saving){
         event.preventDefault();event.stopImmediatePropagation();socialCommentEditing=null;renderSocialCommentThreads(state.modalPostId);return;
       }
@@ -117749,12 +117858,39 @@ function getVisibleChatStackEl(id) {
     const count=document.getElementById('psn-social-modal-count');if(count)count.textContent=String(post.comments||0);
     const body=document.getElementById('psn-social-modal-body');if(body){clearSocialCommentAttachment(body.querySelector('.psn-social-comment-form'));body.innerHTML=commentAreaMarkup(postId);}
     const status=document.getElementById('psn-social-modal-status');if(status)status.textContent='';
+    delete overlay.dataset.psnNavSuspended;delete overlay.__psnNavCommentScroll;
     overlay.hidden=false;
+    document.body.classList.add('psn-social-comments-stacked');
     overlay.querySelector('[data-social-close-comments]')?.focus({preventScroll:true});
     loadComments(postId);
   }
+  // Hide without destroying the loaded post or scroll position while Browse is on top.
+  window.psnSocialSuspendCommentModalForNavigation=function(){
+    const overlay=document.getElementById('psn-social-comments-modal');
+    if(!overlay||overlay.hidden||!state.modalPostId)return false;
+    overlay.__psnNavCommentScroll=overlay.querySelector('.psn-social-comments-list')?.scrollTop||0;
+    overlay.dataset.psnNavSuspended='1';
+    overlay.hidden=true;
+    document.body.classList.remove('psn-social-comments-stacked');
+    return true;
+  };
+  window.psnSocialRestoreCommentModalFromNavigation=function(){
+    const overlay=document.getElementById('psn-social-comments-modal');
+    if(!overlay||overlay.dataset.psnNavSuspended!=='1'||!state.modalPostId)return false;
+    delete overlay.dataset.psnNavSuspended;
+    overlay.hidden=false;
+    document.body.classList.add('psn-social-comments-stacked');
+    const list=overlay.querySelector('.psn-social-comments-list');
+    if(list){
+      const scroll=overlay.__psnNavCommentScroll||0;
+      list.scrollTop=scroll;
+      requestAnimationFrame(()=>{if(!overlay.hidden&&overlay.querySelector('.psn-social-comments-list')===list)list.scrollTop=scroll;});
+    }
+    return true;
+  };
   function closeCommentModal(){
-    const overlay=document.getElementById('psn-social-comments-modal');if(!overlay||overlay.hidden)return;
+    const overlay=document.getElementById('psn-social-comments-modal');
+    if(!overlay||(overlay.hidden&&overlay.dataset.psnNavSuspended!=='1'))return;
     clearTimeout(socialCommentsRefreshTimer);socialCommentsRefreshTimer=0;
     clearTimeout(socialCommentsRecoveryTimer);socialCommentsRecoveryTimer=0;
     clearTimeout(socialCommentsBusyTimer);socialCommentsBusyTimer=0;
@@ -117762,7 +117898,8 @@ function getVisibleChatStackEl(id) {
     closeSocialGifPicker();socialGifCommentForm=null;
     setSocialCommentReply(null);
     clearSocialCommentAttachment(overlay.querySelector('#psn-social-modal-body > .psn-social-comment-form'));
-    overlay.hidden=true;socialCommentEditing=null;state.modalRequest++;state.modalPostId=null;state.replyThreads.clear();state.openComments.clear();
+    overlay.hidden=true;delete overlay.dataset.psnNavSuspended;delete overlay.__psnNavCommentScroll;document.body.classList.remove('psn-social-comments-stacked');
+    socialCommentEditing=null;state.modalRequest++;state.modalPostId=null;state.replyThreads.clear();state.openComments.clear();
     if(state.modalOpener?.isConnected)state.modalOpener.focus({preventScroll:true});
     state.modalOpener=null;
   }
