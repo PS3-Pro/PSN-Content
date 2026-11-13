@@ -16769,6 +16769,14 @@ P
 			window.__profileNotificationPendingSyncCategories.add(runtimeKey);
 			return false;
 		}
+		// A burst of local toggles may cancel out before the queued write.
+		// Drop only empty DELTAS, not absolute replacements or replayable ops.
+		if (!op.replacePending && !op.clearPending && !op.addItems.size && !op.removeItems.size && !op.hasDot && !op.hasColor) {
+			delete window.__profileNotificationPendingOps[runtimeKey];
+			window.__profileNotificationPendingSyncCategories.delete(runtimeKey);
+			clearPersistentProfileNotificationPending(category, owner);
+			return false;
+		}
 		const payload = buildProfileNotificationSyncPayload(category, op);
 		delete window.__profileNotificationPendingOps[runtimeKey];
 		window.__profileNotificationInFlight[runtimeKey] = { owner, category, payload, sending: false, attempt: 0, ackTimer: null };
@@ -16788,7 +16796,7 @@ P
 		window.__profileNotificationPendingSyncCategories.add(runtimeKey);
 		if (!window.__profileNotificationInFlight[runtimeKey]) {
 			clearTimeout(window.__profileNotificationSyncTimers[runtimeKey]);
-			window.__profileNotificationSyncTimers[runtimeKey] = setTimeout(() => flushProfileNotificationCategoryState(category, owner), 45);
+			window.__profileNotificationSyncTimers[runtimeKey] = setTimeout(() => flushProfileNotificationCategoryState(category, owner), 90);
 		}
 		return true;
 	}
@@ -54944,8 +54952,9 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		}
 
 		if (viewId === 'view-social') {
+			if (typeof window.psnSocialOnEntered === 'function') window.psnSocialOnEntered();
 			scheduleViewOpenWork('view-social', () => { if (typeof window.psnSocialOpen === 'function') window.psnSocialOpen(); }, 150);
-		}
+		} else if (typeof window.psnSocialOnLeft === 'function') window.psnSocialOnLeft();
 		if (viewId === 'view-trending') {
 			cancelTrendingPrewarm();
 			document.getElementById('nav-trending')?.classList.add('active');
@@ -116421,7 +116430,7 @@ function getVisibleChatStackEl(id) {
       if(kind==='post'||kind==='delete'||!postId||snapshot.posts.some(post=>post.id===postId))snapshot.dirty=true;
     }
   }
-  const unseen={socket:null,owner:'',serial:0,seen:'0',newest:'0',active:false,ready:false};
+  const unseen={socket:null,owner:'',serial:0,seen:'0',newest:'0',postEpoch:0,active:false,ready:false,marking:false,markEpoch:0,markSeq:0,markTimer:0,retryTimer:0,readTimer:0,readRetryTimer:0,readRetries:0};
   const warmFeed={owner:'',socket:null,token:0,promise:null,ready:null};
   function invalidateWarmFeed(){
     warmFeed.token++;warmFeed.ready=null;warmFeed.promise=null;
@@ -116458,10 +116467,16 @@ function getVisibleChatStackEl(id) {
     return !!(name&&socket?.connected&&socket.__psnGlobalAuthenticatedName===name);
   }
   const newer=(a,b)=>{try{return BigInt(s(a||'0'))>BigInt(s(b||'0'));}catch(e){return false;}};
-  function paintUnseen(){const hidden=!unseen.active||!unseen.ready||unseen.owner!==identity()||!socialSessionReady();document.querySelectorAll('.psn-social-unseen-dot').forEach(dot=>{if(dot.hidden!==hidden)dot.hidden=hidden;});}
+  // Reading the Social tab clears its dot immediately. Persistence happens
+  // independently, and failed acknowledgments restore the dot after leaving.
+  function paintUnseen(){const hidden=visible()||!unseen.active||!unseen.ready||unseen.owner!==identity()||!socialSessionReady();document.querySelectorAll('.psn-social-unseen-dot').forEach(dot=>{if(dot.hidden!==hidden)dot.hidden=hidden;});}
   function resetUnseen(owner='',detach=false){
-    unseen.serial++;
-    unseen.owner=owner;unseen.ready=false;unseen.active=false;unseen.seen='0';unseen.newest='0';
+    unseen.serial++;unseen.markEpoch++;unseen.markSeq++;unseen.marking=false;
+    clearTimeout(unseen.markTimer);unseen.markTimer=0;
+    clearTimeout(unseen.retryTimer);unseen.retryTimer=0;
+    clearTimeout(unseen.readTimer);unseen.readTimer=0;
+    clearTimeout(unseen.readRetryTimer);unseen.readRetryTimer=0;unseen.readRetries=0;
+    unseen.owner=owner;unseen.ready=false;unseen.active=false;unseen.seen='0';unseen.newest='0';unseen.postEpoch=0;
     if(detach&&unseen.socket){
       unseen.socket.off('auth_success',onGlobalSocialAuthenticated);
       unseen.socket.off('social_feed_changed',onUnseenPost);
@@ -116474,12 +116489,38 @@ function getVisibleChatStackEl(id) {
     if(!socialSessionReady()||unseen.socket!==socket)return;
     const owner=identity();
     if(unseen.owner!==owner)resetUnseen(owner);
-    const serial=++unseen.serial;
-    socket.emit('social_unseen_get',{},res=>{
-      if(serial!==unseen.serial||unseen.socket!==socket||unseen.owner!==owner||identity()!==owner||!socialSessionReady()||!res?.success)return;
-      unseen.ready=true;unseen.seen=s(res.lastSeen||'0');unseen.newest=s(res.newest||'0');
-      unseen.active=!!res.unseen;paintUnseen();
-    });
+    clearTimeout(unseen.readTimer);unseen.readTimer=0;
+    clearTimeout(unseen.readRetryTimer);unseen.readRetryTimer=0;
+    const serial=++unseen.serial,postEpoch=unseen.postEpoch;
+    let settled=false;
+    const complete=res=>{
+      if(settled||serial!==unseen.serial||unseen.socket!==socket||unseen.owner!==owner||identity()!==owner)return;
+      settled=true;
+      clearTimeout(unseen.readTimer);unseen.readTimer=0;
+      if(!res?.success){
+        // A dropped read ACK must not leave the badge unknown indefinitely.
+        // Retry at most three times; authentication or a new tab entry resets the budget.
+        if(socialSessionReady()&&unseen.readRetries<3){
+          const delay=[1000,2500,5000][unseen.readRetries++];
+          unseen.readRetryTimer=setTimeout(()=>{unseen.readRetryTimer=0;if(socialSessionReady())refreshUnseen();},delay);
+        }
+        return;
+      }
+      unseen.readRetries=0;
+      unseen.ready=true;
+      const lastSeen=s(res.lastSeen||'0'),newest=s(res.newest||'0');
+      if(newer(lastSeen,unseen.seen))unseen.seen=lastSeen;
+      // A post arriving during this read may be absent from its DB snapshot.
+      // A deletion may instead reduce MAX(id), so trust a fresh snapshot only
+      // if no post/delete event occurred since this request began.
+      if(postEpoch===unseen.postEpoch)unseen.newest=newest;
+      else if(newer(newest,unseen.newest))unseen.newest=newest;
+      unseen.active=newer(unseen.newest,unseen.seen);
+      paintUnseen();
+      if(visible())markUnseenRead();
+    };
+    unseen.readTimer=setTimeout(()=>complete(null),6000);
+    try{socket.emit('social_unseen_get',{},complete);}catch(err){complete(null);}
   }
   function attachUnseen(){
     const socket=typeof socketChat==='undefined'?null:socketChat;
@@ -116493,7 +116534,7 @@ function getVisibleChatStackEl(id) {
   }
   window.psnSocialOnAuthenticatedSession=function(){
     attachUnseen();
-    if(socialSessionReady()&&unseen.owner===identity()&&!unseen.ready)refreshUnseen();
+    if(socialSessionReady()&&unseen.owner===identity()&&!unseen.ready&&!unseen.readTimer&&!unseen.readRetryTimer)refreshUnseen();
     observeSocket();
   };
   function onGlobalSocialAuthenticated(data){
@@ -116517,24 +116558,67 @@ function getVisibleChatStackEl(id) {
   }
   function onUnseenPost(data){
     if(!socialSessionReady()||unseen.socket!==socketChat||unseen.owner!==identity())return;
+    if(data?.kind==='post'||data?.kind==='delete')unseen.postEpoch++;
     if(data?.kind==='post')invalidateWarmFeed();
+    if(data?.kind==='delete'){
+      if(data.id&&s(data.id)===unseen.newest)refreshUnseen();
+      return;
+    }
     if(data?.kind!=='post'||!data.id||data.author===identity())return;
-    if(!unseen.ready)return;
+    // Do not lose a post that arrives before the first unread-state ACK.
+    // The outstanding read may contain an older database snapshot.
     if(newer(data.id,unseen.newest))unseen.newest=s(data.id);
+    if(!unseen.ready)return;
     if(newer(data.id,unseen.seen)) {unseen.active=true;paintUnseen();}
+    if(visible())markUnseenRead();
   }
   function markUnseenRead(){
-    if(!unseen.ready||state.filter!=='all'||!state.loaded||!visible())return;
-    const newest=state.posts[0]?.id;
+    if(!visible())return;
+    // This must not wait for the feed, network or database. The timestamp sent
+    // to the server is bounded to posts already known by this session.
+    unseen.active=false;paintUnseen();
+    const socket=unseen.socket,owner=identity();
+    if(!unseen.ready||!socialSessionReady()||socket!==socketChat||unseen.owner!==owner||unseen.marking)return;
+    const newest=unseen.newest;
     if(!newest||!newer(newest,unseen.seen))return;
-    const socket=unseen.socket,owner=identity(),serial=++unseen.serial;
-    socket?.emit('social_unseen_mark',{upTo:newest},res=>{
-      if(serial!==unseen.serial||unseen.socket!==socket||unseen.owner!==owner||identity()!==owner||!socialSessionReady()||!res?.success)return;
-      unseen.seen=s(res.lastSeen||newest);
+    const markEpoch=unseen.markEpoch,markSeq=++unseen.markSeq;
+    unseen.marking=true;
+    const complete=res=>{
+      if(markEpoch!==unseen.markEpoch||markSeq!==unseen.markSeq||unseen.socket!==socket||unseen.owner!==owner||identity()!==owner)return;
+      unseen.markSeq++; // Ignore any late ACK after this attempt finished or timed out.
+      clearTimeout(unseen.markTimer);unseen.markTimer=0;
+      unseen.marking=false;
+      if(res?.success){
+        clearTimeout(unseen.retryTimer);unseen.retryTimer=0;
+        const confirmed=s(res.lastSeen||newest);
+        if(newer(confirmed,unseen.seen))unseen.seen=confirmed;
+        unseen.active=newer(unseen.newest,unseen.seen);
+        paintUnseen();
+        // A newer post could have arrived during the outstanding write.
+        if(visible()&&newer(unseen.newest,unseen.seen))markUnseenRead();
+        return;
+      }
       unseen.active=newer(unseen.newest,unseen.seen);
       paintUnseen();
-    });
+      if(visible()&&socialSessionReady()&&!unseen.retryTimer){
+        unseen.retryTimer=setTimeout(()=>{unseen.retryTimer=0;if(visible())markUnseenRead();},5000);
+      }
+    };
+    unseen.markTimer=setTimeout(()=>complete({success:false}),6000);
+    try{socket.emit('social_unseen_mark',{upTo:newest},complete);}catch(err){complete({success:false});}
   }
+  window.psnSocialOnLeft=function(){paintUnseen();};
+  window.psnSocialOnEntered=function(){
+    // Called synchronously by tab navigation, before the 150ms view-open work.
+    paintUnseen();
+    if(socialSessionReady()){
+      attachUnseen();
+      // attachUnseen already starts the first query when the socket is new.
+      // Do not invalidate it with a second identical request on tab entry.
+      if(unseen.owner!==identity()||(!unseen.ready&&!unseen.readTimer)){unseen.readRetries=0;refreshUnseen();}
+      else if(unseen.ready)markUnseenRead();
+    }
+  };
   const view = () => document.getElementById('view-social');
   const feed = () => document.getElementById('psn-social-feed');
   const identity = () => String(localStorage.getItem('psn_username') || '').trim();
@@ -118073,6 +118157,9 @@ function getVisibleChatStackEl(id) {
     if(res.counts)saveSocialPostCounts(res.counts);
     else if(!more) scheduleSocialCountRefresh();
     const incoming=Array.isArray(res.posts)?res.posts:[];
+    // Only a successful fresh feed response can advance the unread watermark.
+    // Cached cards must never resurrect IDs of posts deleted meanwhile.
+    if(!more&&mode==='all'&&incoming[0]?.id&&newer(incoming[0].id,unseen.newest))unseen.newest=s(incoming[0].id);
     const hadPosts=state.posts.length>0;
     if(more){
       const ids=new Set(state.posts.map(post=>post.id));
@@ -118800,7 +118887,7 @@ function getVisibleChatStackEl(id) {
     const root=view();if(!root||root.dataset.socialWired)return;
     root.dataset.socialWired='1';
     if(typeof MutationObserver==='function'){
-      const navigationObserver=new MutationObserver(()=>{if(!visible())notify('');});
+      const navigationObserver=new MutationObserver(()=>{paintUnseen();if(!visible())notify('');});
       navigationObserver.observe(root,{attributes:true,attributeFilter:['style','class']});
     }
     root.querySelector('#psn-social-compose-toggle')?.addEventListener('click',()=>{
@@ -118979,6 +119066,8 @@ function getVisibleChatStackEl(id) {
       renderAttachments();
       state.owner=current;state.loaded=false;state.posts=[];state.comments.clear();state.openComments.clear();state.before=null;
     }
+    // Clear the badge on entry, even when the initial feed still shows skeletons.
+    markUnseenRead();
     if(state.filter==='friends'&&socialFilterCache.get('friends')?.friendsKey!==socialFriendsCacheKey())state.stale=true;
     if(!state.loaded||state.stale||Date.now()-socialFeedFetchedAt>SOCIAL_FILTER_CACHE_MS)loadFeed(false,state.loaded,state.loaded);
     else {updateInfiniteFeed();markUnseenRead();}

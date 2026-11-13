@@ -926,7 +926,10 @@ if (dbEventLoopDelay) dbEventLoopDelay.enable();
 let dbLastLoopUtilization = DB_PERF_ENABLED ? performance.eventLoopUtilization() : null;
 let dbLastCpuUsage = DB_PERF_ENABLED ? process.cpuUsage() : null;
 let profileNoopSavesAvoided = 0;
-const profileDeliveryMetrics = { full: 0, gzip: 0, revision: 0, revisionAccepted: 0, revisionRejected: 0, gzipFallback: 0, ackTimeout: 0, rawBytes: 0, gzipBytes: 0, gzipBase64Bytes: 0 };
+// Revision-only updates are intentionally allowed only for ACKed, unchanged
+// sections. Counters explain why the bandwidth-saving path is rarely used.
+const profileDeliveryMetrics = { full: 0, gzip: 0, revision: 0, revisionAccepted: 0, revisionRejected: 0, revisionNoBaseline: 0, revisionContentChanged: 0, revisionEligible: 0, explicitHydration: 0, gzipFallback: 0, ackTimeout: 0, rawBytes: 0, gzipBytes: 0, gzipBase64Bytes: 0 };
+const profileNotificationMetrics = { received: 0, saved: 0, duplicate: 0, logicalNoChange: 0, categoryConflicts: 0, byCategory: Object.create(null) };
 function readDbEventLoopMetrics() {
   if (!dbEventLoopDelay) return null;
   const ms = nanos => Number.isFinite(nanos) ? Math.round(nanos / 1e6) : 0;
@@ -1000,9 +1003,11 @@ function flushDbQueryPerformance() {
     slow:stats.slow, errors:stats.errors, retries:stats.retries, totalMs:stats.total
   })).sort((a,b) => b.totalMs-a.totalMs).slice(0,8);
   dbQueryPerf.clear();
-  console.log('[DB PERF 5MIN]', JSON.stringify({topQueries:summary, pool:{total:pool.totalCount, idle:pool.idleCount, waiting:pool.waitingCount, peakWaiting:dbPerfPeakWaiting, peakConnections:dbPerfPeakConnections}, admission:{enabled:DB_READ_ADMISSION_ENABLED, optionalQueuedPeak:dbAdmissionOptionalPeak, bulkPendingPeak:dbAdmissionBulkPeak, bulkWaits:dbAdmissionBulkWaits}, eventLoop:readDbEventLoopMetrics(), profile:{noopSavesAvoided:profileNoopSavesAvoided, delivery:{...profileDeliveryMetrics}}, personalReadReuse:readPersonalCacheStats}));
+  console.log('[DB PERF 5MIN]', JSON.stringify({topQueries:summary, pool:{total:pool.totalCount, idle:pool.idleCount, waiting:pool.waitingCount, peakWaiting:dbPerfPeakWaiting, peakConnections:dbPerfPeakConnections}, admission:{enabled:DB_READ_ADMISSION_ENABLED, optionalQueuedPeak:dbAdmissionOptionalPeak, bulkPendingPeak:dbAdmissionBulkPeak, bulkWaits:dbAdmissionBulkWaits}, eventLoop:readDbEventLoopMetrics(), profile:{noopSavesAvoided:profileNoopSavesAvoided, delivery:{...profileDeliveryMetrics}}, notifications:{...profileNotificationMetrics,byCategory:{...profileNotificationMetrics.byCategory}}, personalReadReuse:readPersonalCacheStats}));
   profileNoopSavesAvoided = 0;
   Object.keys(profileDeliveryMetrics).forEach(key => { profileDeliveryMetrics[key] = 0; });
+  ['received','saved','duplicate','logicalNoChange','categoryConflicts'].forEach(key => { profileNotificationMetrics[key] = 0; });
+  profileNotificationMetrics.byCategory = Object.create(null);
   readPersonalCacheStats = { rewards:{fresh:0,shared:0,db:0}, reports:{fresh:0,shared:0,db:0} };
   dbAdmissionOptionalPeak = 0;
   dbAdmissionBulkPeak = 0;
@@ -4270,6 +4275,7 @@ async function updateProfileNotificationCategoryInDb(name, category, patch = {})
     const currentState = normalizeProfileNotificationStateServer(rawCurrentState);
     const currentCategory = currentState[category] || normalizeProfileNotificationCategoryServer(category, {});
     if (mutationId && currentCategory.mutationIds.includes(mutationId)) {
+      profileNotificationMetrics.duplicate++;
       return {
         notificationState: currentState,
         profileUpdatedAt: normalizeTimestampValue(currentResult.rows[0].profile_updated_at) || Date.now(),
@@ -4278,6 +4284,11 @@ async function updateProfileNotificationCategoryInDb(name, category, patch = {})
     }
 
     const nextState = updateProfileNotificationCategoryServer(currentState, category, { ...patch, mutationId });
+    // Count redundant intents without suppressing mutation IDs: skipping the
+    // write here would let a delayed retry replay an older operation later.
+    const logicallyUnchanged = currentCategory.dot === nextState[category].dot &&
+      JSON.stringify(currentCategory.pendingItems) === JSON.stringify(nextState[category].pendingItems) &&
+      (category !== 'trophies' || currentCategory.color === nextState[category].color);
     const now = Math.max(Date.now(), normalizeTimestampValue(currentResult.rows[0].profile_updated_at) + 1);
     // Update exactly one notification category in-place. Compare that category,
     // not the whole state: concurrent changes to a different category must be
@@ -4314,6 +4325,8 @@ async function updateProfileNotificationCategoryInDb(name, category, patch = {})
       { attempts: 2, lockTimeoutMs: 1200 }
     );
     if (updateResult.rowCount > 0) {
+      profileNotificationMetrics.saved++;
+      if (logicallyUnchanged) profileNotificationMetrics.logicalNoChange++;
       const saved = updateResult.rows[0] || {};
       return {
         // Return the authoritative combined state, including categories
@@ -4325,6 +4338,7 @@ async function updateProfileNotificationCategoryInDb(name, category, patch = {})
     }
 
     // Another notification mutation won the race. Re-read, merge the delta, and try again.
+    profileNotificationMetrics.categoryConflicts++;
     if (attempt < maxAttempts) await waitMs(attempt === 1 ? 20 : attempt === 2 ? 45 : 90);
   }
 
@@ -8933,6 +8947,12 @@ async function emitChunkedProfileSyncToSocket(socket, name, options = {}) {
         const signature = socket.profileSyncAckV1 === true && packet.userData ?
           crypto.createHash('sha256').update(JSON.stringify(packet.userData[dataKey])).digest('hex') : '';
         const lastSent = socket.__profileSectionLastAck && socket.__profileSectionLastAck.get(dataKey);
+        if (socket.profileSyncRevisionOnlyV1 === true && signature) {
+          if (options.allowAckDedupe !== true) profileDeliveryMetrics.explicitHydration++;
+          else if (!lastSent) profileDeliveryMetrics.revisionNoBaseline++;
+          else if (lastSent !== signature) profileDeliveryMetrics.revisionContentChanged++;
+          else profileDeliveryMetrics.revisionEligible++;
+        }
         if (options.allowAckDedupe === true && socket.profileSyncRevisionOnlyV1 === true && signature && lastSent === signature) {
           const metadata = { profileUpdatedAt };
           if (meta.countKey) metadata[meta.countKey] = packet.userData[meta.countKey];
@@ -11665,7 +11685,7 @@ async function initProfileSyncNotifications() {
         }
         io.emit('social_feed_changed', {
           kind:data.kind,id:String(data.id || ''),commentId:data.commentId ? String(data.commentId) : null,
-          actor:data.actor||'',oldEmoji:data.oldEmoji||'',emoji:data.emoji||'',
+          author:data.author||'',actor:data.actor||'',oldEmoji:data.oldEmoji||'',emoji:data.emoji||'',
           ...(data.kind==='comment-edit'?{text:typeof data.text==='string'?data.text:'',editedAt:data.editedAt||null,parentId:data.parentId||null}:{}),at:data.at
         });
         return;
@@ -16325,6 +16345,8 @@ io.on('connection', (socket) => {
     const category = normalizeText(payload.category, '').toLowerCase();
     if (!PROFILE_NOTIFICATION_CATEGORIES.has(category)) { respond({ ok: false, error: 'Invalid notification category.' }); return; }
     if (category === 'admin' && !isUserAdmin(name, userDatabase[name])) { respond({ ok: false, error: 'Admin notification state is not available.' }); return; }
+    profileNotificationMetrics.received++;
+    profileNotificationMetrics.byCategory[category] = (profileNotificationMetrics.byCategory[category] || 0) + 1;
 
     const categoryPatch = {
       mutationId: normalizeText(payload.mutationId, '').slice(0, 96),
