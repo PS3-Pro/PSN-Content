@@ -5633,9 +5633,51 @@ const CONTENT_DOWNLOAD_INDEX_BATCH_SIZE = Math.max(10, Math.min(100, parseInt(pr
 let contentDownloadIndexSchemaReady = false;
 let contentDownloadIndexReady = false;
 let contentDownloadIndexInitializing = false;
+let contentDownloadIndexReadinessChecked = false;
+let contentDownloadIndexReadinessPromise = null;
 let contentDownloadIndexTimer = null;
 let contentDownloadIndexLastErrorAt = 0;
 let contentDownloadIndexBuiltUsers = 0;
+
+// A previously completed index persists across Render restarts. Check the
+// authoritative ready marker once before falling back to the JSONB-wide scan.
+// Also verify the update trigger: a stale projection must never be trusted.
+async function restoreReadyContentDownloadIndexOnFirstRead() {
+  if (process.env.CONTENT_DOWNLOAD_COUNT_INDEX === '0' || contentDownloadIndexReady || contentDownloadIndexReadinessChecked) return;
+  if (contentDownloadIndexReadinessPromise) return contentDownloadIndexReadinessPromise;
+  const task = (async () => {
+    try {
+      const status = await queryDbWithRetry(`
+        SELECT ready FROM psn_content_download_index_meta
+        WHERE version = $1
+          AND to_regclass('public.psn_content_download_memberships') IS NOT NULL
+          AND to_regclass('public.psn_content_download_index_users') IS NOT NULL
+          AND (
+            SELECT COUNT(*) FROM pg_trigger t
+            WHERE t.tgrelid = 'users'::regclass
+              AND t.tgname IN ('psn_download_index_insert', 'psn_download_index_update')
+              AND t.tgenabled IN ('O', 'A')
+          ) = 2
+        LIMIT 1
+      `, [CONTENT_DOWNLOAD_INDEX_VERSION], { attempts: 1, label: 'CONTENT DOWNLOAD INDEX READY CHECK' });
+      contentDownloadIndexReadinessChecked = true;
+      if (status.rows[0] && status.rows[0].ready === true) {
+        contentDownloadIndexReady = true;
+        contentDownloadIndexSchemaReady = true;
+        clearContentDownloadCountCache();
+        console.log('[CONTENT DOWNLOAD INDEX] Reusing ready index from PostgreSQL.');
+      }
+    } catch (error) {
+      // First deployment may not have created the index tables yet. The normal
+      // background builder will create them and only enable indexed reads once ready.
+      if (error && error.code === '42P01') contentDownloadIndexReadinessChecked = true;
+    }
+  })();
+  contentDownloadIndexReadinessPromise = task;
+  try { await task; } finally {
+    if (contentDownloadIndexReadinessPromise === task) contentDownloadIndexReadinessPromise = null;
+  }
+}
 
 function scheduleContentDownloadIndexMaintenance(delayMs = 30000) {
   if (process.env.CONTENT_DOWNLOAD_COUNT_INDEX === '0' || contentDownloadIndexReady || contentDownloadIndexTimer !== null || contentDownloadIndexInitializing) return;
@@ -5926,6 +5968,7 @@ function scheduleContentDownloadCountBatch() {
         }
       }
       if (queryKeys.length) {
+      if (!contentDownloadIndexReady) await restoreReadyContentDownloadIndexOnFirstRead();
       const useContentIndex = contentDownloadIndexReady && process.env.CONTENT_DOWNLOAD_COUNT_INDEX !== '0' &&
         queryKeys.every(key => Buffer.byteLength(key, 'utf8') <= 2048);
       const candidateIds = useContentIndex || process.env.CONTENT_DOWNLOAD_COUNT_ID_FILTER === '0'

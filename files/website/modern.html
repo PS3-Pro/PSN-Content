@@ -16753,7 +16753,9 @@ P
 				if (updatedAt > currentUpdatedAt) safeLocalStorageSet(scopedTimeKey, String(updatedAt));
 				if (getProfileNotificationRuntimeOwner() === owner && updatedAt > Number(loadState(timeKey) || 0)) safeLocalStorageSet(timeKey, String(updatedAt));
 			}
-			if (response.notificationState && typeof window.applyProfileNotificationStateFromServer === 'function') {
+			// A late ACK from the previous account must not alter the active account's
+			// global notification-migration state or its visible indicators.
+			if (getProfileNotificationRuntimeOwner() === owner && response.notificationState && typeof window.applyProfileNotificationStateFromServer === 'function') {
 				window.applyProfileNotificationStateFromServer(owner, response.notificationState, null);
 			}
 			if (hasQueuedLocalChanges && getProfileNotificationRuntimeOwner() === owner) scheduleProfileNotificationInflightRetry(category, owner, 45);
@@ -16841,7 +16843,7 @@ P
 	window.flushProfileNotificationStateSyncPending = flushProfileNotificationStateSyncPending;
 
 	function syncProfileNotificationStateMigration() {
-		if (!window.isProfileLoaded) return false;
+		if (!window.isProfileLoaded || window.__initialProfileSyncInProgress === true) return false;
 		restorePersistentProfileNotificationPending();
 		if (window.__profileNotificationStateNeedsMigration) {
 			window.__profileNotificationStateNeedsMigration = false;
@@ -16909,10 +16911,13 @@ P
 		};
 	}
 
-	function applyProfileNotificationStateFromServer(username, incomingState = null, legacySettings = null) {
+	function applyProfileNotificationStateFromServer(username, incomingState = null, legacySettings = null, options = {}) {
 		const name = String(username || '').trim();
 		if (!name || name === 'null') return false;
 		let state = incomingState && typeof incomingState === 'object' && !Array.isArray(incomingState) ? incomingState : null;
+		// A partial profile patch can carry legacy settings without a notification snapshot.
+		// Only complete authentication snapshots may trigger a legacy migration.
+		if (!state && options.partial === true) return false;
 		const fromLegacy = !state;
 		if (!state) state = getLegacyProfileNotificationStateFromSettings(legacySettings);
 		if (!state) {
@@ -16953,7 +16958,10 @@ P
 				const localAdmin = adminState && adminState.ready === true && adminState.tokens instanceof Set ? Array.from(adminState.tokens).sort() : null;
 				localMirrorMatches = !!localAdmin && JSON.stringify(localAdmin) === JSON.stringify(incomingAdmin) && Number(adminState.updatedAt || 0) === Math.max(0, Number(state.admin.updatedAt || 0) || 0);
 			}
-			if (localMirrorMatches) return false;
+			if (localMirrorMatches) {
+				window.__profileNotificationStateNeedsMigration = Number(state.version || 0) < Number(PROFILE_NOTIFICATION_STATE_VERSION);
+				return false;
+			}
 		}
 
 		window.__profileNotificationStateNeedsMigration = fromLegacy || Number(state.version || 0) < Number(PROFILE_NOTIFICATION_STATE_VERSION);
@@ -53106,26 +53114,63 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 	function flushAdminPendingSeenServerSync(tokens = null) {
 		const state = getAdminPendingSeenRuntime();
 		if (tokens) state.queued = getAdminPendingTokenList(tokens);
-		if (!state.ready || state.inFlight || !Array.isArray(state.queued)) return false;
+		if (!state.ready || state.inFlight || (!Array.isArray(state.queued) && !state.pendingRequest)) return false;
 		if (!window.isProfileLoaded || typeof socketChat === 'undefined' || !socketChat || !socketChat.connected) return false;
 		const owner = String(localStorage.getItem('psn_username') || '').trim();
 		if (!owner || !document.body.classList.contains('is-admin')) return false;
 
-		const outgoing = state.queued.slice(0, 500);
-		state.queued = null;
-		const signature = JSON.stringify(outgoing.slice().sort());
-		if (signature === state.lastSentSignature && outgoing.every(token => state.tokens.has(token)) && state.tokens.size === outgoing.length) return true;
+		let pending = state.pendingRequest;
+		if (!pending) {
+			const outgoing = state.queued.slice(0, 500);
+			state.queued = null;
+			const signature = JSON.stringify(outgoing.slice().sort());
+			if (signature === state.lastSentSignature && outgoing.every(token => state.tokens.has(token)) && state.tokens.size === outgoing.length) return true;
+			state.mutationSequence = Number(state.mutationSequence || 0) + 1;
+			const mutationId = `admin-seen-${Date.now().toString(36)}-${state.mutationSequence.toString(36)}`;
+			pending = { owner, attempt:0, payload:{ category:'admin', mutationId, replacePending:true, pendingItems:outgoing, clientSentAt:Date.now() } };
+			state.pendingRequest = pending;
+		}
+		if (pending.owner !== owner) return false;
 		state.inFlight = true;
-		state.mutationSequence = Number(state.mutationSequence || 0) + 1;
-		const mutationId = `admin-seen-${Date.now().toString(36)}-${state.mutationSequence.toString(36)}`;
-		socketChat.emit('profile_notification_state_update', { category:'admin', mutationId, replacePending:true, pendingItems:outgoing, clientSentAt:Date.now() }, response => {
+		pending.attempt += 1;
+		const attempt = pending.attempt;
+		clearTimeout(state.ackTimer);
+		clearTimeout(state.retryTimer);
+		state.retryTimer = null;
+		const scheduleRetry = () => {
+			clearTimeout(state.retryTimer);
+			state.retryTimer = setTimeout(() => {
+				state.retryTimer = null;
+				if (window.__adminPendingSeenState !== state || String(localStorage.getItem('psn_username') || '').trim() !== owner) return;
+				flushAdminPendingSeenServerSync();
+			}, 900);
+		};
+		state.ackTimer = setTimeout(() => {
+			if (window.__adminPendingSeenState !== state || String(localStorage.getItem('psn_username') || '').trim() !== owner || state.pendingRequest !== pending || pending.attempt !== attempt) return;
+			state.ackTimer = null;
 			state.inFlight = false;
-			if (response && response.ok === true && response.notificationState && typeof window.applyProfileNotificationStateFromServer === 'function') {
-				window.applyProfileNotificationStateFromServer(owner, response.notificationState, null);
-			} else if (!Array.isArray(state.queued)) {
-				state.queued = outgoing;
+			scheduleRetry();
+		}, 4500);
+
+		socketChat.emit('profile_notification_state_update', pending.payload, response => {
+			// A late admin ACK must not mutate a different login's notification state.
+			if (window.__adminPendingSeenState !== state || String(localStorage.getItem('psn_username') || '').trim() !== owner || state.pendingRequest !== pending || pending.attempt !== attempt) return;
+			clearTimeout(state.ackTimer);
+			clearTimeout(state.retryTimer);
+			state.ackTimer = null;
+			state.retryTimer = null;
+			state.inFlight = false;
+			if (response && response.ok === true) {
+				state.pendingRequest = null;
+				if (response.notificationState && typeof window.applyProfileNotificationStateFromServer === 'function') {
+					window.applyProfileNotificationStateFromServer(owner, response.notificationState, null);
+				}
+				if (Array.isArray(state.queued)) setTimeout(() => {
+					if (window.__adminPendingSeenState === state && String(localStorage.getItem('psn_username') || '').trim() === owner) flushAdminPendingSeenServerSync();
+				}, 180);
+			} else {
+				scheduleRetry();
 			}
-			if (Array.isArray(state.queued)) setTimeout(() => flushAdminPendingSeenServerSync(), 180);
 		});
 		return true;
 	}
@@ -85855,7 +85900,7 @@ function getVisibleChatStackEl(id) {
 				});
 			}
 			if (typeof window.applyProfileNotificationStateFromServer === 'function') {
-				window.applyProfileNotificationStateFromServer(name, userData.notificationState || null, userData.settingsData || null);
+				window.applyProfileNotificationStateFromServer(name, userData.notificationState || null, userData.settingsData || null, { partial: true });
 			}
 
 
