@@ -469,7 +469,7 @@ const CHAT_SYNC_INTERVAL_MS = 3000;
 const KEEP_ALIVE_INTERVAL_MS = Math.max(60000, parseInt(process.env.KEEP_ALIVE_INTERVAL_MS || "600000", 10) || 600000);
 const KEEP_ALIVE_TIMEOUT_MS = Math.max(1000, parseInt(process.env.KEEP_ALIVE_TIMEOUT_MS || "10000", 10) || 10000);
 const KEEP_ALIVE_URLS = [
-  "https://psn-content-ok3c.onrender.com",
+  "https://psn-content-s2k2.onrender.com",
 ];
 const PROFILE_SYNC_INTERVAL_MS = Math.max(10000, parseInt(process.env.PROFILE_SYNC_INTERVAL_MS || "15000", 10) || 15000);
 const ENABLE_PROFILE_PERIODIC_SYNC = process.env.ENABLE_PROFILE_PERIODIC_SYNC === "1";
@@ -1003,12 +1003,13 @@ function flushDbQueryPerformance() {
     slow:stats.slow, errors:stats.errors, retries:stats.retries, totalMs:stats.total
   })).sort((a,b) => b.totalMs-a.totalMs).slice(0,8);
   dbQueryPerf.clear();
-  console.log('[DB PERF 5MIN]', JSON.stringify({topQueries:summary, pool:{total:pool.totalCount, idle:pool.idleCount, waiting:pool.waitingCount, peakWaiting:dbPerfPeakWaiting, peakConnections:dbPerfPeakConnections}, admission:{enabled:DB_READ_ADMISSION_ENABLED, optionalQueuedPeak:dbAdmissionOptionalPeak, bulkPendingPeak:dbAdmissionBulkPeak, bulkWaits:dbAdmissionBulkWaits}, eventLoop:readDbEventLoopMetrics(), profile:{noopSavesAvoided:profileNoopSavesAvoided, delivery:{...profileDeliveryMetrics}}, notifications:{...profileNotificationMetrics,byCategory:{...profileNotificationMetrics.byCategory}}, userRowWrites:{...userRowMutationMetrics}, personalReadReuse:readPersonalCacheStats}));
+  console.log('[DB PERF 5MIN]', JSON.stringify({topQueries:summary, pool:{total:pool.totalCount, idle:pool.idleCount, waiting:pool.waitingCount, peakWaiting:dbPerfPeakWaiting, peakConnections:dbPerfPeakConnections}, admission:{enabled:DB_READ_ADMISSION_ENABLED, optionalQueuedPeak:dbAdmissionOptionalPeak, bulkPendingPeak:dbAdmissionBulkPeak, bulkWaits:dbAdmissionBulkWaits}, eventLoop:readDbEventLoopMetrics(), profile:{noopSavesAvoided:profileNoopSavesAvoided, delivery:{...profileDeliveryMetrics}}, notifications:{...profileNotificationMetrics,byCategory:{...profileNotificationMetrics.byCategory}}, userRowWrites:{...userRowMutationMetrics}, gameOwnershipSync:{...gameOwnershipSyncMetrics}, personalReadReuse:readPersonalCacheStats}));
   profileNoopSavesAvoided = 0;
   Object.keys(profileDeliveryMetrics).forEach(key => { profileDeliveryMetrics[key] = 0; });
   ['received','saved','duplicate','logicalNoChange','categoryConflicts'].forEach(key => { profileNotificationMetrics[key] = 0; });
   profileNotificationMetrics.byCategory = Object.create(null);
   Object.keys(userRowMutationMetrics).forEach(key => { userRowMutationMetrics[key] = 0; });
+  Object.keys(gameOwnershipSyncMetrics).forEach(key => { gameOwnershipSyncMetrics[key] = 0; });
   readPersonalCacheStats = { rewards:{fresh:0,shared:0,db:0}, reports:{fresh:0,shared:0,db:0} };
   dbAdmissionOptionalPeak = 0;
   dbAdmissionBulkPeak = 0;
@@ -8197,102 +8198,169 @@ async function ensureGameOwnershipIndexReady() {
   return gameOwnershipIndexBuildPromise;
 }
 
-async function syncUserGameOwnershipIndex(userName, changes = {}, options = {}) {
+// Coalesce background index updates per account. Read the committed profile
+// inside the transaction: an earlier deferred request must never replay an old
+// Library/Downloads snapshot after a newer profile save or another instance.
+const gameOwnershipSyncJobs = new Map();
+const gameOwnershipSyncMetrics = { requests:0, coalesced:0, runs:0, unchanged:0, changedIds:0, retries:0, failed:0 };
+
+function scheduleUserGameOwnershipIndexSync(userName, options = {}) {
   const safeName = normalizeText(userName, '');
-  if (!safeName || !changes || typeof changes !== 'object') return [];
-
-  const hasLibrary = Object.prototype.hasOwnProperty.call(changes, 'libraryData');
-  const hasDownloads = Object.prototype.hasOwnProperty.call(changes, 'downloadsData');
-  if (!hasLibrary && !hasDownloads) return [];
-
-  const libraryIds = hasLibrary ? getLibraryOwnershipTitleIds(changes.libraryData) : [];
-  const downloadIds = hasDownloads ? getDownloadOwnershipTitleIds(changes.downloadsData) : [];
-  const previousResult = await queryDbWithRetry(
-    'SELECT title_id, in_library, downloaded FROM user_game_ownership WHERE user_name = $1',
-    [safeName],
-    { attempts: 2, label: 'GAME OWNERSHIP INDEX DIFF' }
-  );
-  const previous = new Map();
-  (previousResult.rows || []).forEach(row => {
-    const titleId = normalizeGamePlayersTitleId(row.title_id);
-    if (titleId) previous.set(titleId, { inLibrary: row.in_library === true, downloaded: row.downloaded === true });
-  });
-
-  const next = new Map(Array.from(previous, ([titleId, flags]) => [titleId, { ...flags }]));
-  if (hasLibrary) {
-    next.forEach(flags => { flags.inLibrary = false; });
-    libraryIds.forEach(titleId => {
-      const flags = next.get(titleId) || { inLibrary: false, downloaded: false };
-      flags.inLibrary = true;
-      next.set(titleId, flags);
-    });
+  if (!safeName) return;
+  gameOwnershipSyncMetrics.requests++;
+  const existing = gameOwnershipSyncJobs.get(safeName);
+  if (existing) {
+    gameOwnershipSyncMetrics.coalesced++;
+    existing.dirty = true;
+    // When multiple clients change one list, notify all rather than excluding
+    // the last socket and potentially hiding an earlier change from it.
+    if (existing.sourceSocketId !== (options.sourceSocketId || null)) existing.sourceSocketId = null;
+    return;
   }
-  if (hasDownloads) {
-    next.forEach(flags => { flags.downloaded = false; });
-    downloadIds.forEach(titleId => {
-      const flags = next.get(titleId) || { inLibrary: false, downloaded: false };
-      flags.downloaded = true;
-      next.set(titleId, flags);
-    });
+  const job = { name:safeName, dirty:true, running:false, timer:null, failures:0, sourceSocketId:options.sourceSocketId || null };
+  gameOwnershipSyncJobs.set(safeName, job);
+  scheduleGameOwnershipSyncJob(job, 35);
+}
+
+function scheduleGameOwnershipSyncJob(job, delayMs) {
+  if (job.timer || job.running) return;
+  job.timer = setTimeout(() => {
+    job.timer = null;
+    runGameOwnershipSyncJob(job).catch(err => console.error('[GAME OWNERSHIP INDEX JOB ERROR]:', err));
+  }, delayMs);
+}
+
+async function runGameOwnershipSyncJob(job) {
+  if (job.running || !job.dirty || gameOwnershipSyncJobs.get(job.name) !== job) return;
+  job.running = true;
+  job.dirty = false;
+  const sourceSocketId = job.sourceSocketId;
+  job.sourceSocketId = null;
+  let retryDelayMs = 0;
+  try {
+    gameOwnershipSyncMetrics.runs++;
+    const changedTitleIds = await syncUserGameOwnershipIndex(job.name, { sourceSocketId });
+    gameOwnershipSyncMetrics.changedIds += changedTitleIds.length;
+    if (!changedTitleIds.length) gameOwnershipSyncMetrics.unchanged++;
+    job.failures = 0;
+  } catch (err) {
+    job.failures++;
+    const errorCode = String(err && err.code || '').toUpperCase();
+    // A capacity error or canceled query should NOT be retried immediately by
+    // the global SQL helper, but the deferred index must remain pending until
+    // the database recovers. Dropping it after seven attempts leaves stale
+    // ownership counts until another Library/Downloads change happens.
+    if (isPgTransientConnectionError(err) || errorCode === '53300' || errorCode === '57014') {
+      gameOwnershipSyncMetrics.retries++;
+      job.dirty = true;
+      // Capped exponential delay remains safe during long Aiven outages.
+      retryDelayMs = Math.min(60000, 250 * (2 ** Math.min(job.failures - 1, 8)));
+      if (errorCode === '53300') retryDelayMs = Math.max(15000, retryDelayMs);
+      if (errorCode === '57014') retryDelayMs = Math.max(5000, retryDelayMs);
+      if (job.failures === 1 || job.failures % 10 === 0) {
+        console.warn(`[GAME OWNERSHIP INDEX] Sync pending after temporary PostgreSQL error; retry ${job.failures} in ${retryDelayMs}ms (code ${errorCode || 'connection'}).`);
+      }
+    } else {
+      gameOwnershipSyncMetrics.failed++;
+      console.error('[GAME OWNERSHIP INDEX DEFERRED ERROR]:', err);
+    }
+  } finally {
+    job.running = false;
+    if (job.dirty) {
+      scheduleGameOwnershipSyncJob(job, retryDelayMs || 35);
+    } else if (gameOwnershipSyncJobs.get(job.name) === job) {
+      gameOwnershipSyncJobs.delete(job.name);
+    }
   }
+}
 
-  const changedTitleIds = [...new Set([...previous.keys(), ...next.keys()])].filter(titleId => {
-    const before = previous.get(titleId) || { inLibrary: false, downloaded: false };
-    const after = next.get(titleId) || { inLibrary: false, downloaded: false };
-    return before.inLibrary !== after.inLibrary || before.downloaded !== after.downloaded;
-  });
-  if (!changedTitleIds.length) return [];
+async function syncUserGameOwnershipIndex(userName, options = {}) {
+  const safeName = normalizeText(userName, '');
+  if (!safeName) return [];
 
-  await runDbTransactionWithRetry('GAME OWNERSHIP INDEX SYNC', async client => {
-    if (hasLibrary) {
-      await client.query(
-        'UPDATE user_game_ownership SET in_library = FALSE, updated_at = NOW() WHERE user_name = $1 AND in_library = TRUE',
-        [safeName]
-      );
-      if (libraryIds.length) {
-        await client.query(
-          `INSERT INTO user_game_ownership (user_name, title_id, in_library, downloaded, updated_at)
-           SELECT $1, ids.title_id, TRUE, FALSE, NOW()
-           FROM jsonb_array_elements_text($2::jsonb) AS ids(title_id)
-           WHERE ids.title_id ~ '^[A-Z]{4}[0-9]{5}$'
-           ON CONFLICT (user_name, title_id)
-           DO UPDATE SET in_library = TRUE, updated_at = NOW()`,
-          [safeName, JSON.stringify(libraryIds)]
-        );
-      }
-    }
-
-    if (hasDownloads) {
-      await client.query(
-        'UPDATE user_game_ownership SET downloaded = FALSE, updated_at = NOW() WHERE user_name = $1 AND downloaded = TRUE',
-        [safeName]
-      );
-      if (downloadIds.length) {
-        await client.query(
-          `INSERT INTO user_game_ownership (user_name, title_id, in_library, downloaded, updated_at)
-           SELECT $1, ids.title_id, FALSE, TRUE, NOW()
-           FROM jsonb_array_elements_text($2::jsonb) AS ids(title_id)
-           WHERE ids.title_id ~ '^[A-Z]{4}[0-9]{5}$'
-           ON CONFLICT (user_name, title_id)
-           DO UPDATE SET downloaded = TRUE, updated_at = NOW()`,
-          [safeName, JSON.stringify(downloadIds)]
-        );
-      }
-    }
-
-    await client.query(
-      'DELETE FROM user_game_ownership WHERE user_name = $1 AND in_library = FALSE AND downloaded = FALSE',
+  // Lock the account row first, consistently with ordinary profile writes and
+  // account deletion. This works across Render instances and ensures the index
+  // corresponds to a committed version of BOTH lists, not stale job payloads.
+  const changedTitleIds = await runDbTransactionWithRetry('GAME OWNERSHIP INDEX SYNC', async client => {
+    const profileResult = await client.query(
+      `SELECT data->'libraryData' AS library_data, data->'downloadsData' AS downloads_data
+       FROM users WHERE name = $1 FOR NO KEY UPDATE`,
       [safeName]
     );
-  }, { attempts: 3, lockTimeoutMs: 1200, advisoryLockKey: `user_game_ownership:${safeName}` });
+    if (!profileResult.rows.length) return [];
 
+    const profile = profileResult.rows[0];
+    const libraryIds = getLibraryOwnershipTitleIds(profile.library_data);
+    const downloadIds = getDownloadOwnershipTitleIds(profile.downloads_data);
+    const currentResult = await client.query(
+      'SELECT title_id, in_library, downloaded FROM user_game_ownership WHERE user_name = $1',
+      [safeName]
+    );
+    const current = new Map();
+    for (const row of currentResult.rows) {
+      const titleId = normalizeGamePlayersTitleId(row.title_id);
+      if (titleId) current.set(titleId, { inLibrary: row.in_library === true, downloaded: row.downloaded === true });
+    }
+    const desired = new Map();
+    for (const titleId of libraryIds) desired.set(titleId, { inLibrary:true, downloaded:false });
+    for (const titleId of downloadIds) {
+      const flags = desired.get(titleId) || { inLibrary:false, downloaded:false };
+      flags.downloaded = true;
+      desired.set(titleId, flags);
+    }
+
+    const changed = [...new Set([...current.keys(), ...desired.keys()])].filter(titleId => {
+      const before = current.get(titleId) || { inLibrary:false, downloaded:false };
+      const after = desired.get(titleId) || { inLibrary:false, downloaded:false };
+      return before.inLibrary !== after.inLibrary || before.downloaded !== after.downloaded || (!desired.has(titleId) && current.has(titleId));
+    });
+    if (!changed.length) return [];
+
+    const updates = changed.filter(titleId => desired.has(titleId)).map(titleId => ({
+      title_id:titleId,
+      in_library:desired.get(titleId).inLibrary,
+      downloaded:desired.get(titleId).downloaded
+    }));
+    const removals = changed.filter(titleId => !desired.has(titleId));
+
+    if (updates.length) {
+      await client.query(
+        `INSERT INTO user_game_ownership (user_name, title_id, in_library, downloaded, updated_at)
+         SELECT $1, change.title_id, change.in_library, change.downloaded, NOW()
+         FROM jsonb_to_recordset($2::jsonb) AS change(title_id TEXT, in_library BOOLEAN, downloaded BOOLEAN)
+         ON CONFLICT (user_name, title_id) DO UPDATE SET
+           in_library = EXCLUDED.in_library,
+           downloaded = EXCLUDED.downloaded,
+           updated_at = NOW()
+         WHERE user_game_ownership.in_library IS DISTINCT FROM EXCLUDED.in_library
+            OR user_game_ownership.downloaded IS DISTINCT FROM EXCLUDED.downloaded`,
+        [safeName, JSON.stringify(updates)]
+      );
+    }
+    if (removals.length) {
+      await client.query(
+        'DELETE FROM user_game_ownership WHERE user_name = $1 AND title_id = ANY($2::text[])',
+        [safeName, removals]
+      );
+    }
+    return changed;
+  }, { attempts:4, lockTimeoutMs:3000 });
+
+  if (!changedTitleIds.length) return [];
   changedTitleIds.forEach(clearGamePlayersSummaryCache);
   const changeOptions = {
-    reason: 'ownership',
-    actorName: safeName,
-    excludeSocketId: options.sourceSocketId
+    reason:'ownership',
+    actorName:safeName,
+    excludeSocketId:options.sourceSocketId
   };
-  emitGamePlayersSummaryChanged(changedTitleIds, changeOptions);
+  // The database commit has already succeeded. A local socket broadcast
+  // failure must not make the job retry SQL and then miss the original change.
+  try {
+    emitGamePlayersSummaryChanged(changedTitleIds, changeOptions);
+  } catch (err) {
+    console.error('[GAME PLAYERS LOCAL EMIT ERROR]:', err);
+    deferServerTask('GAME PLAYERS LOCAL EMIT RETRY', () => emitGamePlayersSummaryChanged(changedTitleIds, changeOptions), 250);
+  }
   deferServerTask('GAME PLAYERS NOTIFY', () => notifyGamePlayersSummaryChangedAcrossInstances(changedTitleIds, changeOptions), 0);
   return changedTitleIds;
 }
@@ -16949,10 +17017,7 @@ io.on('connection', (socket) => {
           deferServerTask('GAME PLAYERS FRIEND NOTIFY', () => notifyGamePlayersSummaryChangedAcrossInstances([], friendChangeOptions), 0);
         }
         if (gameOwnershipChanged) {
-          const ownershipChanges = {};
-          if (Object.prototype.hasOwnProperty.call(profileDbPatch, 'libraryData')) ownershipChanges.libraryData = profileDbPatch.libraryData;
-          if (Object.prototype.hasOwnProperty.call(profileDbPatch, 'downloadsData')) ownershipChanges.downloadsData = profileDbPatch.downloadsData;
-          deferServerTask('GAME OWNERSHIP INDEX SYNC', () => syncUserGameOwnershipIndex(name, ownershipChanges, { sourceSocketId: socket.id }), 0);
+          scheduleUserGameOwnershipIndexSync(name, { sourceSocketId: socket.id });
         }
         if (sharedGameAcquisitions.length) {
           const acquisitionAt = workingUser.profileUpdatedAt || Date.now();
