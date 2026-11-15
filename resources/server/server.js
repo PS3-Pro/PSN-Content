@@ -8617,12 +8617,12 @@ async function patchUserDataInternal(name, patch = {}, deleteKeys = [], label = 
   if (!name || !patch || typeof patch !== 'object' || Array.isArray(patch)) return false;
   const outgoing = { ...patch };
   const removals = Array.isArray(deleteKeys) ? deleteKeys.filter(Boolean) : [];
-  const result = await queryDbWithRetry(`
+  const result = await runSerializedProfileNotificationMutation(name, () => queryDbWithRetry(`
     UPDATE users
     SET data = (COALESCE(data, '{}'::jsonb) - $3::text[]) || $1::jsonb
     WHERE name = $2
     RETURNING name
-  `, [outgoing, name, removals], { attempts: 2, label });
+  `, [outgoing, name, removals], { attempts: 2, label }));
   return result.rows.length > 0;
 }
 
@@ -9134,41 +9134,46 @@ function emitChatHistoryToSocket(socket) {
   return socket.__chatHistoryInFlight;
 }
 
-async function ensureFullUserCacheForWrite(name) {
-  if (!name || !userDatabase[name]) return null;
-  if (fullUserCacheNames.has(name)) return userDatabase[name];
-  const loaded = await refreshSingleUserCacheFromDb(name, { forceDuringWrite: true });
-  if (!loaded) return null;
-  return userDatabase[name];
-}
+// Administrative changes are sparse: merging only their explicit fields avoids
+// a stale full-profile cache overwriting newer client sections or notification state.
+async function saveUser(name, options = {}) {
+  if (!name || !userDatabase[name]) return false;
+  const user = userDatabase[name];
+  const fields = Array.isArray(options.fields) ? [...new Set(options.fields)] : [];
+  if (!fields.length) throw new Error('saveUser requires explicit administrative fields');
+  const outgoing = {};
+  fields.forEach(field => {
+    if (Object.prototype.hasOwnProperty.call(user, field)) outgoing[field] = user[field];
+  });
+  const deleteKeys = Array.isArray(options.deleteKeys) ? [...new Set(options.deleteKeys)] : [];
+  const updatedAt = Date.now();
 
-async function updateUserDataPreservingCredentials(name, userData, label = 'USER DATA SAVE') {
-  const outgoing = normalizeUserRecord(name, userData || {});
-  for (const field of ['password','passwordMigratedAt','passwordRecoveredAt','passwordRecoverySource','pendingRolePromotionNotice','migratedFromLocalProfile','migratedAt']) delete outgoing[field];
-  const outgoingHasPasswordHash = Object.prototype.hasOwnProperty.call(outgoing, 'passwordHash') && !!outgoing.passwordHash;
-  const result = await queryDbWithRetry(`
+  const result = await runSerializedProfileNotificationMutation(name, () => queryDbWithRetry(`
     UPDATE users
-    SET data = $1::jsonb
-      || CASE WHEN NOT ($1::jsonb ? 'passwordHash') AND data ? 'passwordHash' THEN jsonb_build_object('passwordHash', data->'passwordHash') ELSE '{}'::jsonb END
-      || CASE WHEN NOT ($1::jsonb ? 'passwordResetAt') AND data ? 'passwordResetAt' THEN jsonb_build_object('passwordResetAt', data->'passwordResetAt') ELSE '{}'::jsonb END
-      || CASE WHEN NOT ($1::jsonb ? 'passwordResetBy') AND data ? 'passwordResetBy' THEN jsonb_build_object('passwordResetBy', data->'passwordResetBy') ELSE '{}'::jsonb END
-      || CASE WHEN NOT ($1::jsonb ? 'passwordResetRequired') AND data ? 'passwordResetRequired' THEN jsonb_build_object('passwordResetRequired', data->'passwordResetRequired') ELSE '{}'::jsonb END
-      || CASE WHEN NOT ($1::jsonb ? 'passwordResetExpiresAt') AND data ? 'passwordResetExpiresAt' THEN jsonb_build_object('passwordResetExpiresAt', data->'passwordResetExpiresAt') ELSE '{}'::jsonb END
-      || CASE WHEN NOT ($1::jsonb ? 'passwordResetCompletedAt') AND data ? 'passwordResetCompletedAt' THEN jsonb_build_object('passwordResetCompletedAt', data->'passwordResetCompletedAt') ELSE '{}'::jsonb END
+    SET data = (COALESCE(data, '{}'::jsonb) - $3::text[]) || $1::jsonb
+      || jsonb_build_object('profileUpdatedAt', GREATEST(
+        $4::bigint,
+        CASE WHEN (data->>'profileUpdatedAt') ~ '^[0-9]{1,18}$'
+          THEN (data->>'profileUpdatedAt')::bigint + 1 ELSE 0 END
+      ))
     WHERE name = $2
     RETURNING data
-  `, [outgoing, name], { attempts: 2, label });
+  `, [outgoing, name, deleteKeys, updatedAt], { attempts: 2, label: 'USER ADMIN PATCH SAVE' }));
 
-  if (!result.rows.length) return null;
+  if (!result.rows.length) return false;
   const saved = normalizeUserRecord(name, result.rows[0].data || {});
-  if (!outgoingHasPasswordHash && saved.passwordHash) {
-    console.warn(`[CREDENTIAL GUARD] ${label} preserved existing credentials for ${name}. Outgoing cache was missing credential fields.`);
-  }
+  // Admin command handlers can still hold a reference to this object.
+  user.profileUpdatedAt = saved.profileUpdatedAt;
   userDatabase[name] = saved;
   userCacheMeta[name] = Date.now();
   fullUserCacheNames.add(name);
-  invalidatePublicProfileListReads(name);
-  return saved;
+  invalidatePublicProfileListReads(name, [...fields, ...deleteKeys, 'profileUpdatedAt']);
+  invalidateOnlineListCache('save-user');
+  if (options.notify !== false) {
+    await notifyProfileSyncAcrossInstances(name, options.sourceSocketId || null, userDatabase[name].profileUpdatedAt);
+  }
+  deferServerTask('USER CACHE COMPACT AFTER SAVE', () => compactCachedUser(name), 250);
+  return true;
 }
 
 async function patchUserData(name, patch = {}, label = 'USER DATA PATCH') {
@@ -9179,34 +9184,20 @@ async function patchUserData(name, patch = {}, label = 'USER DATA PATCH') {
   const keys = Object.keys(outgoing);
   if (!keys.length) return true;
 
-  const result = await queryDbWithRetry(`
+  // Share the per-account write lane with notification-state mutations.
+  // Each PostgreSQL JSONB patch still merges against the latest row value.
+  const result = await runSerializedProfileNotificationMutation(name, () => queryDbWithRetry(`
     UPDATE users
     SET data = COALESCE(data, '{}'::jsonb) || $1::jsonb
     WHERE name = $2
     RETURNING name
-  `, [outgoing, name], { attempts: 2, label });
+  `, [outgoing, name], { attempts: 2, label }));
 
   if (!result.rows.length) return false;
   userCacheMeta[name] = Date.now();
   fullUserCacheNames.delete(name);
   invalidatePublicProfileListReads(name, keys);
   return true;
-}
-
-async function saveUser(name, options = {}) {
-  if (!name || !userDatabase[name]) return;
-  const loaded = await ensureFullUserCacheForWrite(name);
-  if (!loaded) return;
-  userDatabase[name] = normalizeUserRecord(name, userDatabase[name]);
-  userDatabase[name].profileUpdatedAt = Date.now();
-  userCacheMeta[name] = Date.now();
-  const saved = await updateUserDataPreservingCredentials(name, userDatabase[name], 'USER PROFILE SAVE');
-  if (!saved) return;
-  invalidateOnlineListCache('save-user');
-  if (options.notify !== false) {
-    await notifyProfileSyncAcrossInstances(name, options.sourceSocketId || null, userDatabase[name].profileUpdatedAt);
-  }
-  deferServerTask('USER CACHE COMPACT AFTER SAVE', () => compactCachedUser(name), 250);
 }
 
 async function saveAdminState(key, data) {
@@ -14368,7 +14359,7 @@ async function setUserRole(targetName, role, adminName) {
 
   /* Role changes only need a tiny cross-instance patch. Avoid the broad profile sync that
      saveUser() normally publishes, while still persisting the authoritative DB record. */
-  await saveUser(targetName, { notify: false });
+  await saveUser(targetName, { notify: false, fields: ['name', 'role', ...(roleChanged ? ['pendingRoleChangeNotice'] : [])] });
 
   const rolePayload = applyRealtimeRoleState(targetName, targetUser);
   if (roleChanged) emitRoleChangeNoticeState(targetName, roleChangeNotice);
@@ -14444,7 +14435,7 @@ async function banUser(targetName, reason, adminName) {
   userDatabase[targetName].banReason = normalizeText(reason, "Banned by administrator") || "Banned by administrator";
   userDatabase[targetName].bannedBy = adminName || "Admin";
   userDatabase[targetName].bannedAt = new Date().toISOString();
-  await saveUser(targetName);
+  await saveUser(targetName, { fields: ['banned', 'banReason', 'bannedBy', 'bannedAt'] });
 
   disconnectUserSessions(targetName, 'user_banned', { reason: userDatabase[targetName].banReason, by: adminName || 'Admin' });
   invalidateOnlineListCache('ban-user');
@@ -14466,7 +14457,7 @@ async function unbanUser(targetName, adminName) {
   delete userDatabase[targetName].banReason;
   delete userDatabase[targetName].bannedBy;
   delete userDatabase[targetName].bannedAt;
-  await saveUser(targetName);
+  await saveUser(targetName, { fields: ['banned'], deleteKeys: ['banReason', 'bannedBy', 'bannedAt'] });
 
   invalidateOnlineListCache('unban-user');
   emitPresenceUpdate(targetName, userDatabase[targetName]);
@@ -14487,7 +14478,10 @@ async function resetUserPassword(targetName, adminName) {
   userDatabase[targetName].passwordResetExpiresAt = resetExpiresAt;
   userDatabase[targetName].passwordResetBy = adminName || "Admin";
   delete userDatabase[targetName].passwordResetCompletedAt;
-  await saveUser(targetName);
+  await saveUser(targetName, {
+    fields: ['passwordHash', 'passwordResetRequired', 'passwordResetAt', 'passwordResetExpiresAt', 'passwordResetBy'],
+    deleteKeys: ['password', 'passwordResetCompletedAt']
+  });
 
   disconnectUserSessions(targetName, 'password_reset_by_admin', {
     targetName,
