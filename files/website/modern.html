@@ -64,42 +64,135 @@
 		};
 	})();</script>
 	<script>
-	// Start the small editable hero catalog download before Starting and login render.
+	// Start loading the editable hero catalog and its three neighboring images during Starting.
+	window.psnHeroFallbackImage = 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(
+		'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900">' +
+		'<defs><linearGradient id="a" x2="1" y2="1"><stop stop-color="#061529"/><stop offset=".55" stop-color="#13365b"/><stop offset="1" stop-color="#090d1d"/></linearGradient>' +
+		'<radialGradient id="b"><stop stop-color="#51a6e4" stop-opacity=".27"/><stop offset="1" stop-color="#51a6e4" stop-opacity="0"/></radialGradient></defs>' +
+		'<rect width="1600" height="900" fill="url(#a)"/><ellipse cx="1250" cy="300" rx="750" ry="620" fill="url(#b)"/>' +
+		'<path d="M0 720C340 480 620 880 1050 530S1480 390 1600 450" stroke="#72beff" stroke-opacity=".18" stroke-width="5" fill="none"/>' +
+		'<path d="M0 815C350 575 600 1000 1050 640S1480 500 1600 560" stroke="#ffffff" stroke-opacity=".08" stroke-width="3" fill="none"/>' +
+		'<text x="84" y="805" font-family="Arial,sans-serif" font-weight="bold" font-size="46" letter-spacing="8" fill="#c9e6ff" opacity=".64">PSN CONTENT</text></svg>'
+	);
 	window.psnHeroBannersPromise = (function () {
-		var controller = typeof AbortController === 'function' ? new AbortController() : null;
-		var timeout = setTimeout(function () { if (controller) controller.abort(); }, 5000);
-		try {
-			return fetch('../../resources/database/banners/hero-banners.json', { cache: 'no-cache', signal: controller ? controller.signal : undefined })
-				.then(function (response) { if (!response.ok) throw new Error('HTTP ' + response.status); return response.json(); })
-				.then(function (config) {
-					if (!config || !Array.isArray(config.banners)) throw new Error('Expected banners array');
-					var items = config.banners.map(function (entry) {
-						if (!entry || typeof entry !== 'object') return null;
-						var title = typeof entry.title === 'string' ? entry.title.trim().slice(0, 160) : '';
-						var desc = typeof entry.desc === 'string' ? entry.desc.trim().slice(0, 600) : '';
-						var img = typeof entry.img === 'string' ? entry.img.trim() : '';
-						var btnId = typeof entry.btnId === 'string' ? entry.btnId.trim().toUpperCase() : '';
-						var cat = typeof entry.cat === 'string' ? entry.cat.trim() : 'games';
-						if (!title || !desc || !/^[A-Z0-9]{9,16}$/.test(btnId) || !/^[a-z_]+$/.test(cat)) return null;
-						try { var url = new URL(img, document.baseURI); if (url.protocol !== 'https:' && url.protocol !== 'http:') return null; img = url.href; } catch (e) { return null; }
-						return { title: title, desc: desc, img: img, btnId: btnId, cat: cat };
-					}).filter(Boolean);
-					if (!items.length) throw new Error('No valid banners');
-					// Only warm the first two images during Starting; the rest remain lazy.
-					items.slice(0, 2).forEach(function (entry, index) {
-						var preload = new Image();
-						preload.decoding = 'async';
-						if (index === 0) preload.fetchPriority = 'high';
-						preload.src = entry.img;
-					});
-					return items;
-				})
-				.catch(function (error) { console.warn('[HERO] External banners unavailable:', error); return []; })
-				.finally(function () { clearTimeout(timeout); });
-		} catch (error) {
-			clearTimeout(timeout);
-			return Promise.resolve([]);
+		var url = '../../resources/database/banners/hero-banners.json';
+		// Local file previews cannot fetch neighboring JSON with standard browser security.
+		if (location.protocol === 'file:') url = 'https://ps3-pro.github.io/PSN-Content/resources/database/banners/hero-banners.json';
+		var firstSettled = false;
+		var resolveFirst;
+		var pending = null;
+		var retryTimer = null;
+		var failedAttempts = 0;
+		var ready = false;
+		var warmed = new Map();
+		var failedImages = new Set();
+		window.psnHeroChooseImage = function (entry) {
+			return entry && entry.img && !failedImages.has(entry.img)
+				? entry.img : window.psnHeroFallbackImage;
+		};
+		window.psnHeroMarkImageFailed = function (src) {
+			if (src && src !== window.psnHeroFallbackImage) failedImages.add(src);
+		};
+		var initial = new Promise(function (resolve) { resolveFirst = resolve; });
+
+		function normalize(config) {
+			if (!config || !Array.isArray(config.banners)) throw new Error('Expected banners array');
+			var items = config.banners.map(function (entry) {
+				if (!entry || typeof entry !== 'object') return null;
+				var title = typeof entry.title === 'string' ? entry.title.trim().slice(0, 160) : '';
+				var desc = typeof entry.desc === 'string' ? entry.desc.trim().slice(0, 600) : '';
+				var img = typeof entry.img === 'string' ? entry.img.trim() : '';
+				var btnId = typeof entry.btnId === 'string' ? entry.btnId.trim().toUpperCase() : '';
+				var cat = typeof entry.cat === 'string' ? entry.cat.trim() : 'games';
+				if (!title || !desc || !/^[A-Z0-9]{9,16}$/.test(btnId) || !/^[a-z_]+$/.test(cat)) return null;
+				try { var imgUrl = new URL(img, document.baseURI); if (imgUrl.protocol !== 'https:' && imgUrl.protocol !== 'http:') return null; img = imgUrl.href; } catch (e) { return null; }
+				return { title: title, desc: desc, img: img, btnId: btnId, cat: cat };
+			}).filter(Boolean);
+			if (!items.length) throw new Error('No valid banners');
+			return items;
 		}
+
+		function warmImage(entry, highPriority) {
+			if (!entry || !entry.img || failedImages.has(entry.img)) return Promise.resolve(false);
+			if (warmed.has(entry.img)) return warmed.get(entry.img);
+			var promise = new Promise(function (resolve) {
+				var image = new Image();
+				var settled = false;
+				image.decoding = 'async';
+				if (highPriority) image.fetchPriority = 'high';
+				var timer = setTimeout(function () { finish(false); }, 6500);
+				function finish(ok) {
+					if (settled) return;
+					settled = true;
+					clearTimeout(timer);
+					image.onload = image.onerror = null;
+					if (!ok) { failedImages.add(entry.img); image.src = ''; }
+					resolve(ok);
+				}
+				image.onload = function () { finish(true); };
+				image.onerror = function () { finish(false); };
+				image.src = entry.img;
+			});
+			warmed.set(entry.img, promise);
+			if (warmed.size > 8) warmed.delete(warmed.keys().next().value);
+			return promise;
+		}
+
+		window.psnHeroWarmNeighbors = function (items, center) {
+			if (!Array.isArray(items) || !items.length) return Promise.resolve([]);
+			var length = items.length;
+			var indexes = [(center + length - 1) % length, center % length, (center + 1) % length];
+			var unique = indexes.filter(function (index, i) { return indexes.indexOf(index) === i; });
+			return Promise.all(unique.map(function (index) { return warmImage(items[index], index === center); }));
+		};
+		window.psnHeroInitialImagesReady = initial.then(function (items) {
+			return window.psnHeroWarmNeighbors(items, 0);
+		});
+
+		function scheduleRetry() {
+			if (ready || retryTimer || document.hidden) return;
+			var delay = Math.min(30000, 1500 * Math.pow(2, Math.min(failedAttempts - 1, 5)));
+			retryTimer = setTimeout(function () { retryTimer = null; request(); }, delay);
+		}
+		function request() {
+			if (ready || pending) return pending || initial;
+			var controller = typeof AbortController === 'function' ? new AbortController() : null;
+			var timeout = setTimeout(function () { if (controller) controller.abort(); }, failedAttempts ? 8000 : 5000);
+			pending = Promise.resolve().then(function () {
+				return fetch(url, { cache: failedAttempts ? 'reload' : 'no-cache', signal: controller ? controller.signal : undefined });
+			}).then(function (response) {
+				if (!response.ok) throw new Error('HTTP ' + response.status);
+				return response.json();
+			}).then(normalize).then(function (items) {
+				ready = true;
+				window.psnHeroResolvedCatalog = items;
+				if (!firstSettled) {
+					firstSettled = true;
+					resolveFirst(items);
+				} else {
+					window.psnHeroWarmNeighbors(items, 0);
+					window.dispatchEvent(new CustomEvent('psn-hero-catalog-recovered', { detail: items }));
+				}
+			}).catch(function (error) {
+				failedAttempts++;
+				console.warn('[HERO] Banner catalog unavailable (retrying):', error);
+				if (!firstSettled) { firstSettled = true; resolveFirst([]); }
+			}).finally(function () {
+				clearTimeout(timeout);
+				pending = null;
+				scheduleRetry();
+			});
+			return pending;
+		}
+		function resume() {
+			if (ready || document.hidden) return;
+			if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+			request();
+		}
+		window.addEventListener('online', resume);
+		document.addEventListener('visibilitychange', function () { if (!document.hidden) resume(); });
+		request();
+		return initial;
 	})();
 	</script>
     <meta charset="UTF-8">
@@ -1982,7 +2075,7 @@ html.ios-webkit #object-particles { contain:strict; }
 .hero-slide.active-slide { opacity: 1; filter: brightness(1) blur(0); height: 100%; transform: scale(1) translateZ(0); box-shadow: 0 10px 10px rgba(0,0,0,0.1); z-index: 5; }
 
 /* Cinematic zoom on the upper Home banner background only. */
-#view-explore .hero-slide-kenburns { position: absolute; inset: 0; z-index: 0; overflow: hidden; pointer-events: none; }
+#view-explore .hero-slide-kenburns { position: absolute; inset: 0; z-index: 0; overflow: hidden; pointer-events: none; background: radial-gradient(ellipse at 78% 35%, rgba(52,129,188,.35), transparent 55%), linear-gradient(120deg,#061326,#17345a 60%,#090d1c); }
 @keyframes psnHeroKenBurns { from { transform: scale(1) translateZ(0); } to { transform: scale(1.055) translateZ(0); } }
 @media (prefers-reduced-motion: no-preference) {
   #view-explore .hero-slide.active-slide .hero-slide-kenburns { animation: psnHeroKenBurns var(--hero-slide-duration,5000ms) linear both; animation-play-state: paused; }
@@ -24702,7 +24795,11 @@ P
                 ? warmExploreBeforeUserSelect({ cooperative }).catch(e => console.warn('[System] Explore warmup failed', e))
                 : Promise.resolve();
 
-            await Promise.allSettled([backgroundJob, prefetchJob, exploreJob]);
+            const heroJob = Promise.race([
+                Promise.resolve(window.psnHeroInitialImagesReady).catch(() => null),
+                new Promise(resolve => setTimeout(resolve, 1800))
+            ]);
+            await Promise.allSettled([backgroundJob, prefetchJob, exploreJob, heroJob]);
             window.__bootStorePrefetchHighPriority = true;
             return window.psnStoreCache || {};
         })();
@@ -56050,6 +56147,20 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
         container.replaceChildren(fragment);
     }
     
+    function armHeroImageWatchdog(image) {
+        if (!image || image.complete || image.__psnHeroWatchdog) return;
+        image.__psnHeroWatchdog = setTimeout(() => {
+            image.__psnHeroWatchdog = null;
+            // A Cloudflare challenge can leave an image pending without a browser error.
+            if (image.isConnected && !image.complete) image.dispatchEvent(new Event('error'));
+        }, 7000);
+    }
+
+    function clearHeroImageWatchdog(image) {
+        if (image.__psnHeroWatchdog) clearTimeout(image.__psnHeroWatchdog);
+        image.__psnHeroWatchdog = null;
+    }
+
     function initCarousel(options = {}) {
         const track = document.getElementById('carousel-track');
         if (!track || !bannerData.length) return;
@@ -56066,13 +56177,30 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
                 kenburns.className = 'hero-slide-kenburns';
                 const image = document.createElement('img');
                 image.className = 'hero-slide-img';
-                if (data.img) image.src = data.img;
                 image.alt = data.title;
-                image.loading = (i === 1 || i === 2) ? 'eager' : 'lazy';
+                // Configure lazy/eager before src to avoid fetching all banners on construction.
+                // Defer the src on distant slides: mobile browsers may ignore lazy loading in a carousel.
+                image.loading = i <= 2 || i === fullData.length - 2 ? 'eager' : 'lazy';
+                image.__psnHeroData = data;
                 image.decoding = 'async';
                 image.fetchPriority = i === 1 ? 'high' : 'auto';
                 image.draggable = false;
-                image.addEventListener('error', () => { image.style.opacity = '0'; }, { once:true });
+                image.style.opacity = '0';
+                image.addEventListener('load', () => {
+                    clearHeroImageWatchdog(image);
+                    image.style.opacity = '1';
+                });
+                image.addEventListener('error', () => {
+                    clearHeroImageWatchdog(image);
+                    const failed = image.currentSrc || image.src;
+                    if (typeof window.psnHeroMarkImageFailed === 'function') window.psnHeroMarkImageFailed(failed);
+                    if (image.src !== window.psnHeroFallbackImage) image.src = window.psnHeroFallbackImage;
+                });
+                if (image.loading === 'eager') {
+                    image.src = typeof window.psnHeroChooseImage === 'function'
+                        ? window.psnHeroChooseImage(data)
+                        : (data.img || window.psnHeroFallbackImage);
+                }
                 kenburns.appendChild(image);
                 const content = document.createElement('div');
                 content.className = 'hero-content';
@@ -56238,13 +56366,28 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
     }
 
     function primeHeroImages(slides, index) {
-        for (let slideIndex = index - 1; slideIndex <= index + 1; slideIndex++) {
-            const slide = slides[slideIndex];
-            if (!slide || (!heroHomeReady && index === 1 && slideIndex === 0)) continue;
-            const img = slide.querySelector('.hero-slide-img');
+        const count = bannerData.length;
+        if (!count) return;
+        const logical = ((index - 1) % count + count) % count;
+        const previous = (logical + count - 1) % count;
+        const next = (logical + 1) % count;
+        // The cloned edge slides must also preload the logical previous/current/next trio.
+        const positions = new Set([previous + 1, logical + 1, next + 1, index]);
+        if (previous === count - 1) positions.add(0);
+        if (next === 0) positions.add(count + 1);
+        if (typeof window.psnHeroWarmNeighbors === 'function') window.psnHeroWarmNeighbors(bannerData, logical);
+        for (const position of positions) {
+            const img = slides[position]?.querySelector('.hero-slide-img');
             if (!img) continue;
             if (img.loading !== 'eager') img.loading = 'eager';
-            if (slideIndex === index && img.fetchPriority !== 'high') img.fetchPriority = 'high';
+            if (position === index && img.fetchPriority !== 'high') img.fetchPriority = 'high';
+            if (!img.hasAttribute('src')) {
+                const entry = img.__psnHeroData;
+                img.src = typeof window.psnHeroChooseImage === 'function'
+                    ? window.psnHeroChooseImage(entry)
+                    : (entry?.img || window.psnHeroFallbackImage);
+            }
+            armHeroImageWatchdog(img);
         }
     }
 
@@ -56385,6 +56528,13 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 	
 	function goToSlide(index) {
 		if (isTransitioning || index === currentIndex) return;
+		// Use the adjacent infinite-loop clone when selecting the opposite edge.
+		// This avoids sweeping through (and loading) every intervening banner.
+		const lastIndex = bannerData.length;
+		if (lastIndex > 1) {
+			if (currentIndex === 1 && index === lastIndex) index = 0;
+			else if (currentIndex === lastIndex && index === 1) index = lastIndex + 1;
+		}
 		isTransitioning = true;
 		currentIndex = index;
 		updateBanner(true);
@@ -56466,14 +56616,32 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 	
     const initCarouselWhenReady = () => {
         const afterCatalog = entries => {
-            bannerData = Array.isArray(entries) && entries.length ? entries : [{
+            const hasEntries = Array.isArray(entries) && entries.length;
+            // Keep any real catalog already recovered from a pending request.
+            if (!hasEntries && bannerData.length && bannerData[0].btnId) return;
+            if (hasEntries && bannerData === entries) return;
+            const track = document.getElementById('carousel-track');
+            if (track && track.dataset.heroBootPrepared === 'true') {
+                stopAutoSlide();
+                if (heroTransitionFallbackTimer) clearTimeout(heroTransitionFallbackTimer);
+                heroTransitionFallbackTimer = null;
+                isTransitioning = false;
+                currentIndex = 1;
+                heroSlides = [];
+                activeHeroSlide = null;
+                activeHeroIndicator = null;
+                heroGeometryCache = null;
+                track.dataset.heroBootPrepared = 'false';
+            }
+            bannerData = hasEntries ? entries : [{
                 title: 'EXPLORE GAMES',
                 desc: 'Discover games in the PlayStation Network catalog.',
                 img: '', btnId: '', cat: 'games'
             }];
             initCarousel({ bootOnly: !heroHomeReady });
         };
-        Promise.resolve(window.psnHeroBannersPromise || []).then(afterCatalog).catch(() => afterCatalog([]));
+        window.addEventListener('psn-hero-catalog-recovered', event => afterCatalog(event.detail));
+        Promise.resolve(window.psnHeroBannersPromise || []).then(entries => afterCatalog(window.psnHeroResolvedCatalog || entries)).catch(() => afterCatalog(window.psnHeroResolvedCatalog || []));
         const afterHome = () => {
             heroHomeReady = true;
             if (bannerData.length) initCarousel();
