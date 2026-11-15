@@ -846,7 +846,7 @@ async function acknowledgeRoleChangeNotice(name, noticeId) {
   const currentUser = userDatabase[safeName] || null;
   const memoryPending = getPendingRoleChangeNotice(currentUser, safeName);
 
-  const result = await queryDbWithRetry(
+  const result = await runSerializedUserRowMutation(safeName, () => queryDbWithRetry(
     `UPDATE users
      SET data = jsonb_set(
        jsonb_set(
@@ -867,7 +867,7 @@ async function acknowledgeRoleChangeNotice(name, noticeId) {
      RETURNING data->>'roleNoticeAcknowledgedRole' AS acknowledged_role`,
     [safeName, safeNoticeId],
     { attempts: 2, label: 'ROLE CHANGE NOTICE ACK' }
-  );
+  ));
 
   if (result.rows.length && currentUser) {
     const acknowledgedRole = normalizeRoleNoticeRole(
@@ -1003,11 +1003,12 @@ function flushDbQueryPerformance() {
     slow:stats.slow, errors:stats.errors, retries:stats.retries, totalMs:stats.total
   })).sort((a,b) => b.totalMs-a.totalMs).slice(0,8);
   dbQueryPerf.clear();
-  console.log('[DB PERF 5MIN]', JSON.stringify({topQueries:summary, pool:{total:pool.totalCount, idle:pool.idleCount, waiting:pool.waitingCount, peakWaiting:dbPerfPeakWaiting, peakConnections:dbPerfPeakConnections}, admission:{enabled:DB_READ_ADMISSION_ENABLED, optionalQueuedPeak:dbAdmissionOptionalPeak, bulkPendingPeak:dbAdmissionBulkPeak, bulkWaits:dbAdmissionBulkWaits}, eventLoop:readDbEventLoopMetrics(), profile:{noopSavesAvoided:profileNoopSavesAvoided, delivery:{...profileDeliveryMetrics}}, notifications:{...profileNotificationMetrics,byCategory:{...profileNotificationMetrics.byCategory}}, personalReadReuse:readPersonalCacheStats}));
+  console.log('[DB PERF 5MIN]', JSON.stringify({topQueries:summary, pool:{total:pool.totalCount, idle:pool.idleCount, waiting:pool.waitingCount, peakWaiting:dbPerfPeakWaiting, peakConnections:dbPerfPeakConnections}, admission:{enabled:DB_READ_ADMISSION_ENABLED, optionalQueuedPeak:dbAdmissionOptionalPeak, bulkPendingPeak:dbAdmissionBulkPeak, bulkWaits:dbAdmissionBulkWaits}, eventLoop:readDbEventLoopMetrics(), profile:{noopSavesAvoided:profileNoopSavesAvoided, delivery:{...profileDeliveryMetrics}}, notifications:{...profileNotificationMetrics,byCategory:{...profileNotificationMetrics.byCategory}}, userRowWrites:{...userRowMutationMetrics}, personalReadReuse:readPersonalCacheStats}));
   profileNoopSavesAvoided = 0;
   Object.keys(profileDeliveryMetrics).forEach(key => { profileDeliveryMetrics[key] = 0; });
   ['received','saved','duplicate','logicalNoChange','categoryConflicts'].forEach(key => { profileNotificationMetrics[key] = 0; });
   profileNotificationMetrics.byCategory = Object.create(null);
+  Object.keys(userRowMutationMetrics).forEach(key => { userRowMutationMetrics[key] = 0; });
   readPersonalCacheStats = { rewards:{fresh:0,shared:0,db:0}, reports:{fresh:0,shared:0,db:0} };
   dbAdmissionOptionalPeak = 0;
   dbAdmissionBulkPeak = 0;
@@ -4219,16 +4220,17 @@ function getProfileNotificationStatePayloadServer(user = {}) {
   return normalizeProfileNotificationStateServer(user.notificationState);
 }
 
-const profileNotificationMutationQueues = new Map();
+const userRowMutationQueues = new Map();
+const userRowMutationMetrics = { received: 0, queued: 0, maxWaitMs: 0, totalWaitMs: 0, failed: 0 };
 const profileNotificationPendingMutations = new Map();
 
 function runSharedProfileNotificationMutation(name,category,patch) {
   const mutationId = normalizeText(patch.mutationId,'');
-  if (!mutationId) return runSerializedProfileNotificationMutation(name,() => updateProfileNotificationCategoryInDb(name,category,patch));
+  if (!mutationId) return runSerializedUserRowMutation(name,() => updateProfileNotificationCategoryInDb(name,category,patch));
   const key = JSON.stringify([name,category,mutationId,patch]);
   const existing = profileNotificationPendingMutations.get(key);
   if (existing) return existing.then(value => value ? {...value,duplicate:true} : value);
-  const pending = runSerializedProfileNotificationMutation(name,() => updateProfileNotificationCategoryInDb(name,category,patch));
+  const pending = runSerializedUserRowMutation(name,() => updateProfileNotificationCategoryInDb(name,category,patch));
   profileNotificationPendingMutations.set(key,pending);
   pending.finally(() => {
     if (profileNotificationPendingMutations.get(key) === pending) profileNotificationPendingMutations.delete(key);
@@ -4237,18 +4239,28 @@ function runSharedProfileNotificationMutation(name,category,patch) {
 }
 
 
-function runSerializedProfileNotificationMutation(name, task) {
+// Serialize all local mutations of one users.data row; never hold this lane
+// while waiting for client ACKs, socket delivery, or unrelated background work.
+function runSerializedUserRowMutation(name, task) {
   const safeName = normalizeText(name, '');
   if (!safeName || typeof task !== 'function') return Promise.resolve(null);
 
-  const previous = profileNotificationMutationQueues.get(safeName) || Promise.resolve();
-  const run = previous.catch(() => null).then(task);
-  const tail = run.then(() => null, () => null);
-  profileNotificationMutationQueues.set(safeName, tail);
+  const previous = userRowMutationQueues.get(safeName) || Promise.resolve();
+  const queuedAt = Date.now();
+  userRowMutationMetrics.received++;
+  if (userRowMutationQueues.has(safeName)) userRowMutationMetrics.queued++;
+  const run = previous.catch(() => null).then(() => {
+    const waitedMs = Math.max(0, Date.now() - queuedAt);
+    userRowMutationMetrics.maxWaitMs = Math.max(userRowMutationMetrics.maxWaitMs, waitedMs);
+    userRowMutationMetrics.totalWaitMs += waitedMs;
+    return task();
+  });
+  const tail = run.then(() => null, () => { userRowMutationMetrics.failed++; });
+  userRowMutationQueues.set(safeName, tail);
 
   tail.finally(() => {
-    if (profileNotificationMutationQueues.get(safeName) === tail) {
-      profileNotificationMutationQueues.delete(safeName);
+    if (userRowMutationQueues.get(safeName) === tail) {
+      userRowMutationQueues.delete(safeName);
     }
   });
 
@@ -8617,7 +8629,7 @@ async function patchUserDataInternal(name, patch = {}, deleteKeys = [], label = 
   if (!name || !patch || typeof patch !== 'object' || Array.isArray(patch)) return false;
   const outgoing = { ...patch };
   const removals = Array.isArray(deleteKeys) ? deleteKeys.filter(Boolean) : [];
-  const result = await runSerializedProfileNotificationMutation(name, () => queryDbWithRetry(`
+  const result = await runSerializedUserRowMutation(name, () => queryDbWithRetry(`
     UPDATE users
     SET data = (COALESCE(data, '{}'::jsonb) - $3::text[]) || $1::jsonb
     WHERE name = $2
@@ -9148,7 +9160,7 @@ async function saveUser(name, options = {}) {
   const deleteKeys = Array.isArray(options.deleteKeys) ? [...new Set(options.deleteKeys)] : [];
   const updatedAt = Date.now();
 
-  const result = await runSerializedProfileNotificationMutation(name, () => queryDbWithRetry(`
+  const result = await runSerializedUserRowMutation(name, () => queryDbWithRetry(`
     UPDATE users
     SET data = (COALESCE(data, '{}'::jsonb) - $3::text[]) || $1::jsonb
       || jsonb_build_object('profileUpdatedAt', GREATEST(
@@ -9186,7 +9198,7 @@ async function patchUserData(name, patch = {}, label = 'USER DATA PATCH') {
 
   // Share the per-account write lane with notification-state mutations.
   // Each PostgreSQL JSONB patch still merges against the latest row value.
-  const result = await runSerializedProfileNotificationMutation(name, () => queryDbWithRetry(`
+  const result = await runSerializedUserRowMutation(name, () => queryDbWithRetry(`
     UPDATE users
     SET data = COALESCE(data, '{}'::jsonb) || $1::jsonb
     WHERE name = $2
@@ -13939,9 +13951,17 @@ async function upsertPresenceForSocket(socket, name) {
     const now = Date.now();
 
     if (shouldAnnouncePresence) {
-      const transition = await runDbTransactionWithRetry(`PRESENCE ONLINE ${owner}`, async client => {
-        const storedResult = await client.query('SELECT data FROM users WHERE name = $1 LIMIT 1', [name]);
-        const storedUser = storedResult.rows[0] && storedResult.rows[0].data && typeof storedResult.rows[0].data === 'object' ? storedResult.rows[0].data : {};
+      const transition = await runSerializedUserRowMutation(name, () => runDbTransactionWithRetry(`PRESENCE ONLINE ${owner}`, async client => {
+        const storedResult = await client.query(
+          `SELECT data->'online' AS online, data->>'lastSeen' AS last_seen,
+                  data->>'presenceRevision' AS presence_revision
+           FROM users WHERE name = $1 LIMIT 1`, [name]);
+        const storedRow = storedResult.rows[0] || {};
+        const storedUser = {
+          online: storedRow.online === true || storedRow.online === 'true',
+          lastSeen: storedRow.last_seen,
+          presenceRevision: storedRow.presence_revision
+        };
         const activePresence = await client.query(
           `SELECT 1
            FROM presence_sessions
@@ -13987,7 +14007,7 @@ async function upsertPresenceForSocket(socket, name) {
           representativeSocketId: representativeId,
           presenceRevision: nextRevision
         };
-      }, { attempts: 4, lockTimeoutMs: 1200, advisoryLockKey: `presence:${String(name).toLowerCase()}` });
+      }, { attempts: 4, lockTimeoutMs: 1200, advisoryLockKey: `presence:${String(name).toLowerCase()}` }));
       if (transition) {
         isFirstActiveSession = transition.isFirstActiveSession === true;
         shouldRecordOnlineActivity = transition.shouldRecordOnlineActivity === true;
@@ -14039,9 +14059,17 @@ async function markPresenceOfflineIfNoActiveSessions(name, lastSeen = Date.now()
   const actor = normalizeText(name, '');
   if (!actor) return { changed: false, online: false, revision: 0, lastSeen: normalizeTimestampValue(lastSeen) || Date.now() };
 
-  return runDbTransactionWithRetry(`PRESENCE OFFLINE ${actor}`, async client => {
-    const storedResult = await client.query('SELECT data FROM users WHERE name = $1 LIMIT 1', [actor]);
-    const storedUser = storedResult.rows[0] && storedResult.rows[0].data && typeof storedResult.rows[0].data === 'object' ? storedResult.rows[0].data : {};
+  return runSerializedUserRowMutation(actor, () => runDbTransactionWithRetry(`PRESENCE OFFLINE ${actor}`, async client => {
+    const storedResult = await client.query(
+      `SELECT data->'online' AS online, data->>'lastSeen' AS last_seen,
+              data->>'presenceRevision' AS presence_revision
+       FROM users WHERE name = $1 LIMIT 1`, [actor]);
+    const storedRow = storedResult.rows[0] || {};
+    const storedUser = {
+      online: storedRow.online === true || storedRow.online === 'true',
+      lastSeen: storedRow.last_seen,
+      presenceRevision: storedRow.presence_revision
+    };
     const removeSocketId = normalizeText(options && options.removeSocketId, '');
     if (removeSocketId) await client.query('DELETE FROM presence_sessions WHERE socket_id = $1 AND name = $2', [removeSocketId, actor]);
     const active = await client.query(
@@ -14054,7 +14082,7 @@ async function markPresenceOfflineIfNoActiveSessions(name, lastSeen = Date.now()
       return { changed: false, online: true, revision: Math.max(0, Number(storedUser.presenceRevision) || 0), row: active.rows[0] };
     }
 
-    const safeLastSeen = normalizeTimestampValue(lastSeen) || Date.now();
+    const safeLastSeen = Math.max(normalizeTimestampValue(lastSeen) || Date.now(), normalizeTimestampValue(storedUser.lastSeen));
     const wasOnline = storedUser.online === true;
     const revision = Math.max(0, Number(storedUser.presenceRevision) || Number(userDatabase[actor] && userDatabase[actor].presenceRevision) || 0) + (wasOnline ? 1 : 0);
     if (wasOnline || normalizeTimestampValue(storedUser.lastSeen) < safeLastSeen) {
@@ -14066,7 +14094,7 @@ async function markPresenceOfflineIfNoActiveSessions(name, lastSeen = Date.now()
       );
     }
     return { changed: wasOnline, online: false, revision, lastSeen: safeLastSeen };
-  }, { attempts: 4, lockTimeoutMs: 1200, advisoryLockKey: `presence:${actor.toLowerCase()}` });
+  }, { attempts: 4, lockTimeoutMs: 1200, advisoryLockKey: `presence:${actor.toLowerCase()}` }));
 }
 
 async function syncPresenceOnlineFromDb() {
@@ -14526,7 +14554,7 @@ async function deleteUserAccount(targetName, reason, adminName, options = {}) {
     presenceRevision: Math.max(0, Number(userDatabase[targetName] && userDatabase[targetName].presenceRevision) || 0)
   };
 
-  const dbDelete = await runDbTransactionWithRetry('DELETE USER ACCOUNT', async client => {
+  const dbDelete = await runSerializedUserRowMutation(targetName, () => runDbTransactionWithRetry('DELETE USER ACCOUNT', async client => {
     const existingUser = await client.query('SELECT name FROM users WHERE name = $1 FOR UPDATE', [targetName]);
     if (!existingUser.rows.length) return { missing: true, deletedReportCount: 0 };
 
@@ -14553,7 +14581,7 @@ async function deleteUserAccount(targetName, reason, adminName, options = {}) {
       deletedReportCount: Math.max(0, Number(deletedContentReports.rowCount) || 0),
       deletedMetadataSuggestionIds: (deletedMetadataSuggestions.rows || []).map(row => Number(row.id) || 0).filter(Boolean)
     };
-  }, { advisoryLockKey: `content-report-user:${targetName.toLowerCase()}` });
+  }, { advisoryLockKey: `content-report-user:${targetName.toLowerCase()}` }));
 
   if (dbDelete && dbDelete.missing) return { success: false, message: "User not found." };
   invalidateUserContentReportsRead(targetName);
@@ -16295,10 +16323,10 @@ io.on('connection', (socket) => {
         fullUserCacheNames.delete(name);
         markSocketAuthenticated(socket);
 
-        await pool.query(
+        await runSerializedUserRowMutation(name, () => pool.query(
           'INSERT INTO users (name, data) VALUES ($1, $2)',
           [name, userDatabase[name]]
-        );
+        ));
         // Adding a player changes the denominator for global trophy rarity.
         invalidateGlobalTrophyStatsCache();
         scheduleTrophyStatsRefreshBroadcast(1200);
@@ -16442,7 +16470,7 @@ io.on('connection', (socket) => {
     if (!name || !userDatabase[name]) { respond({ ok: false, error: 'Profile is not available.' }); return; }
 
     try {
-      const visitState = await runDbTransactionWithRetry(
+      const visitState = await runSerializedUserRowMutation(name, () => runDbTransactionWithRetry(
         'EXPLORE VISIT SAVE',
         async client => {
           const currentResult = await client.query(
@@ -16455,7 +16483,7 @@ io.on('connection', (socket) => {
           );
           if (!currentResult.rows.length) return null;
           const previousVisitAt = normalizeTimestampValue(currentResult.rows[0].explore_last_visit_at);
-          const visitAt = Date.now();
+          const visitAt = Math.max(Date.now(), previousVisitAt + 1);
           await client.query(
             `UPDATE users
              SET data = COALESCE(data, '{}'::jsonb) || jsonb_build_object('exploreLastVisitAt', $2::bigint)
@@ -16465,7 +16493,7 @@ io.on('connection', (socket) => {
           return { previousVisitAt, visitAt };
         },
         { attempts: 3, lockTimeoutMs: 1200, advisoryLockKey: `explore-visit:${name}` }
-      );
+      ));
 
       if (!visitState) { respond({ ok: false, error: 'Profile is not available.' }); return; }
       userDatabase[name].exploreLastVisitAt = visitState.visitAt;
@@ -16517,10 +16545,14 @@ io.on('connection', (socket) => {
     const updatedAt = Math.max(Date.now(), getProfileSettingsUpdatedAt(userDatabase[name].settingsData || {}) + 1);
     const profileUpdatedAt = Date.now();
     try {
-      const result = await queryDbWithRetry(
+      const result = await runSerializedUserRowMutation(name, () => queryDbWithRetry(
         `UPDATE users
          SET data = jsonb_set(
-           COALESCE(data, '{}'::jsonb) || jsonb_build_object('profileUpdatedAt', $5::bigint),
+           COALESCE(data, '{}'::jsonb) || jsonb_build_object('profileUpdatedAt', GREATEST(
+             $5::bigint,
+             CASE WHEN (data->>'profileUpdatedAt') ~ '^[0-9]{1,18}$'
+               THEN (data->>'profileUpdatedAt')::bigint + 1 ELSE 0 END
+           )),
            '{settingsData}',
            (CASE WHEN jsonb_typeof(data->'settingsData') = 'object' THEN data->'settingsData' ELSE '{}'::jsonb END)
              || jsonb_build_object(
@@ -16535,7 +16567,7 @@ io.on('connection', (socket) => {
          RETURNING data->'settingsData' AS settings_data, data->>'profileUpdatedAt' AS profile_updated_at`,
         [name, JSON.stringify(consoles), activeId, currentIp, profileUpdatedAt, updatedAt],
         { attempts:3, label:'PS3 CONSOLES SAVE' }
-      );
+      ));
       if (!result.rows.length) { respond({ ok:false, error:'Account not found.' }); return; }
       const savedSettings = result.rows[0].settings_data || {};
       const safeProfile = userDatabase[name];
