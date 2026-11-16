@@ -469,7 +469,7 @@ const CHAT_SYNC_INTERVAL_MS = 3000;
 const KEEP_ALIVE_INTERVAL_MS = Math.max(60000, parseInt(process.env.KEEP_ALIVE_INTERVAL_MS || "600000", 10) || 600000);
 const KEEP_ALIVE_TIMEOUT_MS = Math.max(1000, parseInt(process.env.KEEP_ALIVE_TIMEOUT_MS || "10000", 10) || 10000);
 const KEEP_ALIVE_URLS = [
-  "https://psn-content-s2k2.onrender.com",
+"https://psn-content-s2k2.onrender.com",
 ];
 const PROFILE_SYNC_INTERVAL_MS = Math.max(10000, parseInt(process.env.PROFILE_SYNC_INTERVAL_MS || "15000", 10) || 15000);
 const ENABLE_PROFILE_PERIODIC_SYNC = process.env.ENABLE_PROFILE_PERIODIC_SYNC === "1";
@@ -648,7 +648,8 @@ function buildOnlineListSignature(list = []) {
       getUserCountryCode(user),
       user && user.banned ? "1" : "0",
       Math.max(0, Number(user && user.presenceRevision) || 0),
-      getPs3StatusPresenceSignature(user && user.ps3Status)
+      getPs3StatusPresenceSignature(user && user.ps3Status),
+      online ? (Number(user && user.onlineSince) || 0) : 0
     ].join(":");
   }).join("|");
 }
@@ -3142,10 +3143,12 @@ async function initDb() {
     if (result.online === true && result.row) {
       userDatabase[name].online = true;
       userDatabase[name].id = result.row.socket_id || userDatabase[name].id;
+      userDatabase[name].onlineSince = normalizeTimestampValue(result.row.connected_at) || null;
       userDatabase[name].lastSeen = result.row.last_seen ? new Date(result.row.last_seen).getTime() : Date.now();
       continue;
     }
     userDatabase[name].online = false;
+    userDatabase[name].onlineSince = null;
     userDatabase[name].lastSeen = Math.max(Number(userDatabase[name].lastSeen || 0), Number(result.lastSeen || removedLastSeen));
     userDatabase[name].presenceRevision = Math.max(Number(userDatabase[name].presenceRevision) || 0, Number(result.revision) || 0);
     if (result.changed) {
@@ -3192,7 +3195,8 @@ function getSanitizedOnlineList() {
     online: true,
     lastSeen: u.lastSeen,
     presenceRevision: Math.max(0, Number(u.presenceRevision) || 0),
-    ps3Status: u.ps3Status || null
+    ps3Status: u.ps3Status || null,
+    onlineSince: normalizeTimestampValue(u.onlineSince) || null
   }));
 }
 
@@ -4983,6 +4987,7 @@ function getPublicUserData(username, user = {}, includeAdminFields = false) {
     countryCode: getUserCountryCode(user),
     online: !!user.online,
     lastSeen: user.lastSeen || null,
+    onlineSince: user.online === true ? (normalizeTimestampValue(user.onlineSince) || null) : null,
     ps3Status: user.ps3Status || null,
     profileUpdatedAt: normalizeTimestampValue(user.profileUpdatedAt),
     profileCardStyle: getUserProfileCardStyle(user),
@@ -5150,7 +5155,8 @@ function compactCachedUser(name) {
     ...buildCompactUserSummary(name, current),
     online,
     id,
-    lastSeen
+    lastSeen,
+    onlineSince: online ? (normalizeTimestampValue(current.onlineSince) || null) : null
   };
   fullUserCacheNames.delete(name);
   userCacheMeta[name] = Date.now();
@@ -5243,7 +5249,8 @@ async function refreshSingleUserSummaryFromDb(name, options = {}) {
     ...buildCompactUserSummary(safeName, summaryData),
     online: preserveOnline ? localUser.online === true : false,
     id: preserveOnline ? (localUser.id || summaryData.id || null) : (summaryData.id || null),
-    lastSeen: preserveOnline ? (localUser.lastSeen || summaryData.lastSeen || null) : (summaryData.lastSeen || null)
+    lastSeen: preserveOnline ? (localUser.lastSeen || summaryData.lastSeen || null) : (summaryData.lastSeen || null),
+    onlineSince: preserveOnline && localUser.online === true ? (normalizeTimestampValue(localUser.onlineSince) || null) : null
   };
   if (!hadCachedUser) markUserNameIndexDirty();
   fullUserCacheNames.delete(safeName);
@@ -5315,7 +5322,8 @@ async function refreshAllUsersCacheFromDb(options = {}) {
         ...buildCompactUserSummary(username, summaryData),
         online: preserveOnline ? localUser.online === true : false,
         id: preserveOnline ? (localUser.id || summaryData.id || null) : (summaryData.id || null),
-        lastSeen: preserveOnline ? (localUser.lastSeen || summaryData.lastSeen || null) : (summaryData.lastSeen || null)
+        lastSeen: preserveOnline ? (localUser.lastSeen || summaryData.lastSeen || null) : (summaryData.lastSeen || null),
+        onlineSince: preserveOnline && localUser.online === true ? (normalizeTimestampValue(localUser.onlineSince) || null) : null
       };
       nextMeta[username] = now;
     });
@@ -5373,7 +5381,8 @@ async function refreshSingleUserCacheFromDb(name, options = {}) {
     ...dbUser,
     online: preserveOnline ? localUser.online === true : false,
     id: preserveOnline ? (localUser.id || dbUser.id || null) : (dbUser.id || null),
-    lastSeen: preserveOnline ? (localUser.lastSeen || dbUser.lastSeen || null) : (dbUser.lastSeen || null)
+    lastSeen: preserveOnline ? (localUser.lastSeen || dbUser.lastSeen || null) : (dbUser.lastSeen || null),
+    onlineSince: preserveOnline && localUser.online === true ? (normalizeTimestampValue(localUser.onlineSince) || null) : null
   };
   if (!hadCachedUser) markUserNameIndexDirty();
   userCacheMeta[safeName] = Date.now();
@@ -9244,7 +9253,14 @@ async function saveUser(name, options = {}) {
   const saved = normalizeUserRecord(name, result.rows[0].data || {});
   // Admin command handlers can still hold a reference to this object.
   user.profileUpdatedAt = saved.profileUpdatedAt;
-  userDatabase[name] = saved;
+  const currentPresence = userDatabase[name] || user;
+  userDatabase[name] = {
+    ...saved,
+    online: currentPresence.online === true,
+    id: currentPresence.id || saved.id || null,
+    lastSeen: Math.max(Number(currentPresence.lastSeen) || 0, Number(saved.lastSeen) || 0) || null,
+    onlineSince: currentPresence.online === true ? (normalizeTimestampValue(currentPresence.onlineSince) || null) : null
+  };
   userCacheMeta[name] = Date.now();
   fullUserCacheNames.add(name);
   invalidatePublicProfileListReads(name, [...fields, ...deleteKeys, 'profileUpdatedAt']);
@@ -11557,7 +11573,8 @@ function buildPresenceUpdatePayload(name, user = null) {
     role: getUserRole(name, source),
     isAdmin: isUserAdmin(name, source),
     banned: isUserBanned(source),
-    ps3Status: source.online === true ? (source.ps3Status || null) : null
+    ps3Status: source.online === true ? (source.ps3Status || null) : null,
+    onlineSince: source.online === true ? (normalizeTimestampValue(source.onlineSince) || null) : null
   };
 }
 
@@ -12188,6 +12205,8 @@ async function initProfileSyncNotifications() {
 
         userDatabase[name].presenceRevision = Math.max(currentRevision, incomingRevision);
         userDatabase[name].online = hasLocalSession ? true : data.online === true;
+        if (data.online === true && normalizeTimestampValue(data.onlineSince)) userDatabase[name].onlineSince = normalizeTimestampValue(data.onlineSince);
+        else if (data.online === false && !hasLocalSession) userDatabase[name].onlineSince = null;
         if (data.online === true && data.id) userDatabase[name].id = data.id;
         if (incomingLastSeen) userDatabase[name].lastSeen = Math.max(currentLastSeen, incomingLastSeen);
         if (Object.prototype.hasOwnProperty.call(data, 'ps3Status')) userDatabase[name].ps3Status = data.ps3Status || null;
@@ -14016,6 +14035,7 @@ async function upsertPresenceForSocket(socket, name) {
     let isFirstActiveSession = false;
     let representativeSocketId = normalizeText(userDatabase[name] && userDatabase[name].id, '');
     let presenceRevision = Math.max(0, Number(userDatabase[name] && userDatabase[name].presenceRevision) || 0);
+    let onlineSince = normalizeTimestampValue(userDatabase[name] && userDatabase[name].onlineSince);
     const now = Date.now();
 
     if (shouldAnnouncePresence) {
@@ -14050,11 +14070,15 @@ async function upsertPresenceForSocket(socket, name) {
         await client.query(
           `INSERT INTO presence_sessions (socket_id, name, instance_id, connected_at, last_seen, data)
            VALUES ($1, $2, $3, NOW(), NOW(), $4)
-           ON CONFLICT (socket_id) DO UPDATE SET name = $2, instance_id = $3, last_seen = NOW(), data = $4`,
+           ON CONFLICT (socket_id) DO UPDATE SET name = $2, instance_id = $3, last_seen = NOW(), data = $4,
+           connected_at = CASE
+             WHEN presence_sessions.name IS DISTINCT FROM EXCLUDED.name
+               OR presence_sessions.last_seen < NOW() - INTERVAL '${PRESENCE_TTL_SECONDS} seconds'
+             THEN EXCLUDED.connected_at ELSE presence_sessions.connected_at END`,
           [socket.id, name, INSTANCE_ID, presenceData]
         );
         const representativePresence = await client.query(
-          `SELECT socket_id FROM presence_sessions
+          `SELECT socket_id, connected_at FROM presence_sessions
            WHERE name = $1 AND last_seen >= NOW() - INTERVAL '${PRESENCE_TTL_SECONDS} seconds'
            ORDER BY connected_at ASC, socket_id ASC LIMIT 1`,
           [name]
@@ -14073,6 +14097,7 @@ async function upsertPresenceForSocket(socket, name) {
           isFirstActiveSession: firstActiveSession,
           shouldRecordOnlineActivity: firstActiveSession && !shortReconnect,
           representativeSocketId: representativeId,
+          onlineSince: representativePresence.rows[0] && representativePresence.rows[0].connected_at,
           presenceRevision: nextRevision
         };
       }, { attempts: 4, lockTimeoutMs: 1200, advisoryLockKey: `presence:${String(name).toLowerCase()}` }));
@@ -14080,13 +14105,18 @@ async function upsertPresenceForSocket(socket, name) {
         isFirstActiveSession = transition.isFirstActiveSession === true;
         shouldRecordOnlineActivity = transition.shouldRecordOnlineActivity === true;
         representativeSocketId = transition.representativeSocketId || socket.id;
+        onlineSince = normalizeTimestampValue(transition.onlineSince) || now;
         presenceRevision = Math.max(presenceRevision, Number(transition.presenceRevision) || 0);
       }
     } else {
       await queryDbWithRetry(
         `INSERT INTO presence_sessions (socket_id, name, instance_id, connected_at, last_seen, data)
          VALUES ($1, $2, $3, NOW(), NOW(), $4)
-         ON CONFLICT (socket_id) DO UPDATE SET name = $2, instance_id = $3, last_seen = NOW(), data = $4`,
+         ON CONFLICT (socket_id) DO UPDATE SET name = $2, instance_id = $3, last_seen = NOW(), data = $4,
+           connected_at = CASE
+             WHEN presence_sessions.name IS DISTINCT FROM EXCLUDED.name
+               OR presence_sessions.last_seen < NOW() - INTERVAL '${PRESENCE_TTL_SECONDS} seconds'
+             THEN EXCLUDED.connected_at ELSE presence_sessions.connected_at END`,
         [socket.id, name, INSTANCE_ID, presenceData],
         { attempts: 3, label: 'PRESENCE UPSERT' }
       );
@@ -14095,6 +14125,7 @@ async function upsertPresenceForSocket(socket, name) {
     cancelFriendActivityOffline(name);
     if (userDatabase[name]) {
       userDatabase[name].online = true;
+      if (onlineSince) userDatabase[name].onlineSince = onlineSince;
       if (shouldAnnouncePresence) userDatabase[name].id = representativeSocketId || socket.id;
       userDatabase[name].lastSeen = Math.max(Number(userDatabase[name].lastSeen) || 0, now);
       userDatabase[name].presenceRevision = Math.max(Number(userDatabase[name].presenceRevision) || 0, presenceRevision);
@@ -14141,7 +14172,7 @@ async function markPresenceOfflineIfNoActiveSessions(name, lastSeen = Date.now()
     const removeSocketId = normalizeText(options && options.removeSocketId, '');
     if (removeSocketId) await client.query('DELETE FROM presence_sessions WHERE socket_id = $1 AND name = $2', [removeSocketId, actor]);
     const active = await client.query(
-      `SELECT socket_id, last_seen FROM presence_sessions
+      `SELECT socket_id, last_seen, connected_at FROM presence_sessions
        WHERE name = $1 AND last_seen >= NOW() - INTERVAL '${PRESENCE_TTL_SECONDS} seconds'
        ORDER BY connected_at ASC, socket_id ASC LIMIT 1`,
       [actor]
@@ -14161,7 +14192,7 @@ async function markPresenceOfflineIfNoActiveSessions(name, lastSeen = Date.now()
         [actor, safeLastSeen, revision]
       );
     }
-    return { changed: wasOnline, online: false, revision, lastSeen: safeLastSeen };
+    return { changed: wasOnline, online: false, onlineSince: null, revision, lastSeen: safeLastSeen };
   }, { attempts: 4, lockTimeoutMs: 1200, advisoryLockKey: `presence:${actor.toLowerCase()}` }));
 }
 
@@ -14175,18 +14206,19 @@ async function syncPresenceOnlineFromDb() {
       RETURNING name, last_seen
     ), expired_names AS (
       SELECT 'expired'::text AS source, name, MAX(last_seen) AS last_seen,
-             NULL::text AS socket_id
+             NULL::text AS socket_id, NULL::timestamptz AS connected_at
       FROM expired GROUP BY name
     ), active_names AS (
       SELECT 'active'::text AS source, name, MAX(last_seen) AS last_seen,
-             (ARRAY_AGG(socket_id ORDER BY connected_at ASC, socket_id ASC))[1] AS socket_id
+             (ARRAY_AGG(socket_id ORDER BY connected_at ASC, socket_id ASC))[1] AS socket_id,
+             MIN(connected_at) AS connected_at
       FROM presence_sessions
       WHERE last_seen >= NOW() - INTERVAL '${PRESENCE_TTL_SECONDS} seconds'
       GROUP BY name
     )
-    SELECT source,name,last_seen,socket_id FROM expired_names
+    SELECT source,name,last_seen,socket_id,connected_at FROM expired_names
     UNION ALL
-    SELECT source,name,last_seen,socket_id FROM active_names
+    SELECT source,name,last_seen,socket_id,connected_at FROM active_names
   `, [], { attempts: 2, label: 'PRESENCE SNAPSHOT' });
   const expiredRes = { rows: presenceSnapshot.rows.filter(row => row.source === 'expired') };
   const presenceRes = { rows: presenceSnapshot.rows.filter(row => row.source === 'active') };
@@ -14202,7 +14234,8 @@ async function syncPresenceOnlineFromDb() {
       online: user.online === true,
       id: user.id || null,
       lastSeen: Number(user.lastSeen || 0),
-      revision: Math.max(0, Number(user.presenceRevision) || 0)
+      revision: Math.max(0, Number(user.presenceRevision) || 0),
+      onlineSince: normalizeTimestampValue(user.onlineSince)
     });
   });
 
@@ -14211,6 +14244,7 @@ async function syncPresenceOnlineFromDb() {
     if (!userDatabase[username]) return;
     userDatabase[username].online = true;
     userDatabase[username].id = row.socket_id || userDatabase[username].id;
+    userDatabase[username].onlineSince = normalizeTimestampValue(row.connected_at) || null;
     userDatabase[username].lastSeen = row.last_seen ? new Date(row.last_seen).getTime() : Date.now();
   });
 
@@ -14227,10 +14261,12 @@ async function syncPresenceOnlineFromDb() {
       if (result.online === true && result.row) {
         userDatabase[username].online = true;
         userDatabase[username].id = result.row.socket_id || userDatabase[username].id;
+        userDatabase[username].onlineSince = normalizeTimestampValue(result.row.connected_at) || null;
         userDatabase[username].lastSeen = result.row.last_seen ? new Date(result.row.last_seen).getTime() : Date.now();
         return;
       }
       userDatabase[username].online = false;
+      userDatabase[username].onlineSince = null;
       userDatabase[username].lastSeen = Math.max(Number(userDatabase[username].lastSeen || 0), Number(result.lastSeen || expiredLastSeen));
       userDatabase[username].presenceRevision = Math.max(Number(userDatabase[username].presenceRevision) || 0, Number(result.revision) || 0);
       userCacheMeta[username] = Date.now();
@@ -14247,7 +14283,8 @@ async function syncPresenceOnlineFromDb() {
     const activeSessionChanged = user.online === true && String(user.id || '') !== String(previous.id || '');
     const offlineLastSeenChanged = user.online !== true && Number(user.lastSeen || 0) > previous.lastSeen;
     const revisionChanged = Math.max(0, Number(user.presenceRevision) || 0) > previous.revision;
-    if (!onlineChanged && !activeSessionChanged && !offlineLastSeenChanged && !revisionChanged) return;
+    const onlineSinceChanged = user.online === true && normalizeTimestampValue(user.onlineSince) !== previous.onlineSince;
+    if (!onlineChanged && !activeSessionChanged && !offlineLastSeenChanged && !revisionChanged && !onlineSinceChanged) return;
     presenceChanged = true;
     const payload = emitPresenceUpdate(username, user);
     if (payload) deferServerTask('PRESENCE STATE NOTIFY', () => notifyPresenceAcrossInstances(username, user), 0);
@@ -14261,20 +14298,23 @@ async function syncPresenceOnlineFromDb() {
 // lastSeen, so foreground resume and reconnections always reconstruct a snapshot.
 function packOnlineListForSocket(client, list) {
   if (!client || client.onlineListCompactV1 !== true || !Array.isArray(list)) return list;
+  const withSince = client.onlineListSinceV1 === true;
   return { onlineListCompactV1: 1, rows: list.map(user => [
     user.id, user.name, user.avatar, user.isAdmin, user.role, user.banned,
     user.level, user.joined, user.countryCode, user.online, user.lastSeen,
-    user.presenceRevision, user.ps3Status
+    user.presenceRevision, user.ps3Status, ...(withSince ? [user.onlineSince] : [])
   ]) };
 }
 
 function prepareOnlineListWire(list) {
-  const compact = packOnlineListForSocket({ onlineListCompactV1: true }, list);
-  return {
+  const makePrepared = compact => ({
     compact,
     fullBytes: Buffer.byteLength(JSON.stringify(compact)),
     byName: new Map(compact.rows.map(row => [row[1], JSON.stringify(row)]))
-  };
+  });
+  const legacy = makePrepared(packOnlineListForSocket({ onlineListCompactV1: true }, list));
+  legacy.withSince = makePrepared(packOnlineListForSocket({ onlineListCompactV1: true, onlineListSinceV1: true }, list));
+  return legacy;
 }
 
 // Targeted and global sends use the same per-socket protocol. Prepared tuples
@@ -14291,19 +14331,20 @@ function sendOnlineListToSocket(client, list, prepared, signature, options = {})
     logMemoryTrace('online-list:send', `user=${client.userName || '-'} socket=${client.id} items=${list.length} approx=${formatApproxBytes(estimate.bytes)}${estimate.truncated ? '+' : ''} buffer=${getSocketWriteBufferLength(client)}`);
   }
 
-  let wireList = client.onlineListCompactV1 === true ? prepared.compact : list;
+  const wirePrepared = client.onlineListSinceV1 === true ? (prepared.withSince || prepared) : prepared;
+  let wireList = client.onlineListCompactV1 === true ? wirePrepared.compact : list;
   if (client.onlineListDeltaV1 === true && client.onlineListCompactV1 === true) {
     const previous = client.__onlineListWireSnapshot;
     const version = previous ? previous.version + 1 : 1;
     if (previous && options.force !== true && options.forceSend !== true) {
       if (previous.signature === signature) return false;
-      const changed = prepared.compact.rows.filter(row => prepared.byName.get(row[1]) !== previous.byName.get(row[1]));
-      const removed = [...previous.byName.keys()].filter(name => !prepared.byName.has(name));
+      const changed = wirePrepared.compact.rows.filter(row => wirePrepared.byName.get(row[1]) !== previous.byName.get(row[1]));
+      const removed = [...previous.byName.keys()].filter(name => !wirePrepared.byName.has(name));
       const delta = { onlineListDeltaV1: 1, baseVersion: previous.version, version, changed, removed };
-      if (Buffer.byteLength(JSON.stringify(delta)) < prepared.fullBytes * 0.78) wireList = delta;
+      if (Buffer.byteLength(JSON.stringify(delta)) < wirePrepared.fullBytes * 0.78) wireList = delta;
     }
-    client.__onlineListWireSnapshot = { version, signature, byName: new Map(prepared.byName) };
-    if (wireList === prepared.compact) wireList = { ...prepared.compact, version };
+    client.__onlineListWireSnapshot = { version, signature, byName: new Map(wirePrepared.byName) };
+    if (wireList === wirePrepared.compact) wireList = { ...wirePrepared.compact, version };
   }
 
   const event = wireList && wireList.onlineListDeltaV1 ? 'online_list:delta' :
@@ -16137,6 +16178,7 @@ io.on('connection', (socket) => {
       const supportsPresenceDeltaV1 = data && data.presenceDeltaV1 === true;
       const supportsOnlineListCompactV1 = data && data.onlineListCompactV1 === true;
       const supportsOnlineListDeltaV1 = supportsOnlineListCompactV1 && data && data.onlineListDeltaV1 === true;
+      const supportsOnlineListSinceV1 = supportsOnlineListCompactV1 && data && data.onlineListSinceV1 === true;
       const supportsProfileSyncGzipV1 = supportsProfileSyncAckV1 && data && data.profileSyncGzipV1 === true;
       const supportsProfileSyncRevisionOnlyV1 = supportsProfileSyncAckV1 && data && data.profileSyncRevisionOnlyV1 === true;
       const supportsChatHistoryAckV1 = data && data.chatHistoryAckV1 === true;
@@ -16246,11 +16288,14 @@ io.on('connection', (socket) => {
 
           const serverUser = buildCompactUserSummary(name, dbUser);
           const authCacheHadUser = Object.prototype.hasOwnProperty.call(userDatabase, name);
+          const priorOnlineSince = userDatabase[name] && userDatabase[name].online === true
+            ? (normalizeTimestampValue(userDatabase[name].onlineSince) || null) : null;
 
           userDatabase[name] = {
             ...serverUser,
             online: true,
             id: socket.id,
+            onlineSince: priorOnlineSince,
             lastSeen: Date.now(),
             name: name,
             role: getUserRole(name, serverUser),
@@ -16267,6 +16312,7 @@ io.on('connection', (socket) => {
           socket.presenceDeltaV1 = supportsPresenceDeltaV1;
           socket.onlineListCompactV1 = supportsOnlineListCompactV1;
           socket.onlineListDeltaV1 = supportsOnlineListDeltaV1;
+          socket.onlineListSinceV1 = supportsOnlineListSinceV1;
           socket.profileSyncGzipV1 = supportsProfileSyncGzipV1;
           socket.__onlineListWireSnapshot = null;
           socket.__onlineListAuthGeneration = (socket.__onlineListAuthGeneration || 0) + 1;
@@ -16377,6 +16423,7 @@ io.on('connection', (socket) => {
         socket.presenceDeltaV1 = supportsPresenceDeltaV1;
         socket.onlineListCompactV1 = supportsOnlineListCompactV1;
         socket.onlineListDeltaV1 = supportsOnlineListDeltaV1;
+        socket.onlineListSinceV1 = supportsOnlineListSinceV1;
         socket.profileSyncGzipV1 = supportsProfileSyncGzipV1;
         socket.__onlineListWireSnapshot = null;
         socket.__onlineListAuthGeneration = (socket.__onlineListAuthGeneration || 0) + 1;
@@ -20935,6 +20982,7 @@ io.on('connection', (socket) => {
         // Online state is unchanged, but publish the surviving socket so moderation never points at a closed session.
         userDatabase[name].online = true;
         userDatabase[name].id = result.row.socket_id || userDatabase[name].id;
+        userDatabase[name].onlineSince = normalizeTimestampValue(result.row.connected_at) || null;
         const remainingLastSeen = result.row.last_seen ? new Date(result.row.last_seen).getTime() : 0;
         userDatabase[name].lastSeen = Math.max(Number(userDatabase[name].lastSeen || 0), remainingLastSeen, Date.now());
         invalidateOnlineListCache('presence-session-handoff');
@@ -20942,6 +20990,7 @@ io.on('connection', (socket) => {
         if (presencePayload) deferServerTask('PRESENCE SESSION HANDOFF NOTIFY', () => notifyPresenceAcrossInstances(name, userDatabase[name]), 0);
       } else {
         userDatabase[name].online = false;
+        userDatabase[name].onlineSince = null;
         userDatabase[name].lastSeen = Math.max(Number(userDatabase[name].lastSeen || 0), Number(result.lastSeen || Date.now()));
         userDatabase[name].presenceRevision = Math.max(Number(userDatabase[name].presenceRevision) || 0, Number(result.revision) || 0);
         userCacheMeta[name] = Date.now();
