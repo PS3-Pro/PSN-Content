@@ -85,13 +85,9 @@
 		var failedAttempts = 0;
 		var ready = false;
 		var warmed = new Map();
-		var failedImages = new Set();
+		// A slow/blocked external host must not blacklist a valid banner for this session.
 		window.psnHeroChooseImage = function (entry) {
-			return entry && entry.img && !failedImages.has(entry.img)
-				? entry.img : window.psnHeroFallbackImage;
-		};
-		window.psnHeroMarkImageFailed = function (src) {
-			if (src && src !== window.psnHeroFallbackImage) failedImages.add(src);
+			return entry && entry.img ? entry.img : window.psnHeroFallbackImage;
 		};
 		var initial = new Promise(function (resolve) { resolveFirst = resolve; });
 
@@ -113,29 +109,32 @@
 		}
 
 		function warmImage(entry, highPriority) {
-			if (!entry || !entry.img || failedImages.has(entry.img)) return Promise.resolve(false);
-			if (warmed.has(entry.img)) return warmed.get(entry.img);
-			var promise = new Promise(function (resolve) {
+			if (!entry || !entry.img) return Promise.resolve(false);
+			var cached = warmed.get(entry.img);
+			if (cached && cached.until > Date.now()) return cached.promise;
+			var state = { until: Date.now() + 20000, promise: null };
+			state.promise = new Promise(function (resolve) {
 				var image = new Image();
 				var settled = false;
 				image.decoding = 'async';
 				if (highPriority) image.fetchPriority = 'high';
-				var timer = setTimeout(function () { finish(false); }, 6500);
+				var timer = setTimeout(function () { finish(false); }, 12000);
 				function finish(ok) {
 					if (settled) return;
 					settled = true;
 					clearTimeout(timer);
 					image.onload = image.onerror = null;
-					if (!ok) { failedImages.add(entry.img); image.src = ''; }
+					state.until = ok ? Infinity : Date.now() + 45000;
+					if (!ok) image.src = '';
 					resolve(ok);
 				}
 				image.onload = function () { finish(true); };
 				image.onerror = function () { finish(false); };
 				image.src = entry.img;
 			});
-			warmed.set(entry.img, promise);
+			warmed.set(entry.img, state);
 			if (warmed.size > 8) warmed.delete(warmed.keys().next().value);
-			return promise;
+			return state.promise;
 		}
 
 		window.psnHeroWarmNeighbors = function (items, center) {
@@ -56219,18 +56218,71 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
         container.replaceChildren(fragment);
     }
     
+    function clearHeroImageWatchdog(image) {
+        if (image.__psnHeroWatchdog) clearTimeout(image.__psnHeroWatchdog);
+        image.__psnHeroWatchdog = null;
+    }
+
+    function isHeroImageNearby(image) {
+        const slide = image.closest('.hero-slide');
+        const index = heroSlides.indexOf(slide);
+        return index >= 0 && Math.abs(index - currentIndex) <= 1;
+    }
+
+    function queueHeroImageRetry(image) {
+        const source = image.__psnHeroData?.img;
+        if (!source || !image.isConnected || !isHeroImageNearby(image) ||
+            image.__psnHeroRetryTimer || image.__psnHeroProbe || document.hidden) return;
+        const delays = [3500, 11000, 30000, 90000, 180000];
+        const failures = image.__psnHeroFailures || 0;
+        const delay = delays[Math.min(failures, delays.length - 1)];
+        image.__psnHeroRetryTimer = setTimeout(() => {
+            image.__psnHeroRetryTimer = null;
+            if (!image.isConnected || !isHeroImageNearby(image) || document.hidden || navigator.onLine === false) return;
+            const probe = new Image();
+            image.__psnHeroProbe = probe;
+            probe.decoding = 'async';
+            const timer = setTimeout(() => finish(false), 22000);
+            let settled = false;
+            function finish(ok) {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                probe.onload = probe.onerror = null;
+                image.__psnHeroProbe = null;
+                if (!image.isConnected || image.__psnHeroData?.img !== source) return;
+                if (ok) {
+                    image.__psnHeroFailures = 0;
+                    image.src = source;
+                } else {
+                    image.__psnHeroFailures = Math.min(4, (image.__psnHeroFailures || 0) + 1);
+                    probe.src = '';
+                    queueHeroImageRetry(image);
+                }
+            }
+            probe.onload = () => finish(true);
+            probe.onerror = () => finish(false);
+            probe.src = source;
+        }, delay);
+    }
+
     function armHeroImageWatchdog(image) {
         if (!image || image.complete || image.__psnHeroWatchdog) return;
         image.__psnHeroWatchdog = setTimeout(() => {
             image.__psnHeroWatchdog = null;
-            // A Cloudflare challenge can leave an image pending without a browser error.
-            if (image.isConnected && !image.complete) image.dispatchEvent(new Event('error'));
-        }, 7000);
+            // Give remote hosts time; never poison their URL after a slow response.
+            if (!image.isConnected || image.complete || document.hidden) return;
+            image.src = window.psnHeroFallbackImage;
+            queueHeroImageRetry(image);
+        }, 22000);
     }
 
-    function clearHeroImageWatchdog(image) {
-        if (image.__psnHeroWatchdog) clearTimeout(image.__psnHeroWatchdog);
-        image.__psnHeroWatchdog = null;
+    function resumeHeroImageRetries() {
+        if (document.hidden) return;
+        for (const image of heroSlides.map(slide => slide.querySelector('.hero-slide-img'))) {
+            if (!image || !image.isConnected || !isHeroImageNearby(image)) continue;
+            if (image.__psnHeroData?.img && image.src === window.psnHeroFallbackImage) queueHeroImageRetry(image);
+        }
     }
 
     function initCarousel(options = {}) {
@@ -56260,13 +56312,18 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
                 image.style.opacity = '0';
                 image.addEventListener('load', () => {
                     clearHeroImageWatchdog(image);
+                    if (image.src !== window.psnHeroFallbackImage) {
+                        image.__psnHeroFailures = 0;
+                        clearTimeout(image.__psnHeroRetryTimer);
+                        image.__psnHeroRetryTimer = null;
+                    }
                     image.style.opacity = '1';
                 });
                 image.addEventListener('error', () => {
                     clearHeroImageWatchdog(image);
-                    const failed = image.currentSrc || image.src;
-                    if (typeof window.psnHeroMarkImageFailed === 'function') window.psnHeroMarkImageFailed(failed);
-                    if (image.src !== window.psnHeroFallbackImage) image.src = window.psnHeroFallbackImage;
+                    if (image.src === window.psnHeroFallbackImage) return;
+                    image.src = window.psnHeroFallbackImage;
+                    queueHeroImageRetry(image);
                 });
                 if (image.loading === 'eager') {
                     image.src = typeof window.psnHeroChooseImage === 'function'
@@ -56459,7 +56516,8 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
                     ? window.psnHeroChooseImage(entry)
                     : (entry?.img || window.psnHeroFallbackImage);
             }
-            armHeroImageWatchdog(img);
+            if (img.src === window.psnHeroFallbackImage && img.__psnHeroData?.img) queueHeroImageRetry(img);
+            else armHeroImageWatchdog(img);
         }
     }
 
@@ -56737,7 +56795,11 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
     };
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initCarouselWhenReady, { once:true });
     else initCarouselWhenReady();
-	document.addEventListener('visibilitychange', handleHeroVisibilityChange);
+	document.addEventListener('visibilitychange', () => {
+        handleHeroVisibilityChange();
+        resumeHeroImageRetries();
+    });
+    window.addEventListener('online', resumeHeroImageRetries);
 	
 
 	async function deletePsnRepairCacheDatabase(dbName, openPromise) {
