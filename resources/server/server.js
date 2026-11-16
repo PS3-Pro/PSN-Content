@@ -469,7 +469,7 @@ const CHAT_SYNC_INTERVAL_MS = 3000;
 const KEEP_ALIVE_INTERVAL_MS = Math.max(60000, parseInt(process.env.KEEP_ALIVE_INTERVAL_MS || "600000", 10) || 600000);
 const KEEP_ALIVE_TIMEOUT_MS = Math.max(1000, parseInt(process.env.KEEP_ALIVE_TIMEOUT_MS || "10000", 10) || 10000);
 const KEEP_ALIVE_URLS = [
-"https://psn-content-s2k2.onrender.com",
+  "https://psn-content-s2k2.onrender.com",
 ];
 const PROFILE_SYNC_INTERVAL_MS = Math.max(10000, parseInt(process.env.PROFILE_SYNC_INTERVAL_MS || "15000", 10) || 15000);
 const ENABLE_PROFILE_PERIODIC_SYNC = process.env.ENABLE_PROFILE_PERIODIC_SYNC === "1";
@@ -522,7 +522,7 @@ const ADMIN_STATE_KEYS = {
 // This pool is per server instance, and each instance also holds one dedicated
 // LISTEN/NOTIFY connection. Keep headroom during zero-downtime deploys when
 // old and new instances overlap; PG_POOL_MAX/DB_POOL_MAX can override this.
-const PG_POOL_MAX = Math.max(1, Math.min(10, parseInt(process.env.PG_POOL_MAX || process.env.DB_POOL_MAX || "5", 10) || 5));
+const PG_POOL_MAX = Math.max(1, Math.min(10, parseInt(process.env.PG_POOL_MAX || process.env.DB_POOL_MAX || "4", 10) || 4));
 const PG_CONNECTION_TIMEOUT_MS = Math.max(3000, parseInt(process.env.PG_CONNECTION_TIMEOUT_MS || "10000", 10) || 10000);
 const PG_IDLE_TIMEOUT_MS = Math.max(30000, parseInt(process.env.PG_IDLE_TIMEOUT_MS || "120000", 10) || 120000);
 const PG_QUERY_TIMEOUT_MS = Math.max(5000, parseInt(process.env.PG_QUERY_TIMEOUT_MS || "25000", 10) || 25000);
@@ -1159,6 +1159,8 @@ async function runDbTransactionWithRetry(label, taskFn, options = {}) {
     let client = null;
     let inTransaction = false;
     let queryStartedAt = 0;
+    let retryDelayMs = 0;
+    let discardClient = false;
     try {
       if (DB_PERF_ENABLED && pool.waitingCount > 0) wasQueued = true;
       const acquireStartedAt = DB_PERF_ENABLED ? Date.now() : 0;
@@ -1196,7 +1198,8 @@ async function runDbTransactionWithRetry(label, taskFn, options = {}) {
     } catch (err) {
       lastError = err;
       if (client && inTransaction) {
-        try { await client.query('ROLLBACK'); } catch (rollbackErr) {}
+        try { await client.query('ROLLBACK'); }
+        catch (rollbackErr) { discardClient = true; }
         inTransaction = false;
       }
       if (DB_PERF_ENABLED && queryStartedAt) totalQueryMs += Date.now() - queryStartedAt;
@@ -1205,12 +1208,14 @@ async function runDbTransactionWithRetry(label, taskFn, options = {}) {
           { acquireMs: totalAcquireMs, queryMs: totalQueryMs, queued: wasQueued });
         throw err;
       }
-      const delayMs = attempt === 1 ? 40 : attempt === 2 ? 100 : attempt === 3 ? 220 : 450;
-      console.warn(`[${label}] Temporary PostgreSQL lock/connection contention. Retrying ${attempt + 1}/${attempts} in ${delayMs}ms.`);
-      await waitMs(delayMs);
+      retryDelayMs = attempt === 1 ? 40 : attempt === 2 ? 100 : attempt === 3 ? 220 : 450;
+      console.warn(`[${label}] Temporary PostgreSQL lock/connection contention. Retrying ${attempt + 1}/${attempts} in ${retryDelayMs}ms.`);
     } finally {
-      if (client) client.release();
+      // Always return the connection BEFORE backing off; otherwise retries
+      // occupy scarce Aiven pool slots while doing no database work.
+      if (client) client.release(discardClient ? lastError || new Error('ROLLBACK failed') : undefined);
     }
+    if (retryDelayMs) await waitMs(retryDelayMs);
   }
   throw lastError;
 }
@@ -3051,6 +3056,7 @@ async function initDb() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS idx_friend_activity_actor_id ON friend_activity(actor_name, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_friend_activity_actor_type_id ON friend_activity(actor_name, event_type, id DESC);
     CREATE INDEX IF NOT EXISTS idx_friend_activity_created_at ON friend_activity(created_at DESC);
     CREATE TABLE IF NOT EXISTS friend_activity_read_state (
       user_name TEXT PRIMARY KEY,
@@ -3249,6 +3255,8 @@ async function createPsnStatsIndexSchema() {
       );
       CREATE INDEX IF NOT EXISTS idx_psn_stat_projection_kind_title
         ON psn_stat_projection_entries(kind,md5(title_id));
+      CREATE INDEX IF NOT EXISTS idx_psn_stat_projection_kind_title_group
+        ON psn_stat_projection_entries(kind,title_id);
       CREATE TABLE IF NOT EXISTS psn_stat_projection_users (
         username TEXT PRIMARY KEY REFERENCES users(name) ON DELETE CASCADE
       );
@@ -5484,6 +5492,14 @@ async function calculateTrendingFromDb() {
         CASE WHEN jsonb_typeof(u.data->'downloadsData') = 'array' THEN u.data->'downloadsData' ELSE '[]'::jsonb END
       ) item
     `;
+  const indexedGameTopSql = `
+      SELECT substring(content_key FROM 9) AS key, COUNT(*)::int AS count
+      FROM psn_content_download_memberships
+      WHERE content_key >= 'games|T:' AND content_key < 'games|U:'
+      GROUP BY content_key
+      ORDER BY count DESC, content_key ASC
+      LIMIT ${TRENDING_MAX_ITEMS}
+    `;
   const rows = await queryDbWithRetry(`
     WITH game_downloads AS (${gameDownloadsSource}
     ), wishlist_items AS (${psnStatsIndexReady && process.env.PSN_STATS_INDEX !== '0' ? `
@@ -5496,14 +5512,14 @@ async function calculateTrendingFromDb() {
       CROSS JOIN LATERAL jsonb_array_elements(
         CASE WHEN jsonb_typeof(u.data->'wishlistData') = 'array' THEN u.data->'wishlistData' ELSE '[]'::jsonb END
       ) item
-    `}), top_games AS (
+    `}), top_games AS (${useIndexedGameDownloads ? indexedGameTopSql : `
       SELECT title_id AS key, COUNT(DISTINCT username)::int AS count
       FROM game_downloads
       WHERE raw_category IN ('game','games') AND title_id <> ''
       GROUP BY title_id
       ORDER BY count DESC, title_id ASC
       LIMIT ${TRENDING_MAX_ITEMS}
-    ), top_wishlist AS (
+    `}), top_wishlist AS (
       SELECT title_id AS key, COUNT(*)::int AS count
       FROM wishlist_items
       WHERE title_id <> ''
@@ -6206,18 +6222,6 @@ async function getGlobalTrophyStats(options = {}) {
     })
     .finally(() => { globalTrophyStatsBuildInFlight = null; });
   return globalTrophyStatsBuildInFlight;
-}
-
-function profileUpdateTouchesTrending(userData = {}) {
-  return !!(userData && (
-    Object.prototype.hasOwnProperty.call(userData, 'downloadsData') ||
-    Object.prototype.hasOwnProperty.call(userData, 'downloads') ||
-    Object.prototype.hasOwnProperty.call(userData, 'downloadsClearedAt') ||
-    Object.prototype.hasOwnProperty.call(userData, 'downloadsUpdatedAt') ||
-    Object.prototype.hasOwnProperty.call(userData, 'wishlistData') ||
-    Object.prototype.hasOwnProperty.call(userData, 'wishlist') ||
-    Object.prototype.hasOwnProperty.call(userData, 'wishlistUpdatedAt')
-  ));
 }
 
 function withTimeout(promise, ms, fallbackValue) {
@@ -7641,6 +7645,16 @@ function getDownloadOwnershipTitleIds(downloadsData = []) {
   return Array.from(ids);
 }
 
+function ownershipMembershipChanged(oldLibrary, newLibrary, oldDownloads, newDownloads, checkLibrary, checkDownloads) {
+  function differs(left, right) {
+    const before = new Set(left);
+    const after = new Set(right);
+    return before.size !== after.size || [...before].some(id => !after.has(id));
+  }
+  return (checkLibrary && differs(getLibraryOwnershipTitleIds(oldLibrary), getLibraryOwnershipTitleIds(newLibrary))) ||
+    (checkDownloads && differs(getDownloadOwnershipTitleIds(oldDownloads), getDownloadOwnershipTitleIds(newDownloads)));
+}
+
 function getLibraryOwnershipEntryMap(libraryData = []) {
   const entries = new Map();
   (Array.isArray(libraryData) ? libraryData : []).forEach(item => {
@@ -8211,7 +8225,7 @@ async function ensureGameOwnershipIndexReady() {
 // inside the transaction: an earlier deferred request must never replay an old
 // Library/Downloads snapshot after a newer profile save or another instance.
 const gameOwnershipSyncJobs = new Map();
-const gameOwnershipSyncMetrics = { requests:0, coalesced:0, runs:0, unchanged:0, changedIds:0, retries:0, failed:0 };
+const gameOwnershipSyncMetrics = { requests:0, coalesced:0, skippedUnchanged:0, runs:0, unchanged:0, changedIds:0, retries:0, failed:0 };
 
 function scheduleUserGameOwnershipIndexSync(userName, options = {}) {
   const safeName = normalizeText(userName, '');
@@ -8228,7 +8242,7 @@ function scheduleUserGameOwnershipIndexSync(userName, options = {}) {
   }
   const job = { name:safeName, dirty:true, running:false, timer:null, failures:0, sourceSocketId:options.sourceSocketId || null };
   gameOwnershipSyncJobs.set(safeName, job);
-  scheduleGameOwnershipSyncJob(job, 35);
+  scheduleGameOwnershipSyncJob(job, 90);
 }
 
 function scheduleGameOwnershipSyncJob(job, delayMs) {
@@ -8276,7 +8290,7 @@ async function runGameOwnershipSyncJob(job) {
   } finally {
     job.running = false;
     if (job.dirty) {
-      scheduleGameOwnershipSyncJob(job, retryDelayMs || 35);
+      scheduleGameOwnershipSyncJob(job, retryDelayMs || 90);
     } else if (gameOwnershipSyncJobs.get(job.name) === job) {
       gameOwnershipSyncJobs.delete(job.name);
     }
@@ -8287,6 +8301,10 @@ async function syncUserGameOwnershipIndex(userName, options = {}) {
   const safeName = normalizeText(userName, '');
   if (!safeName) return [];
 
+  // The profile handler filters out unchanged ownership memberships before
+  // queuing this job. Read the committed profile under the original row lock:
+  // two extra preflight queries would add latency for every real change.
+  // Coalesced jobs still safely return [] if the index already matches.
   // Lock the account row first, consistently with ordinary profile writes and
   // account deletion. This works across Render instances and ensures the index
   // corresponds to a committed version of BOTH lists, not stale job payloads.
@@ -8353,7 +8371,7 @@ async function syncUserGameOwnershipIndex(userName, options = {}) {
       );
     }
     return changed;
-  }, { attempts:4, lockTimeoutMs:3000 });
+  }, { attempts:2, lockTimeoutMs:1200 });
 
   if (!changedTitleIds.length) return [];
   changedTitleIds.forEach(clearGamePlayersSummaryCache);
@@ -11666,10 +11684,6 @@ async function notifyPs3PlayTimeAcrossInstances(payload = {}) {
   }
 }
 
-function profileUpdateTouchesPublicCounts(userData = {}) {
-  return !!(userData && Object.entries(PROFILE_HEAVY_SECTION_META).some(([dataKey, meta]) => meta.publicCount !== false && incomingTouchesHeavyProfileSection(userData, dataKey, meta)));
-}
-
 function emitSettingsRealtimeSync(name, sourceSocketId = null, extra = {}) {
   if (!name || !userDatabase[name]) return;
   const safe = normalizeUserRecord(name, userDatabase[name] || {});
@@ -12595,7 +12609,7 @@ async function notifyFriendActivityClearedAcrossInstances(userName, throughId = 
 // (owner, id DESC) indexes; cleaning once per short burst prevents one DELETE
 // roundtrip per reaction/mention/activity event on a small Aiven instance.
 const HISTORY_RETENTION_DELAY_MS = 1800;
-const HISTORY_RETENTION_BATCH_MAX = 80;
+const HISTORY_RETENTION_BATCH_MAX = 24;
 const HISTORY_RETENTION_PENDING_MAX = 4096;
 const historyRetentionPending = { activity:new Set(), notification:new Set() };
 let historyRetentionTimer = null;
@@ -16831,7 +16845,8 @@ io.on('connection', (socket) => {
     let shouldForceProfileSyncToSource = false;
     let profileThemeMerge = { accepted: false, rejected: false };
     let settingsReplayStatus = null;
-    const shouldEmitTrendingUpdate = profileUpdateTouchesTrending(userData || {});
+    // A supplied list/version is not necessarily a changed download or wishlist.
+    let shouldEmitTrendingUpdate = false;
     if (name && userDatabase[name]) {
 
         if (incomingSettingsData) {
@@ -16939,7 +16954,7 @@ io.on('connection', (socket) => {
           replaySectionStatus[section] = dataKey && Object.prototype.hasOwnProperty.call(userData, dataKey) ? 'accepted' : 'rejected';
         });
         if (requestedSyncSections.some(section => replaySectionStatus[section] === 'rejected')) shouldForceProfileSyncToSource = true;
-        const publicCountsChanged = profileUpdateTouchesPublicCounts(userData);
+        let publicCountsChanged = false;
         // Global rarity depends only on which IDs are unlocked, not on XP,
         // progress or unlock-date changes in an otherwise identical trophy set.
         const trophiesChanged = Object.prototype.hasOwnProperty.call(userData, 'trophiesData') &&
@@ -16954,6 +16969,13 @@ io.on('connection', (socket) => {
         if (nextLibraryPlayHistoryData && !isDeepStrictEqual(workingUser.libraryPlayHistoryData, nextLibraryPlayHistoryData)) {
           changedPublicListKeys.push('libraryPlayHistoryData');
         }
+        shouldEmitTrendingUpdate = changedPublicListKeys.includes('downloadsData') || changedPublicListKeys.includes('wishlistData');
+        // Count-only profile updates are relevant only if the persisted count actually changes.
+        const publicCountKeys = ['downloads', 'wishlist', 'favorites', 'trophies', 'library'];
+        const effectivePublicCountsChanged = changedPublicListKeys.some(key => key !== 'libraryPlayHistoryData') ||
+          publicCountKeys.some(key => Object.prototype.hasOwnProperty.call(userData, key) &&
+            Number(workingUser[key] || 0) !== Number(userData[key] || 0));
+        publicCountsChanged = effectivePublicCountsChanged;
 
         Object.assign(workingUser, userData);
         if (nextLibraryPlayHistoryData) workingUser.libraryPlayHistoryData = nextLibraryPlayHistoryData;
@@ -16995,6 +17017,19 @@ io.on('connection', (socket) => {
         }
         profileDbPatch.lastSeen = workingUser.lastSeen;
         profileDbPatch.profileUpdatedAt = workingUser.profileUpdatedAt;
+
+        // The authoritative heavy sections were fetched from PostgreSQL before merging.
+        // Don't rewrite multi-MB JSONB fields when a reconnect replays identical data.
+        for (const dataKey of Object.keys(PROFILE_HEAVY_SECTION_META)) {
+          if (!Object.prototype.hasOwnProperty.call(profileDbPatch, dataKey)) continue;
+          if (dataKey === 'friendsData'
+            ? isDeepStrictEqual(originalProfileForNoopCheck[dataKey], profileDbPatch[dataKey])
+            : !changedPublicListKeys.includes(dataKey)) {
+            delete profileDbPatch[dataKey];
+          }
+        }
+        if (Object.prototype.hasOwnProperty.call(profileDbPatch, 'libraryPlayHistoryData') &&
+          !changedPublicListKeys.includes('libraryPlayHistoryData')) delete profileDbPatch.libraryPlayHistoryData;
 
         // Skip only empty, non-replay updates. Equality against an in-memory
         // profile is insufficient proof of a DB no-op on multi-instance deploys:
@@ -17053,7 +17088,18 @@ io.on('connection', (socket) => {
           emitContentDownloadCountsChanged(contentDownloadCountChangedKeys, { reason: 'downloads' });
           deferServerTask('CONTENT DOWNLOAD COUNTS NOTIFY', () => notifyContentDownloadCountsChangedAcrossInstances(contentDownloadCountChangedKeys, { reason: 'downloads' }), 0);
         }
-        const gameOwnershipChanged = Object.prototype.hasOwnProperty.call(profileDbPatch, 'libraryData') || Object.prototype.hasOwnProperty.call(profileDbPatch, 'downloadsData');
+        // A metadata edit, repeat download or identical list does not alter
+        // user_game_ownership. Only schedule SQL when title-ID membership changes.
+        const gameOwnershipChanged = ownershipMembershipChanged(
+          previousLibraryForSharedGameMatch, workingUser.libraryData,
+          previousDownloadsData, workingUser.downloadsData,
+          Object.prototype.hasOwnProperty.call(profileDbPatch, 'libraryData'),
+          Object.prototype.hasOwnProperty.call(profileDbPatch, 'downloadsData')
+        );
+        if (!gameOwnershipChanged && (
+          Object.prototype.hasOwnProperty.call(userData, 'libraryData') ||
+          Object.prototype.hasOwnProperty.call(userData, 'downloadsData')
+        )) gameOwnershipSyncMetrics.skippedUnchanged++;
         const friendsChangedForGamePlayers = Object.prototype.hasOwnProperty.call(profileDbPatch, 'friendsData');
         if (gameOwnershipChanged || friendsChangedForGamePlayers) {
           clearGamePlayersSummaryCache();
