@@ -118,13 +118,13 @@
 				var settled = false;
 				image.decoding = 'async';
 				if (highPriority) image.fetchPriority = 'high';
-				var timer = setTimeout(function () { finish(false); }, 12000);
+				var timer = setTimeout(function () { finish(false); }, 30000);
 				function finish(ok) {
 					if (settled) return;
 					settled = true;
 					clearTimeout(timer);
 					image.onload = image.onerror = null;
-					state.until = ok ? Infinity : Date.now() + 45000;
+					state.until = ok ? Infinity : Date.now() + 8000;
 					if (!ok) image.src = '';
 					resolve(ok);
 				}
@@ -156,7 +156,7 @@
 		function request() {
 			if (ready || pending) return pending || initial;
 			var controller = typeof AbortController === 'function' ? new AbortController() : null;
-			var timeout = setTimeout(function () { if (controller) controller.abort(); }, failedAttempts ? 8000 : 5000);
+			var timeout = setTimeout(function () { if (controller) controller.abort(); }, failedAttempts ? 25000 : 15000);
 			pending = Promise.resolve().then(function () {
 				return fetch(url, { cache: failedAttempts ? 'reload' : 'no-cache', signal: controller ? controller.signal : undefined });
 			}).then(function (response) {
@@ -56230,16 +56230,17 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
         const source = image.__psnHeroData?.img;
         if (!source || !image.isConnected || !isHeroImageNearby(image) ||
             image.__psnHeroRetryTimer || image.__psnHeroProbe || document.hidden) return;
-        const delays = [3500, 11000, 30000, 90000, 180000];
+        const delays = [2000, 6000, 15000, 30000, 60000];
         const failures = image.__psnHeroFailures || 0;
         const delay = delays[Math.min(failures, delays.length - 1)];
+        image.__psnHeroRetrying = '1';
         image.__psnHeroRetryTimer = setTimeout(() => {
             image.__psnHeroRetryTimer = null;
             if (!image.isConnected || !isHeroImageNearby(image) || document.hidden || navigator.onLine === false) return;
             const probe = new Image();
             image.__psnHeroProbe = probe;
             probe.decoding = 'async';
-            const timer = setTimeout(() => finish(false), 22000);
+            const timer = setTimeout(() => finish(false), 30000);
             let settled = false;
             function finish(ok) {
                 if (settled) return;
@@ -56250,7 +56251,9 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
                 if (!image.isConnected || image.__psnHeroData?.img !== source) return;
                 if (ok) {
                     image.__psnHeroFailures = 0;
+                    image.__psnHeroRetrying = '0';
                     image.src = source;
+                    armHeroImageWatchdog(image);
                 } else {
                     image.__psnHeroFailures = Math.min(4, (image.__psnHeroFailures || 0) + 1);
                     probe.src = '';
@@ -56264,21 +56267,23 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
     }
 
     function armHeroImageWatchdog(image) {
-        if (!image || image.complete || image.__psnHeroWatchdog) return;
+        clearHeroImageWatchdog(image);
+        if (!image || image.complete) return;
         image.__psnHeroWatchdog = setTimeout(() => {
             image.__psnHeroWatchdog = null;
-            // Give remote hosts time; never poison their URL after a slow response.
-            if (!image.isConnected || image.complete || document.hidden) return;
-            image.src = window.psnHeroFallbackImage;
+            // Slow connections should keep waiting for the real image. Only schedule a background retry.
+            if (!image.isConnected || image.complete || document.hidden || image.__psnHeroRetrying === '1') return;
             queueHeroImageRetry(image);
-        }, 22000);
+        }, 45000);
     }
 
     function resumeHeroImageRetries() {
         if (document.hidden) return;
         for (const image of heroSlides.map(slide => slide.querySelector('.hero-slide-img'))) {
             if (!image || !image.isConnected || !isHeroImageNearby(image)) continue;
-            if (image.__psnHeroData?.img && image.src === window.psnHeroFallbackImage) queueHeroImageRetry(image);
+            if (image.__psnHeroData?.img && (image.__psnHeroRetrying === '1' || !image.getAttribute('src'))) {
+                queueHeroImageRetry(image);
+            }
         }
     }
 
@@ -56309,6 +56314,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
                 image.style.opacity = '0';
                 image.addEventListener('load', () => {
                     clearHeroImageWatchdog(image);
+                    image.__psnHeroRetrying = '0';
                     if (image.src !== window.psnHeroFallbackImage) {
                         image.__psnHeroFailures = 0;
                         clearTimeout(image.__psnHeroRetryTimer);
@@ -56318,14 +56324,20 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
                 });
                 image.addEventListener('error', () => {
                     clearHeroImageWatchdog(image);
-                    if (image.src === window.psnHeroFallbackImage) return;
-                    image.src = window.psnHeroFallbackImage;
+                    image.__psnHeroRetrying = '1';
+                    image.style.opacity = '0';
+                    if (!image.__psnHeroData?.img) {
+                        image.src = window.psnHeroFallbackImage;
+                        image.style.opacity = '1';
+                        return;
+                    }
                     queueHeroImageRetry(image);
                 });
                 if (image.loading === 'eager') {
                     image.src = typeof window.psnHeroChooseImage === 'function'
                         ? window.psnHeroChooseImage(data)
                         : (data.img || window.psnHeroFallbackImage);
+                    armHeroImageWatchdog(image);
                 }
                 kenburns.appendChild(image);
                 const content = document.createElement('div');
@@ -56512,8 +56524,9 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
                 img.src = typeof window.psnHeroChooseImage === 'function'
                     ? window.psnHeroChooseImage(entry)
                     : (entry?.img || window.psnHeroFallbackImage);
+                armHeroImageWatchdog(img);
             }
-            if (img.src === window.psnHeroFallbackImage && img.__psnHeroData?.img) queueHeroImageRetry(img);
+            if (img.__psnHeroRetrying === '1') queueHeroImageRetry(img);
             else armHeroImageWatchdog(img);
         }
     }
