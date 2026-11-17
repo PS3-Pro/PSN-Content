@@ -930,6 +930,24 @@ let profileNoopSavesAvoided = 0;
 // Revision-only updates are intentionally allowed only for ACKed, unchanged
 // sections. Counters explain why the bandwidth-saving path is rarely used.
 const profileDeliveryMetrics = { full: 0, gzip: 0, revision: 0, revisionAccepted: 0, revisionRejected: 0, revisionNoBaseline: 0, revisionContentChanged: 0, revisionEligible: 0, explicitHydration: 0, gzipFallback: 0, ackTimeout: 0, rawBytes: 0, gzipBytes: 0, gzipBase64Bytes: 0 };
+const profileAckTimeoutSections = Object.create(null);
+const serverPhaseMetrics = new Map();
+function recordServerWorkPhase(label, elapsedMs) {
+  if (!DB_PERF_ENABLED) return;
+  const elapsed = Math.round(elapsedMs);
+  let stats = serverPhaseMetrics.get(label);
+  if (!stats) {
+    stats = { calls:0, totalMs:0, maxMs:0, slow:0 };
+    serverPhaseMetrics.set(label, stats);
+  }
+  stats.calls++;
+  stats.totalMs += elapsed;
+  stats.maxMs = Math.max(stats.maxMs, elapsed);
+  if (elapsed >= 300) {
+    stats.slow++;
+    console.warn(`[SERVER WORK SLOW] ${label}: ${elapsed}ms`);
+  }
+}
 const profileNotificationMetrics = { received: 0, saved: 0, duplicate: 0, logicalNoChange: 0, categoryConflicts: 0, byCategory: Object.create(null) };
 function readDbEventLoopMetrics() {
   if (!dbEventLoopDelay) return null;
@@ -994,7 +1012,7 @@ function dbPerfP95(values) {
   return Math.round(sorted[Math.ceil(sorted.length * .95) - 1] || 0);
 }
 function flushDbQueryPerformance() {
-  if (!dbQueryPerf.size) return;
+  if (!dbQueryPerf.size && !serverPhaseMetrics.size && !Object.keys(profileAckTimeoutSections).length) return;
   const summary = [...dbQueryPerf.entries()].map(([label, stats]) => ({
     label, calls:stats.calls, avgMs:Math.round(stats.total / stats.calls),
     p95Ms:dbPerfP95(stats.samples), maxMs:stats.max,
@@ -1004,7 +1022,12 @@ function flushDbQueryPerformance() {
     slow:stats.slow, errors:stats.errors, retries:stats.retries, totalMs:stats.total
   })).sort((a,b) => b.totalMs-a.totalMs).slice(0,8);
   dbQueryPerf.clear();
-  console.log('[DB PERF 5MIN]', JSON.stringify({topQueries:summary, pool:{total:pool.totalCount, idle:pool.idleCount, waiting:pool.waitingCount, peakWaiting:dbPerfPeakWaiting, peakConnections:dbPerfPeakConnections}, admission:{enabled:DB_READ_ADMISSION_ENABLED, optionalQueuedPeak:dbAdmissionOptionalPeak, bulkPendingPeak:dbAdmissionBulkPeak, bulkWaits:dbAdmissionBulkWaits}, eventLoop:readDbEventLoopMetrics(), profile:{noopSavesAvoided:profileNoopSavesAvoided, delivery:{...profileDeliveryMetrics}}, notifications:{...profileNotificationMetrics,byCategory:{...profileNotificationMetrics.byCategory}}, userRowWrites:{...userRowMutationMetrics}, gameOwnershipSync:{...gameOwnershipSyncMetrics}, personalReadReuse:readPersonalCacheStats}));
+  const work = [...serverPhaseMetrics.entries()].map(([label, stats]) => ({
+    label, calls:stats.calls, avgMs:Math.round(stats.totalMs / stats.calls), maxMs:stats.maxMs, slow:stats.slow
+  })).sort((a,b) => b.maxMs - a.maxMs).slice(0,8);
+  console.log('[DB PERF 5MIN]', JSON.stringify({topQueries:summary, pool:{total:pool.totalCount, idle:pool.idleCount, waiting:pool.waitingCount, peakWaiting:dbPerfPeakWaiting, peakConnections:dbPerfPeakConnections}, admission:{enabled:DB_READ_ADMISSION_ENABLED, optionalQueuedPeak:dbAdmissionOptionalPeak, bulkPendingPeak:dbAdmissionBulkPeak, bulkWaits:dbAdmissionBulkWaits}, eventLoop:readDbEventLoopMetrics(), serverWork:work, profile:{noopSavesAvoided:profileNoopSavesAvoided, delivery:{...profileDeliveryMetrics}, ackTimeoutSections:{...profileAckTimeoutSections}}, notifications:{...profileNotificationMetrics,byCategory:{...profileNotificationMetrics.byCategory}}, userRowWrites:{...userRowMutationMetrics}, gameOwnershipSync:{...gameOwnershipSyncMetrics}, personalReadReuse:readPersonalCacheStats}));
+  serverPhaseMetrics.clear();
+  Object.keys(profileAckTimeoutSections).forEach(key => { delete profileAckTimeoutSections[key]; });
   profileNoopSavesAvoided = 0;
   Object.keys(profileDeliveryMetrics).forEach(key => { profileDeliveryMetrics[key] = 0; });
   ['received','saved','duplicate','logicalNoChange','categoryConflicts'].forEach(key => { profileNotificationMetrics[key] = 0; });
@@ -7633,15 +7656,26 @@ function getLibraryOwnershipTitleIds(libraryData = []) {
 }
 
 function getDownloadOwnershipTitleIds(downloadsData = []) {
+  const source = Array.isArray(downloadsData) ? downloadsData : [];
   const ids = new Set();
-  const normalizedDownloads = normalizeDownloadHistoryRecordsServer(Array.isArray(downloadsData) ? downloadsData : []).history;
-  normalizedDownloads.forEach(item => {
-    if (!item || typeof item !== 'object' || Array.isArray(item)) return;
-    const category = normalizeDownloadHistoryCategoryServer(item.category || item.rawCategory || 'games');
-    if (category !== 'games') return;
+  for (const item of source) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    if (normalizeDownloadHistoryCategoryServer(item.category || item.rawCategory || 'games') !== 'games') continue;
     const titleId = normalizeGamePlayersTitleId(item.titleId || item.id);
-    if (titleId) ids.add(titleId);
-  });
+    if (!titleId) {
+      // Incomplete records may merge into a named/content-matched game and
+      // alter the group's effective ID; preserve exact legacy semantics.
+      const normalized = normalizeDownloadHistoryRecordsServer(source).history;
+      const mergedIds = new Set();
+      normalized.forEach(record => {
+        if (normalizeDownloadHistoryCategoryServer(record.category || record.rawCategory || 'games') !== 'games') return;
+        const mergedId = normalizeGamePlayersTitleId(record.titleId || record.id);
+        if (mergedId) mergedIds.add(mergedId);
+      });
+      return Array.from(mergedIds);
+    }
+    ids.add(titleId);
+  }
   return Array.from(ids);
 }
 
@@ -8225,7 +8259,11 @@ async function ensureGameOwnershipIndexReady() {
 // inside the transaction: an earlier deferred request must never replay an old
 // Library/Downloads snapshot after a newer profile save or another instance.
 const gameOwnershipSyncJobs = new Map();
-const gameOwnershipSyncMetrics = { requests:0, coalesced:0, skippedUnchanged:0, runs:0, unchanged:0, changedIds:0, retries:0, failed:0 };
+// Background ownership writes are deferred; never let a burst exhaust the four-connection pool.
+const GAME_OWNERSHIP_SYNC_CONCURRENCY = Math.max(1, Math.min(2, PG_POOL_MAX - 2));
+const gameOwnershipSyncReady = [];
+let gameOwnershipSyncActive = 0;
+const gameOwnershipSyncMetrics = { requests:0, coalesced:0, skippedUnchanged:0, runs:0, unchanged:0, changedIds:0, retries:0, failed:0, peakPending:0, peakActive:0 };
 
 function scheduleUserGameOwnershipIndexSync(userName, options = {}) {
   const safeName = normalizeText(userName, '');
@@ -8246,11 +8284,30 @@ function scheduleUserGameOwnershipIndexSync(userName, options = {}) {
 }
 
 function scheduleGameOwnershipSyncJob(job, delayMs) {
-  if (job.timer || job.running) return;
+  if (job.timer || job.running || job.queued) return;
   job.timer = setTimeout(() => {
     job.timer = null;
-    runGameOwnershipSyncJob(job).catch(err => console.error('[GAME OWNERSHIP INDEX JOB ERROR]:', err));
+    if (job.queued || job.running || !job.dirty || gameOwnershipSyncJobs.get(job.name) !== job) return;
+    job.queued = true;
+    gameOwnershipSyncReady.push(job);
+    gameOwnershipSyncMetrics.peakPending = Math.max(gameOwnershipSyncMetrics.peakPending, gameOwnershipSyncReady.length);
+    pumpGameOwnershipSyncJobs();
   }, delayMs);
+}
+
+function pumpGameOwnershipSyncJobs() {
+  while (gameOwnershipSyncActive < GAME_OWNERSHIP_SYNC_CONCURRENCY && gameOwnershipSyncReady.length) {
+    const job = gameOwnershipSyncReady.shift();
+    job.queued = false;
+    if (job.running || !job.dirty || gameOwnershipSyncJobs.get(job.name) !== job) continue;
+    gameOwnershipSyncActive++;
+    gameOwnershipSyncMetrics.peakActive = Math.max(gameOwnershipSyncMetrics.peakActive, gameOwnershipSyncActive);
+    runGameOwnershipSyncJob(job).catch(err => console.error('[GAME OWNERSHIP INDEX JOB ERROR]:', err))
+      .finally(() => {
+        gameOwnershipSyncActive--;
+        pumpGameOwnershipSyncJobs();
+      });
+  }
 }
 
 async function runGameOwnershipSyncJob(job) {
@@ -8309,20 +8366,33 @@ async function syncUserGameOwnershipIndex(userName, options = {}) {
   // account deletion. This works across Render instances and ensures the index
   // corresponds to a committed version of BOTH lists, not stale job payloads.
   const changedTitleIds = await runDbTransactionWithRetry('GAME OWNERSHIP INDEX SYNC', async client => {
+    let phaseStarted = DB_PERF_ENABLED ? performance.now() : 0;
     const profileResult = await client.query(
       `SELECT data->'libraryData' AS library_data, data->'downloadsData' AS downloads_data
        FROM users WHERE name = $1 FOR NO KEY UPDATE`,
       [safeName]
     );
+    if (DB_PERF_ENABLED) {
+      recordServerWorkPhase('OWNERSHIP ROW READ (WALL)', performance.now() - phaseStarted);
+      phaseStarted = performance.now();
+    }
     if (!profileResult.rows.length) return [];
 
     const profile = profileResult.rows[0];
     const libraryIds = getLibraryOwnershipTitleIds(profile.library_data);
     const downloadIds = getDownloadOwnershipTitleIds(profile.downloads_data);
+    if (DB_PERF_ENABLED) {
+      recordServerWorkPhase('OWNERSHIP NORMALIZE (JS)', performance.now() - phaseStarted);
+      phaseStarted = performance.now();
+    }
     const currentResult = await client.query(
       'SELECT title_id, in_library, downloaded FROM user_game_ownership WHERE user_name = $1',
       [safeName]
     );
+    if (DB_PERF_ENABLED) {
+      recordServerWorkPhase('OWNERSHIP INDEX READ (WALL)', performance.now() - phaseStarted);
+      phaseStarted = performance.now();
+    }
     const current = new Map();
     for (const row of currentResult.rows) {
       const titleId = normalizeGamePlayersTitleId(row.title_id);
@@ -8341,6 +8411,10 @@ async function syncUserGameOwnershipIndex(userName, options = {}) {
       const after = desired.get(titleId) || { inLibrary:false, downloaded:false };
       return before.inLibrary !== after.inLibrary || before.downloaded !== after.downloaded || (!desired.has(titleId) && current.has(titleId));
     });
+    if (DB_PERF_ENABLED) {
+      recordServerWorkPhase('OWNERSHIP DIFF (JS)', performance.now() - phaseStarted);
+      phaseStarted = performance.now();
+    }
     if (!changed.length) return [];
 
     const updates = changed.filter(titleId => desired.has(titleId)).map(titleId => ({
@@ -8370,6 +8444,7 @@ async function syncUserGameOwnershipIndex(userName, options = {}) {
         [safeName, removals]
       );
     }
+    if (DB_PERF_ENABLED) recordServerWorkPhase('OWNERSHIP INDEX WRITE (WALL)', performance.now() - phaseStarted);
     return changed;
   }, { attempts:2, lockTimeoutMs:1200 });
 
@@ -8867,11 +8942,15 @@ async function emitProfileSyncPacket(socket, payload, options = {}) {
   const requireAck = socket && socket.profileSyncAckV1 === true;
   let outgoingPayload = payload;
   let compressedBytesInfo = null;
+  let serializedBytes = 0;
   // Legacy clients do not acknowledge compressed packets and use the plain
   // payload path below. Avoid spending CPU on gzip that will be discarded.
   if (requireAck && socket && socket.connected && socket.profileSyncGzipV1 === true && payload && payload.userData) {
     try {
+      const stringifyStartedAt = DB_PERF_ENABLED ? performance.now() : 0;
       const serialized = Buffer.from(JSON.stringify(payload));
+      if (DB_PERF_ENABLED) recordServerWorkPhase('PROFILE PACKET SERIALIZE (JS)', performance.now() - stringifyStartedAt);
+      serializedBytes = serialized.length;
       if (serialized.length >= 4096 && serialized.length <= 4 * 1024 * 1024) {
         const compressed = await new Promise((resolve, reject) => zlib.gzip(serialized, { level: 1 },
           (err, bytes) => err ? reject(err) : resolve(bytes)));
@@ -8887,7 +8966,12 @@ async function emitProfileSyncPacket(socket, payload, options = {}) {
       }
     } catch (err) { outgoingPayload = payload; }
   }
-  const timeoutMs = Math.max(3000, Number(options.timeoutMs || 15000));
+  const requestedTimeoutMs = Math.max(3000, Number(options.timeoutMs || 15000));
+  // A large section may take longer to decompress/apply on a slow browser.
+  // Keep the normal deadline for small packets; never exceed 22 seconds.
+  const timeoutMs = requireAck && serializedBytes > 512 * 1024
+    ? Math.min(22000, Math.max(requestedTimeoutMs, requestedTimeoutMs + Math.ceil(serializedBytes / (1024 * 1024)) * 2000))
+    : requestedTimeoutMs;
   const label = String(options.label || 'profile');
   if (!socket || !socket.connected) return Promise.reject(new Error(`Socket disconnected before ${label}.`));
 
@@ -9037,6 +9121,8 @@ async function emitChunkedProfileSyncToSocket(socket, name, options = {}) {
       const result = await emitProfileSyncPacket(socket, corePayload, { label: coreLabel, timeoutMs: 8000 });
       if (result && result.cancelled) { logMemoryTrace('profile-sync:cancel', `user=${name} socket=${socket.id} stage=${coreLabel}`); return; }
       if (result && result.ackTimeout) {
+        profileDeliveryMetrics.ackTimeout++;
+        profileAckTimeoutSections[coreLabel] = (profileAckTimeoutSections[coreLabel] || 0) + 1;
         logMemoryTrace(`profile-sync:${coreLabel}:ack-timeout`, `user=${name} socket=${socket.id} drained=${result.drained === true} ms=${result.elapsedMs || 0} pending=${result.pending || 0} buffer=${getSocketWriteBufferLength(socket)}`);
       } else {
         logMemoryTrace(`profile-sync:${coreLabel}:ack`, `user=${name} socket=${socket.id} ack=${result.acked === true} ms=${result.elapsedMs || 0} buffer=${getSocketWriteBufferLength(socket)}`);
@@ -9094,8 +9180,15 @@ async function emitChunkedProfileSyncToSocket(socket, name, options = {}) {
         // A confirmed section is reusable even if another profile field changed.
         // Send the new revision/counts as a tiny patch; do not resend the same list.
         // Only an ACK from this socket qualifies. Explicit hydration never dedupes.
-        const signature = socket.profileSyncAckV1 === true && packet.userData ?
+        // A successful full hydration establishes this socket's ACKed baseline.
+        // Without its signature the first unchanged delta would resend the
+        // entire section, increasing bandwidth and client work after login.
+        const shouldHashSection = socket.profileSyncAckV1 === true &&
+          socket.profileSyncRevisionOnlyV1 === true && !!packet.userData;
+        const signatureStartedAt = shouldHashSection && DB_PERF_ENABLED ? performance.now() : 0;
+        const signature = shouldHashSection ?
           crypto.createHash('sha256').update(JSON.stringify(packet.userData[dataKey])).digest('hex') : '';
+        if (signatureStartedAt) recordServerWorkPhase('PROFILE SIGNATURE (JS)', performance.now() - signatureStartedAt);
         const lastSent = socket.__profileSectionLastAck && socket.__profileSectionLastAck.get(dataKey);
         if (socket.profileSyncRevisionOnlyV1 === true && signature) {
           if (options.allowAckDedupe !== true) profileDeliveryMetrics.explicitHydration++;
@@ -9129,6 +9222,7 @@ async function emitChunkedProfileSyncToSocket(socket, name, options = {}) {
         if (result && result.cancelled) { sectionCancelled = true; return; }
         if (result && result.ackTimeout) {
           profileDeliveryMetrics.ackTimeout++;
+          profileAckTimeoutSections[dataKey] = (profileAckTimeoutSections[dataKey] || 0) + 1;
           logMemoryTrace('profile-sync:section:ack-timeout', `user=${name} socket=${socket.id} section=${dataKey} drained=${result.drained === true} ms=${result.elapsedMs || 0} pending=${result.pending || 0} buffer=${getSocketWriteBufferLength(socket)}`);
         } else {
           logMemoryTrace('profile-sync:section:ack', `user=${name} socket=${socket.id} section=${dataKey} ack=${result.acked === true} ms=${result.elapsedMs || 0} buffer=${getSocketWriteBufferLength(socket)}`);
@@ -16913,8 +17007,10 @@ io.on('connection', (socket) => {
             }
         }
 
+        const reconcileStartedAt = DB_PERF_ENABLED ? performance.now() : 0;
         userData = reconcileIncomingDownloads(workingUser, userData || {});
         userData = reconcileIncomingProfileArrays(workingUser, userData || {});
+        if (DB_PERF_ENABLED) recordServerWorkPhase('PROFILE LIST RECONCILE (JS)', performance.now() - reconcileStartedAt);
         const friendsSafetyRejected = userData.__friendsSafetyRejected === true;
         delete userData.__friendsSafetyRejected;
         delete userData._friendsMutation;
@@ -16962,6 +17058,7 @@ io.on('connection', (socket) => {
 
         // A profile patch may repeat a whole list with identical contents. Only
         // genuine changes should notify every viewer to reload that public list.
+        const compareStartedAt = DB_PERF_ENABLED ? performance.now() : 0;
         const changedPublicListKeys = Object.keys(PUBLIC_PROFILE_LIST_CHANGE_KEYS).filter(key =>
           Object.prototype.hasOwnProperty.call(userData, key) &&
           !isDeepStrictEqual(workingUser[key], userData[key])
@@ -16969,6 +17066,7 @@ io.on('connection', (socket) => {
         if (nextLibraryPlayHistoryData && !isDeepStrictEqual(workingUser.libraryPlayHistoryData, nextLibraryPlayHistoryData)) {
           changedPublicListKeys.push('libraryPlayHistoryData');
         }
+        if (DB_PERF_ENABLED) recordServerWorkPhase('PROFILE LIST COMPARE (JS)', performance.now() - compareStartedAt);
         shouldEmitTrendingUpdate = changedPublicListKeys.includes('downloadsData') || changedPublicListKeys.includes('wishlistData');
         // Count-only profile updates are relevant only if the persisted count actually changes.
         const publicCountKeys = ['downloads', 'wishlist', 'favorites', 'trophies', 'library'];
