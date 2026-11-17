@@ -860,6 +860,8 @@ select option { background-color: var(--bg-dark); }
 #view-explore .horizontal-scroll > .explore-snap-slot:last-child > .game-card { transform-origin: right center; }
 #subview-online-revived .horizontal-scroll > .revived-snap-slot { position: relative; flex: 0 0 160px; width: 160px; min-width: 0; scroll-snap-align: start; scroll-snap-stop: always; }
 #subview-online-revived .horizontal-scroll > .revived-snap-slot:hover { z-index: 10; }
+#subview-online-revived .horizontal-scroll > .revived-virtual-spacer { flex: 0 0 auto; height: 1px; scroll-snap-align: none; scroll-snap-stop: normal; pointer-events: none; }
+#subview-online-revived .horizontal-scroll.revived-virtualized { scroll-snap-type: x proximity; }
 #subview-online-revived .horizontal-scroll > .revived-snap-slot > .game-card { width: 100% !important; transform-origin: center center; }
 #subview-online-revived .horizontal-scroll > .revived-snap-slot:first-child > .game-card { transform-origin: left center; }
 #subview-online-revived .horizontal-scroll > .revived-snap-slot:last-child > .game-card { transform-origin: right center; }
@@ -55979,7 +55981,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
             const gap = parseFloat(containerStyle.columnGap || containerStyle.gap) || 0;
             let itemWidth = 0;
             for (const item of container.children) {
-                if (item.classList.contains('explore-virtual-spacer')) continue;
+                if (item.classList.contains('explore-virtual-spacer') || item.classList.contains('revived-virtual-spacer')) continue;
                 const style = getComputedStyle(item);
                 if (style.display === 'none') continue;
                 const width = item.getBoundingClientRect().width;
@@ -58685,11 +58687,16 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 				if (section !== 'featured') {
 					const revivedAlreadyPopulated = !!targetView.querySelector('.game-card, [data-server-name]');
 					if (typeof loadRevivedServersFromTSV === 'function' && (!window.isRestoringHistory || !revivedAlreadyPopulated)) loadRevivedServersFromTSV();
+					if (typeof window.resumeRevivedServerCards === 'function') window.resumeRevivedServerCards();
 				}
 				if (typeof setupSkeletonAnimations === 'function') setupSkeletonAnimations(targetView);
 				const carousels = targetView.querySelectorAll('.horizontal-scroll');
 				carousels.forEach(c => {
 					if (!window.isRestoringHistory) c.scrollLeft = 0;
+					if (section !== 'featured') {
+						const rect = c.getBoundingClientRect();
+						if (rect.top > window.innerHeight + 160 || rect.bottom < -160) return;
+					}
 					c.querySelectorAll('.game-card').forEach(card => resetRevealTargetToStatic(card, 'anim-reveal'));
 					if (c.id && typeof setupRevealAnimations === 'function') setupRevealAnimations(c.id);
 				});
@@ -59542,7 +59549,6 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 			const lines = text.split('\n');
 			container.innerHTML = '';
 	
-			const renderPromises = [];
 			const serverSections = [];
 			const serverCardJobs = [];
 			let revivedServerCount = 0;
@@ -59646,16 +59652,96 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 				serverCardJobs.push({ gridId, ids });
 			}
 			if (serverSections.length) container.insertAdjacentHTML('beforeend', serverSections.join(''));
+			// Prioritize nearby servers, then prepare the rest without blocking the initial paint.
+			if (window.__revivedCardObserver) window.__revivedCardObserver.disconnect();
+			const priorityServerJobs = [];
+			const backgroundServerJobs = [];
+			const serverJobsBySection = new Map();
+			const serverScrollRoot = document.getElementById('scroll-area');
+			let cardsFrameScheduled = false;
+			let sectionObserver = null;
+
+			const isJobNearViewport = job => {
+				if (!job?.section?.isConnected) return false;
+				const rect = job.section.getBoundingClientRect();
+				const viewport = serverScrollRoot?.getBoundingClientRect() || { top: 0, bottom: window.innerHeight };
+				return rect.top < viewport.bottom + 1200 && rect.bottom > viewport.top - 800;
+			};
+
+			const scheduleServerCards = () => {
+				if (cardsFrameScheduled || (!priorityServerJobs.length && !backgroundServerJobs.length)) return;
+				cardsFrameScheduled = true;
+				const next = () => requestAnimationFrame(() => {
+					cardsFrameScheduled = false;
+					if (!revivedStillVisible()) return;
+					let job;
+					while (priorityServerJobs.length && !job) {
+						const candidate = priorityServerJobs.shift();
+						if (!candidate.rendered) job = candidate;
+					}
+					while (!job && backgroundServerJobs.length) {
+						const candidate = backgroundServerJobs.shift();
+						if (!candidate.rendered) job = candidate;
+					}
+					if (job?.section?.isConnected) {
+						job.rendered = true;
+						renderServerGamesCards(job.gridId, job.ids, false, { isCurrent: revivedStillVisible });
+					}
+					if (priorityServerJobs.length || backgroundServerJobs.length) scheduleServerCards();
+				});
+				// Give input/scroll frames room between offscreen server builds.
+				if (priorityServerJobs.length) next();
+				else setTimeout(next, 24);
+			};
+
+			const enqueueServerCards = (job, priority = true) => {
+				if (!job || job.rendered || !job.section?.isConnected) return;
+				if (priority) {
+					if (!job.priorityQueued) { job.priorityQueued = true; priorityServerJobs.push(job); }
+				} else if (!job.backgroundQueued) {
+					job.backgroundQueued = true;
+					backgroundServerJobs.push(job);
+				}
+				scheduleServerCards();
+			};
+
 			for (const job of serverCardJobs) {
-				renderPromises.push(renderServerGamesCards(job.gridId, job.ids, false, { isCurrent: revivedStillVisible }));
+				job.section = document.getElementById(job.gridId)?.closest('.revived-server-section');
+				job.rendered = false;
+				if (job.section) serverJobsBySection.set(job.section, job);
 			}
+
+			if (typeof IntersectionObserver === 'function') {
+				sectionObserver = new IntersectionObserver(entries => {
+					for (const entry of entries) {
+						if (!entry.isIntersecting) continue;
+						const job = serverJobsBySection.get(entry.target);
+						if (!job?.rendered) enqueueServerCards(job, true);
+						else refreshRevivedServerVisibleNames(document.getElementById(job.gridId));
+					}
+				}, { root: serverScrollRoot || null, rootMargin: '1200px 0px' });
+				window.__revivedCardObserver = sectionObserver;
+				for (const section of serverJobsBySection.keys()) sectionObserver.observe(section);
+			}
+
+			window.resumeRevivedServerCards = () => {
+				if (!revivedStillVisible()) return;
+				for (const job of serverCardJobs) {
+					if (!isJobNearViewport(job)) continue;
+					if (!job.rendered) enqueueServerCards(job, true);
+					else refreshRevivedServerVisibleNames(document.getElementById(job.gridId));
+				}
+				scheduleServerCards();
+			};
+			window.resumeRevivedServerCards();
+			// Backfill all remaining server carousels after the first visible paint.
+			setTimeout(() => {
+				for (const job of serverCardJobs) enqueueServerCards(job, false);
+			}, 180);
 			if (revivedServerTitleEl) revivedServerTitleEl.textContent = revivedServerCount === 1 ? 'Revived Server' : 'Revived Servers';
 			if (revivedServerCountEl) revivedServerCountEl.textContent = `(${window.formatUiCount ? window.formatUiCount(revivedServerCount, 'item', 'items') : `${revivedServerCount} ${revivedServerCount === 1 ? 'item' : 'items'}`})`;
 			window.revivedServersTotalCount = revivedServerCount;
 			if (typeof window.setSidebarCountPill === 'function') window.setSidebarCountPill('revived', revivedServerCount);
-	
-			await Promise.all(renderPromises);
-			if (!revivedStillVisible()) return;
 	
 			window.isRevivedLoaded = true;
 		} catch (error) {
@@ -59772,6 +59858,130 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		finally { revivedGameNamePending.delete(requestKey); }
 	}
 
+	const REVIVED_VIRTUAL_CARD_BUFFER = 7;
+	const revivedVirtualCarousels = new Set();
+
+	function getRevivedVirtualMetrics(container) {
+		const style = getComputedStyle(container);
+		const gap = parseFloat(style.columnGap || style.gap) || 15;
+		const width = window.matchMedia('(max-width: 768px)').matches ? 140 : 160;
+		return { gap, step: width + gap };
+	}
+
+	function requestRevivedVirtualName(container, item) {
+		if (!item.needsNameLookup || item.nameLookupStarted) return;
+		const data = container.__revivedVirtualData;
+		if (!data) return;
+		item.nameLookupStarted = true;
+		getGameName(item.id, item.consoleTag, item.gameData?.cleanName || '', !!item.consoleTag).then(name => {
+			if (!name || name === item.id || container.__revivedVirtualData !== data) return;
+			item.displayName = name;
+			item.needsNameLookup = false;
+			const card = Array.from(container.querySelectorAll('.game-card[data-title-id]'))
+				.find(node => node.dataset.titleId === item.id);
+			if (!card) return;
+			const title = card.querySelector('.game-title');
+			if (title) { title.textContent = name; title.title = name; }
+			const image = card.querySelector('.game-img');
+			if (image) {
+				image.dataset.name = name;
+				if (!item.consoleTag) {
+					const platform = revivedGameNamePlatformCache.get(`${item.gameDbPlatform}:${item.id.replace(/-/g, '')}`);
+					if (platform) image.dataset.console = platform.toLowerCase();
+				}
+			}
+		}).catch(() => { item.nameLookupStarted = false; });
+	}
+
+	function refreshRevivedServerVisibleNames(container) {
+		const data = container?.__revivedVirtualData;
+		if (!data) return;
+		const rect = container.getBoundingClientRect();
+		const root = document.getElementById('scroll-area')?.getBoundingClientRect() || { top: 0, bottom: window.innerHeight };
+		if (rect.bottom < root.top - 1000 || rect.top > root.bottom + 1000) return;
+		for (let i = data.start; i < data.end; i++) requestRevivedVirtualName(container, data.items[i]);
+	}
+
+	function renderRevivedVirtualWindow(container) {
+		const data = container?.__revivedVirtualData;
+		if (!data || !container.isConnected) return;
+		const { step, gap } = getRevivedVirtualMetrics(container);
+		const items = data.items;
+		const visible = Math.max(4, Math.ceil((container.clientWidth || window.innerWidth) / step) + 1);
+		const firstVisible = Math.max(0, Math.floor(Math.max(0, container.scrollLeft) / step));
+		const start = Math.max(0, firstVisible - REVIVED_VIRTUAL_CARD_BUFFER);
+		const end = Math.min(items.length, firstVisible + visible + REVIVED_VIRTUAL_CARD_BUFFER);
+		if (data.start === start && data.end === end && data.step === step) return;
+		const oldScroll = container.scrollLeft;
+		const existing = new Map();
+		container.querySelectorAll(':scope > .revived-snap-slot[data-revived-index]').forEach(node => {
+			existing.set(Number(node.dataset.revivedIndex), node);
+		});
+		const nodes = [];
+		if (start) {
+			const spacer = data.leftSpacer || (data.leftSpacer = document.createElement('div'));
+			spacer.className = 'revived-virtual-spacer';
+			spacer.style.width = `${Math.max(0, start * step - gap)}px`;
+			nodes.push(spacer);
+		}
+		for (let i = start; i < end; i++) {
+			let slot = existing.get(i);
+			if (!slot) {
+				const template = document.createElement('template');
+				template.innerHTML = data.buildCardHtml(items[i], i);
+				slot = template.content.firstElementChild;
+				slot.dataset.revivedIndex = String(i);
+			}
+			nodes.push(slot);
+		}
+		if (end < items.length) {
+			const spacer = data.rightSpacer || (data.rightSpacer = document.createElement('div'));
+			spacer.className = 'revived-virtual-spacer';
+			spacer.style.width = `${Math.max(0, (items.length - end) * step - gap)}px`;
+			nodes.push(spacer);
+		}
+		// Reconcile in place to preserve loaded covers and uninterrupted horizontal gestures.
+		let cursor = container.firstChild;
+		for (const node of nodes) {
+			if (node !== cursor) container.insertBefore(node, cursor);
+			cursor = node.nextSibling;
+		}
+		while (cursor) { const next = cursor.nextSibling; cursor.remove(); cursor = next; }
+		data.start = start;
+		data.end = end;
+		data.step = step;
+		if (Math.abs(container.scrollLeft - oldScroll) > 1) container.scrollLeft = oldScroll;
+		refreshRevivedServerVisibleNames(container);
+		if (typeof window.scheduleCarouselArrowSync === 'function') window.scheduleCarouselArrowSync(container);
+	}
+
+	function scheduleRevivedVirtualWindow(container) {
+		if (!container?.__revivedVirtualData || container.__revivedVirtualFrame) return;
+		container.__revivedVirtualFrame = requestAnimationFrame(() => {
+			container.__revivedVirtualFrame = 0;
+			renderRevivedVirtualWindow(container);
+		});
+	}
+
+	function attachRevivedVirtualCarousel(container) {
+		if (container.__revivedVirtualHandlersAttached) return;
+		container.__revivedVirtualHandlersAttached = true;
+		container.classList.add('revived-virtualized');
+		revivedVirtualCarousels.add(container);
+		container.addEventListener('scroll', () => scheduleRevivedVirtualWindow(container), { passive: true });
+		if (!window.__revivedVirtualResizeAttached) {
+			window.__revivedVirtualResizeAttached = true;
+			const onResize = () => {
+				for (const current of revivedVirtualCarousels) {
+					if (!current.isConnected) { revivedVirtualCarousels.delete(current); continue; }
+					scheduleRevivedVirtualWindow(current);
+				}
+			};
+			if (typeof window.registerPsnResizeFrameTask === 'function') window.registerPsnResizeFrameTask(onResize);
+			else window.addEventListener('resize', onResize, { passive: true });
+		}
+	}
+
 	const revivedGamesNameCollator = new Intl.Collator(undefined, { sensitivity: 'base' });
 	window.renderServerGamesCards = async function (containerId, idsArray, isSilent = false, options = {}) {
 		isSilent = isSilent || !!window.isRestoringHistory;
@@ -59866,9 +60076,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 			return compareGameNames(a.displayName, b.displayName);
 		});
 	
-		let html = '';
-	
-		processedItems.forEach((item, idx) => {
+		const buildCardHtml = (item, idx) => {
 			const id = item.id;
 			const isMissing = !item.isInStore;
 			const consoleTag = item.consoleTag || (item.gameDbPlatform === 'PSX' ? 'psx' : (item.gameDbPlatform || 'ps3').toLowerCase());
@@ -59891,7 +60099,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 			const safeGithubCover = escapeHtml(githubCoverUrl);
 			const safeCoverKey = escapeHtml(coverKey);
 	
-			html += `
+			return `
 			<div class="revived-snap-slot">
 			<div class="game-card ${animClass}"
 				data-missing="${isMissing}"
@@ -59902,6 +60110,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 	
 				<div class="game-img-container">
 					<img src="${imgUrl}"
+						loading="lazy"
 						class="game-img"
 						decoding="async"
 						data-cover-key="${safeCoverKey}"
@@ -59944,44 +60153,14 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 				</div>
 			</div>
 			</div>`;
-		});
-	
+		};
 		if (isCurrentRender && !isCurrentRender()) return;
 		const replacingRevivedSkeletons = !!container.querySelector('.skeleton-card');
-		container.innerHTML = html;
-	
+		container.__revivedVirtualData = { items: processedItems, buildCardHtml, start: -1, end: -1, step: 0 };
+		attachRevivedVirtualCarousel(container);
+		renderRevivedVirtualWindow(container);
 		if (!isSilent && typeof setupRevealAnimations === 'function') {
 			setupRevealAnimations(containerId, { immediate: replacingRevivedSkeletons });
-		}
-	
-		if (isCurrentRender && !isCurrentRender()) return;
-		for (const item of processedItems) {
-			if (!item.needsNameLookup) continue;
-			(async () => {
-				const fetchedName = await getGameName(item.id, item.consoleTag, item.gameData?.cleanName || '', !!item.consoleTag);
-				if (isCurrentRender && !isCurrentRender()) return;
-	
-				if (!fetchedName || fetchedName === item.id) return;
-	
-				const safeFetchedName = escapeHtml(fetchedName);
-	
-				const titleEl = container.querySelector(`.game-title[data-title-id="${item.id}"]`);
-				if (titleEl) {
-					titleEl.innerHTML = safeFetchedName;
-					titleEl.title = fetchedName;
-				}
-	
-				const cardEl = container.querySelector(`.game-card[data-title-id="${item.id}"]`);
-				const imgEl = cardEl?.querySelector('.game-img');
-	
-				if (imgEl) {
-					imgEl.dataset.name = fetchedName;
-					if (!item.consoleTag) {
-						const foundPlatform = revivedGameNamePlatformCache.get(`${item.gameDbPlatform}:${item.id.replace(/-/g, '')}`);
-						if (foundPlatform) imgEl.dataset.console = foundPlatform.toLowerCase();
-					}
-				}
-			})();
 		}
 	};
 	
