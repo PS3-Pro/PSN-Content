@@ -19401,6 +19401,37 @@ P
 		return window.trimPsnServerLimitedArray(normalized, 'recentlyVisited');
 	}
 
+
+	// Recover categories from the account's existing cache when legacy server data
+	// wrongly reports an item as a game. Keep items with shared Title IDs distinct.
+	function restoreRecentlyVisitedServerCategories(serverItems, username) {
+		let cached = [];
+		try { cached = JSON.parse(localStorage.getItem(getRecentlyVisitedStorageKey(username)) || '[]'); } catch (e) {}
+		const known = new Map();
+		const getKeys = item => {
+			const contentId = String(item.contentId || '').trim().toUpperCase();
+			const id = String(item.id || item.titleId || '').trim().toUpperCase();
+			const region = String(item.region || '').trim().toUpperCase();
+			const name = String(item.cleanName || item.name || '').trim().toLowerCase();
+			return [contentId && contentId !== 'MISSING' ? `content:${contentId}` : '', id && name ? `title:${id}|${region}|${name}` : ''].filter(Boolean);
+		};
+		for (const item of normalizeRecentlyVisitedGames(cached)) {
+			for (const key of getKeys(item)) {
+				if (!known.has(key)) known.set(key, item.category);
+				else if (known.get(key) !== item.category) known.set(key, null);
+			}
+		}
+		return normalizeRecentlyVisitedGames((Array.isArray(serverItems) ? serverItems : []).map(raw => {
+			if (!raw || typeof raw !== 'object') return raw;
+			const category = window.normalizeContentCategoryKey(raw.category || raw.rawCategory || 'games', 'games');
+			if (category !== 'games') return raw;
+			const keys = getKeys(raw);
+			const matches = keys.map(key => known.get(key)).filter(Boolean);
+			const savedCategory = matches.length && matches.every(value => value === matches[0]) ? matches[0] : null;
+			return savedCategory && savedCategory !== 'games' ? { ...raw, category: savedCategory } : raw;
+		}));
+	}
+
 	function readRecentlyVisitedGames() {
 		if (Array.isArray(window.recentlyVisitedGames)) return normalizeRecentlyVisitedGames(window.recentlyVisitedGames);
 		const storageKey = getRecentlyVisitedStorageKey();
@@ -86393,7 +86424,7 @@ function getVisibleChatStackEl(id) {
 				}
 			if (profileSyncChanges.friends && Array.isArray(userData.friendsData)) { window.friendsList = userData.friendsData; safeLocalStorageSet(`${name}_psn_friends_list`, JSON.stringify(userData.friendsData)); applyProfileListUpdatedAtFromServer(name, 'friends', userData.friendsUpdatedAt); }
 			if (profileSyncChanges.recentlyVisited && Array.isArray(userData.recentlyVisitedData)) {
-				window.recentlyVisitedGames = normalizeRecentlyVisitedGames(userData.recentlyVisitedData);
+				window.recentlyVisitedGames = restoreRecentlyVisitedServerCategories(userData.recentlyVisitedData, name);
 				safeLocalStorageSet(getRecentlyVisitedStorageKey(name), JSON.stringify(window.recentlyVisitedGames));
 				applyProfileListUpdatedAtFromServer(name, 'recentlyvisited', userData.recentlyVisitedUpdatedAt);
 				if (typeof window.renderRecentlyVisited === 'function') window.renderRecentlyVisited();
@@ -93602,7 +93633,7 @@ function getVisibleChatStackEl(id) {
 			if (!isLightAuthPayload && typeof updateConsoleLibraryStatusUI === 'function') updateConsoleLibraryStatusUI(window.lastScannedGames || []);
 
 			if (Array.isArray(userData.recentlyVisitedData)) {
-				window.recentlyVisitedGames = normalizeRecentlyVisitedGames(userData.recentlyVisitedData);
+				window.recentlyVisitedGames = restoreRecentlyVisitedServerCategories(userData.recentlyVisitedData, name);
 				safeLocalStorageSet(getRecentlyVisitedStorageKey(name), JSON.stringify(window.recentlyVisitedGames));
 				applyProfileListUpdatedAtFromServer(name, 'recentlyvisited', userData.recentlyVisitedUpdatedAt);
 				if (typeof window.renderRecentlyVisited === 'function') window.renderRecentlyVisited();

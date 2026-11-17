@@ -4131,6 +4131,16 @@ function getClientContentLimits() {
   };
 }
 
+const RECENTLY_VISITED_CATEGORY_ALIASES = Object.freeze({
+  game: 'games', app: 'apps', application: 'apps', dlc: 'dlcs', addon: 'dlcs', add_on: 'dlcs',
+  avatar: 'avatars', theme: 'themes', demo: 'demos', update: 'updates', patch: 'updates',
+  homebrew: 'homebrew_games', homebrew_game: 'homebrew_games', port: 'ports',
+  guide: 'guides', soundtrack: 'soundtracks', video: 'videos', movie: 'videos',
+  prototype: 'prototypes', proto: 'prototypes', tool: 'tools', dev: 'dev_tools', dev_tool: 'dev_tools',
+  emu: 'emulators', emulator: 'emulators', launcher: 'launchers', manager: 'backup_manager',
+  'add-on': 'dlcs', movies: 'videos', 'no-psn': 'no_psn', nopsn: 'no_psn'
+});
+
 function normalizeRecentlyVisitedRecordsServer(records = []) {
   const seen = new Set();
   const normalized = [];
@@ -4141,11 +4151,17 @@ function normalizeRecentlyVisitedRecordsServer(records = []) {
     const cleanName = normalizeText(raw.cleanName || raw.name, '').slice(0, 180);
     const cTag = normalizeText(raw.cTag, '').toLowerCase().slice(0, 16);
     const region = normalizeText(raw.region, '').toUpperCase().slice(0, 16);
+    const rawCategory = normalizeText(raw.category || raw.rawCategory, 'games').toLowerCase().replace(/\s+/g, '_');
+    const category = /^[a-z0-9_-]{1,48}$/.test(rawCategory) ? (RECENTLY_VISITED_CATEGORY_ALIASES[rawCategory] || rawCategory) : 'games';
     if (!cleanName || (!contentId && !id)) continue;
-    const key = contentId && contentId !== 'MISSING' ? `content:${contentId}` : `title:${id}|${region}`;
+    const key = category !== 'games' && contentId && contentId !== 'MISSING'
+      ? `${category}|content:${contentId}`
+      : id && id !== 'MISSING'
+        ? `${category}|title:${id}|${region}${category !== 'games' ? `|${cleanName.toLowerCase()}` : ''}`
+        : `${category}|content:${contentId}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    normalized.push({ id, contentId, cleanName, cTag, region, category: 'games' });
+    normalized.push({ id, contentId, cleanName, cTag, region, category });
     if (normalized.length >= RECENTLY_VISITED_MAX_ITEMS) break;
   }
   return normalized;
