@@ -518,11 +518,10 @@ const ADMIN_STATE_KEYS = {
 // ============================================================================
 // PostgreSQL pool & shared server limits
 // ============================================================================
-// Aiven PostgreSQL Free defaults to 20 connections; some are reserved by Aiven.
 // This pool is per server instance, and each instance also holds one dedicated
 // LISTEN/NOTIFY connection. Keep headroom during zero-downtime deploys when
 // old and new instances overlap; PG_POOL_MAX/DB_POOL_MAX can override this.
-const PG_POOL_MAX = Math.max(1, Math.min(10, parseInt(process.env.PG_POOL_MAX || process.env.DB_POOL_MAX || "4", 10) || 4));
+const PG_POOL_MAX = Math.max(1, Math.min(10, parseInt(process.env.PG_POOL_MAX || process.env.DB_POOL_MAX || "5", 10) || 5));
 const PG_CONNECTION_TIMEOUT_MS = Math.max(3000, parseInt(process.env.PG_CONNECTION_TIMEOUT_MS || "10000", 10) || 10000);
 const PG_IDLE_TIMEOUT_MS = Math.max(30000, parseInt(process.env.PG_IDLE_TIMEOUT_MS || "120000", 10) || 120000);
 const PG_QUERY_TIMEOUT_MS = Math.max(5000, parseInt(process.env.PG_QUERY_TIMEOUT_MS || "25000", 10) || 25000);
@@ -1025,7 +1024,7 @@ function flushDbQueryPerformance() {
   const work = [...serverPhaseMetrics.entries()].map(([label, stats]) => ({
     label, calls:stats.calls, avgMs:Math.round(stats.totalMs / stats.calls), maxMs:stats.maxMs, slow:stats.slow
   })).sort((a,b) => b.maxMs - a.maxMs).slice(0,8);
-  console.log('[DB PERF 5MIN]', JSON.stringify({topQueries:summary, pool:{total:pool.totalCount, idle:pool.idleCount, waiting:pool.waitingCount, peakWaiting:dbPerfPeakWaiting, peakConnections:dbPerfPeakConnections}, admission:{enabled:DB_READ_ADMISSION_ENABLED, optionalQueuedPeak:dbAdmissionOptionalPeak, bulkPendingPeak:dbAdmissionBulkPeak, bulkWaits:dbAdmissionBulkWaits}, eventLoop:readDbEventLoopMetrics(), serverWork:work, profile:{noopSavesAvoided:profileNoopSavesAvoided, delivery:{...profileDeliveryMetrics}, ackTimeoutSections:{...profileAckTimeoutSections}}, notifications:{...profileNotificationMetrics,byCategory:{...profileNotificationMetrics.byCategory}}, userRowWrites:{...userRowMutationMetrics}, gameOwnershipSync:{...gameOwnershipSyncMetrics}, personalReadReuse:readPersonalCacheStats}));
+  console.log('[DB PERF 5MIN]', JSON.stringify({topQueries:summary, pool:{total:pool.totalCount, idle:pool.idleCount, waiting:pool.waitingCount, peakWaiting:dbPerfPeakWaiting, peakConnections:dbPerfPeakConnections}, admission:{enabled:DB_READ_ADMISSION_ENABLED, optionalQueuedPeak:dbAdmissionOptionalPeak, bulkPendingPeak:dbAdmissionBulkPeak, bulkWaits:dbAdmissionBulkWaits}, friendActivityNotifyPending:friendActivityNotifyPending.length, friendActivityNotifyOverflows, eventLoop:readDbEventLoopMetrics(), serverWork:work, profile:{noopSavesAvoided:profileNoopSavesAvoided, delivery:{...profileDeliveryMetrics}, ackTimeoutSections:{...profileAckTimeoutSections}}, notifications:{...profileNotificationMetrics,byCategory:{...profileNotificationMetrics.byCategory}}, userRowWrites:{...userRowMutationMetrics}, gameOwnershipSync:{...gameOwnershipSyncMetrics}, personalReadReuse:readPersonalCacheStats}));
   serverPhaseMetrics.clear();
   Object.keys(profileAckTimeoutSections).forEach(key => { delete profileAckTimeoutSections[key]; });
   profileNoopSavesAvoided = 0;
@@ -3635,6 +3634,14 @@ function normalizeDownloadHistoryRecordsServer(history = []) {
     changed = true;
     const existing = grouped[existingIndex];
     existing.downloadCount = getDownloadHistoryItemCountServer(existing) + itemCount;
+    const previousLastAt = Number(existing.lastDownloadedAt) || Number(existing.id) || 0;
+    const incomingLastAt = Number(item.lastDownloadedAt) || Number(item.id) || 0;
+    if (incomingLastAt > previousLastAt && incomingLastAt > 946684800000) {
+      existing.lastDownloadedAt = incomingLastAt;
+      if (item.date) existing.date = item.date;
+    } else if (!Number(existing.lastDownloadedAt) && previousLastAt > 946684800000) {
+      existing.lastDownloadedAt = previousLastAt;
+    }
 
     ['titleId', 'contentId', 'cleanName', 'name', 'cTag', 'console', 'rawCategory', 'cover'].forEach(key => {
       if (!existing[key] && item[key]) existing[key] = item[key];
@@ -4888,10 +4895,27 @@ function reconcileIncomingProfileArrays(currentUser = {}, incomingUser = {}) {
     const hasIncomingVersion = hasOwnPayload(incomingUser, sync.versionKey);
     if (!hasIncomingArray && !hasIncomingCount && !hasIncomingVersion) return;
 
-    const currentList = normalizeProfileArrayListServer(key, currentUser[key]);
-    const incomingList = normalizeProfileArrayListServer(key, incomingUser[key]);
     const currentVersion = normalizeTimestampValue(currentUser[sync.versionKey]);
     const incomingVersion = normalizeTimestampValue(incomingUser[sync.versionKey]);
+    if (!hasIncomingArray || (currentVersion && (!incomingVersion || incomingVersion < currentVersion))) {
+      delete incomingUser[key];
+      delete incomingUser[sync.countKey];
+      delete incomingUser[sync.versionKey];
+      return;
+    }
+
+    if (incomingVersion && incomingVersion === currentVersion &&
+      Array.isArray(currentUser[key]) && Array.isArray(incomingUser[key]) &&
+      isDeepStrictEqual(currentUser[key], incomingUser[key])) {
+      incomingUser[key] = currentUser[key];
+      incomingUser[sync.countKey] = currentUser[key].length;
+      incomingUser[sync.versionKey] = incomingVersion;
+      return;
+    }
+    const currentList = key === 'downloadsData' && Array.isArray(currentUser[key])
+      ? currentUser[key] : normalizeProfileArrayListServer(key, currentUser[key]);
+    const incomingList = key === 'downloadsData' && Array.isArray(incomingUser[key])
+      ? incomingUser[key] : normalizeProfileArrayListServer(key, incomingUser[key]);
     const currentHasItems = currentList.length > 0;
     const incomingHasItems = incomingList.length > 0;
 
@@ -4925,7 +4949,7 @@ function reconcileIncomingProfileArrays(currentUser = {}, incomingUser = {}) {
     currentUser[sync.countKey] = currentList.length;
 
     if (acceptIncoming) {
-      let acceptedList = normalizeProfileArrayListServer(key, incomingList, currentList);
+      let acceptedList = key === 'downloadsData' ? incomingList : normalizeProfileArrayListServer(key, incomingList, currentList);
       if (key === 'friendsData') acceptedList = stampNewFriendAddedAtServer(currentList, acceptedList);
       incomingUser[key] = acceptedList;
       incomingUser[sync.countKey] = acceptedList.length;
@@ -4958,8 +4982,23 @@ function reconcileIncomingDownloads(currentUser = {}, incomingUser = {}) {
   }
 
   if (hasIncomingDownloadsData && Array.isArray(incomingUser.downloadsData)) {
+    if (currentDownloadsUpdatedAt && (!incomingDownloadsUpdatedAt || incomingDownloadsUpdatedAt < currentDownloadsUpdatedAt)) {
+      delete incomingUser.downloadsData;
+      delete incomingUser.downloads;
+      delete incomingUser.downloadsUpdatedAt;
+      if (currentClearAt > incomingClearAt) incomingUser.downloadsClearedAt = currentClearAt;
+      return incomingUser;
+    }
+    if (incomingDownloadsUpdatedAt && incomingDownloadsUpdatedAt === currentDownloadsUpdatedAt &&
+      Array.isArray(currentUser.downloadsData) && isDeepStrictEqual(currentUser.downloadsData, incomingUser.downloadsData)) {
+      incomingUser.downloadsData = currentUser.downloadsData;
+      incomingUser.downloads = currentUser.downloadsData.length;
+      incomingUser.downloadsUpdatedAt = incomingDownloadsUpdatedAt;
+      if (incomingClearAt || currentClearAt) incomingUser.downloadsClearedAt = Math.max(incomingClearAt, currentClearAt);
+      return incomingUser;
+    }
     const incomingList = normalizeDownloadHistoryRecordsServer(incomingUser.downloadsData).history;
-    const currentList = normalizeDownloadHistoryRecordsServer(Array.isArray(currentUser.downloadsData) ? currentUser.downloadsData : []).history;
+    const currentList = Array.isArray(currentUser.downloadsData) ? currentUser.downloadsData : [];
     incomingUser.downloadsData = incomingList;
     currentUser.downloadsData = currentList;
     const currentHasItems = currentList.length > 0;
@@ -8275,7 +8314,7 @@ async function ensureGameOwnershipIndexReady() {
 // inside the transaction: an earlier deferred request must never replay an old
 // Library/Downloads snapshot after a newer profile save or another instance.
 const gameOwnershipSyncJobs = new Map();
-// Background ownership writes are deferred; never let a burst exhaust the four-connection pool.
+// Background ownership writes are deferred; never let a burst exhaust the PostgreSQL pool.
 const GAME_OWNERSHIP_SYNC_CONCURRENCY = Math.max(1, Math.min(2, PG_POOL_MAX - 2));
 const gameOwnershipSyncReady = [];
 let gameOwnershipSyncActive = 0;
@@ -12082,6 +12121,9 @@ async function initProfileSyncNotifications() {
       }
 
       if (message.channel === 'friend_activity_sync') {
+        if (data.resync === true) io.sockets.sockets.forEach(client => {
+          if (client.connected && client.userName && client.__friendActivitySubscribed) client.emit('friend_activity_resync');
+        });
         if (data.event) emitFriendActivityToLocalSubscribers(data.event);
         if (data.dismissed && data.dismissed.userName) emitFriendActivityDismissedToLocalUser(data.dismissed.userName, data.dismissed.activityId);
         if (data.cleared && data.cleared.userName) emitFriendActivityClearedToLocalUser(data.cleared.userName, data.cleared.throughId, data.cleared.lastReadId);
@@ -12658,14 +12700,70 @@ function emitFriendActivityToLocalSubscribers(event) {
   io.to(room).emit('friend_activity_event', safeEvent);
 }
 
-async function notifyFriendActivityAcrossInstances(event) {
-  const safeEvent = serializeFriendActivityRow(event);
-  if (!safeEvent) return;
-  try {
-    await pool.query('SELECT pg_notify($1, $2)', ['friend_activity_sync', JSON.stringify({ event: safeEvent, instanceId: INSTANCE_ID })]);
-  } catch (err) {
-    console.error('[FRIEND ACTIVITY NOTIFY ERROR]:', err);
+const FRIEND_ACTIVITY_NOTIFY_PENDING_MAX = 2048;
+const friendActivityNotifyPending = [];
+let friendActivityNotifyEpoch = 0;
+let friendActivityNotifyOverflows = 0;
+let friendActivityNotifyTimer = null;
+let friendActivityNotifyBusy = false;
+let friendActivityNotifyRetryMs = 1000;
+let friendActivityNotifyLastErrorAt = 0;
+
+function scheduleFriendActivityNotify(delayMs = 60) {
+  if (friendActivityNotifyTimer || friendActivityNotifyBusy || !friendActivityNotifyPending.length) return;
+  friendActivityNotifyTimer = setTimeout(() => {
+    friendActivityNotifyTimer = null;
+    flushFriendActivityNotifies();
+  }, delayMs);
+  friendActivityNotifyTimer.unref?.();
+}
+
+async function flushFriendActivityNotifies() {
+  if (friendActivityNotifyBusy || !friendActivityNotifyPending.length) return;
+  if (pool.waitingCount >= PG_POOL_MAX) {
+    scheduleFriendActivityNotify(250);
+    return;
   }
+  friendActivityNotifyBusy = true;
+  const batch = friendActivityNotifyPending.slice(0, 32);
+  const batchEpoch = friendActivityNotifyEpoch;
+  let retryMs = 0;
+  try {
+    await queryDbWithRetry(
+      'SELECT pg_notify($1, payload) FROM unnest($2::text[]) AS changes(payload)',
+      ['friend_activity_sync', batch],
+      { attempts: 1, label: 'FRIEND ACTIVITY NOTIFY BATCH' }
+    );
+    if (batchEpoch === friendActivityNotifyEpoch) friendActivityNotifyPending.splice(0, batch.length);
+    friendActivityNotifyRetryMs = 1000;
+  } catch (err) {
+    const now = Date.now();
+    if (now - friendActivityNotifyLastErrorAt > 30000) {
+      console.error('[FRIEND ACTIVITY NOTIFY ERROR]:', err && err.message || err);
+      friendActivityNotifyLastErrorAt = now;
+    }
+    retryMs = friendActivityNotifyRetryMs;
+    friendActivityNotifyRetryMs = Math.min(30000, friendActivityNotifyRetryMs * 2);
+  } finally {
+    friendActivityNotifyBusy = false;
+    scheduleFriendActivityNotify(retryMs || (friendActivityNotifyPending.length > 32 ? 0 : 60));
+  }
+}
+
+function queueFriendActivityNotify(payload) {
+  if (friendActivityNotifyPending.length >= FRIEND_ACTIVITY_NOTIFY_PENDING_MAX) {
+    friendActivityNotifyPending.length = 0;
+    friendActivityNotifyPending.push(JSON.stringify({ instanceId: INSTANCE_ID, resync: true }));
+    friendActivityNotifyEpoch++;
+    friendActivityNotifyOverflows++;
+  }
+  friendActivityNotifyPending.push(JSON.stringify({ ...payload, instanceId: INSTANCE_ID }));
+  scheduleFriendActivityNotify();
+}
+
+function notifyFriendActivityAcrossInstances(event) {
+  const safeEvent = serializeFriendActivityRow(event);
+  if (safeEvent) queueFriendActivityNotify({ event: safeEvent });
 }
 
 function emitFriendActivityDismissedToLocalUser(userName, activityId, excludeSocketId = '') {
@@ -12690,29 +12788,18 @@ function emitFriendActivityClearedToLocalUser(userName, throughId = 0, lastReadI
   });
 }
 
-async function notifyFriendActivityDismissedAcrossInstances(userName, activityId) {
+function notifyFriendActivityDismissedAcrossInstances(userName, activityId) {
   const name = normalizeSocialUserName(userName);
   const id = String(activityId || '').trim();
-  if (!name || !/^\d+$/.test(id)) return;
-  try {
-    await pool.query('SELECT pg_notify($1, $2)', ['friend_activity_sync', JSON.stringify({ dismissed: { userName: name, activityId: id }, instanceId: INSTANCE_ID })]);
-  } catch (err) {
-    console.error('[FRIEND ACTIVITY DISMISS SYNC ERROR]:', err);
-  }
+  if (name && /^\d+$/.test(id)) queueFriendActivityNotify({ dismissed: { userName: name, activityId: id } });
 }
 
-async function notifyFriendActivityClearedAcrossInstances(userName, throughId = 0, lastReadId = 0) {
+function notifyFriendActivityClearedAcrossInstances(userName, throughId = 0, lastReadId = 0) {
   const name = normalizeSocialUserName(userName);
   const safeThroughId = Math.max(0, Math.floor(Number(throughId) || 0));
-  if (!name || !safeThroughId) return;
-  try {
-    await pool.query('SELECT pg_notify($1, $2)', ['friend_activity_sync', JSON.stringify({
-      cleared: { userName: name, throughId: safeThroughId, lastReadId: Math.max(0, Math.floor(Number(lastReadId) || safeThroughId)) },
-      instanceId: INSTANCE_ID
-    })]);
-  } catch (err) {
-    console.error('[FRIEND ACTIVITY CLEAR SYNC ERROR]:', err);
-  }
+  if (name && safeThroughId) queueFriendActivityNotify({
+    cleared: { userName: name, throughId: safeThroughId, lastReadId: Math.max(0, Math.floor(Number(lastReadId) || safeThroughId)) }
+  });
 }
 
 // Coalesce history cleanup for busy accounts and busy posts. Both tables have
@@ -12893,19 +12980,16 @@ async function recordAggregatedFriendActivity(actorName, type, rawData = {}, opt
         replacesIds
       });
 
-      const insertResult = await client.query(
-        `INSERT INTO friend_activity (actor_name, event_type, data, dedupe_key, created_at)
-         VALUES ($1, $2, $3::jsonb, NULL, to_timestamp($4::double precision / 1000.0))
-         RETURNING id, actor_name, event_type, data, created_at`,
-        [actor, eventType, JSON.stringify(data), at]
-      );
-      if (replacesIds.length) {
-        await client.query(
-          `DELETE FROM friend_activity
-           WHERE actor_name = $1 AND id = ANY($2::bigint[])`,
-          [actor, replacesIds]
-        );
-      }
+      const insertSql = `INSERT INTO friend_activity (actor_name, event_type, data, dedupe_key, created_at)
+        VALUES ($1, $2, $3::jsonb, NULL, to_timestamp($4::double precision / 1000.0))
+        RETURNING id, actor_name, event_type, data, created_at`;
+      const insertResult = replacesIds.length
+        ? await client.query(`WITH inserted AS (${insertSql}), removed AS (
+            DELETE FROM friend_activity WHERE actor_name = $1 AND id = ANY($5::bigint[])
+            RETURNING id
+          ) SELECT inserted.*, (SELECT COUNT(*) FROM removed) AS removed_count FROM inserted`,
+          [actor, eventType, JSON.stringify(data), at, replacesIds])
+        : await client.query(insertSql, [actor, eventType, JSON.stringify(data), at]);
       return serializeFriendActivityRow(insertResult.rows[0]);
     }, {
       attempts: 3,
@@ -17106,8 +17190,7 @@ io.on('connection', (socket) => {
         workingUser.downloadsClearedAt = normalizeTimestampValue(workingUser.downloadsClearedAt);
         Object.entries(PROFILE_ARRAY_SYNC_KEYS).forEach(([key, sync]) => {
           if (!Object.prototype.hasOwnProperty.call(userData, key)) return;
-          const list = normalizeProfileArrayListServer(key, workingUser[key]);
-          workingUser[key] = list;
+          const list = Array.isArray(workingUser[key]) ? workingUser[key] : [];
           workingUser[sync.countKey] = list.length;
           workingUser[sync.versionKey] = normalizeTimestampValue(workingUser[sync.versionKey]);
         });
@@ -17145,12 +17228,19 @@ io.on('connection', (socket) => {
         if (Object.prototype.hasOwnProperty.call(profileDbPatch, 'libraryPlayHistoryData') &&
           !changedPublicListKeys.includes('libraryPlayHistoryData')) delete profileDbPatch.libraryPlayHistoryData;
 
-        // Skip only empty, non-replay updates. Equality against an in-memory
+        Object.entries(PROFILE_ARRAY_SYNC_KEYS).forEach(([key, sync]) => {
+          if (changedPublicListKeys.includes(key)) return;
+          if (Object.prototype.hasOwnProperty.call(profileDbPatch, sync.countKey) &&
+            Number(profileDbPatch[sync.countKey]) === Number(originalProfileForNoopCheck[sync.countKey])) delete profileDbPatch[sync.countKey];
+          if (Object.prototype.hasOwnProperty.call(profileDbPatch, sync.versionKey) &&
+            normalizeTimestampValue(profileDbPatch[sync.versionKey]) === normalizeTimestampValue(originalProfileForNoopCheck[sync.versionKey])) delete profileDbPatch[sync.versionKey];
+        });
+        // Skip redundant non-replay updates only when nothing remains to save. An in-memory
         // profile is insufficient proof of a DB no-op on multi-instance deploys:
         // another socket may have updated a small field since this cache loaded.
         // Presence is updated by its own heartbeat, not by an empty patch.
         const patchKeys = Object.keys(profileDbPatch).filter(key => key !== 'lastSeen' && key !== 'profileUpdatedAt');
-        const safeSmallNoop = patchKeys.length === 0 && !Object.keys(userData).length &&
+        const safeSmallNoop = patchKeys.length === 0 &&
           !syncRequestId && !syncReason && !requestedSyncSections.length &&
           !shouldForceProfileSyncToSource && !friendsSafetyRejected && !incomingSettingsData &&
           !profileThemeMerge.accepted && !profileThemeMerge.rejected && !shouldBroadcastProfileBanner &&

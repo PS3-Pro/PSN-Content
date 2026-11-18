@@ -17842,6 +17842,14 @@ P
 			changed = true;
 			const existing = grouped[existingIndex];
 			existing.downloadCount = getDownloadHistoryItemCount(existing) + itemCount;
+			const previousLastAt = Number(existing.lastDownloadedAt) || Number(existing.id) || 0;
+			const incomingLastAt = Number(item.lastDownloadedAt) || Number(item.id) || 0;
+			if (incomingLastAt > previousLastAt && incomingLastAt > 946684800000) {
+				existing.lastDownloadedAt = incomingLastAt;
+				if (item.date) existing.date = item.date;
+			} else if (!Number(existing.lastDownloadedAt) && previousLastAt > 946684800000) {
+				existing.lastDownloadedAt = previousLastAt;
+			}
 
 			['titleId', 'contentId', 'cleanName', 'name', 'cTag', 'console', 'region', 'rawCategory', 'cover'].forEach(key => {
 				if (!existing[key] && item[key]) existing[key] = item[key];
@@ -45808,6 +45816,40 @@ P
 	};
 
 
+    window.formatPsnLocalEventDate = (function() {
+        const formatters = new Map();
+        return function(timestamp, fallback = '') {
+            const value = Number(timestamp);
+            if (!Number.isFinite(value) || value < 946684800000 || value > Date.now() + 86400000) return String(fallback || '');
+            const locale = typeof getChatDateLocale === 'function' ? getChatDateLocale() : 'en';
+            let formatter = formatters.get(locale);
+            if (!formatter) {
+                try {
+                    formatter = {
+                        date: new Intl.DateTimeFormat(locale, { month:'short', day:'numeric', year:'numeric' }),
+                        time: new Intl.DateTimeFormat(locale, { hour:'2-digit', minute:'2-digit', hourCycle:'h23' })
+                    };
+                } catch (err) {
+                    formatter = {
+                        date: new Intl.DateTimeFormat('en', { month:'short', day:'numeric', year:'numeric' }),
+                        time: new Intl.DateTimeFormat('en', { hour:'2-digit', minute:'2-digit', hourCycle:'h23' })
+                    };
+                }
+                if (formatters.size >= 8) formatters.clear();
+                formatters.set(locale, formatter);
+            }
+            const date = new Date(value);
+            return `${formatter.date.format(date)} - ${formatter.time.format(date)}`;
+        };
+    })();
+
+    window.getPsnDownloadDisplayDate = function(item, fallback = 'Recently') {
+        if (!item || typeof item !== 'object') return fallback;
+        const count = typeof getDownloadHistoryItemCount === 'function' ? getDownloadHistoryItemCount(item) : Math.max(1, Number(item.downloadCount) || 1);
+        const lastAt = Number(item.lastDownloadedAt) || (count === 1 ? Number(item.id) : 0);
+        return window.formatPsnLocalEventDate(lastAt, item.date || fallback);
+    };
+
     window.addToDownloadManager = async function(fileName, sizeBytes, titleId, category, contentId, sentToPs3 = false, motionAnchor = null) {
         const downloadMotionSource = motionAnchor && typeof window.captureDownloadCoverMotionSource === 'function' ? window.captureDownloadCoverMotionSource(motionAnchor) : null;
         if (typeof window.ensureMutableProfileSectionReady === 'function' && !(await window.ensureMutableProfileSectionReady('downloads', 'download-history-add'))) return;
@@ -46960,7 +47002,7 @@ P
 			const category = dl.category || '';
 			const contentId = dl.contentId || '';
 			downloadRenderParts.push([
-				entry.key, dl.date || '', dl.sizeText || '', Number(dl.downloadCount) || 1,
+				entry.key, dl.date || '', Number(dl.lastDownloadedAt) || 0, dl.sizeText || '', Number(dl.downloadCount) || 1,
 				remote, name, category, contentId, playTogether
 			].join('~'));
 			downloadStructureParts.push([
@@ -46985,7 +47027,8 @@ P
 				const dl = byKey.get(key);
 				if (!dl) return;
 				const countValue = typeof getDownloadHistoryItemCount === 'function' ? getDownloadHistoryItemCount(dl) : Math.max(1, Number(dl.downloadCount) || 1);
-				const dateText = countValue > 1 ? `Last download: ${dl.date || ''}` : String(dl.date || '');
+				const displayDate = window.getPsnDownloadDisplayDate(dl, '');
+				const dateText = countValue > 1 ? `Last download: ${displayDate}` : displayDate;
 				const dateNode = row.querySelector('.dl-date');
 				if (dateNode && dateNode.textContent !== dateText) {
 					const icon = dateNode.querySelector('i');
@@ -47068,7 +47111,8 @@ P
 			const downloadCount = Number.isFinite(parsedDownloadCount) && parsedDownloadCount > 0
 				? Math.floor(parsedDownloadCount)
 				: 1;
-			const downloadDateText = downloadCount > 1 ? `Last download: ${dl.date}` : dl.date;
+			const displayDate = window.getPsnDownloadDisplayDate(dl, '');
+			const downloadDateText = downloadCount > 1 ? `Last download: ${displayDate}` : displayDate;
 			const remoteStatusHtml = dl.sentToPs3 === true
 				? `<span class="dl-download-count dl-remote-status" title="Sent to PS3™" aria-label="Sent to PS3™"><i class="fas fa-paper-plane"></i><span>PS3</span></span>`
 				: '';
@@ -47149,7 +47193,8 @@ P
 					const record = downloadEntryByKey.get(recordKey) || null;
 					if (record) {
 						const countValue = typeof getDownloadHistoryItemCount === 'function' ? getDownloadHistoryItemCount(record) : Math.max(1, Number(record.downloadCount) || 1);
-						const dateText = countValue > 1 ? `Last download: ${record.date || ''}` : String(record.date || '');
+						const displayDate = window.getPsnDownloadDisplayDate(record, '');
+        				const dateText = countValue > 1 ? `Last download: ${displayDate}` : displayDate;
 						const dateNode = previousRow.querySelector('.dl-date');
 						if (dateNode && dateNode.textContent !== dateText) {
 							const icon = dateNode.querySelector('i');
@@ -57948,6 +57993,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 
 			const itemToAdd = { 
 				...gameData,
+				addedAt: Date.now(),
 				category: (typeof window.getProfileListItemCategory === 'function' ? window.getProfileListItemCategory({ ...gameData, category: gameData.category || currentCat }, 'wishlist') : (gameData.category || currentCat)),
 				rawCategory: gameData.category || currentCat
 			};
@@ -64507,7 +64553,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 				card.classList.add('fav-effect');
 				setTimeout(() => card.classList.remove('fav-effect'), 350);
 			}
-			const itemToAdd = { ...game };
+			const itemToAdd = { ...game, addedAt: Date.now() };
 			if (!itemToAdd.date) {
 				const now = new Date();
 				const datePart = now.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
@@ -72981,7 +73027,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 				filter: filterSelect ? filterSelect.value : 'all',
 				grades: grades,
 				sort: sortSelect ? sortSelect.value : 'default',
-				order: (window.sortOrders && window.sortOrders.trophy) || 'desc'
+				order: (window.sortOrders && window.sortOrders.trophy) || 'desc',
+				dateLocale: typeof getChatDateLocale === 'function' ? getChatDateLocale() : 'en'
 			});
 		} catch (e) {
 			return String(Date.now());
@@ -73183,6 +73230,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			const datePart = now.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 			const timePart = now.getHours().toString().padStart(2, '0') + ':' + now.getMinutes().toString().padStart(2, '0');
 			window.userTrophies[trophyId].unlockDate = `${datePart} - ${timePart}`;
+			window.userTrophies[trophyId].unlockAt = now.getTime();
 	
 			saveState('psn_user_trophies', JSON.stringify(window.userTrophies));
 			saveState('psn_trophy_dot_items', JSON.stringify(collectTrophyNotificationPendingItems()));
@@ -73572,6 +73620,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 				unlocked: true, 
 				progress: 1, 
 				isNew: true,
+				unlockAt: now.getTime(),
 				unlockDate: `${datePart} - ${timePart}`
 			};
 			recordPsnRewardUnlock('platinum');
@@ -73622,6 +73671,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	
 	function psnGetTrophyUnlockTime(state) {
 		if (!state || !state.unlocked) return 0;
+		const exact = Number(state.unlockAt);
+		if (Number.isFinite(exact) && exact >= 946684800000) return exact;
 		const raw = String(state.unlockDate || '').trim();
 		if (!raw) return 0;
 
@@ -73758,7 +73809,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			const animIndex = index % 15;
 			
 			const progressPct = Math.min((state.progress / t.max) * 100, 100);
-			const unlockDateText = state.unlockDate ? state.unlockDate : "";
+			const unlockDateText = window.formatPsnLocalEventDate(state.unlockAt, state.unlockDate || '');
 
 			const realPercent = Number(window.globalTrophyStats[id] || 0.1);
 			const rarityMarkup = getTrophyRarityHtml(realPercent);
@@ -73885,6 +73936,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 				window.userTrophies[id].unlocked = true;
 				window.userTrophies[id].isNew = true;
 				window.userTrophies[id].unlockDate = dateTime;
+				window.userTrophies[id].unlockAt = now.getTime();
 				newlyUnlockedRewardTrophies.push(id);
 			}
 		});
@@ -95593,6 +95645,19 @@ function getVisibleChatStackEl(id) {
 			}
 		});
 
+		socketChat.on('friend_activity_resync', function() {
+			if (!socketChat.connected) return;
+			window.__friendActivityRecoveryPending = true;
+			window.__friendActivityRecoveryGeneration = (Number(window.__friendActivityRecoveryGeneration) || 0) + 1;
+			window.__friendActivityRecoveryRetryCount = 0;
+			clearTimeout(window.__friendActivityResyncTimer);
+			window.__friendActivityResyncTimer = setTimeout(function() {
+				window.__friendActivityResyncTimer = null;
+				if (!window.__friendActivityRecoveryPending || !socketChat.connected) return;
+				if (!window.__friendActivitySyncInFlight) window.bootstrapFriendActivityRealtime?.({ forceFull:true, reason:'cross-instance-recovery' });
+			}, 600 + Math.floor(Math.random() * 500));
+		});
+
 		socketChat.on('friend_activity_event', function(rawEvent = {}) {
 			try {
 				const item = normalizeFriendActivityItem(rawEvent);
@@ -102729,12 +102794,38 @@ function getVisibleChatStackEl(id) {
 		const afterId = forceFull ? 0 : getRealtimeFeedMaxId(window.friendActivityItems);
 		const localReadBeforeSync = Math.max(0, Number(window.__friendActivityLastReadId) || 0);
 		const token = ++window.__friendActivityRequestToken;
+		const recoveryGeneration = Number(window.__friendActivityRecoveryGeneration) || 0;
 		window.__friendActivitySyncInFlight = true;
 		window.__friendActivityRemoteError = '';
 		if (window.isFriendActivityVisible() && !window.friendActivityItems.length) window.renderFriendActivity();
-		socketChat.emit('request_friend_activity', { afterId:afterId }, function(response) {
+		let requestSettled = false;
+		const finishRequest = function(response) {
+			if (requestSettled) return;
+			requestSettled = true;
 			if (token !== window.__friendActivityRequestToken) return;
 			window.__friendActivitySyncInFlight = false;
+			if (response && response.timedOut === true && socketChat.connected && !window.__friendActivityRecoveryPending) {
+				window.__friendActivityRecoveryPending = true;
+				window.__friendActivityRecoveryGeneration = (Number(window.__friendActivityRecoveryGeneration) || 0) + 1;
+			}
+			if (window.__friendActivityRecoveryPending) {
+				clearTimeout(window.__friendActivityResyncTimer);
+				if (response && response.ok === true && response.delta !== true &&
+					recoveryGeneration === (Number(window.__friendActivityRecoveryGeneration) || 0)) {
+					window.__friendActivityRecoveryPending = false;
+					window.__friendActivityRecoveryRetryCount = 0;
+					window.__friendActivityResyncTimer = null;
+				} else if (socketChat.connected) {
+					const retryCount = Math.min(5, (Number(window.__friendActivityRecoveryRetryCount) || 0) + 1);
+					window.__friendActivityRecoveryRetryCount = retryCount;
+					const retryDelay = response && response.ok === true ? 500 : Math.min(30000, 2500 * 2 ** (retryCount - 1)) + Math.floor(Math.random() * 600);
+					window.__friendActivityResyncTimer = setTimeout(function() {
+						window.__friendActivityResyncTimer = null;
+						if (window.__friendActivityRecoveryPending && socketChat.connected)
+							window.bootstrapFriendActivityRealtime?.({ forceFull:true, reason:'cross-instance-recovery' });
+					}, retryDelay);
+				}
+			}
 			if (!response || response.ok !== true) {
 				window.__friendActivityRemoteError = response && response.error ? response.error : 'Please try again in a moment.';
 				if (window.isFriendActivityVisible()) {
@@ -102789,7 +102880,18 @@ function getVisibleChatStackEl(id) {
 				}
 				window.markFriendActivityRead();
 			} else window.refreshFriendActivityIndicators();
-		});
+		};
+		if (typeof socketChat.timeout === 'function') {
+			socketChat.timeout(12000).emit('request_friend_activity', { afterId:afterId }, function(err, response) {
+				finishRequest(err ? { ok:false, timedOut:true, error:'Friend activity request timed out.' } : response);
+			});
+		} else {
+			const requestTimer = setTimeout(function() { finishRequest({ ok:false, timedOut:true, error:'Friend activity request timed out.' }); }, 12000);
+			socketChat.emit('request_friend_activity', { afterId:afterId }, function(response) {
+				clearTimeout(requestTimer);
+				finishRequest(response);
+			});
+		}
 		return true;
 	};
 
@@ -108269,7 +108371,7 @@ function getVisibleChatStackEl(id) {
 		if (item.__profileListGroupDivider === true) return `group|${item.tone || ''}|${item.label || ''}|${Number(item.count) || 0}`;
 		if (normalized === 'trophies') {
 			return [
-				item.id, item.title, item.desc, item.type, item.unlocked ? 1 : 0, item.unlockDate,
+				item.id, item.title, item.desc, item.type, item.unlocked ? 1 : 0, item.unlockDate, item.unlockAt,
 				item.hidden ? 1 : 0, item.rarity, item.rarityPercent
 			].join('\x1f');
 		}
@@ -108278,7 +108380,7 @@ function getVisibleChatStackEl(id) {
 			item.contentId, item.contentID, item.cleanName, item.name, item.title, item.rawName,
 			item.category, item.rawCategory, item.cTag, item.console, item.region,
 			item.path, item.cover, item.noBingCover ? 1 : 0,
-			item.date, item.lastPlayed, item.lastDownloadedAt, item.downloadCount,
+			item.date, item.addedAt, item.lastPlayed, item.lastPlayedAt, item.lastDownloadedAt, item.downloadCount,
 			item.sentToPs3 ? 1 : 0, item.sizeText, item.size, item.sizeBytes
 		].join('\x1f');
 	};
@@ -108512,7 +108614,9 @@ function getVisibleChatStackEl(id) {
 		const profileListRenderSignatureBase = profileListRenderTokenState.reliable
 			? profileListRenderTokenState.token
 			: ((typeof window.getProfileSyncComparableSignature === 'function') ? window.getProfileSyncComparableSignature(rawData || []) : JSON.stringify(rawData || []));
-		const profileListRenderSignature = `${profileListRenderSignatureBase}|metadata:${profileListMetadataRevision}`;
+		const profileDateLocale = typeof getChatDateLocale === 'function' ? getChatDateLocale() : 'en';
+		const profileTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+		const profileListRenderSignature = `${profileListRenderSignatureBase}|metadata:${profileListMetadataRevision}|time:${profileDateLocale}:${profileTimeZone}`;
 		const lastProfileListRender = window.__lastProfileListRender;
 		const bodyHasProfileListLoader = !!(body && body.querySelector && body.querySelector('.profile-ps-list-loader'));
 		const isLiveProfileListRefresh = !!(lastProfileListRender
@@ -108639,6 +108743,8 @@ function getVisibleChatStackEl(id) {
 			isMe ? 'self' : 'remote',
 			bgView,
 			returnToOnline,
+			profileDateLocale,
+			profileTimeZone,
 			Number(window.__psnStoreCacheRevision || 0),
 			Number(window.__libraryDataRevision || 0),
 			Number(window.__contentMetadataOverridesRevision || 0),
@@ -108678,7 +108784,7 @@ function getVisibleChatStackEl(id) {
 					const isLocked = !item.unlocked;
 					const lockClass = isLocked ? 'locked' : '';
 					const trophyIconMarkup = isLocked ? '<i class="fas fa-lock" style="color: rgba(255,255,255,0.28);"></i>' : `<span class="ps-trophy-icon ps-trophy-${item.type}" aria-hidden="true"></span>`;
-					const trophyDate = item.unlockDate ? item.unlockDate.split(' - ')[0] : 'Locked';
+					const trophyDate = item.unlocked ? window.formatPsnLocalEventDate(item.unlockAt, item.unlockDate || 'Locked').split(' - ')[0] : 'Locked';
 					html += `
 						<div class="trophy-card social-list-item ${lockClass}" data-profile-list-key="${profileListDomKey}" data-profile-list-signature="${profileListDomSignature}" style="--trophy-rgb: ${cardRgb};" onmouseenter="if(typeof playUiHover === 'function') playUiHover()">
 							<div class="trophy-card-icon" style="background: rgba(0,0,0,0.28); border-radius: 6px; border: 1px solid rgba(255,255,255,0.06);">${trophyIconMarkup}</div>
@@ -108816,14 +108922,16 @@ function getVisibleChatStackEl(id) {
 					}
 
 					const profileDownloadCount = listType === 'downloads' ? getDownloadHistoryItemCount(item) : 1;
-					const profileDownloadDateText = listType === 'downloads' && profileDownloadCount > 1
-						? `Last download: ${item.date || 'Recently'}`
-						: (item.date || 'Recently');
-					let dateDisp = listType === 'library'
-						? (item.lastPlayed ? `Last played: <span style="color:#fff;">${item.lastPlayed}</span>` : `Last played: Unknown`)
-						: (listType === 'downloads'
-							? `<i class="far fa-clock"></i>${profileDownloadDateText}`
-							: `<i class="far fa-clock"></i> ${item.date || 'Recently'}`);
+                    let dateDisp;
+                    if (listType === 'library') {
+                        const lastPlayed = window.formatPsnLocalEventDate(item.lastPlayedAt, item.lastPlayed || '');
+                        dateDisp = lastPlayed ? `Last played: <span style="color:#fff;">${lastPlayed}</span>` : 'Last played: Unknown';
+                    } else if (listType === 'downloads') {
+                        const dateText = window.getPsnDownloadDisplayDate(item);
+                        dateDisp = `<i class="far fa-clock"></i>${profileDownloadCount > 1 ? `Last download: ${dateText}` : dateText}`;
+                    } else {
+                        dateDisp = `<i class="far fa-clock"></i> ${window.formatPsnLocalEventDate(item.addedAt, item.date || 'Recently')}`;
+                    }
 					const profileRemoteStatusHtml = listType === 'downloads' && item.sentToPs3 === true
 						? `<span class="dl-download-count dl-remote-status" title="Sent to PS3™" aria-label="Sent to PS3™"><i class="fas fa-paper-plane"></i><span>PS3</span></span>`
 						: '';
