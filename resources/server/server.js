@@ -2098,6 +2098,176 @@ app.get('/api/metadata/live', async (req, res) => {
   return res.json(payload);
 });
 
+// ScreenScraper hover previews: developer credentials never reach the browser.
+const SS_PREVIEW_DEVID = String(process.env.SCREENSCRAPER_DEV_ID || '').trim();
+const SS_PREVIEW_DEVPASSWORD = String(process.env.SCREENSCRAPER_DEV_PASSWORD || '').trim();
+const SS_PREVIEW_USER = String(process.env.SCREENSCRAPER_USER || '').trim();
+const SS_PREVIEW_PASSWORD = String(process.env.SCREENSCRAPER_PASSWORD || '').trim();
+const SS_PREVIEW_ENABLED = process.env.SCREENSCRAPER_PREVIEWS_ENABLED !== '0' && !!SS_PREVIEW_DEVID && !!SS_PREVIEW_DEVPASSWORD;
+const SS_PREVIEW_SYSTEM_IDS = new Set([57, 58, 59, 61, 62, 60]); // PS1, PS2, PS3, PSP, Vita, PS4
+const SS_PREVIEW_POSITIVE_MS = 24 * 60 * 60 * 1000;
+const SS_PREVIEW_NEGATIVE_MS = 6 * 60 * 60 * 1000;
+const SS_PREVIEW_MAX_CACHE = 500;
+const SS_PREVIEW_MINUTE_MAX = Math.max(1, Math.min(30, Number(process.env.SCREENSCRAPER_PREVIEW_MINUTE_MAX) || 10));
+const SS_PREVIEW_DAILY_MAX = Math.max(10, Math.min(20000, Number(process.env.SCREENSCRAPER_PREVIEW_DAILY_MAX) || 500));
+let ssPreviewMinuteWindow = Date.now();
+let ssPreviewDailyWindow = Date.now();
+let ssPreviewMinuteUsed = 0;
+let ssPreviewDailyUsed = 0;
+const ssPreviewCache = new Map();
+const ssPreviewInflight = new Map();
+let ssPreviewQueueTail = Promise.resolve();
+let ssPreviewQueued = 0;
+let ssPreviewNextRequestAt = 0;
+
+function normalizeSsPreviewTitle(value) {
+  return String(value || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/\b(?:demo|trial|digital version)\b/gi, ' ')
+    .replace(/\b(?:the|a|an)\b/gi, ' ')
+    .replace(/&/g, ' and ').replace(/[^a-z0-9]+/gi, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function ssPreviewNames(game) {
+  const names = game && game.noms;
+  const rows = Array.isArray(names) ? names : (names && Array.isArray(names.nom) ? names.nom : (names && names.nom ? [names.nom] : (names ? [names] : [])));
+  return rows.map(item => String(item && (item.text || item.nom || item.name) || '').trim()).filter(Boolean);
+}
+
+function ssPreviewTitleSimilarity(a, b) {
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  // Reject differing sequel numbers; only permit minor punctuation/wording differences.
+  const nums = value => (value.match(/\b\d+\b/g) || []).join('|');
+  if (nums(a) !== nums(b)) return 0;
+  const left = a.split(' '), right = b.split(' ');
+  const leftSet = new Set(left), rightSet = new Set(right);
+  const common = [...leftSet].filter(value => rightSet.has(value)).length;
+  const coverage = 2 * common / (leftSet.size + rightSet.size);
+  return coverage >= 0.92 && Math.abs(a.length - b.length) <= 6 ? coverage : 0;
+}
+
+function ssPreviewFindVideo(game) {
+  const medias = game && game.medias;
+  const list = Array.isArray(medias) ? medias : (medias && Array.isArray(medias.media) ? medias.media : (medias && medias.media ? [medias.media] : (medias ? [medias] : [])));
+  const id = Number(game && game.id);
+  const system = Number(game && (game.systemeid || (game.systeme && game.systeme.id)));
+  if (!Number.isSafeInteger(id) || id <= 0 || !SS_PREVIEW_SYSTEM_IDS.has(system)) return null;
+  const chosen = ['video-normalized', 'video'].find(type => list.some(media => media && media.type === type));
+  if (!chosen) return null;
+  // Official ScreenScraper media paths are public media URLs. Never return API
+  // query URLs, tokens or developer credentials to the frontend.
+  return `https://www.screenscraper.fr/medias/${system}/${id}/${chosen}.mp4`;
+}
+
+function ssPreviewGetCached(key) {
+  const entry = ssPreviewCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.until) { ssPreviewCache.delete(key); return null; }
+  ssPreviewCache.delete(key);
+  ssPreviewCache.set(key, entry);
+  return entry.payload;
+}
+
+function ssPreviewSetCached(key, payload) {
+  ssPreviewCache.delete(key);
+  ssPreviewCache.set(key, { payload, until:Date.now() + (payload.found ? SS_PREVIEW_POSITIVE_MS : SS_PREVIEW_NEGATIVE_MS) });
+  while (ssPreviewCache.size > SS_PREVIEW_MAX_CACHE) ssPreviewCache.delete(ssPreviewCache.keys().next().value);
+}
+
+function ssPreviewLookup(name, systemId) {
+  const key = `${systemId}:${normalizeSsPreviewTitle(name)}`;
+  const cached = ssPreviewGetCached(key);
+  if (cached) return Promise.resolve(cached);
+  if (ssPreviewInflight.has(key)) return ssPreviewInflight.get(key);
+  // One upstream request at a time, spaced apart; a hover storm cannot flood the API.
+  if (ssPreviewQueued >= 4) {
+    const busy = new Error('ScreenScraper preview queue full.');
+    busy.status = 429;
+    return Promise.reject(busy);
+  }
+  ssPreviewQueued++;
+  const work = ssPreviewQueueTail.then(async () => {
+    const pause = ssPreviewNextRequestAt - Date.now();
+    if (pause > 0) await waitMs(pause);
+    const now = Date.now();
+    if (now - ssPreviewMinuteWindow >= 60000) { ssPreviewMinuteWindow = now; ssPreviewMinuteUsed = 0; }
+    if (now - ssPreviewDailyWindow >= 86400000) { ssPreviewDailyWindow = now; ssPreviewDailyUsed = 0; }
+    if (ssPreviewMinuteUsed >= SS_PREVIEW_MINUTE_MAX || ssPreviewDailyUsed >= SS_PREVIEW_DAILY_MAX) {
+      const limited = new Error('ScreenScraper preview quota reached.');
+      limited.status = 429;
+      throw limited;
+    }
+    ssPreviewMinuteUsed++;
+    ssPreviewDailyUsed++;
+    ssPreviewNextRequestAt = now + 1600;
+    const url = new URL('https://api.screenscraper.fr/api2/jeuRecherche.php');
+    url.searchParams.set('devid', SS_PREVIEW_DEVID);
+    url.searchParams.set('devpassword', SS_PREVIEW_DEVPASSWORD);
+    url.searchParams.set('softname', 'PSN-Content');
+    url.searchParams.set('output', 'json');
+    url.searchParams.set('systemeid', String(systemId));
+    url.searchParams.set('recherche', name);
+    if (SS_PREVIEW_USER && SS_PREVIEW_PASSWORD) {
+      url.searchParams.set('ssid', SS_PREVIEW_USER);
+      url.searchParams.set('sspassword', SS_PREVIEW_PASSWORD);
+    }
+    const response = await requestMetadataJson(url, { timeoutMs:6500, headers:{ 'User-Agent':'PSN-Content/1.0 ScreenScraper-Preview' } });
+    if (!response.ok || !response.data || typeof response.data !== 'object') {
+      const error = new Error('ScreenScraper search unavailable.');
+      error.status = Number(response.status) === 429 ? 429 : 502;
+      throw error;
+    }
+    const header = response.data.header;
+    if (header && ['false', '0'].includes(String(header.success ?? '').toLowerCase())) {
+      const error = new Error('ScreenScraper rejected the search.');
+      error.status = 502;
+      throw error;
+    }
+    const data = response.data.response || {};
+    const rawGames = data.jeux || data.jeu || [];
+    const games = Array.isArray(rawGames) ? rawGames : (Array.isArray(rawGames.jeu) ? rawGames.jeu : (rawGames.jeu ? [rawGames.jeu] : (rawGames.id ? [rawGames] : [])));
+    const wanted = normalizeSsPreviewTitle(name);
+    let best = null;
+    let bestScore = 0;
+    for (const game of games.slice(0, 30)) {
+      if (Number(game && (game.systemeid || (game.systeme && game.systeme.id))) !== systemId) continue;
+      const videoUrl = ssPreviewFindVideo(game);
+      if (!videoUrl) continue;
+      const score = Math.max(0, ...ssPreviewNames(game).map(title => ssPreviewTitleSimilarity(wanted, normalizeSsPreviewTitle(title))));
+      if (score > bestScore) {
+        best = { found:true, url:videoUrl, provider:'screenscraper' };
+        bestScore = score;
+      }
+      if (bestScore === 1) break;
+    }
+    const result = best || { found:false, provider:'screenscraper' };
+    ssPreviewSetCached(key, result);
+    return result;
+  });
+  ssPreviewQueueTail = work.catch(() => null);
+  const pending = work.finally(() => { ssPreviewQueued--; ssPreviewInflight.delete(key); });
+  ssPreviewInflight.set(key, pending);
+  return pending;
+}
+
+app.options('/api/gameplay-preview', (req, res) => { setMetadataCors(res); res.status(204).end(); });
+app.get('/api/gameplay-preview', async (req, res) => {
+  setMetadataCors(res);
+  res.setHeader('Cache-Control', 'no-store');
+  if (!SS_PREVIEW_ENABLED) return res.status(503).json({ ok:false, configured:false });
+  const name = String(req.query && req.query.name || '').trim().slice(0, 140);
+  const systemId = Number(req.query && req.query.system);
+  if (name.length < 3 || !SS_PREVIEW_SYSTEM_IDS.has(systemId) || !normalizeSsPreviewTitle(name)) {
+    return res.status(400).json({ ok:false, error:'Invalid game or system.' });
+  }
+  try {
+    return res.json({ ok:true, configured:true, ...await ssPreviewLookup(name, systemId) });
+  } catch (error) {
+    // Keep provider secrets and raw API URLs out of logs and client responses.
+    return res.status(error && error.status === 429 ? 429 : 502).json({ ok:false, configured:true, retry:true });
+  }
+});
+
 app.options('/api/metadata/igdb', (req, res) => { setMetadataCors(res); res.status(204).end(); });
 app.options('/api/metadata/steam/search', (req, res) => { setMetadataCors(res); res.status(204).end(); });
 app.options('/api/metadata/steam/details', (req, res) => { setMetadataCors(res); res.status(204).end(); });
