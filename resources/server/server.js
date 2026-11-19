@@ -17109,8 +17109,14 @@ io.on('connection', (socket) => {
 
         const reconcileStartedAt = DB_PERF_ENABLED ? performance.now() : 0;
         userData = reconcileIncomingDownloads(workingUser, userData || {});
+        const arrayReconcileStartedAt = DB_PERF_ENABLED ? performance.now() : 0;
+        if (DB_PERF_ENABLED) recordServerWorkPhase('PROFILE DOWNLOADS RECONCILE (JS)', arrayReconcileStartedAt - reconcileStartedAt);
         userData = reconcileIncomingProfileArrays(workingUser, userData || {});
-        if (DB_PERF_ENABLED) recordServerWorkPhase('PROFILE LIST RECONCILE (JS)', performance.now() - reconcileStartedAt);
+        if (DB_PERF_ENABLED) {
+          const finishedAt = performance.now();
+          recordServerWorkPhase('PROFILE ARRAYS RECONCILE (JS)', finishedAt - arrayReconcileStartedAt);
+          recordServerWorkPhase('PROFILE LIST RECONCILE (JS)', finishedAt - reconcileStartedAt);
+        }
         const friendsSafetyRejected = userData.__friendsSafetyRejected === true;
         delete userData.__friendsSafetyRejected;
         delete userData._friendsMutation;
@@ -17118,25 +17124,30 @@ io.on('connection', (socket) => {
 
         let nextLibraryPlayHistoryData = null;
         if (Object.prototype.hasOwnProperty.call(userData, 'libraryData')) {
-          nextLibraryPlayHistoryData = mergeLibraryPlayHistoryRecordsServer(
-            workingUser.libraryPlayHistoryData || [],
-            workingUser.libraryData || [],
-            userData.libraryData || []
-          );
-          userData.libraryData = applyLibraryPlayHistoryServer(userData.libraryData || [], nextLibraryPlayHistoryData);
+          if (userData.libraryData !== workingUser.libraryData) {
+            nextLibraryPlayHistoryData = mergeLibraryPlayHistoryRecordsServer(
+              workingUser.libraryPlayHistoryData || [],
+              workingUser.libraryData || [],
+              userData.libraryData || []
+            );
+            userData.libraryData = applyLibraryPlayHistoryServer(userData.libraryData || [], nextLibraryPlayHistoryData);
+          }
           userData.library = userData.libraryData.length;
         }
 
-        let sharedGameAcquisitions = collectNewSharedGameAcquisitions(
-          previousLibraryForSharedGameMatch,
-          userData.libraryData,
-          previousDownloadsData,
-          userData.downloadsData,
-          {
-            hasLibrary: Object.prototype.hasOwnProperty.call(userData, 'libraryData'),
-            hasDownloads: Object.prototype.hasOwnProperty.call(userData, 'downloadsData')
-          }
-        );
+        const libraryAcquisitionChanged = Object.prototype.hasOwnProperty.call(userData, 'libraryData') &&
+          userData.libraryData !== workingUser.libraryData;
+        const downloadsAcquisitionChanged = Object.prototype.hasOwnProperty.call(userData, 'downloadsData') &&
+          userData.downloadsData !== workingUser.downloadsData;
+        let sharedGameAcquisitions = libraryAcquisitionChanged || downloadsAcquisitionChanged
+          ? collectNewSharedGameAcquisitions(
+              previousLibraryForSharedGameMatch,
+              userData.libraryData,
+              previousDownloadsData,
+              userData.downloadsData,
+              { hasLibrary: libraryAcquisitionChanged, hasDownloads: downloadsAcquisitionChanged }
+            )
+          : [];
         if (sharedGameAcquisitions.length) {
           sharedGameAcquisitions = await filterPreviouslyOwnedGameAcquisitions(name, sharedGameAcquisitions);
         }
