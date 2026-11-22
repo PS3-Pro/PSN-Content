@@ -939,23 +939,11 @@ html.ios-webkit #object-particles { contain:strict; }
 .game-img[data-loaded="true"] { opacity: 1; }
 .game-img-container > .psn-gameplay-preview-video { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; z-index:1; pointer-events:none; opacity:0; transition:opacity .18s ease; }
 .game-img-container > .psn-gameplay-preview-video.is-ready { opacity:1; }
-/* ScreenScraper only supplements our existing providers; fanart is opt-in for preview. */
-#game-modal .psn-ss-extras { margin: 10px 0 0; padding-top: 10px; border-top: 1px solid rgba(255,255,255,.09); }
-#game-modal .psn-ss-extras-title { color:var(--text-muted);font-size:10px;font-weight:800;letter-spacing:.7px;text-transform:uppercase;margin-bottom:8px; }
-#game-modal .psn-ss-extra-row { display:flex;align-items:center;gap:8px;overflow-x:auto;padding:2px 0 5px;scrollbar-width:none; }
-#game-modal .psn-ss-extra-row::-webkit-scrollbar { display:none; }
-#game-modal .psn-ss-extra-img { position:relative;flex:0 0 78px;display:flex;flex-direction:column;gap:4px;border:0;background:transparent;color:var(--text-muted);font:inherit;font-size:9px;text-align:center;cursor:pointer;padding:0; }
-#game-modal .psn-ss-extra-img img { display:block;width:78px;height:70px;object-fit:contain;border-radius:7px;background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.09); }
-#game-modal .psn-ss-extra-img:hover img { border-color:rgba(255,255,255,.35); }
-#game-modal .psn-ss-bg-toggle { margin:8px 0 4px;border-radius:999px;padding:6px 11px;border:1px solid rgba(255,255,255,.20);background:rgba(255,255,255,.06);color:#fff;font-size:10px;cursor:pointer; }
-#game-modal .psn-ss-bg-toggle[aria-pressed="true"] { border-color:rgba(102,204,255,.68);background:rgba(102,204,255,.13); }
-#game-modal .psn-ss-extras-details { display:flex;flex-wrap:wrap;gap:6px;margin:5px 0 7px;font-size:10px;color:#b6c6d6; }
-#game-modal .psn-ss-extras-details span { border:1px solid rgba(255,255,255,.10);border-radius:8px;padding:4px 7px;background:rgba(0,0,0,.16); }
-#game-modal .sys-modal-content.psn-ss-bg-preview { isolation:isolate;position:relative; }
-#game-modal .sys-modal-content.psn-ss-bg-preview::before { content:"";position:absolute;inset:0;z-index:0;pointer-events:none;background:linear-gradient(to bottom,rgba(7,12,22,.46),rgba(7,12,22,.84)),var(--psn-ss-modal-bg) center/cover no-repeat;opacity:.85; }
-#game-modal .sys-modal-content.psn-ss-bg-preview > .sys-modal-header,
-#game-modal .sys-modal-content.psn-ss-bg-preview > .sys-modal-body { position:relative;z-index:1; }
-
+/* ScreenScraper fanart is a background-only supplement; no extra modal controls. */
+#game-modal .sys-modal-content.psn-ss-fanart { isolation:isolate; position:relative; }
+#game-modal .sys-modal-content.psn-ss-fanart::before { content:""; position:absolute; inset:0; z-index:0; pointer-events:none; background:linear-gradient(to bottom,rgba(7,12,22,.56),rgba(7,12,22,.87)),var(--psn-ss-modal-bg) center/cover no-repeat; opacity:.92; }
+#game-modal .sys-modal-content.psn-ss-fanart > .sys-modal-header,
+#game-modal .sys-modal-content.psn-ss-fanart > .sys-modal-body { position:relative; z-index:1; }
 
 .game-card:hover .game-img { transform: scale(1.02); filter: brightness(1.1); }
 @media (hover: hover) and (pointer: fine) { .game-card:hover .game-img { transform: scale(1.06); } }
@@ -42358,7 +42346,12 @@ P
 			}
 			setGameModalNoScreenshots(modal, false);
 		}
-		modal.querySelector('.sys-modal-content')?.classList.remove('psn-ss-bg-preview');
+		const scraperBackground = modal.querySelector('.sys-modal-content');
+		if (scraperBackground) {
+			scraperBackground.classList.remove('psn-ss-fanart');
+			scraperBackground.style.removeProperty('--psn-ss-modal-bg');
+		}
+		modal.__psnScraperAppliedToken = null;
 		const modalBody = modal.querySelector('.sys-modal-body');
 		const modalHeader = modal.querySelector('.sys-modal-header h2');
 		
@@ -42753,6 +42746,13 @@ P
 			setTimeout(() => {
 				if (Number(modal.__psnGameModalCloseGeneration) !== closeGeneration) return;
 				modal.style.display = 'none';
+				const scraperBackground = modal.querySelector('.sys-modal-content');
+				if (scraperBackground) {
+					scraperBackground.classList.remove('psn-ss-fanart');
+					scraperBackground.style.removeProperty('--psn-ss-modal-bg');
+				}
+				modal.__psnScraperAppliedToken = null;
+				window.dispatchEvent(new Event('psn-game-modal-closed'));
 				if (typeof window.resetGameModalCardMorphStyles === 'function') window.resetGameModalCardMorphStyles(modal);
 				modal.style.opacity = '';
 				modal.__psnCardMorphOriginCard = null;
@@ -120427,102 +120427,59 @@ function getVisibleChatStackEl(id) {
     const match=()=>root.isConnected&&root.classList.contains('show')&&String(root.dataset.titleId||'')===String(titleId||'')&&(!requestToken||String(root.dataset.openHydrationToken||'')===String(requestToken));
     const data=await getAssets(name,system,isPort);
     if(!match()||!data?.found||!data.extras) return;
-    const ext=data.extras, wrapper=root.querySelector('#modal-screenshots-wrapper');
-    if(!wrapper || !wrapper.parentNode) return;
-    let panel=root.querySelector('.psn-ss-extras');
-    if(panel) panel.remove();
-    panel=document.createElement('section');panel.className='psn-ss-extras';
-    wrapper.insertAdjacentElement('afterend',panel);
-    const details=[];
+    const ext=data.extras;
+    const wrapper=root.querySelector('#modal-screenshots-wrapper');
+    const screenshots=root.querySelector('#modal-screenshots');
     const summary=root.querySelector('#modal-summary');
     if(summary && (/No description available\.?/i.test(summary.textContent||'') || !String(summary.textContent||'').trim()) && ext.summary) {
       summary.innerHTML='<span style="font-size:10px;color:var(--text-muted);font-weight:bold;letter-spacing:1px;display:block;margin-bottom:8px"><i class="fas fa-align-left"></i> Summary</span>'+escapeText(ext.summary).replace(/\n/g,'<br>');
     }
-    const badges=root.querySelector('#modal-badges');
-    const hasStudio=!!(badges&&badges.querySelector('.rawg-alt2-studio:not(.rawg-alt2-placeholder)'));
-    if(!hasStudio && (ext.developer||ext.publisher)) details.push('Studio: '+(ext.developer||ext.publisher));
-    if(ext.genres && !root.__resolvedProviderMetadata?.genres?.length) details.push('Genre: '+ext.genres);
-    if(ext.releaseDate && !root.__resolvedProviderMetadata?.year) details.push('Released: '+ext.releaseDate);
-    if(ext.players) details.push('Players: '+ext.players);
-    if(ext.rating!==null && ext.rating!==undefined && !root.__resolvedProviderMetadata?.score) details.push('Rating: '+ext.rating+'/20');
-    if(details.length) {
-      const detailRow=document.createElement('div');detailRow.className='psn-ss-extras-details';
-      details.forEach(value=>{const el=document.createElement('span');el.textContent=value;detailRow.appendChild(el);});
-      panel.appendChild(detailRow);
-    }
-    // Screenshots come after all existing providers, never before or instead of them.
-    const screenshots=root.querySelector('#modal-screenshots');
-    const existingImages=screenshots?Array.from(screenshots.querySelectorAll('img.screenshot-item')):[];
-    const existingUrls=existingImages.map(el=>el.currentSrc||el.src);
-    const newShotUrls=(ext.images||[]).filter(item=>item.kind==='screenshot').map(item=>validImg(item.url)).filter(src=>src&&!existingUrls.includes(src));
-    if(screenshots && newShotUrls.length) {
-      for(const url of newShotUrls.slice(0,3)) {
-        const tile=document.createElement('span');tile.className='modal-screenshot-tile';
-        const shot=document.createElement('img');shot.className='screenshot-item';shot.loading='lazy';shot.decoding='async';shot.src=url;shot.alt='ScreenScraper screenshot';
-        tile.appendChild(shot);screenshots.appendChild(tile);
+    // ScreenScraper is fallback-only: never append images to an existing source gallery.
+    if(screenshots && root.__psnScraperAppliedToken !== requestToken) {
+      const originals=screenshots.querySelector('img.screenshot-item');
+      let manuallyControlled=false;
+      if(typeof window.getContentMetadataOverride==='function') {
+        try {
+          const override=window.getContentMetadataOverride({titleId:root.dataset.titleId,contentId:root.dataset.contentId},category);
+          manuallyControlled=Array.isArray(override?.screenshots);
+        } catch(_) {}
       }
-      wrapper.style.display='flex';root.classList.remove('modal-no-screenshots');
-      if(typeof window.scheduleCarouselArrowSync==='function')window.scheduleCarouselArrowSync(screenshots);
-      const urls=Array.from(screenshots.querySelectorAll('img.screenshot-item')).map(el=>el.currentSrc||el.src);
-      Array.from(screenshots.querySelectorAll('img.screenshot-item')).forEach((el,i)=>{
-        if(typeof openImageModal==='function')el.onclick=()=>openImageModal(i,urls,{gallery:true,sourceElement:el});
-      });
-    }
-    const arts=(ext.images||[]).filter(item=>item.kind==='artwork').slice(0,5).map(item=>({...item,src:validImg(item.url)})).filter(item=>item.src);
-    if(arts.length) {
-      const heading=document.createElement('div');heading.className='psn-ss-extras-title';heading.textContent='Additional artwork · ScreenScraper';panel.appendChild(heading);
-      const row=document.createElement('div');row.className='psn-ss-extra-row';
-      arts.forEach(item=>{
-        const button=document.createElement('button');button.type='button';button.className='psn-ss-extra-img';
-        const im=document.createElement('img');im.loading='lazy';im.decoding='async';im.src=item.src;im.alt=item.type;
-        const label=document.createElement('span');label.textContent=item.type;button.append(im,label);
-        button.addEventListener('click',()=>{if(typeof openImageModal==='function')openImageModal(0,[item.src],{gallery:true,sourceElement:im});});
-        row.appendChild(button);
-      });
-      panel.appendChild(row);
-    }
-    const manual=(ext.images||[]).find(item=>item.kind==='manual');
-    if(manual){
-      try {
-        const link=new URL(manual.url,baseServer());
-        if(link.origin===new URL(baseServer()).origin&&link.pathname==='/api/screenscraper-manual'){
-          const anchor=document.createElement('a');anchor.href=link.href;anchor.target='_blank';anchor.rel='noopener noreferrer';
-          anchor.textContent='View game manual (PDF) · ScreenScraper';
-          anchor.style.cssText='display:block;margin-top:8px;color:var(--ps-blue);font-size:11px;';
-          panel.appendChild(anchor);
+      if(!originals && !manuallyControlled) {
+        const urls=Array.from(new Set((ext.images||[])
+          .filter(item=>item.kind==='screenshot')
+          .map(item=>validImg(item.url)).filter(Boolean))).slice(0,3);
+        if(urls.length) {
+          const tiles=urls.map((url,index)=>{
+            const tile=document.createElement('span');tile.className='modal-screenshot-tile';
+            const image=document.createElement('img');image.className='screenshot-item';
+            image.loading='lazy';image.decoding='async';image.src=url;image.alt='Gameplay screenshot';
+            image.onmouseenter=()=>{if(typeof playUiHover==='function')playUiHover();};
+            image.onclick=()=>{if(typeof openImageModal==='function')openImageModal(index,urls,{gallery:true,sourceElement:image});};
+            tile.appendChild(image);return tile;
+          });
+          screenshots.replaceChildren(...tiles);
+          if(wrapper)wrapper.style.display='flex';
+          root.classList.remove('modal-no-screenshots');
+          if(summary)['height','min-height','max-height','flex'].forEach(prop=>summary.style.removeProperty(prop));
+          if(typeof window.scheduleCarouselArrowSync==='function')window.scheduleCarouselArrowSync(screenshots);
         }
-      }catch(_){}
+      }
+      root.__psnScraperAppliedToken=requestToken;
     }
     const fanart=(ext.images||[]).find(item=>item.kind==='background'&&validImg(item.url));
     if(fanart) {
       const url=validImg(fanart.url);
-      const testBtn=document.createElement('button');testBtn.type='button';testBtn.className='psn-ss-bg-toggle';
-      testBtn.setAttribute('aria-pressed','false');testBtn.textContent='Test fanart background';
-      testBtn.addEventListener('click',()=>{
-        const content=root.querySelector('.sys-modal-content');if(!content)return;
-        if(content.classList.contains('psn-ss-bg-preview')) {
-          content.classList.remove('psn-ss-bg-preview');
-          testBtn.setAttribute('aria-pressed','false');
-          testBtn.textContent='Test fanart background';
-          return;
-        }
-        testBtn.disabled=true;
-        testBtn.textContent='Loading fanart…';
+      const content=root.querySelector('.sys-modal-content');
+      if(content && !content.classList.contains('psn-ss-fanart') && (getComputedStyle(content).backgroundImage==='none')) {
         const image=new Image();
         image.onload=()=>{
-          if(match()) {
-            content.style.setProperty('--psn-ss-modal-bg',`url("${url}")`);
-            content.classList.add('psn-ss-bg-preview');
-            testBtn.setAttribute('aria-pressed','true');
-            testBtn.textContent='Restore original background';
-          }
-          testBtn.disabled=false;
+          if(!match())return;
+          content.style.setProperty('--psn-ss-modal-bg',`url("${url}")`);
+          content.classList.add('psn-ss-fanart');
         };
-        image.onerror=()=>{testBtn.disabled=false;testBtn.textContent='Fanart unavailable · Retry';};
         image.src=url;
-      });panel.appendChild(testBtn);
+      }
     }
-    if(!panel.children.length) panel.remove();
   };
 })();
 </script>
@@ -120585,18 +120542,37 @@ function getVisibleChatStackEl(id) {
     video.className='psn-gameplay-preview-video';video.muted=true;video.defaultMuted=true;video.playsInline=true;
     video.loop=true;video.preload='auto';video.setAttribute('aria-hidden','true');video.setAttribute('disablepictureinpicture','');
     video.addEventListener('playing',()=>{if(active===current)video.classList.add('is-ready');});
-    video.addEventListener('error',()=>{failures.set(info.key,Date.now()+20000);if(active===current)stop();});
+    video.addEventListener('error',()=>{if(active!==current)return;failures.set(info.key,Date.now()+20000);stop();});
     parent.appendChild(video);video.src=url;
     video.play().catch(()=>{if(active===current&&!video.classList.contains('is-ready'))stop();});
   }
-  document.addEventListener('pointerover',event=>{
-    const card=cardFrom(event.target);if(!card||(active&&active.card===card))return;
-    stop();const info=identity(card);if(!info)return;
-    if((failures.get(info.key)||0)>Date.now())return;
+  let rearmAfterModal=false;
+  function modalVisible() {
+    const modal=document.getElementById('game-modal');
+    return !!(modal && (modal.classList.contains('show') || modal.style.display==='flex'));
+  }
+  function startPreview(target) {
+    if(document.hidden||modalVisible())return false;
+    const card=cardFrom(target);
+    if(!card || (active&&active.card===card))return false;
+    stop();const info=identity(card);if(!info)return false;
+    if((failures.get(info.key)||0)>Date.now())return false;
+    rearmAfterModal=false;
     const current={card,timer:null,lookupTimer:null,lookup:null,video:null};active=current;
     // Keep the original 400 ms hover, while starting the metadata lookup slightly earlier.
     current.lookupTimer=setTimeout(()=>{if(active===current)current.lookup=getResult(info);},250);
     current.timer=setTimeout(()=>play(current,info),400);
+    return true;
+  }
+  document.addEventListener('pointerover',event=>{startPreview(event.target);},{passive:true});
+  // After a modal closes, the same card might never receive another pointerover.
+  window.addEventListener('psn-game-modal-closed',()=>{
+    rearmAfterModal=true;
+    const hovered=document.querySelector('.game-card:hover');
+    if(hovered)startPreview(hovered);
+  });
+  document.addEventListener('pointermove',event=>{
+    if(rearmAfterModal && !active && event.pointerType==='mouse')startPreview(event.target);
   },{passive:true});
   document.addEventListener('pointerout',event=>{
     if(active&&active.card.contains(event.target)&&(!event.relatedTarget||!active.card.contains(event.relatedTarget)))stop();
