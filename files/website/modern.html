@@ -120366,15 +120366,26 @@ function getVisibleChatStackEl(id) {
 
 <script>
 (() => {
-  // Load gameplay only after deliberate hover; keep all existing card effects intact.
-  const platformIds = { ps3:59, ps2:58, ps1:57, psx:57, psp:61, psv:62, vita:62, ps4:60 };
-  const localCache = new Map();
-  const maxCache = 250;
+  // Gameplay preview: desktop hover only; never change existing card animations.
+  const platformIds = { ps3:59, ps2:58, ps1:57, psx:57, psp:61, psv:62, psvita:62, vita:62, ps4:60 };
+  const cache = new Map();
+  const failures = new Map();
   const delayMs = 400;
   let active = null;
-  let disabledUntil = 0;
   const supported = !!(window.matchMedia && matchMedia('(hover: hover) and (pointer: fine)').matches && !matchMedia('(prefers-reduced-motion: reduce)').matches);
-  if (!supported) return;
+  const baseServer = () => {
+    const url = typeof getMetadataServerBaseCompat === 'function' ? getMetadataServerBaseCompat() : '';
+    return String(url || 'https://psn-content-fd6j.onrender.com').replace(/\/+$/, '');
+  };
+  function note(event, info = {}) {
+    window.__psnGameplayStatus = { event, ...info, at: new Date().toISOString() };
+    if (window.__psnGameplayDebug) console.debug('[GAMEPLAY PREVIEW]',event,info);
+  }
+  window.__psnGameplayCheck = async () => {
+    const response = await fetch(`${baseServer()}/api/gameplay-preview/status`,{cache:'no-store'});
+    return response.json();
+  };
+  if (!supported) { note('desktop_only'); return; }
 
   function videoCardFrom(target) {
     const card = target && target.closest && target.closest('.game-card');
@@ -120383,68 +120394,86 @@ function getVisibleChatStackEl(id) {
     if (!card.querySelector('.game-img-container > img.game-img')) return null;
     return card;
   }
-
   function identity(card) {
     const image = card.querySelector('.game-img-container > img.game-img');
     if (!image) return null;
-    const platform = String(image.dataset.console || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const platform = String(image.dataset.console || card.dataset.console || '').toLowerCase().replace(/[^a-z0-9]/g,'');
     const system = platformIds[platform];
     if (!system) return null;
     const category = String(image.dataset.coverCategory || card.dataset.storeCategory || '').toLowerCase();
-    if (category && !['games','ps1','ps2','ps3','psp','psvita','ps4','minis','classics'].includes(category)) return null;
-    const name = String(image.dataset.name || '').trim();
+    // Exclude unrelated DLC, themes and apps, not normal Library / Wishlist cards.
+    if (/^(?:dlcs?|updates?|avatars?|themes?|tools?|apps?|demos?|homebrew_games)$/.test(category)) return null;
+    const name = String(image.dataset.name || image.getAttribute('alt') || '').trim();
     if (name.length < 3 || name.length > 140) return null;
-    return { key: `${system}:${name.toLowerCase()}`, name, system };
+    return {key:`${system}:${name.toLowerCase()}`,name,system};
   }
-
-  function remember(key, data, ttl) {
-    localCache.delete(key);
-    localCache.set(key, { data, until:Date.now()+ttl });
-    while (localCache.size > maxCache) localCache.delete(localCache.keys().next().value);
+  function remember(key,data,ttlMs) {
+    cache.delete(key);
+    cache.set(key,{data,until:Date.now()+ttlMs});
+    while(cache.size>250) cache.delete(cache.keys().next().value);
   }
-
   function stop() {
     if (!active) return;
-    const current = active;
+    const old = active;
     active = null;
-    clearTimeout(current.timer);
-    if (current.controller) current.controller.abort();
-    if (current.video) {
-      current.video.pause();
-      current.video.removeAttribute('src');
-      current.video.load();
-      current.video.remove();
+    clearTimeout(old.timer);
+    if(old.controller) old.controller.abort();
+    if(old.video) {
+      old.video.pause();
+      old.video.removeAttribute('src');
+      old.video.load();
+      old.video.remove();
     }
   }
-
-  async function start(current, info) {
-    if (active !== current || !current.card.isConnected || !current.card.matches(':hover') || document.hidden) return;
-    let cached = localCache.get(info.key);
-    if (cached && Date.now() > cached.until) { localCache.delete(info.key); cached = null; }
-    let data = cached && cached.data;
+  function validPublicVideo(raw) {
+    try {
+      const url = new URL(raw);
+      if (url.protocol === 'https:' && ['www.screenscraper.fr','screenscraper.fr'].includes(url.hostname) &&
+          /^\/medias\/(57|58|59|60|61|62)\/\d+\/video(?:-normalized)?\.mp4$/.test(url.pathname) && !url.search) return url.href;
+    } catch (_) {}
+    return '';
+  }
+  function fallbackVideo(raw) {
+    try {
+      const url = new URL(raw,baseServer());
+      return url.origin === new URL(baseServer()).origin && url.pathname === '/api/gameplay-video' && url.searchParams.has('token') ? url.href : '';
+    } catch (_) { return ''; }
+  }
+  async function start(current,info) {
+    if(active!==current || !current.card.isConnected || !current.card.matches(':hover') || document.hidden) return;
+    const failedUntil = failures.get(info.key) || 0;
+    if (Date.now() < failedUntil) return;
+    if (failedUntil) failures.delete(info.key);
+    let entry = cache.get(info.key);
+    if (entry && Date.now()>entry.until) { cache.delete(info.key); entry=null; }
+    let data = entry && entry.data;
     if (!data) {
-      const base = typeof getMetadataServerBaseCompat === 'function' ? getMetadataServerBaseCompat() : '';
-      if (!base) return;
       current.controller = new AbortController();
       try {
-        const response = await fetch(`${base}/api/gameplay-preview?name=${encodeURIComponent(info.name)}&system=${info.system}`, { signal:current.controller.signal });
-        if (response.status === 503) { disabledUntil = Date.now() + 30000; return; }
-        if (response.status === 429) { remember(info.key, { found:false }, 60000); return; }
+        const response = await fetch(`${baseServer()}/api/gameplay-preview?name=${encodeURIComponent(info.name)}&system=${info.system}`,{signal:current.controller.signal,cache:'no-store'});
+        data = await response.json();
         if (!response.ok) {
-          if (window.__psnGameplayDebug) console.debug('[GAMEPLAY PREVIEW] HTTP', response.status);
+          note('api_error',{name:info.name,http:response.status,reason:data.reason || 'unknown',upstreamStatus:data.upstreamStatus || 0});
+          failures.set(info.key,Date.now()+20000);
+          if (failures.size > 250) failures.delete(failures.keys().next().value);
           return;
         }
-        data = await response.json();
-        if (!data || data.configured !== true) return;
-        remember(info.key, data, data.found ? 24*60*60*1000 : 10*60*1000);
-        if (window.__psnGameplayDebug && !data.found) console.debug('[GAMEPLAY PREVIEW]', info.name, data.reason || 'no_video');
-      } catch (error) { return; }
+        if (!data || data.configured !== true) { note('not_configured',{name:info.name}); return; }
+        if (!data.found) {
+          note('no_video',{name:info.name,reason:data.reason || 'unknown'});
+          remember(info.key,data,3*60*1000);
+          return;
+        }
+        remember(info.key,data,12*60*1000); // Signed proxy URLs last only 15 min.
+      } catch(error) {
+        if (error && error.name !== 'AbortError') note('network_error',{name:info.name});
+        return;
+      }
     }
-    if (active !== current || !current.card.isConnected || !current.card.matches(':hover') || document.hidden || !data.found) return;
-    let url;
-    try { url = new URL(data.url); } catch (error) { return; }
-    if (url.protocol !== 'https:' || url.hostname !== 'www.screenscraper.fr' ||
-        !/^\/medias\/(57|58|59|60|61|62)\/\d+\/video(?:-normalized)?\.mp4$/.test(url.pathname) || url.search) return;
+    if(active!==current || !current.card.isConnected || !current.card.matches(':hover') || document.hidden || !data.found) return;
+    const direct = validPublicVideo(data.url);
+    const fallback = fallbackVideo(data.fallbackUrl);
+    if (!direct && !fallback) { note('invalid_video_url',{name:info.name}); return; }
     const parent = current.card.querySelector('.game-img-container');
     if (!parent) return;
     const video = document.createElement('video');
@@ -120453,38 +120482,63 @@ function getVisibleChatStackEl(id) {
     video.defaultMuted = true;
     video.loop = true;
     video.playsInline = true;
-    video.preload = 'none';
-    video.setAttribute('aria-hidden', 'true');
-    video.setAttribute('disablepictureinpicture', '');
-    video.addEventListener('playing', () => { if (active === current) video.classList.add('is-ready'); }, { once:true });
-    video.addEventListener('error', () => { remember(info.key, { found:false }, 10*60*1000); if (active === current) stop(); }, { once:true });
+    video.preload = 'metadata';
+    video.setAttribute('aria-hidden','true');
+    video.setAttribute('disablepictureinpicture','');
     current.video = video;
+    let fallbackTried = false;
+    let isPlaying = false;
+    const switchToFallback = () => {
+      if (fallbackTried || !fallback || active!==current) return false;
+      fallbackTried = true;
+      isPlaying = false;
+      note('trying_fallback',{name:info.name});
+      video.classList.remove('is-ready');
+      video.src = fallback;
+      video.load();
+      video.play().catch(() => { if (active===current && !isPlaying) { note('fallback_play_rejected',{name:info.name}); stop(); } });
+      return true;
+    };
+    video.addEventListener('playing',() => {
+      if (active===current) { isPlaying = true; video.classList.add('is-ready'); note('playing',{name:info.name,via:fallbackTried?'fallback':'direct'}); }
+    });
+    video.addEventListener('error',() => {
+      if (switchToFallback()) return;
+      note('video_error',{name:info.name,via:fallbackTried?'fallback':'direct'});
+      failures.set(info.key,Date.now()+30000);
+      if (failures.size > 250) failures.delete(failures.keys().next().value);
+      if(active===current) stop();
+    });
     parent.appendChild(video);
-    video.src = url.href;
-    try { await video.play(); } catch (error) { if (active === current) stop(); }
+    video.src = direct || fallback;
+    fallbackTried = !direct;
+    try { await video.play(); }
+    catch(error) {
+      if (active===current && !isPlaying && !fallbackTried && !switchToFallback()) note('play_rejected',{name:info.name});
+    }
   }
-
-  document.addEventListener('pointerover', event => {
+  document.addEventListener('pointerover',event => {
     const card = videoCardFrom(event.target);
-    if (!card || Date.now() < disabledUntil || (active && active.card === card)) return;
+    if(!card || (active && active.card===card)) return;
     stop();
     const info = identity(card);
-    if (!info) return;
-    const current = { card, timer:null, controller:null, video:null };
+    if(!info) return;
+    note('hover',{name:info.name,system:info.system});
+    const current = {card,timer:null,controller:null,video:null};
     active = current;
-    current.timer = setTimeout(() => start(current, info), delayMs);
-  }, { passive:true });
-  document.addEventListener('pointerout', event => {
-    if (!active || !active.card.contains(event.target)) return;
-    if (event.relatedTarget && active.card.contains(event.relatedTarget)) return;
+    current.timer = setTimeout(() => start(current,info),delayMs);
+  },{passive:true});
+  document.addEventListener('pointerout',event => {
+    if(!active || !active.card.contains(event.target)) return;
+    if(event.relatedTarget && active.card.contains(event.relatedTarget)) return;
     stop();
-  }, { passive:true });
-  document.addEventListener('visibilitychange', () => { if (document.hidden) stop(); });
-  window.addEventListener('blur', stop);
-  document.addEventListener('pointerdown', stop, { passive:true });
-  document.addEventListener('scroll', () => {
-    if (active && (!active.card.isConnected || !active.card.matches(':hover'))) stop();
-  }, { passive:true, capture:true });
+  },{passive:true});
+  document.addEventListener('visibilitychange',() => { if(document.hidden) stop(); });
+  window.addEventListener('blur',stop);
+  document.addEventListener('pointerdown',stop,{passive:true});
+  document.addEventListener('scroll',() => {
+    if(active && (!active.card.isConnected || !active.card.matches(':hover'))) stop();
+  },{passive:true,capture:true});
 })();
 </script>
 
