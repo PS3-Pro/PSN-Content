@@ -74783,83 +74783,205 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		return summary;
 	}
 
-	function markVisibleChatAsRead() {
-		const myName = localStorage.getItem('psn_username') || "Guest";
-		const history = Array.isArray(window.messageHistory) ? window.messageHistory : [];
-		const historySignature = getChatReadScanSignature(history);
-		const seenScanSignature = `${myName}|${historySignature}`;
-		const latestTime = getLatestChatHistoryTime(history);
-		const previousRead = parseInt(loadState('psn_last_chat_read') || '0', 10) || 0;
-		const readChanged = latestTime > previousRead;
-		if (readChanged) saveState('psn_last_chat_read', String(Math.max(Date.now(), latestTime)));
-		if (loadState('psn_chat_dot') !== 'false') saveState('psn_chat_dot', 'false');
+    // Distinguish unread UI counters from actual Seen By acknowledgements.
+    // Only a message visible for 500ms in the focused Global Chat is confirmed.
+    const chatSeenVisible = new Map();
+    const chatSeenPending = new Map();
+    const chatSeenQueued = new Set();
+    let chatSeenObserver = null;
+    let chatSeenMutationObserver = null;
+    let chatSeenObservedBox = null;
+    let chatSeenFlushTimer = 0;
+    let chatSeenFlushBusy = false;
+    let chatSeenRenderFrame = 0;
+    const CHAT_SEEN_VISIBLE_MS = 500;
+    const CHAT_SEEN_VIEW_BATCH = 40;
 
-		const dot = document.getElementById('chat-dot');
-		if (dot && dot.style.display !== 'none') dot.style.display = 'none';
-		if (typeof updateJumpBottomUnreadBadge === 'function') updateJumpBottomUnreadBadge(0);
+    function isChatSeenViewportActive() {
+        return !document.hidden && document.hasFocus() && isChatScreenVisibleForRead()
+            && typeof socketChat !== 'undefined' && !!socketChat && socketChat.connected
+            && window.__chatInitialSnapshotPending !== true;
+    }
 
-		if (readChanged && typeof broadcastProfileUpdate === 'function') broadcastProfileUpdate({ silentIndicator:true });
+    function chatSeenRowVisible(row, box) {
+        if (!row || !row.isConnected || !box || !box.contains(row)) return false;
+        const rect = row.getBoundingClientRect(), viewport = box.getBoundingClientRect();
+        const visible = Math.max(0, Math.min(rect.bottom, viewport.bottom) - Math.max(rect.top,viewport.top));
+        return visible >= Math.min(rect.height,viewport.height) * 0.5 && rect.height > 0 && viewport.height > 0;
+    }
 
-		if (history.length && typeof socketChat !== 'undefined' && socketChat && socketChat.connected && window.__chatSeenScanSignature !== seenScanSignature) {
-			window.__chatSeenScanSignature = seenScanSignature;
-			window.__chatSeenEmitPending = window.__chatSeenEmitPending instanceof Map ? window.__chatSeenEmitPending : new Map();
-			const now = Date.now();
-			for (const [pendingKey, pendingValue] of window.__chatSeenEmitPending) {
-				const pendingAt = Number(pendingValue || 0);
-				if (!pendingAt || now - pendingAt >= 5000) window.__chatSeenEmitPending.delete(pendingKey);
-			}
-			const unseenIds = [];
-			for (let i = 0; i < history.length; i++) {
-				const m = history[i];
-				if (!m || m.user === myName) continue;
-				const hasSeen = Array.isArray(m.seenBy) && m.seenBy.includes(myName);
-				if (hasSeen) continue;
-				const msgId = new Date(m.time).getTime();
-				if (!Number.isFinite(msgId)) continue;
-				const key = String(msgId);
-				const pendingAt = Number(window.__chatSeenEmitPending.get(key) || 0);
-				if (pendingAt && now - pendingAt < 5000) continue;
-				window.__chatSeenEmitPending.set(key, now);
-				unseenIds.push(key);
-			}
-			if (unseenIds.length) {
-				const confirmSeen = response => {
-					if (!response || response.success !== true) return;
-					const confirmed = Array.isArray(response.seenIds) ? response.seenIds.map(String) : unseenIds;
-					const confirmedAt = new Date().toISOString();
-					let changed = false;
-					for (const id of confirmed) {
-						window.__chatSeenEmitPending.delete(id);
-						const message = typeof getChatMessageByIdFast === 'function' ? getChatMessageByIdFast(id) : null;
-						if (!message || message.user === myName) continue;
-						if (!Array.isArray(message.seenBy)) message.seenBy = [];
-						let messageChanged = false;
-						if (!message.seenBy.includes(myName)) { message.seenBy.push(myName); changed = true; messageChanged = true; }
-						if (!message.seenAt || typeof message.seenAt !== 'object' || Array.isArray(message.seenAt)) message.seenAt = {};
-						if (!message.seenAt[myName]) { message.seenAt[myName] = confirmedAt; changed = true; messageChanged = true; }
-						if (messageChanged && typeof markChatMessageSeenDataDirty === 'function') markChatMessageSeenDataDirty(message);
-					}
-					if (changed && typeof scheduleChatPersistentCacheWrite === 'function') scheduleChatPersistentCacheWrite();
-				};
-				const retrySeen = () => {
-					for (const id of unseenIds) window.__chatSeenEmitPending.delete(id);
-					window.__chatSeenScanSignature = '';
-					setTimeout(() => {
-						if (typeof isChatScreenVisibleForRead === 'function' && isChatScreenVisibleForRead() && typeof markVisibleChatAsRead === 'function') markVisibleChatAsRead();
-					}, 300);
-				};
-				if (typeof socketChat.timeout === 'function') socketChat.timeout(8000).emit('mark_messages_as_read', { msgIds: unseenIds }, (err, response) => {
-					if (err || !response || response.success !== true) { retrySeen(); return; }
-					confirmSeen(response);
-				});
-				else socketChat.emit('mark_messages_as_read', { msgIds: unseenIds }, response => {
-					if (!response || response.success !== true) { retrySeen(); return; }
-					confirmSeen(response);
-				});
-			}
-		}
-		return readChanged;
-	}
+    function scheduleChatSeenFlush(delay = 130) {
+        if (chatSeenFlushTimer || !chatSeenQueued.size) return;
+        chatSeenFlushTimer = setTimeout(() => { chatSeenFlushTimer = 0; flushChatSeenVisibleBatch(); },delay);
+    }
+
+    function flushChatSeenVisibleBatch() {
+        if (chatSeenFlushBusy || !isChatSeenViewportActive() || !chatSeenQueued.size) return;
+        const box = document.getElementById('chat-messages');
+        const myName = localStorage.getItem('psn_username') || '';
+        const ids = [];
+        for (const id of chatSeenQueued) {
+            if (ids.length >= CHAT_SEEN_VIEW_BATCH) break;
+            chatSeenQueued.delete(id);
+            const row = box && box.querySelector(`[data-chat-msg-id="${id}"]`);
+            const message = getChatMessageByIdFast(id);
+            if (!message || message.user === myName || (Array.isArray(message.seenBy) && message.seenBy.includes(myName))) continue;
+            if (!chatSeenRowVisible(row,box)) continue;
+            const pendingAt = Number(chatSeenPending.get(id)||0);
+            if (pendingAt && Date.now()-pendingAt < 10000) continue;
+            chatSeenPending.set(id,Date.now());
+            ids.push(id);
+        }
+        if (!ids.length) {
+            if (chatSeenQueued.size) scheduleChatSeenFlush(250);
+            return;
+        }
+        chatSeenFlushBusy = true;
+        const requestSocket = socketChat;
+        const sessionUser = myName;
+        const done = (err,response) => {
+            chatSeenFlushBusy = false;
+            ids.forEach(id => chatSeenPending.delete(id));
+            if (requestSocket !== socketChat || sessionUser !== (localStorage.getItem('psn_username')||'')) return;
+            if (err || !response || response.success !== true) {
+                setTimeout(() => {
+                    if (!isChatSeenViewportActive()) return;
+                    scheduleChatSeenViewportScan();
+                    if (chatSeenQueued.size) scheduleChatSeenFlush(250);
+                },1800);
+                return;
+            }
+            const confirmed = Array.isArray(response.seenIds) ? response.seenIds.map(String) : ids;
+            let changed = false;
+            for (const id of confirmed) {
+                const message = getChatMessageByIdFast(id);
+                if (!message || message.user === sessionUser) continue;
+                if (!Array.isArray(message.seenBy)) message.seenBy = [];
+                if (message.seenBy.includes(sessionUser)) continue;
+                message.seenBy.push(sessionUser);
+                if (!message.seenAt || typeof message.seenAt !== 'object') message.seenAt = {};
+                message.seenAt[sessionUser] = new Date().toISOString();
+                if (typeof markChatMessageSeenDataDirty === 'function') markChatMessageSeenDataDirty(message);
+                changed = true;
+            }
+            if (changed && typeof scheduleChatPersistentCacheWrite === 'function') scheduleChatPersistentCacheWrite();
+            scheduleChatSeenFlush();
+        };
+        if (typeof requestSocket.timeout === 'function') requestSocket.timeout(8000).emit('mark_messages_as_read',{ visibleV2:true,msgIds:ids },done);
+        else requestSocket.emit('mark_messages_as_read',{ visibleV2:true,msgIds:ids },response => done(null,response));
+    }
+
+    function queueChatSeenCandidate(row) {
+        if (!isChatSeenViewportActive()) return;
+        const id = row && row.getAttribute('data-chat-msg-id');
+        if (!id || chatSeenVisible.has(id) || chatSeenQueued.has(id) || chatSeenPending.has(id)) return;
+        const me = localStorage.getItem('psn_username') || '';
+        const message = getChatMessageByIdFast(id);
+        if (!message || message.user === me || (Array.isArray(message.seenBy) && message.seenBy.includes(me))) return;
+        if (!chatSeenRowVisible(row, chatSeenObservedBox)) return;
+        const timer = setTimeout(() => {
+            chatSeenVisible.delete(id);
+            if (isChatSeenViewportActive() && chatSeenRowVisible(row,chatSeenObservedBox)) {
+                chatSeenQueued.add(id);
+                scheduleChatSeenFlush();
+            }
+        },CHAT_SEEN_VISIBLE_MS);
+        chatSeenVisible.set(id,timer);
+    }
+
+    function cancelChatSeenCandidate(id) {
+        if (!chatSeenVisible.has(id)) return;
+        clearTimeout(chatSeenVisible.get(id));
+        chatSeenVisible.delete(id);
+    }
+
+    function scheduleChatSeenViewportScan() {
+        if (chatSeenRenderFrame) return;
+        chatSeenRenderFrame = requestAnimationFrame(() => {
+            chatSeenRenderFrame = 0;
+            const box = chatSeenObservedBox;
+            if (!box || !isChatSeenViewportActive()) return;
+            for (const row of box.querySelectorAll('[data-chat-msg-id]')) {
+                if (chatSeenRowVisible(row,box)) queueChatSeenCandidate(row);
+            }
+        });
+    }
+
+    function ensureChatSeenViewportObserver() {
+        const box = document.getElementById('chat-messages');
+        if (!box) return;
+        if (chatSeenObservedBox !== box) {
+            if (chatSeenObserver) chatSeenObserver.disconnect();
+            if (chatSeenMutationObserver) chatSeenMutationObserver.disconnect();
+            for (const timer of chatSeenVisible.values()) clearTimeout(timer);
+            chatSeenVisible.clear();
+            chatSeenObservedBox = box;
+            chatSeenObserver = new IntersectionObserver(entries => {
+                for (const entry of entries) {
+                    const id = entry.target.getAttribute('data-chat-msg-id');
+                    if (!id) continue;
+                    if (entry.isIntersecting && chatSeenRowVisible(entry.target,box)) queueChatSeenCandidate(entry.target);
+                    else cancelChatSeenCandidate(id);
+                }
+            }, { root:box, threshold:[0,0.5,1] });
+            chatSeenMutationObserver = new MutationObserver(records => {
+                let addedRows = false;
+                for (const record of records) {
+                    for (const node of record.removedNodes) {
+                        if (node.nodeType !== 1) continue;
+                        if (node.hasAttribute('data-chat-msg-id')) {
+                            chatSeenObserver.unobserve(node);
+                            cancelChatSeenCandidate(node.getAttribute('data-chat-msg-id'));
+                        }
+                        for (const row of node.querySelectorAll('[data-chat-msg-id]')) {
+                            chatSeenObserver.unobserve(row);
+                            cancelChatSeenCandidate(row.getAttribute('data-chat-msg-id'));
+                        }
+                    }
+                    if (!addedRows) addedRows = Array.from(record.addedNodes).some(node => node.nodeType === 1 &&
+                        (node.hasAttribute('data-chat-msg-id') || node.querySelector('[data-chat-msg-id]')));
+                }
+                if (addedRows) {
+                    for (const row of box.querySelectorAll('[data-chat-msg-id]')) chatSeenObserver.observe(row);
+                    scheduleChatSeenViewportScan();
+                }
+            });
+            chatSeenMutationObserver.observe(box, {childList:true,subtree:true});
+        }
+        for (const row of box.querySelectorAll('[data-chat-msg-id]')) chatSeenObserver.observe(row);
+        scheduleChatSeenViewportScan();
+    }
+
+    // Start observing even when unread navigation opens halfway through history.
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', ensureChatSeenViewportObserver, { once:true });
+    else setTimeout(ensureChatSeenViewportObserver, 0);
+
+    function markVisibleChatAsRead() {
+        const myName = localStorage.getItem('psn_username') || 'Guest';
+        const history = Array.isArray(window.messageHistory) ? window.messageHistory : [];
+        const latestTime = getLatestChatHistoryTime(history);
+        const previousRead = parseInt(loadState('psn_last_chat_read') || '0',10) || 0;
+        const readChanged = latestTime > previousRead;
+        if (readChanged) saveState('psn_last_chat_read',String(Math.max(Date.now(),latestTime)));
+        if (loadState('psn_chat_dot') !== 'false') saveState('psn_chat_dot','false');
+        const dot = document.getElementById('chat-dot');
+        if (dot && dot.style.display !== 'none') dot.style.display = 'none';
+        if (typeof updateJumpBottomUnreadBadge === 'function') updateJumpBottomUnreadBadge(0);
+        if (readChanged && typeof broadcastProfileUpdate === 'function') broadcastProfileUpdate({silentIndicator:true});
+        ensureChatSeenViewportObserver();
+        return readChanged;
+    }
+
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+            for (const id of chatSeenVisible.keys()) cancelChatSeenCandidate(id);
+            chatSeenQueued.clear();
+        } else if (isChatScreenVisibleForRead()) ensureChatSeenViewportObserver();
+    });
+    window.addEventListener('focus', () => {
+        if (isChatScreenVisibleForRead()) ensureChatSeenViewportObserver();
+    });
+
 
 
     function getChatMessageRenderSignature(msg = {}) {
@@ -75990,7 +76112,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
     const CHAT_CACHE_DB_NAME = 'psn-chat-history-cache-v1';
     const CHAT_CACHE_DB_VERSION = 1;
     const CHAT_CACHE_STORE = 'history';
-    const CHAT_CACHE_FORMAT_VERSION = 2;
+    const CHAT_CACHE_FORMAT_VERSION = 3;
     const CHAT_CACHE_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 
     function getChatCacheUserName() {
@@ -76203,7 +76325,11 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             if (!msg.seenAt || typeof msg.seenAt !== 'object' || Array.isArray(msg.seenAt)) msg.seenAt = {};
             if (event.seenAt) {
                 const nextSeenAt = String(event.seenAt);
-                if (String(msg.seenAt[reader] || '') !== nextSeenAt) { msg.seenAt[reader] = nextSeenAt; semanticChanged = true; }
+                const previousTime = Date.parse(msg.seenAt[reader] || '');
+                const incomingTime = Date.parse(nextSeenAt);
+                if ((!Number.isFinite(previousTime) || (Number.isFinite(incomingTime) && incomingTime < previousTime)) && msg.seenAt[reader] !== nextSeenAt) {
+                    msg.seenAt[reader] = nextSeenAt; semanticChanged = true;
+                }
             }
             if (semanticChanged) {
                 invalidateChatMessageSeenDataSignature(msg);
@@ -76299,7 +76425,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             return true;
         }
         const cursor = Math.max(0, Number(event.cursor) || 0);
-        if (cursor && cursor <= Math.max(0, Number(window.__chatSeenCursor) || 0)) return true;
+        // Out-of-order realtime receipts must still update their message.
         const msgId = String(event.msgId || '');
         const reader = String(event.reader || '');
         const msg = typeof getChatMessageByIdFast === 'function' ? getChatMessageByIdFast(msgId) : null;
@@ -76316,10 +76442,14 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             if (!msg.seenAt || typeof msg.seenAt !== 'object' || Array.isArray(msg.seenAt)) { msg.seenAt = {}; changed = true; }
             if (event.seenAt) {
                 const nextSeenAt = String(event.seenAt);
-                if (String(msg.seenAt[reader] || '') !== nextSeenAt) { msg.seenAt[reader] = nextSeenAt; changed = true; semanticDataChanged = true; }
+                const previousTime = Date.parse(msg.seenAt[reader] || '');
+                const incomingTime = Date.parse(nextSeenAt);
+                if ((!Number.isFinite(previousTime) || (Number.isFinite(incomingTime) && incomingTime < previousTime)) && msg.seenAt[reader] !== nextSeenAt) {
+                    msg.seenAt[reader] = nextSeenAt; changed = true; semanticDataChanged = true;
+                }
             }
         }
-        if (cursor) window.__chatSeenCursor = cursor;
+        if (cursor) window.__chatSeenCursor = Math.max(Math.max(0,Number(window.__chatSeenCursor)||0),cursor);
         const myName = localStorage.getItem('psn_username') || '';
         if (event.reader && myName && String(event.reader) === myName && window.__chatSeenEmitPending instanceof Map) window.__chatSeenEmitPending.delete(msgId);
         if (changed) {
@@ -76453,10 +76583,19 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
                 }
                 window.__chatSeenRehydrationAttempts = 0;
                 const state = { changed:false, ids:new Set() };
+                if (response.seenEncoding === 'ranges-v2') {
+                    for (const message of window.messageHistory || []) {
+                        if (!message) continue;
+                        if ((Array.isArray(message.seenBy) && message.seenBy.length) || Number(message.seenCount)||0) state.ids.add(getChatIndexedMessageKey(message));
+                        message.seenBy=[]; message.seenAt={}; message.seenCount=0;
+                    }
+                    state.changed = state.ids.size > 0;
+                }
                 applyChatSeenSummaryToHistory(window.messageHistory || [], response.seenSummary || [], state);
                 applyChatSeenEventsToHistory(window.messageHistory || [], response.seenEvents || [], state);
-                window.__chatSeenCursor = Math.max(Math.max(0, Number(window.__chatSeenCursor) || 0),
-                    Math.max(0, Number(response.seenCursor) || 0));
+                window.__chatSeenCursor = response.seenEncoding === 'ranges-v2'
+                    ? Math.max(0, Number(response.seenCursor) || 0)
+                    : Math.max(Math.max(0, Number(window.__chatSeenCursor) || 0), Math.max(0, Number(response.seenCursor) || 0));
                 if (state.changed) {
                     for (const id of state.ids) refreshChatSeenDomForMessage(id);
                     if (typeof updateChatHistoryRenderSignature === 'function') updateChatHistoryRenderSignature();
@@ -76486,7 +76625,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
                 return Math.max(0, Number(change.revision) || 0) > responseRevision;
             })
             : [];
-        const pendingSeenEvents = wasInitialSyncPending && Array.isArray(window.__chatInitialPendingSeenEvents)
+        const pendingSeenEvents = wasInitialSyncPending && previousEpoch === responseEpoch && Array.isArray(window.__chatInitialPendingSeenEvents)
             ? window.__chatInitialPendingSeenEvents.filter(event => Math.max(0, Number(event && event.cursor) || 0) > responseSeenCursor)
             : [];
         const responseChanges = Array.isArray(response.changes) ? response.changes : [];
@@ -76498,6 +76637,16 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         if (previousEpoch && previousEpoch === responseEpoch) preserveKnownChatSeen(previousHistory, nextHistory);
         const combinedSeenEvents = (Array.isArray(response.seenEvents) ? response.seenEvents : []).concat(pendingSeenEvents);
         const seenChangeState = { changed:false, ids:new Set() };
+        if (response.seenEncoding === 'ranges-v2' && response.seenMode === 'summary' && response.seenDegraded !== true) {
+            for (const message of nextHistory) {
+                if (!message) continue;
+                if ((Array.isArray(message.seenBy) && message.seenBy.length) || Number(message.seenCount)||0) seenChangeState.ids.add(getChatIndexedMessageKey(message));
+                message.seenBy = [];
+                message.seenAt = {};
+                message.seenCount = 0;
+            }
+            if (seenChangeState.ids.size) seenChangeState.changed = true;
+        }
         applyChatSeenSummaryToHistory(nextHistory, response.seenSummary || [], seenChangeState);
         applyChatSeenEventsToHistory(nextHistory, combinedSeenEvents, seenChangeState);
         let historyDataChanged = false;
@@ -76520,8 +76669,11 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             window.__chatSeenRehydrationAttempts = 0;
         }
         if ((response.seenSyncV1 === true && response.seenDegraded !== true) || pendingSeenEvents.length) {
-            const pendingSeenCursor = pendingSeenEvents.reduce((max, event) => Math.max(max, Math.max(0, Number(event && event.cursor) || 0)), 0);
-            window.__chatSeenCursor = Math.max(Math.max(0,Number(window.__chatSeenCursor)||0),responseSeenCursor,pendingSeenCursor);
+            const sameEpoch = previousEpoch === responseEpoch;
+            const pendingSeenCursor = sameEpoch ? pendingSeenEvents.reduce((max, event) => Math.max(max, Math.max(0, Number(event && event.cursor) || 0)), 0) : 0;
+            window.__chatSeenCursor = response.seenEncoding === 'ranges-v2' && response.seenMode === 'summary' && response.seenDegraded !== true
+                ? Math.max(responseSeenCursor,pendingSeenCursor)
+                : Math.max(Math.max(0,Number(window.__chatSeenCursor)||0),responseSeenCursor,pendingSeenCursor);
         }
         if (wasInitialSyncPending || mode === 'snapshot') {
             window.__chatInitialPendingSyncChanges = [];
