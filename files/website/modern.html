@@ -120433,7 +120433,29 @@ function getVisibleChatStackEl(id) {
     return result?.found && result.extras?.summaryEnglishChecked === true ? String(result.extras.summary || '').trim() : '';
   };
   window.__psnApplyScraperSupplement = async function(root,name,titleId,requestToken) {
-    if(!root || !root.isConnected || !root.classList.contains('show')) return;
+    if(!root || !root.isConnected) return;
+    // Cached metadata can finish before openModal adds .show (two animation frames later).
+    // Wait for that opening instead of silently dropping the fanart and fallbacks.
+    if(!root.classList.contains('show')) {
+      if(!requestToken || root.style.display !== 'flex' ||
+          String(root.dataset.openHydrationToken||'') !== String(requestToken) ||
+          String(root.dataset.titleId||'') !== String(titleId||'')) return;
+      if(root.__psnSsShowObserver?.token === requestToken) return;
+      root.__psnSsShowObserver?.observer?.disconnect();
+      const sameOpening=()=>root.isConnected && root.style.display === 'flex' &&
+        String(root.dataset.openHydrationToken||'') === String(requestToken) &&
+        String(root.dataset.titleId||'') === String(titleId||'');
+      const observer=new MutationObserver(()=>{
+        if(sameOpening() && !root.classList.contains('show')) return;
+        observer.disconnect();
+        if(root.__psnSsShowObserver?.observer===observer) root.__psnSsShowObserver=null;
+        if(sameOpening() && root.classList.contains('show'))
+          window.__psnApplyScraperSupplement(root,name,titleId,requestToken);
+      });
+      root.__psnSsShowObserver={token:requestToken,observer};
+      observer.observe(root,{attributes:true,attributeFilter:['class','style','data-open-hydration-token','data-title-id']});
+      return;
+    }
     const category=String(root.dataset.storeCategory||'').toLowerCase();
     if(!['games','prototypes','ports'].includes(category)) return;
     const img=root.querySelector('img.modal-img');
