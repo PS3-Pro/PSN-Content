@@ -2388,6 +2388,7 @@ const ssExtraImageWaiters = [];
 let ssExtraImageActive = 0;
 let ssExtraImageBytes = 0;
 const SS_EXTRA_IMAGE_LIMIT = 16 * 1024 * 1024;
+const SS_EXTRA_IMAGE_TTL_MS = 60 * 60 * 1000;
 function ssExtraImageToken(system, gameId, type, region) {
   const raw = Buffer.from(JSON.stringify({s:system,g:gameId,t:type,r:region || '',e:Math.floor(Date.now()/1000)+3600})).toString('base64url');
   return raw + '.' + crypto.createHmac('sha256',ssPreviewVideoSecret).update(raw).digest('hex');
@@ -2438,7 +2439,10 @@ function ssExtraEnglishSynopsis(value) {
 function ssPreviewExtractExtras(game, system) {
   if (!game || !Number.isSafeInteger(Number(game.id))) return null;
   const id = Number(game.id);
-  const media = ssPreviewMediaList(game);
+  const media = ssPreviewMediaList(game).sort((a,b) => {
+    const rank = item => item?.type === 'box-2D-front' ? 0 : item?.type === 'box-2D' ? 1 : 2;
+    return rank(a)-rank(b);
+  });
   const images = [];
   const used = new Set();
   for (const item of media) {
@@ -3105,7 +3109,8 @@ app.get('/api/screenscraper-image',async(req,res)=>{
   let cached=ssExtraImageCache.get(key);
   if(cached&&cached.until<Date.now()) {ssExtraImageCache.delete(key);ssExtraImageBytes-=cached.body.length;cached=null;}
   if (cached) {
-    // Refresh LRU position: frequently opened artwork survives cache eviction.
+    // Sliding one-hour TTL: popular artwork stays warm without increasing the RAM limit.
+    cached.until = Date.now() + SS_EXTRA_IMAGE_TTL_MS;
     ssExtraImageCache.delete(key);
     ssExtraImageCache.set(key,cached);
   }
@@ -3122,12 +3127,12 @@ app.get('/api/screenscraper-image',async(req,res)=>{
           const oldest=ssExtraImageCache.keys().next().value;
           ssExtraImageBytes-=ssExtraImageCache.get(oldest).body.length;ssExtraImageCache.delete(oldest);
         }
-        ssExtraImageCache.set(key,{...cached,until:Date.now()+15*60*1000});
+        ssExtraImageCache.set(key,{...cached,until:Date.now()+SS_EXTRA_IMAGE_TTL_MS});
         ssExtraImageBytes+=cached.body.length;
       }
     } catch (error) {return res.status(error && error.code==='local_rate_limit'?429:404).end();}
   }
-  res.setHeader('Cache-Control','private,max-age=900');
+  res.setHeader('Cache-Control','private,max-age=3600');
   res.setHeader('Content-Type',cached.type);
   res.setHeader('X-Content-Type-Options','nosniff');
   return res.send(cached.body);

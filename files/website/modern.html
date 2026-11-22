@@ -941,7 +941,7 @@ html.ios-webkit #object-particles { contain:strict; }
 .game-img-container > .psn-gameplay-preview-video.is-ready { opacity:1; }
 /* ScreenScraper fanart is a background-only supplement; no extra modal controls. */
 #game-modal .sys-modal-content.psn-ss-fanart { isolation:isolate; position:relative; }
-#game-modal .sys-modal-content.psn-ss-fanart::before { content:""; position:absolute; inset:0; z-index:0; pointer-events:none; background-image:linear-gradient(to bottom,rgba(7,12,22,.20),rgba(7,12,22,.38)),var(--psn-ss-modal-bg); background-position:center; background-size:cover; background-repeat:no-repeat; opacity:1; -webkit-mask-image:linear-gradient(to bottom,#000 0,#000 var(--psn-ss-fade-start,320px),transparent var(--psn-ss-fade-end,435px)); mask-image:linear-gradient(to bottom,#000 0,#000 var(--psn-ss-fade-start,320px),transparent var(--psn-ss-fade-end,435px)); }
+#game-modal .sys-modal-content.psn-ss-fanart::before { content:""; position:absolute; inset:0; z-index:0; pointer-events:none; background-image:linear-gradient(to bottom,rgba(7,12,22,.38),rgba(7,12,22,.54)),var(--psn-ss-modal-bg); background-position:center; background-size:cover; background-repeat:no-repeat; opacity:1; -webkit-mask-image:linear-gradient(to bottom,#000 0,#000 var(--psn-ss-fade-start,64%),transparent var(--psn-ss-fade-end,82%)); mask-image:linear-gradient(to bottom,#000 0,#000 var(--psn-ss-fade-start,64%),transparent var(--psn-ss-fade-end,82%)); }
 #game-modal .sys-modal-content.psn-ss-fanart > .sys-modal-header,
 #game-modal .sys-modal-content.psn-ss-fanart > .sys-modal-body { position:relative; z-index:1; }
 
@@ -34045,6 +34045,7 @@ P
 			return;
 		}
 
+		if (window.tryScreenScraperCoverFallback && window.tryScreenScraperCoverFallback(imgElement, cat)) return;
 		getOnlineCoverFallback(imgElement);
 	};
 	
@@ -120439,6 +120440,43 @@ function getVisibleChatStackEl(id) {
     try {const u=new URL(raw,baseServer());return u.origin===new URL(baseServer()).origin && u.pathname==='/api/screenscraper-image' && u.searchParams.has('token') ? u.href : '';}
     catch (_) {return '';}
   }
+  // Front-cover fallback only. All existing cover sources are tried before this path.
+  // Never use back covers, 3D boxes, wheel artwork or screenshots as a game cover.
+  window.tryScreenScraperCoverFallback = function(img, category) {
+    if (!img || !img.isConnected) return false;
+    const cat=String(category||img.dataset.coverCategory||'').toLowerCase();
+    if (!['games','prototypes','ports'].includes(cat)) return false;
+    const platform=String(img.dataset.console||'').toLowerCase().replace(/[^a-z0-9]/g,'');
+    const isPort=cat==='ports';
+    const system=platformIds[platform] || (isPort ? 59 : 0);
+    const name=String(img.dataset.name||'').trim();
+    if (!system || normalize(name).length<3) return false;
+    const attempted=img.dataset.psnSsCoverTried==='1';
+    const renewal=attempted && img.dataset.psnSsCoverActive==='1' && img.dataset.psnSsCoverRenewed!=='1';
+    if(attempted && !renewal)return false;
+    img.dataset.psnSsCoverTried='1';
+    if(renewal)img.dataset.psnSsCoverRenewed='1';
+    img.dataset.psnSsCoverActive='0';
+    const identity=cat+':'+platform+':'+normalize(name)+':'+String(img.dataset.titleId||'');
+    img.__psnSsCoverIdentity=identity;
+    const stillCurrent=()=>img.isConnected && img.__psnSsCoverIdentity===identity &&
+      String(img.dataset.name||'').trim()===name;
+    getAssets(name,system,isPort,renewal).then(data=>{
+      if(!stillCurrent())return;
+      const artwork=data?.extras?.images||[];
+      const candidates=['box-2D-front','box-2D'];
+      const regionRank={us:0,wor:1,eu:2,ss:3,fr:4};
+      const matches=artwork.filter(item=>candidates.includes(item.type)&&item.kind==='artwork'&&validImg(item.url));
+      matches.sort((a,b)=>candidates.indexOf(a.type)-candidates.indexOf(b.type)||
+        (regionRank[a.region]??10)-(regionRank[b.region]??10));
+      const url=validImg(matches[0]?.url);
+      if(!url){window.getOnlineCoverFallback?.(img);return;}
+      img.dataset.psnSsCoverActive='1';
+      img.dataset.coverSource='screenscraper-front';
+      img.src=url;
+    }).catch(()=>{if(stillCurrent())window.getOnlineCoverFallback?.(img);});
+    return true;
+  };
   // Warm the current Regions game's fanart without opening a modal or repeating regional requests.
   const warmImages = new Map();
   const imageKey = (name,system,isPort) => (isPort?'port':system)+':'+normalize(name);
@@ -120494,9 +120532,12 @@ function getVisibleChatStackEl(id) {
       const contentBox=content.getBoundingClientRect();
       const summaryBox=summary?.getBoundingClientRect();
       if(!contentBox.height)return;
-      // Keep the art fully visible through the Summary, then dissolve into the original panel.
-      const start=Math.max(0,Math.min(contentBox.height-12,(summaryBox?.bottom||contentBox.top+contentBox.height*.6)-contentBox.top+4));
-      const end=Math.min(contentBox.height+1,start+Math.max(76,Math.min(122,contentBox.height*.17)));
+      // Keep the first-open coverage on every reopen, even if summary measurement
+      // runs before the modal's staged entrance animation has settled.
+      const summaryEnd=summaryBox && summaryBox.height>20
+        ? summaryBox.bottom-contentBox.top+16 : 0;
+      const start=Math.min(contentBox.height-12,Math.max(contentBox.height*.64,summaryEnd));
+      const end=Math.min(contentBox.height+1,start+Math.max(118,Math.min(162,contentBox.height*.18)));
       content.style.setProperty('--psn-ss-fade-start',Math.round(start)+'px');
       content.style.setProperty('--psn-ss-fade-end',Math.round(end)+'px');
     };
