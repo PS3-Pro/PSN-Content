@@ -60,7 +60,13 @@ const MAX_CHAT_HISTORY = 1000;
 const CHAT_SYNC_CHANGE_LOG_MAX = Math.max(1000, Math.min(20000, parseInt(process.env.CHAT_SYNC_CHANGE_LOG_MAX || "5000", 10) || 5000));
 const CHAT_SYNC_MAX_DELTA = Math.max(100, Math.min(5000, parseInt(process.env.CHAT_SYNC_MAX_DELTA || "1500", 10) || 1500));
 const CHAT_BATCH_DELETE_MAX = 100;
-const CHAT_SEEN_BATCH_MAX = MAX_CHAT_HISTORY;
+const CHAT_SEEN_BATCH_MAX = 48;
+// Bounded Global Chat Seen history for small PostgreSQL plans. Old receipts
+// expire; message content and private/group read markers are unaffected.
+const CHAT_SEEN_RETENTION_DAYS = Math.max(1, Math.min(90, parseInt(process.env.CHAT_SEEN_RETENTION_DAYS || '30', 10) || 30));
+const CHAT_SEEN_MAX_EVENTS = Math.max(2000, Math.min(50000, parseInt(process.env.CHAT_SEEN_MAX_EVENTS || '25000', 10) || 25000));
+const CHAT_SEEN_PRUNE_BATCH = 2500;
+const STORAGE_MAINTENANCE_MS = 10 * 60 * 1000;
 const CHAT_MESSAGE_TEXT_MAX = 64 * 1024;
 const CHAT_MESSAGE_MEDIA_MAX = 20;
 const CHAT_MESSAGE_URL_MAX = 4096;
@@ -2824,6 +2830,24 @@ const SERVER_LOG_FALLBACK_REFRESH_MS = 120000;
 const ADMIN_LOG_HISTORY_MAX = 100;
 const MODERATION_LOG_HISTORY_MAX = ADMIN_LOG_HISTORY_MAX;
 const SERVER_LOG_HISTORY_MAX = ADMIN_LOG_HISTORY_MAX;
+const SERVER_LOG_STORED_MAX = 200;
+let serverLogWritesSinceTrim = 0;
+let serverLogTrimBusy = false;
+
+async function pruneServerLog() {
+  if (serverLogTrimBusy || pool.waitingCount > 0) return;
+  serverLogTrimBusy = true;
+  try {
+    await queryDbWithRetry(
+      `DELETE FROM server_log
+       WHERE id < (SELECT id FROM server_log ORDER BY id DESC OFFSET $1 LIMIT 1)`,
+      [SERVER_LOG_STORED_MAX - 1],
+      { attempts: 1, label: 'SERVER LOG RETENTION', queryTimeoutMs: 8000 }
+    );
+  } finally {
+    serverLogTrimBusy = false;
+  }
+}
 
 function getAdminLogLimits() {
   return { moderation: MODERATION_LOG_HISTORY_MAX, server: SERVER_LOG_HISTORY_MAX };
@@ -2969,6 +2993,19 @@ async function initDb() {
     );
     CREATE INDEX IF NOT EXISTS idx_chat_seen_events_sender_id ON chat_seen_events(sender, id);
     CREATE INDEX IF NOT EXISTS idx_chat_seen_events_reader_id ON chat_seen_events(reader, id);
+    CREATE TABLE IF NOT EXISTS chat_seen_ranges (
+      id BIGSERIAL PRIMARY KEY,
+      reader TEXT NOT NULL,
+      first_msg_id BIGINT NOT NULL,
+      last_msg_id BIGINT NOT NULL,
+      sender_names TEXT[] NOT NULL DEFAULT '{}'::text[],
+      seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (reader, first_msg_id, last_msg_id),
+      CHECK (first_msg_id <= last_msg_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_chat_seen_ranges_overlap ON chat_seen_ranges USING gist (int8range(first_msg_id, last_msg_id, '[]'));
+    CREATE INDEX IF NOT EXISTS idx_chat_seen_ranges_reader_id ON chat_seen_ranges(reader, id);
+    CREATE INDEX IF NOT EXISTS idx_chat_seen_ranges_senders ON chat_seen_ranges USING gin(sender_names);
     CREATE TABLE IF NOT EXISTS direct_messages (
       id BIGSERIAL PRIMARY KEY,
       sender_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
@@ -9675,95 +9712,93 @@ function getPublicChatHistoryForUser(userName = '') {
   return messageHistory.map(message => getPublicChatMessageForUser(message, userName));
 }
 
-// Compact Seen hydration: one indexed aggregate per current message; the full reader
-// list is fetched only for a user-requested popup. Realtime changes still stream instantly.
+// Global Chat Seen V2: one indexed interval per contiguous visible batch,
+// not one PostgreSQL row for every viewer/message pair. A range only covers
+// consecutive server-verified messages. Intervals keep actual viewing time.
+const CHAT_SEEN_CURSOR_STEP = MAX_CHAT_HISTORY + 1;
 const compactChatSeenPendingByUser = new Map();
+function chatSeenEventCursor(rangeId, offset = MAX_CHAT_HISTORY) {
+  return Math.max(0, Number(rangeId) || 0) * CHAT_SEEN_CURSOR_STEP + Math.min(MAX_CHAT_HISTORY, Math.max(0, offset));
+}
+function getActiveChatMessageSpans() {
+  const entries = [];
+  for (let i = 0; i < messageHistory.length; i++) {
+    const m = messageHistory[i];
+    const id = m && m.time ? new Date(m.time).getTime() : NaN;
+    if (Number.isSafeInteger(id) && id > 0 && m.user) entries.push({ id, msgId:String(id), sender:String(m.user), position:i });
+  }
+  return entries;
+}
 async function getCompactChatSeenSnapshotForUser(userName = '') {
   const targetUser = String(userName || '');
   if (!targetUser) return { mode:'summary', cursor:0, events:[], summary:[] };
-  const pendingRead = compactChatSeenPendingByUser.get(targetUser);
-  if (pendingRead) return pendingRead;
-  const authoredIds = [], otherIds = [], uniqueIds = new Set();
-  for (const message of messageHistory) {
-    const stamp = message && message.time ? new Date(message.time).getTime() : NaN;
-    if (!Number.isFinite(stamp)) continue;
-    const id = String(stamp);
-    if (uniqueIds.has(id)) continue;
-    uniqueIds.add(id);
-    (String(message.user || '') === targetUser ? authoredIds : otherIds).push(id);
-  }
+  const pending = compactChatSeenPendingByUser.get(targetUser);
+  if (pending) return pending;
+  const authoredIds = [], otherIds = [];
+  for (const m of getActiveChatMessageSpans()) (m.sender === targetUser ? authoredIds : otherIds).push(m.id);
   const work = (async () => {
     const res = await queryDbWithRetry(
       `WITH authored AS (
-         SELECT e.message_id, COUNT(*)::integer AS seen_count
-         FROM chat_seen_events e
-         WHERE e.message_id = ANY($1::text[])
-         GROUP BY e.message_id
+         SELECT msg_id::text AS message_id, COUNT(DISTINCT r.reader)::integer AS seen_count
+         FROM unnest($1::bigint[]) AS messages(msg_id)
+         LEFT JOIN chat_seen_ranges r ON int8range(r.first_msg_id,r.last_msg_id,'[]') @> messages.msg_id
+         GROUP BY msg_id
        ), read_by_me AS (
-         SELECT e.message_id, e.seen_at
-         FROM chat_seen_events e
-         WHERE e.message_id = ANY($2::text[]) AND e.reader = $3
+         SELECT msg_id::text AS message_id, MIN(r.seen_at) AS seen_at
+         FROM unnest($2::bigint[]) AS messages(msg_id)
+         JOIN chat_seen_ranges r ON r.reader = $3 AND int8range(r.first_msg_id,r.last_msg_id,'[]') @> messages.msg_id
+         GROUP BY msg_id
        )
-       SELECT
-         (SELECT COALESCE(MAX(id),0)::bigint FROM chat_seen_events) AS cursor,
+       SELECT (SELECT COALESCE(MAX(id),0)::bigint FROM chat_seen_ranges) AS cursor,
          COALESCE((SELECT jsonb_agg(jsonb_build_object('msgId',message_id,'seenCount',seen_count)) FROM authored),'[]'::jsonb) AS authored,
          COALESCE((SELECT jsonb_agg(jsonb_build_object('msgId',message_id,'seenByMe',true,'seenAt',seen_at)) FROM read_by_me),'[]'::jsonb) AS read_by_me`,
       [authoredIds, otherIds, targetUser],
-      { attempts:1, label:'CHAT SEEN SUMMARY READ', queryTimeoutMs:8000 }
+      { attempts:1, label:'CHAT SEEN RANGES SUMMARY', queryTimeoutMs:8000 }
     );
     const row = res.rows[0] || {};
-    const authored = Array.isArray(row.authored) ? row.authored : [];
-    const readByMe = Array.isArray(row.read_by_me) ? row.read_by_me : [];
-    return { mode:'summary', cursor:Math.max(0,Number(row.cursor)||0), events:[], summary:authored.concat(readByMe) };
+    return { mode:'summary', cursor:Math.max(1,chatSeenEventCursor(row.cursor)), events:[],
+      summary:[...(Array.isArray(row.authored)?row.authored:[]), ...(Array.isArray(row.read_by_me)?row.read_by_me:[])] };
   })();
-  compactChatSeenPendingByUser.set(targetUser,work);
+  compactChatSeenPendingByUser.set(targetUser, work);
   try { return await work; }
-  finally { if (compactChatSeenPendingByUser.get(targetUser)===work) compactChatSeenPendingByUser.delete(targetUser); }
+  finally { if (compactChatSeenPendingByUser.get(targetUser) === work) compactChatSeenPendingByUser.delete(targetUser); }
 }
 
 async function getChatSeenSyncForUser(userName = '', cursor = 0) {
   const targetUser = String(userName || '');
   const safeCursor = Math.max(0, Number(cursor) || 0);
   if (!safeCursor) return getCompactChatSeenSnapshotForUser(targetUser);
-
-  // One round trip gets the current global cursor and the relevant delta.
-  // LEFT JOIN LATERAL keeps the cursor available even when there are no changes.
+  const minRangeId = Math.floor(safeCursor / CHAT_SEEN_CURSOR_STEP);
   const res = await queryDbWithRetry(
-    `WITH current_cursor AS (
-       SELECT COALESCE(MAX(id), 0)::bigint AS max_id FROM chat_seen_events
-     )
-     SELECT delta.id, delta.message_id, delta.sender, delta.reader, delta.seen_at,
-            current_cursor.max_id
-     FROM current_cursor
-     LEFT JOIN LATERAL (
-       SELECT id, message_id, sender, reader, seen_at
-       FROM chat_seen_events
-       WHERE id > $1 AND (sender = $2 OR reader = $2)
+    `WITH latest AS (SELECT COALESCE(MAX(id),0)::bigint AS max_id FROM chat_seen_ranges)
+     SELECT r.id, r.reader, r.first_msg_id, r.last_msg_id, r.seen_at, latest.max_id
+     FROM latest LEFT JOIN LATERAL (
+       SELECT id, reader, first_msg_id, last_msg_id, seen_at
+       FROM chat_seen_ranges
+       WHERE id >= $1 AND (reader = $2 OR sender_names @> ARRAY[$2]::text[])
        ORDER BY id ASC LIMIT 2001
-     ) delta ON TRUE
-     ORDER BY delta.id ASC`,
-    [safeCursor, targetUser],
-    { attempts: 2, label: 'CHAT SEEN DELTA READ' }
+     ) r ON TRUE ORDER BY r.id ASC`,
+    [minRangeId, targetUser], { attempts:2, label:'CHAT SEEN RANGES DELTA', queryTimeoutMs:8000 }
   );
   const maxId = Math.max(0, Number(res.rows[0]?.max_id) || 0);
-  if (safeCursor > maxId) {
-    return getCompactChatSeenSnapshotForUser(targetUser);
+  if (safeCursor > Math.max(1,chatSeenEventCursor(maxId)) || res.rows.length > 2000) return getCompactChatSeenSnapshotForUser(targetUser);
+  const active = getActiveChatMessageSpans();
+  const events = [];
+  for (const row of res.rows) {
+    if (row.id == null) continue;
+    const first = Number(row.first_msg_id), last = Number(row.last_msg_id);
+    let offset = 0;
+    for (const m of active) {
+      if (m.id < first || m.id > last) continue;
+      offset++;
+      const eventId = chatSeenEventCursor(row.id,offset);
+      if (eventId <= safeCursor || (m.sender !== targetUser && row.reader !== targetUser)) continue;
+      events.push({ eventId, msgId:m.msgId, sender:m.sender, reader:String(row.reader),
+        seenAt:row.seen_at ? new Date(row.seen_at).toISOString() : '' });
+      if (events.length > 2000) return getCompactChatSeenSnapshotForUser(targetUser);
+    }
   }
-  const rows = res.rows.filter(row => row.id != null);
-  if (rows.length > 2000) {
-    return getCompactChatSeenSnapshotForUser(targetUser);
-  }
-  return {
-    mode: 'changes',
-    cursor: maxId,
-    events: rows.map(row => ({
-      eventId: Math.max(0, Number(row.id) || 0),
-      msgId: String(row.message_id || ''),
-      sender: String(row.sender || ''),
-      reader: String(row.reader || ''),
-      seenAt: row.seen_at ? new Date(row.seen_at).toISOString() : ''
-    }))
-  };
+  return { mode:'changes', cursor:Math.max(1,chatSeenEventCursor(maxId)), events };
 }
 
 // Seen is optional metadata: a slow/failed Seen snapshot must not prevent
@@ -9783,48 +9818,54 @@ async function getChatSeenSyncSafely(userName = '', cursor = 0) {
 }
 
 async function recordChatSeenEventsBatch(entries = [], readerName = '') {
-  const reader = normalizeText(readerName, '').slice(0, 120);
-  if (!reader) return [];
-  const ids = [];
-  const senders = [];
-  const seen = new Set();
-  for (const entry of Array.isArray(entries) ? entries : []) {
-    const msgId = normalizeText(entry && (entry.msgId || entry.id), '').slice(0, 100);
-    const sender = normalizeText(entry && entry.sender, '').slice(0, 120);
-    if (!msgId || !sender || sender === reader || seen.has(msgId)) continue;
-    seen.add(msgId);
-    ids.push(msgId);
-    senders.push(sender);
-    if (ids.length >= CHAT_SEEN_BATCH_MAX) break;
-  }
-  if (!ids.length) return [];
-
-  const res = await queryDbWithRetry(
-    `WITH input AS (
-       SELECT msg_id, sender
-       FROM unnest($1::text[], $2::text[]) AS x(msg_id, sender)
-     ),
-     inserted AS (
-       INSERT INTO chat_seen_events (message_id, sender, reader, seen_at)
-       SELECT input.msg_id, input.sender, $3, NOW()
-       FROM input
-       ON CONFLICT (message_id, reader) DO NOTHING
-       RETURNING id, message_id, sender, reader, seen_at
-     )
-     SELECT id, message_id, sender, reader, seen_at
-     FROM inserted
-     ORDER BY id ASC`,
-    [ids, senders, reader],
-    { attempts: 2, label: ids.length > 1 ? 'CHAT SEEN BATCH SAVE' : 'CHAT SEEN EVENT SAVE' }
+  const reader = normalizeText(readerName, '').slice(0,120);
+  if (!reader || !entries.length) return [];
+  const ordered = entries.filter(e => Number.isSafeInteger(e.id) && e.id > 0 && e.sender !== reader)
+    .slice(0, CHAT_SEEN_BATCH_MAX);
+  if (!ordered.length) return [];
+  const firstId = Math.min(...ordered.map(e => e.id));
+  const lastId = Math.max(...ordered.map(e => e.id));
+  // Indexed overlap check prevents rewrites on reconnect, scrolling back or
+  // a second browser session. A unique constraint handles concurrent repeats.
+  const existing = await queryDbWithRetry(
+    `SELECT first_msg_id, last_msg_id FROM chat_seen_ranges
+     WHERE reader = $1 AND int8range(first_msg_id,last_msg_id,'[]') && int8range($2::bigint,$3::bigint,'[]')`,
+    [reader, firstId, lastId], { attempts:1, label:'CHAT SEEN RANGES COVERAGE' }
   );
-
-  return (res.rows || []).map(row => ({
-    eventId: Math.max(0, Number(row.id) || 0),
-    msgId: String(row.message_id || ''),
-    sender: String(row.sender || ''),
-    reader: String(row.reader || reader),
-    seenAt: row.seen_at ? new Date(row.seen_at).toISOString() : ''
-  })).filter(event => event.eventId && event.msgId && event.reader);
+  const uncovered = ordered.filter(m => !(existing.rows || []).some(r => m.id >= Number(r.first_msg_id) && m.id <= Number(r.last_msg_id)));
+  if (!uncovered.length) return [];
+  const batches = [];
+  for (const m of uncovered) {
+    let batch = batches[batches.length - 1];
+    if (!batch || m.position !== batch.endPosition + 1 || m.id <= batch.last) {
+      batch = { first:m.id, last:m.id, endPosition:m.position, senders:[], messages:[] };
+      batches.push(batch);
+    }
+    batch.last = m.id;
+    batch.endPosition = m.position;
+    if (!batch.senders.includes(m.sender)) batch.senders.push(m.sender);
+    batch.messages.push(m);
+  }
+  const res = await queryDbWithRetry(
+    `INSERT INTO chat_seen_ranges (reader,first_msg_id,last_msg_id,sender_names)
+     SELECT $1, (item.value->>'first')::bigint, (item.value->>'last')::bigint,
+       ARRAY(SELECT jsonb_array_elements_text(item.value->'senders'))
+     FROM jsonb_array_elements($2::jsonb) AS item(value)
+     ON CONFLICT (reader,first_msg_id,last_msg_id) DO NOTHING
+     RETURNING id, first_msg_id, last_msg_id, seen_at`,
+    [reader, JSON.stringify(batches.map(b => ({first:b.first,last:b.last,senders:b.senders})))],
+    { attempts:2, label:'CHAT SEEN COMPACT BATCH SAVE' }
+  );
+  const events = [];
+  for (const row of res.rows || []) {
+    const batch = batches.find(b => b.first === Number(row.first_msg_id) && b.last === Number(row.last_msg_id));
+    if (!batch) continue;
+    batch.messages.forEach((m, i) => events.push({
+      eventId:chatSeenEventCursor(row.id,i+1), msgId:m.msgId, sender:m.sender, reader,
+      seenAt:row.seen_at ? new Date(row.seen_at).toISOString() : ''
+    }));
+  }
+  return events.sort((a,b) => a.eventId-b.eventId);
 }
 
 function emitChatSeenSyncEvents(events = []) {
@@ -10121,6 +10162,9 @@ async function deleteChatMessagesWithSyncBatch(entries = [], trace = null) {
 
     const ids = deletedEntries.map(entry => entry.id);
     await client.query('DELETE FROM pinned_messages WHERE message_id = ANY($1::text[])', [ids]);
+    // Do not keep Seen events for messages that no longer exist.
+    // Compact ranges keep only active-message coverage; deleted timestamps are no longer matched.
+    // Ranges are reclaimed by bounded retention (splitting would increase writes).
     const stateResult = await client.query(
       `UPDATE chat_sync_state
        SET revision = revision + $1::bigint, updated_at = NOW()
@@ -10242,6 +10286,7 @@ async function resetChatSyncEpoch() {
     await client.query('BEGIN');
     await client.query('UPDATE chat_sync_state SET epoch = $1, revision = 0, updated_at = NOW() WHERE id = 1', [nextEpoch]);
     await client.query('DELETE FROM chat_changes');
+    await client.query('TRUNCATE chat_seen_ranges RESTART IDENTITY');
     await client.query('TRUNCATE chat_seen_events RESTART IDENTITY');
     await client.query('SELECT pg_notify($1, $2)', ['chat_sync_notify', JSON.stringify({ instanceId: INSTANCE_ID, reason: 'reset' })]);
     await client.query('COMMIT');
@@ -10316,6 +10361,7 @@ async function getStableInitialChatSyncForUser(userName = '') {
           snapshotExpectedCount: expectedCount,
           snapshotComplete: true,
           seenSyncV1: true,
+          seenEncoding: 'ranges-v2',
           seenMode: seenSync.mode,
           seenCursor: seenSync.cursor,
           seenEvents: seenSync.events,
@@ -10527,6 +10573,10 @@ async function addServerLog(type, message, detail = {}, user = "Server") {
 
   try {
     await pool.query('INSERT INTO server_log (entry) VALUES ($1)', [entry]);
+    if (++serverLogWritesSinceTrim >= 50) {
+      serverLogWritesSinceTrim = 0;
+      deferServerTask('SERVER LOG RETENTION', pruneServerLog, 1000);
+    }
   } catch (err) {
     console.error('[SERVER LOG ERROR]:', err);
   }
@@ -15236,6 +15286,33 @@ const presenceHeartbeatIntervalTask = runNonOverlappingTask('PRESENCE HEARTBEAT'
 const chatPollIntervalTask = runNonOverlappingTask('CHAT POLL', runChatSyncFallback);
 const profileSyncIntervalTask = runNonOverlappingTask('PROFILE SYNC', syncActiveProfilesAcrossInstances);
 
+async function pruneChatSeenEvents() {
+  if (pool.waitingCount > 0) return;
+  // Avoid OFFSET-heavy scans on the legacy million-row event index. New receipt
+  // ranges have a strict small ceiling, with at most 2,500 removals per sweep.
+  for (let pass = 0; pass < 5; pass++) {
+    if (pool.waitingCount > 0) break;
+    const result = await queryDbWithRetry(
+      `WITH boundary AS (SELECT id FROM chat_seen_ranges ORDER BY id DESC OFFSET $1 LIMIT 1),
+       oldest AS (SELECT id,seen_at FROM chat_seen_ranges ORDER BY id ASC LIMIT $2),
+       removed AS (DELETE FROM chat_seen_ranges r USING oldest
+         WHERE r.id = oldest.id AND
+           (oldest.seen_at < NOW() - ($3::integer * INTERVAL '1 day') OR r.id <= COALESCE((SELECT id FROM boundary),0))
+         RETURNING r.id)
+       SELECT COUNT(*)::integer AS removed FROM removed`,
+      [CHAT_SEEN_MAX_EVENTS, CHAT_SEEN_PRUNE_BATCH, CHAT_SEEN_RETENTION_DAYS],
+      { attempts:1, label:'CHAT SEEN COMPACT RETENTION', queryTimeoutMs:8000 }
+    );
+    if (Number(result.rows[0]?.removed||0) < CHAT_SEEN_PRUNE_BATCH) break;
+  }
+}
+
+const storageMaintenanceTask = runNonOverlappingTask('STORAGE RETENTION', async () => {
+  if (pool.waitingCount > 0) return;
+  await pruneServerLog();
+  if (pool.waitingCount === 0) await pruneChatSeenEvents();
+});
+
 let backgroundTasksStarted = false;
 function startBackgroundTasks() {
   if (backgroundTasksStarted) return;
@@ -15243,6 +15320,11 @@ function startBackgroundTasks() {
   setInterval(syncAdminStateIntervalTask, 15000);
   setInterval(presenceHeartbeatIntervalTask, PRESENCE_HEARTBEAT_MS);
   setInterval(chatPollIntervalTask, CHAT_SYNC_INTERVAL_MS);
+  // Low-frequency pruning keeps free-tier tables bounded without polling on reads.
+  const storageTimer = setInterval(storageMaintenanceTask, STORAGE_MAINTENANCE_MS);
+  if (typeof storageTimer.unref === 'function') storageTimer.unref();
+  const initialStorageTimer = setTimeout(storageMaintenanceTask, 60000);
+  if (typeof initialStorageTimer.unref === 'function') initialStorageTimer.unref();
   setInterval(() => logMemoryPressureIfNeeded('periodic'), 30000);
   if (DB_PERF_ENABLED) {
     const dbPerfTimer = setInterval(flushDbQueryPerformance, DB_PERF_INTERVAL_MS);
@@ -18187,6 +18269,7 @@ io.on('connection', (socket) => {
         const withSeenSync = payload => ({
           ...payload,
           seenSyncV1: true,
+          seenEncoding: 'ranges-v2',
           seenMode: seenSync.mode,
           seenCursor: seenSync.cursor,
           seenEvents: seenSync.events,
@@ -18290,7 +18373,7 @@ io.on('connection', (socket) => {
     const userName = socket.userName;
     const seen = await getChatSeenSyncSafely(userName, 0);
     if (userName !== socket.userName || !socket.connected) return;
-    respond({ success:true, seenSyncV1:true, seenDegraded:seen.degraded === true,
+    respond({ success:true, seenSyncV1:true, seenEncoding:'ranges-v2', seenDegraded:seen.degraded === true,
       seenCursor:seen.cursor, seenEvents:seen.events, seenSummary:seen.summary || [] });
   });
 
@@ -18302,9 +18385,9 @@ io.on('connection', (socket) => {
     if (!owner || !message || String(message.user || '') !== owner) return respond({ success:false, error:'Not authorized.' });
     try {
       const rows = await queryDbWithRetry(
-        `SELECT reader, seen_at FROM chat_seen_events
-         WHERE message_id = $1::text
-         ORDER BY id ASC LIMIT 10000`,
+        `SELECT reader, MIN(seen_at) AS seen_at FROM chat_seen_ranges
+         WHERE int8range(first_msg_id,last_msg_id,'[]') @> $1::bigint
+         GROUP BY reader ORDER BY MIN(seen_at) ASC LIMIT 10000`,
         [msgId], { attempts:2, label:'CHAT SEEN DETAILS READ', queryTimeoutMs:10000 }
       );
       if (socket.userName !== owner || !socket.connected) return;
@@ -21024,43 +21107,37 @@ io.on('connection', (socket) => {
   });
 
   async function processChatSeenBatchForSocket(rawIds = []) {
-    const reader = normalizeText(socket.userName, '').slice(0, 120);
-    if (!reader) return { success: false, seen: 0, seenIds: [] };
-
-    const ids = [];
-    const requested = new Set();
-    for (const value of Array.isArray(rawIds) ? rawIds : [rawIds]) {
-      const id = normalizeText(value && typeof value === 'object' ? (value.msgId || value.id) : value, '').slice(0, 100);
+    const reader = normalizeText(socket.userName,'').slice(0,120);
+    if (!reader) return { success:false, seen:0, seenIds:[] };
+    const acknowledged = socket.__globalChatSeenAcknowledged || (socket.__globalChatSeenAcknowledged = new Set());
+    const accepted = [], requested = new Set(), needed = new Set();
+    for (const value of Array.isArray(rawIds) ? rawIds.slice(0, CHAT_SEEN_BATCH_MAX) : []) {
+      const id = normalizeText(value && typeof value === 'object' ? (value.msgId || value.id) : value,'').slice(0,100);
       if (!id || requested.has(id)) continue;
       requested.add(id);
-      ids.push(id);
-      if (ids.length >= CHAT_SEEN_BATCH_MAX) break;
+      if (acknowledged.has(id)) accepted.push(id);
+      else needed.add(id);
     }
-    if (!ids.length) return { success: true, seen: 0, seenIds: [] };
-
-    const targets = [];
-    for (const msg of messageHistory) {
-      if (!msg || !msg.time || !msg.user) continue;
-      const msgId = String(new Date(msg.time).getTime());
-      if (!requested.has(msgId) || String(msg.user) === reader) continue;
-      targets.push({ msgId, sender: String(msg.user) });
-    }
-    if (!targets.length) return { success: true, seen: 0, seenIds: [] };
-
+    if (!needed.size) return { success:true, seen:accepted.length, newSeen:0, seenIds:accepted };
+    const targets = getActiveChatMessageSpans().filter(m => needed.has(m.msgId) && m.sender !== reader);
+    if (!targets.length) return { success:true, seen:accepted.length, newSeen:0, seenIds:accepted };
     const events = await recordChatSeenEventsBatch(targets, reader);
-    if (events.length) {
-      emitChatSeenSyncEvents(events);
-    }
-    return { success: true, seen: targets.length, newSeen: events.length, seenIds: targets.map(target => target.msgId) };
+    for (const target of targets) acknowledged.add(target.msgId);
+    if (acknowledged.size > MAX_CHAT_HISTORY * 2) acknowledged.clear();
+    if (events.length) emitChatSeenSyncEvents(events);
+    return { success:true, seen:targets.length + accepted.length, newSeen:events.length,
+      seenIds:accepted.concat(targets.map(t => t.msgId)) };
   }
 
   socket.on('mark_messages_as_read', async (data = {}, callback) => {
     const respond = typeof callback === 'function' ? callback : () => {};
-    if (socket.__chatSeenBatchInFlight === true) return respond({ success: false, busy: true, seen: 0, seenIds: [] });
-    const ids = Array.isArray(data && data.msgIds) ? data.msgIds : [];
-    recordChatTraceTraffic('seenBatch', 1);
-    recordChatTraceTraffic('seenIds', ids.length);
-    const trace = createChatMemoryTrace('seen_batch', socket, CHAT_MEMORY_TRACE_ENABLED ? { ids:ids.length, request:formatChatTraceBytes(ids.reduce((sum, id) => sum + chatTraceByteLength(id), 0)) } : {});
+    if (!socket.userName || !data || data.visibleV2 !== true || !Array.isArray(data.msgIds) || data.msgIds.length > CHAT_SEEN_BATCH_MAX)
+      return respond({ success:false, seen:0, seenIds:[], upgradeRequired:true });
+    if (socket.__chatSeenBatchInFlight === true) return respond({ success:false, busy:true, seen:0, seenIds:[] });
+    const ids = data.msgIds;
+    recordChatTraceTraffic('seenBatch',1);
+    recordChatTraceTraffic('seenIds',ids.length);
+    const trace = createChatMemoryTrace('seen_batch',socket,CHAT_MEMORY_TRACE_ENABLED ? { ids:ids.length } : {});
     socket.__chatSeenBatchInFlight = true;
     try {
       trace.stage('before_process');
@@ -21068,12 +21145,10 @@ io.on('connection', (socket) => {
       trace.finish({ seen:Number(result && result.seen)||0, newSeen:Number(result && result.newSeen)||0 });
       respond(result);
     } catch (err) {
-      trace.finish({ error:1 });
-      console.error('[CHAT SEEN BATCH ERROR]:', err && err.message ? err.message : err);
-      respond({ success: false, seen: 0, seenIds: [] });
-    } finally {
-      socket.__chatSeenBatchInFlight = false;
-    }
+      trace.finish({error:1});
+      console.error('[CHAT SEEN COMPACT BATCH ERROR]:',err && err.message ? err.message : err);
+      respond({ success:false, seen:0, seenIds:[] });
+    } finally { socket.__chatSeenBatchInFlight = false; }
   });
 
   socket.on('edit_message', async (data) => {
