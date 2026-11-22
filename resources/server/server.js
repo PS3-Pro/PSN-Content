@@ -2230,7 +2230,7 @@ function ssPreviewSearchName(value) {
     .replace(/\s*[[(](?:usa|eur|europe|japan|jpn|us|eu|ps3|ps2|psp|ps1|ps4|digital version)[)\]]/gi, '')
     .replace(/\b(?:digital version|version digitale)\b/gi, '')
     // ScreenScraper often uses a hyphen where PSN game titles use a colon or dash.
-    .replace(/\s*[:：‐‑‒–—−]\s*/g, ' - ').replace(/\s+-\s+/g, ' - ')
+    .replace(/\s*[:：;；‐‑‒–—−]\s*/g, ' - ').replace(/\s+-\s+/g, ' - ')
     .replace(/\s+/g, ' ').trim();
 }
 function ssPreviewSearchVariants(value) {
@@ -2325,7 +2325,12 @@ function ssPreviewFindVideo(game, expectedSystem) {
 
 // Short-lived signed fallback: clients never see ScreenScraper developer credentials.
 // Proxy only when the public media URL failed, to limit Render egress.
-const ssPreviewVideoSecret = crypto.randomBytes(32);
+// Stable signing key across Render restarts: previously every restart invalidated
+// cached artwork and playback URLs already held by connected browsers.
+// Keep the signing secret server-side. Changing it invalidates existing signed links.
+const ssPreviewVideoSecret = crypto.createHmac('sha256',
+  String(process.env.SCREENSCRAPER_MEDIA_SIGNING_KEY || SS_PREVIEW_DEVPASSWORD))
+  .update('PSN-Content ScreenScraper media links v1').digest();
 // Bounded temporary MP4 cache: one ScreenScraper download per game/media.
 // Range requests are served locally, not counted as new ScreenScraper downloads.
 const ssVideoFs = require('node:fs');
@@ -2414,6 +2419,22 @@ function ssExtraLocalized(value) {
   }
   return '';
 }
+function ssExtraEnglishSynopsis(value) {
+  if (!value || typeof value !== 'object') return '';
+  const keys = ['synopsis_en','synopsis_us','en','us'];
+  for (const key of keys) {
+    const text = ssExtraPlainText(value[key]);
+    if (text) return text;
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      if (!entry || !['en','us'].includes(String(entry.langue || entry.lang || '').toLowerCase())) continue;
+      const text = ssExtraPlainText(entry.texte || entry.text || entry.value);
+      if (text) return text;
+    }
+  }
+  return '';
+}
 function ssPreviewExtractExtras(game, system) {
   if (!game || !Number.isSafeInteger(Number(game.id))) return null;
   const id = Number(game.id);
@@ -2436,8 +2457,8 @@ function ssPreviewExtractExtras(game, system) {
     images.push({type,kind,region:safeRegion});
   }
   const genres = game.genres && typeof game.genres === 'object' ? ssExtraLocalized(game.genres) : '';
-  return {gameId:id, system, images,
-    summary:ssExtraLocalized(game.synopsis),developer:ssExtraPlainText(game.developpeur),
+  return {gameId:id, system, images, artworkChecked:true,
+    summary:ssExtraEnglishSynopsis(game.synopsis),summaryEnglishChecked:true,developer:ssExtraPlainText(game.developpeur),
     publisher:ssExtraPlainText(game.editeur),players:ssExtraPlainText(game.joueurs),
     rating:game.note !== undefined && game.note !== null && Number.isFinite(Number(game.note)) ? Number(game.note) : null,
     releaseDate:ssExtraLocalized(game.dates),genres};
@@ -2643,13 +2664,25 @@ function ssPreviewFetchUpstream(name, systemId, key) {
   ssPreviewQueueTail = work.catch(() => null);
   return work.finally(() => { ssPreviewQueued--; });
 }
-function ssPreviewLookup(name, systemId) {
+function ssPreviewLookup(name, systemId, options = null) {
   const key = `${systemId}:${normalizeSsPreviewTitle(name)}`;
+  const requireEnglish = options?.englishSummary === true;
+  const requireArtwork = options?.artwork === true;
+  // Old persisted matches predate the fanart fallback. Refresh their media list
+  // once when the modal requests it, without changing hover/video cache behavior.
+  const ready = result => !!result &&
+    (!requireEnglish || !result.extras || result.extras.summaryEnglishChecked === true) &&
+    (!requireArtwork || (!result.found && !result.extras) || result.extras?.artworkChecked === true);
   const cached = ssPreviewGetCached(key);
-  if (cached) return Promise.resolve(cached);
+  if (ready(cached)) return Promise.resolve(cached);
+  if (cached) ssPreviewCache.delete(key);
   if (ssPreviewInflight.has(key)) return ssPreviewInflight.get(key);
   const work = ssPreviewLoadDatabase(key, systemId).then(result =>
-    result || ssPreviewFetchUpstream(name, systemId, key));
+    ready(result) ? result : ssPreviewFetchUpstream(name, systemId, key).catch(error => {
+      // A provider outage must not discard a previously known good match.
+      if (result) return result;
+      throw error;
+    }));
   const pending = work.finally(() => ssPreviewInflight.delete(key));
   ssPreviewInflight.set(key, pending);
   return pending;
@@ -2967,7 +3000,7 @@ app.get('/api/screenscraper-extras', async (req,res) => {
   const system = isPort ? 0 : Number(req.query && req.query.system);
   if ((!isPort && !SS_PREVIEW_SYSTEM_IDS.has(system)) || name.length < 3 || !normalizeSsPreviewTitle(name)) return res.status(400).json({ok:false});
   try {
-    const result = await ssPreviewLookup(name,system);
+    const result = await ssPreviewLookup(name,system,{englishSummary:true,artwork:true});
     return res.json({ok:true,found:!!result.extras,extras:ssExtraPublic(result.extras)});
   } catch (e) {return res.status(e.status === 429 ? 429 : 502).json({ok:false,reason:e.code || 'unavailable'});}
 });

@@ -941,7 +941,7 @@ html.ios-webkit #object-particles { contain:strict; }
 .game-img-container > .psn-gameplay-preview-video.is-ready { opacity:1; }
 /* ScreenScraper fanart is a background-only supplement; no extra modal controls. */
 #game-modal .sys-modal-content.psn-ss-fanart { isolation:isolate; position:relative; }
-#game-modal .sys-modal-content.psn-ss-fanart::before { content:""; position:absolute; inset:0; z-index:0; pointer-events:none; background:linear-gradient(to bottom,rgba(7,12,22,.56),rgba(7,12,22,.87)),var(--psn-ss-modal-bg) center/cover no-repeat; opacity:.92; }
+#game-modal .sys-modal-content.psn-ss-fanart::before { content:""; position:absolute; inset:0; z-index:0; pointer-events:none; background-image:linear-gradient(to bottom,rgba(7,12,22,.54),rgba(7,12,22,.80)),var(--psn-ss-modal-bg); background-position:center; background-size:cover; background-repeat:no-repeat; opacity:.94; }
 #game-modal .sys-modal-content.psn-ss-fanart > .sys-modal-header,
 #game-modal .sys-modal-content.psn-ss-fanart > .sys-modal-body { position:relative; z-index:1; }
 
@@ -42352,6 +42352,7 @@ P
 			scraperBackground.style.removeProperty('--psn-ss-modal-bg');
 		}
 		modal.__psnScraperAppliedToken = null;
+		modal.__psnFanartGeneration = (Number(modal.__psnFanartGeneration)||0)+1;
 		const modalBody = modal.querySelector('.sys-modal-body');
 		const modalHeader = modal.querySelector('.sys-modal-header h2');
 		
@@ -42752,6 +42753,7 @@ P
 					scraperBackground.style.removeProperty('--psn-ss-modal-bg');
 				}
 				modal.__psnScraperAppliedToken = null;
+		modal.__psnFanartGeneration = (Number(modal.__psnFanartGeneration)||0)+1;
 				window.dispatchEvent(new Event('psn-game-modal-closed'));
 				if (typeof window.resetGameModalCardMorphStyles === 'function') window.resetGameModalCardMorphStyles(modal);
 				modal.style.opacity = '';
@@ -52966,6 +52968,13 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 				const lookupRoot = adminCreateMetadataLookupRoot(category, titleId, contentId, gameName);
 				await window.fetchGameSummary(gameName, titleId, contentId, region, { prepared:true, modalRoot:lookupRoot, trackSources:true, collectSummaryCandidates:true });
 				if (Array.isArray(lookupRoot.__metadataSummaryCandidates)) candidates.push(...lookupRoot.__metadataSummaryCandidates);
+				if (typeof window.__psnGetScraperSummary === 'function') {
+				    const consoleTag = typeof window.getSafeConsoleTagForItem === 'function'
+				        ? window.getSafeConsoleTagForItem(item, category)
+				        : String(item?.cTag || item?.console || 'ps3');
+				    const scraperText = await window.__psnGetScraperSummary(gameName, consoleTag).catch(() => '');
+				    if (scraperText) candidates.push({ source:'ScreenScraper', text:scraperText });
+				}
 				state.candidates = adminNormalizeSummaryCandidateList(candidates);
 				state.loaded = true;
 				const currentText = String(textarea.value || '').trim();
@@ -120399,14 +120408,15 @@ function getVisibleChatStackEl(id) {
   const cleanName = value => String(value || '').replace(/[™®©]/g,' ').replace(/\b(?:tm|registered)\b/gi,' ').replace(/\s*[[(](?:usa|eur|europe|japan|ps3|ps2|psp|ps1|ps4)[)\]]/gi,'').replace(/\b(?:digital version)\b/gi,'').trim();
   const normalize = value => cleanName(value).normalize('NFKD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
   const escapeText = value => String(value || '').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-  function getAssets(name,system,isPort=false) {
-    const key = (isPort?'port':system)+':'+normalize(name), now=Date.now();
+  function getAssets(name,system,isPort=false,renew=false) {
+    const key=(isPort?'port':system)+':'+normalize(name), now=Date.now();
+    if(renew) memory.delete(key);
     const cached=memory.get(key);
-    if(cached && now-cached.at<30*60*1000) return Promise.resolve(cached.data);
+    if(cached && now-cached.at<15*60*1000) return Promise.resolve(cached.data);
     if(pending.has(key)) return pending.get(key);
     const url=baseServer()+'/api/screenscraper-extras?name='+encodeURIComponent(cleanName(name))+'&system='+system+(isPort?'&port=1':'');
-    const promise=fetch(url,{cache:'default'}).then(r=>r.ok?r.json():null).then(data=>{
-      if(data&&data.ok) {memory.set(key,{at:Date.now(),data});while(memory.size>90) memory.delete(memory.keys().next().value);}
+    const promise=fetch(url,{cache:'no-store'}).then(r=>r.ok?r.json():null).then(data=>{
+      if(data?.ok){memory.delete(key);memory.set(key,{at:Date.now(),data});while(memory.size>90)memory.delete(memory.keys().next().value);}
       return data;
     }).catch(()=>null).finally(()=>pending.delete(key));
     pending.set(key,promise);return promise;
@@ -120415,6 +120425,13 @@ function getVisibleChatStackEl(id) {
     try {const u=new URL(raw,baseServer());return u.origin===new URL(baseServer()).origin && u.pathname==='/api/screenscraper-image' && u.searchParams.has('token') ? u.href : '';}
     catch (_) {return '';}
   }
+  window.__psnGetScraperSummary = async function(name, consoleTag) {
+    const platform = String(consoleTag || '').toLowerCase().replace(/[^a-z0-9]/g,'');
+    const system = platformIds[platform];
+    if (!system || !name || String(name).length < 3) return '';
+    const result = await getAssets(name,system);
+    return result?.found && result.extras?.summaryEnglishChecked === true ? String(result.extras.summary || '').trim() : '';
+  };
   window.__psnApplyScraperSupplement = async function(root,name,titleId,requestToken) {
     if(!root || !root.isConnected || !root.classList.contains('show')) return;
     const category=String(root.dataset.storeCategory||'').toLowerCase();
@@ -120453,6 +120470,14 @@ function getVisibleChatStackEl(id) {
             const tile=document.createElement('span');tile.className='modal-screenshot-tile';
             const image=document.createElement('img');image.className='screenshot-item';
             image.loading='lazy';image.decoding='async';image.src=url;image.alt='Gameplay screenshot';
+            image.onerror=async()=>{
+              if(!match()||image.dataset.psnSsRenewed)return;
+              image.dataset.psnSsRenewed='1';
+              const fresh=await getAssets(name,system,isPort,true);
+              if(!match())return;
+              const replacements=(fresh?.extras?.images||[]).filter(item=>item.kind==='screenshot').map(item=>validImg(item.url)).filter(Boolean);
+              if(replacements[index] && replacements[index]!==image.src)image.src=replacements[index];
+            };
             image.onmouseenter=()=>{if(typeof playUiHover==='function')playUiHover();};
             image.onclick=()=>{if(typeof openImageModal==='function')openImageModal(index,urls,{gallery:true,sourceElement:image});};
             tile.appendChild(image);return tile;
@@ -120468,16 +120493,35 @@ function getVisibleChatStackEl(id) {
     }
     const fanart=(ext.images||[]).find(item=>item.kind==='background'&&validImg(item.url));
     if(fanart) {
-      const url=validImg(fanart.url);
       const content=root.querySelector('.sys-modal-content');
-      if(content && !content.classList.contains('psn-ss-fanart') && (getComputedStyle(content).backgroundImage==='none')) {
-        const image=new Image();
-        image.onload=()=>{
-          if(!match())return;
-          content.style.setProperty('--psn-ss-modal-bg',`url("${url}")`);
-          content.classList.add('psn-ss-fanart');
-        };
-        image.src=url;
+      if(content && !content.classList.contains('psn-ss-fanart')) {
+        // CSS gradients are not custom artwork. Check the real background only.
+        const originalBackground=getComputedStyle(content).backgroundImage;
+        if(!/url\s*\(/i.test(originalBackground)) {
+          const generation=Number(root.__psnFanartGeneration||0)+1;
+          root.__psnFanartGeneration=generation;
+          const valid=()=>match()&&root.__psnFanartGeneration===generation;
+          const load=(url,retry)=>{
+            const image=new Image();
+            image.onload=()=>{
+              if(!valid())return;
+              content.style.setProperty('--psn-ss-modal-bg',`url("${url}")`);
+              content.classList.add('psn-ss-fanart');
+            };
+            image.onerror=async()=>{
+              if(!valid()||retry)return;
+              // A former Render instance may have signed this URL. Ask our
+              // own Server for a fresh token, reusing its existing DB cache.
+              const fresh=await getAssets(name,system,isPort,true);
+              if(!valid()||!fresh?.found)return;
+              const replacement=(fresh.extras?.images||[]).find(item=>item.kind==='background'&&validImg(item.url));
+              const next=validImg(replacement?.url);
+              if(next)load(next,true);
+            };
+            image.src=url;
+          };
+          load(validImg(fanart.url),false);
+        }
       }
     }
   };
@@ -120511,14 +120555,15 @@ function getVisibleChatStackEl(id) {
     if(name.length<3||name.length>140)return null;
     return {name,system,isPort,key:(isPort?'port':system)+':'+normalized(name)};
   }
-  function getResult(info) {
+  function getResult(info,renew=false) {
+    if(renew)cache.delete(info.key);
     const entry=cache.get(info.key);if(entry&&entry.until>Date.now())return Promise.resolve(entry.value);
     if(pending.has(info.key))return pending.get(info.key);
-    const promise=fetch(base()+'/api/gameplay-preview?name='+encodeURIComponent(info.name)+'&system='+info.system+(info.isPort?'&port=1':''))
+    const promise=fetch(base()+'/api/gameplay-preview?name='+encodeURIComponent(info.name)+'&system='+info.system+(info.isPort?'&port=1':''),{cache:'no-store'})
       .then(async response=>({ok:response.ok,data:await response.json()}))
       .then(({ok,data})=>{
-        const until=Date.now()+(ok&&data?.found?10*60*1000:ok?2*60*1000:20000);
-        cache.set(info.key,{value:ok?data:null,until});while(cache.size>250)cache.delete(cache.keys().next().value);
+        // Cache real matches and misses, never persist temporary HTTP errors.
+        if(ok){cache.delete(info.key);cache.set(info.key,{value:data,until:Date.now()+(data?.found?10*60*1000:2*60*1000)});while(cache.size>250)cache.delete(cache.keys().next().value);}
         return ok?data:null;
       }).catch(()=>null).finally(()=>pending.delete(info.key));
     pending.set(info.key,promise);return promise;
@@ -120532,19 +120577,27 @@ function getVisibleChatStackEl(id) {
     const old=active;active=null;clearTimeout(old.timer);clearTimeout(old.lookupTimer);
     if(old.video){old.video.pause();old.video.removeAttribute('src');old.video.load();old.video.remove();}
   }
-  async function play(current,info) {
-    const data=await (current.lookup||getResult(info));
+  async function play(current,info,renew=false) {
+    const data=await (renew?getResult(info,true):(current.lookup||getResult(info)));
     if(!data?.found||active!==current||!current.card.isConnected||!current.card.matches(':hover')||document.hidden)return;
     const url=validProxy(data.fallbackUrl);
     if(!url)return;
     const parent=current.card.querySelector('.game-img-container');if(!parent)return;
+    if(current.video){const old=current.video;current.video=null;old.pause();old.removeAttribute('src');old.remove();}
     const video=document.createElement('video');current.video=video;
     video.className='psn-gameplay-preview-video';video.muted=true;video.defaultMuted=true;video.playsInline=true;
     video.loop=true;video.preload='auto';video.setAttribute('aria-hidden','true');video.setAttribute('disablepictureinpicture','');
     video.addEventListener('playing',()=>{if(active===current)video.classList.add('is-ready');});
-    video.addEventListener('error',()=>{if(active!==current)return;failures.set(info.key,Date.now()+20000);stop();});
+    let handledError=false;
+    const handleError=()=>{
+      if(handledError||active!==current||current.video!==video)return;
+      handledError=true;
+      if(!renew){play(current,info,true);return;}
+      failures.set(info.key,Date.now()+3500);stop();
+    };
+    video.addEventListener('error',handleError);
     parent.appendChild(video);video.src=url;
-    video.play().catch(()=>{if(active===current&&!video.classList.contains('is-ready'))stop();});
+    video.play().catch(()=>{if(active===current&&current.video===video&&!video.classList.contains('is-ready'))handleError();});
   }
   let rearmAfterModal=false;
   function modalVisible() {
@@ -120558,10 +120611,9 @@ function getVisibleChatStackEl(id) {
     stop();const info=identity(card);if(!info)return false;
     if((failures.get(info.key)||0)>Date.now())return false;
     rearmAfterModal=false;
-    const current={card,timer:null,lookupTimer:null,lookup:null,video:null};active=current;
-    // Keep the original 400 ms hover, while starting the metadata lookup slightly earlier.
-    current.lookupTimer=setTimeout(()=>{if(active===current)current.lookup=getResult(info);},250);
-    current.timer=setTimeout(()=>play(current,info),400);
+    const current={card,timer:null,lookupTimer:null,lookup:getResult(info),video:null};active=current;
+    // No artificial hover delay: card animation and video lookup begin together.
+    play(current,info);
     return true;
   }
   document.addEventListener('pointerover',event=>{startPreview(event.target);},{passive:true});
@@ -120569,7 +120621,7 @@ function getVisibleChatStackEl(id) {
   window.addEventListener('psn-game-modal-closed',()=>{
     rearmAfterModal=true;
     const hovered=document.querySelector('.game-card:hover');
-    if(hovered)startPreview(hovered);
+    if(hovered){const info=identity(hovered);if(info)failures.delete(info.key);startPreview(hovered);}
   });
   document.addEventListener('pointermove',event=>{
     if(rearmAfterModal && !active && event.pointerType==='mouse')startPreview(event.target);
