@@ -2110,7 +2110,10 @@ const SS_PREVIEW_DEVPASSWORD = String(process.env.SCREENSCRAPER_DEV_PASSWORD || 
 const SS_PREVIEW_USER = String(process.env.SCREENSCRAPER_USER || '').trim();
 const SS_PREVIEW_PASSWORD = String(process.env.SCREENSCRAPER_PASSWORD || '').trim();
 const SS_PREVIEW_ENABLED = process.env.SCREENSCRAPER_PREVIEWS_ENABLED !== '0' && !!SS_PREVIEW_DEVID && !!SS_PREVIEW_DEVPASSWORD;
-const SS_PREVIEW_SYSTEM_IDS = new Set([57, 58, 59, 61, 62, 60]); // PS1, PS2, PS3, PSP, Vita, PS4
+const SS_PREVIEW_SYSTEM_IDS = new Set([57, 58, 59, 61, 62, 60]); // Explicit PlayStation categories
+// Ports can originate on PC or another console. Cross-system search is selected only
+// for Ports and the resulting media platform comes from ScreenScraper's game record.
+const ssPreviewValidMediaSystem = value => Number.isSafeInteger(value) && value >= 1 && value <= 2000;
 const SS_PREVIEW_POSITIVE_MS = 24 * 60 * 60 * 1000;
 const SS_PREVIEW_NEGATIVE_MS = 3 * 60 * 1000;
 const SS_PREVIEW_MAX_CACHE = 500;
@@ -2126,11 +2129,24 @@ let ssPreviewQueueTail = Promise.resolve();
 let ssPreviewQueued = 0;
 let ssPreviewNextRequestAt = 0;
 
+function ssPreviewSearchName(value) {
+  return String(value || '').replace(/[™®©]/g, ' ').replace(/\b(?:tm|registered)\b/gi, ' ')
+    .replace(/\s*[[(](?:usa|eur|europe|japan|jpn|us|eu|ps3|ps2|psp|ps1|ps4|digital version)[)\]]/gi, '')
+    .replace(/\b(?:digital version|version digitale)\b/gi, '')
+    // ScreenScraper often uses a hyphen where PSN game titles use a colon or dash.
+    .replace(/\s*[:：‐‑‒–—−]\s*/g, ' - ').replace(/\s+-\s+/g, ' - ')
+    .replace(/\s+/g, ' ').trim();
+}
+function ssPreviewSearchVariants(value) {
+  const title = ssPreviewSearchName(value);
+  const plain = title.replace(/\s+-\s+/g, ' ').replace(/\s+/g, ' ').trim();
+  // A second search is useful only when the title has a subtitle separator.
+  return [...new Set([title, plain])].filter(Boolean);
+}
 function normalizeSsPreviewTitle(value) {
-  return String(value || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
-    .replace(/\b(?:demo|trial|digital version)\b/gi, ' ')
-    .replace(/\b(?:the|a|an)\b/gi, ' ')
-    .replace(/&/g, ' and ').replace(/[^a-z0-9]+/gi, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+  return ssPreviewSearchName(value).normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/\b(?:the|a|an)\b/gi, ' ').replace(/&/g, ' and ')
+    .replace(/[^a-z0-9]+/gi, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
 function ssPreviewNames(game) {
@@ -2162,14 +2178,14 @@ function ssPreviewMediaList(game) {
   if (!medias || typeof medias !== 'object') return [];
   if (Array.isArray(medias.media)) return medias.media;
   if (medias.media) return [medias.media];
-  // The v2 API has returned both media arrays and media_video-style objects.
   const mapped = [];
   for (const [key, value] of Object.entries(medias)) {
-    if (!/video/i.test(key) || !value) continue;
-    const type = /norm/i.test(key) ? 'video-normalized' : 'video';
-    if (Array.isArray(value)) {
-      for (const item of value) mapped.push(typeof item === 'string' ? {type,url:item} : {type,...item});
-    } else mapped.push(typeof value === 'string' ? {type,url:value} : {type,...value});
+    if (!value) continue;
+    const type = key.replace(/^media_/, '').replace(/_/g, '-');
+    for (const item of (Array.isArray(value) ? value : [value])) {
+      if (typeof item === 'string') mapped.push({type, url:item});
+      else if (item && typeof item === 'object') mapped.push({type,...item});
+    }
   }
   return mapped;
 }
@@ -2182,7 +2198,7 @@ function ssPreviewAllowedMediaHost(hostname) {
 function ssPreviewFindVideo(game, expectedSystem) {
   const id = Number(game && game.id);
   const system = Number(game && (game.systemeid || (game.systeme && game.systeme.id)) || expectedSystem);
-  if (!Number.isSafeInteger(id) || id <= 0 || !SS_PREVIEW_SYSTEM_IDS.has(system) ||
+  if (!Number.isSafeInteger(id) || id <= 0 || !ssPreviewValidMediaSystem(system) ||
       (expectedSystem && system !== expectedSystem)) return null;
   const medias = ssPreviewMediaList(game);
   for (const type of ['video-normalized', 'video']) {
@@ -2255,13 +2271,86 @@ function ssPreviewVerifyVideoToken(token) {
   if (!crypto.timingSafeEqual(Buffer.from(sig,'hex'),Buffer.from(expected,'hex'))) return null;
   let parsed;
   try { parsed = JSON.parse(Buffer.from(raw,'base64url').toString('utf8')); } catch (_) { return null; }
-  if (!parsed || !SS_PREVIEW_SYSTEM_IDS.has(parsed.s) || !Number.isSafeInteger(parsed.g) || parsed.g <= 0 ||
+  if (!parsed || !ssPreviewValidMediaSystem(parsed.s) || !Number.isSafeInteger(parsed.g) || parsed.g <= 0 ||
       !['video','video-normalized'].includes(parsed.t) ||
       !ssPreviewAllowedMediaHost(parsed.h || 'api.screenscraper.fr') ||
       !Number.isSafeInteger(parsed.e) || parsed.e < Math.floor(Date.now()/1000)) return null;
   return parsed;
 }
 
+// Optional ScreenScraper enrichment, always lower priority than local/PS Store/RAWG sources.
+const SS_EXTRA_MEDIA_TYPES = new Set(['ss','sstitle','fanart','box-2D','box-3D','box-2D-back',
+  'box-2D-front','wheel','wheel-hd','wheel-carbon','wheel-steel','steamgrid','screenmarquee','manuel','manual']);
+const ssExtraImageCache = new Map();
+const ssExtraImagePending = new Map();
+const ssExtraImageWaiters = [];
+let ssExtraImageActive = 0;
+let ssExtraImageBytes = 0;
+const SS_EXTRA_IMAGE_LIMIT = 16 * 1024 * 1024;
+function ssExtraImageToken(system, gameId, type, region) {
+  const raw = Buffer.from(JSON.stringify({s:system,g:gameId,t:type,r:region || '',e:Math.floor(Date.now()/1000)+3600})).toString('base64url');
+  return raw + '.' + crypto.createHmac('sha256',ssPreviewVideoSecret).update(raw).digest('hex');
+}
+function ssExtraVerifyToken(token) {
+  if (typeof token !== 'string' || token.length > 400 || !/^[A-Za-z0-9_-]+\.[a-f0-9]{64}$/.test(token)) return null;
+  const dot = token.indexOf('.'); const payload = token.slice(0,dot); const sig = token.slice(dot+1);
+  const expected = crypto.createHmac('sha256',ssPreviewVideoSecret).update(payload).digest('hex');
+  if (!crypto.timingSafeEqual(Buffer.from(sig,'hex'),Buffer.from(expected,'hex'))) return null;
+  let data;
+  try { data=JSON.parse(Buffer.from(payload,'base64url').toString('utf8')); } catch (_) { return null; }
+  if (!data || !ssPreviewValidMediaSystem(data.s) || !Number.isSafeInteger(data.g) || data.g<=0 ||
+      !SS_EXTRA_MEDIA_TYPES.has(data.t) || typeof data.r !== 'string' || !/^[a-z]{0,12}$/.test(data.r) ||
+      !Number.isSafeInteger(data.e) || data.e < Math.floor(Date.now()/1000)) return null;
+  return data;
+}
+function ssExtraPlainText(value) {
+  return typeof value === 'string' ? value.trim().slice(0,1200) : '';
+}
+function ssExtraLocalized(value) {
+  if (typeof value === 'string') return ssExtraPlainText(value);
+  if (!value || typeof value !== 'object') return '';
+  for (const lang of ['pt','en','us','wor','fr']) {
+    const v = value['synopsis_'+lang] || value['genre_'+lang] || value['date_'+lang] || value[lang];
+    if (typeof v === 'string' && v.trim()) return ssExtraPlainText(v);
+  }
+  for (const v of Object.values(value)) {
+    if (typeof v === 'string' && v.trim()) return ssExtraPlainText(v);
+  }
+  return '';
+}
+function ssPreviewExtractExtras(game, system) {
+  if (!game || !Number.isSafeInteger(Number(game.id))) return null;
+  const id = Number(game.id);
+  const media = ssPreviewMediaList(game);
+  const images = [];
+  const used = new Set();
+  for (const item of media) {
+    const type = String(item && item.type || '').trim();
+    if (!SS_EXTRA_MEDIA_TYPES.has(type)) continue;
+    const region = String(item.region || item.regionid || '').toLowerCase();
+    const safeRegion = /^[a-z]{2,8}$/.test(region) ? region : '';
+    const kind = type === 'ss' || type === 'sstitle' ? 'screenshot' : type === 'fanart' ? 'background' : ['manuel','manual'].includes(type) ? 'manual' : 'artwork';
+    if (kind === 'screenshot' && images.filter(v=>v.kind==='screenshot').length>=3) continue;
+    if (kind === 'artwork' && images.filter(v=>v.kind==='artwork').length>=5) continue;
+    if (kind === 'background' && images.some(v=>v.kind==='background')) continue;
+    if (kind === 'manual' && images.some(v=>v.kind==='manual')) continue;
+    const key = type+':'+safeRegion;
+    if (used.has(key)) continue;
+    used.add(key);
+    images.push({type,kind,region:safeRegion});
+  }
+  const genres = game.genres && typeof game.genres === 'object' ? ssExtraLocalized(game.genres) : '';
+  return {gameId:id, system, images,
+    summary:ssExtraLocalized(game.synopsis),developer:ssExtraPlainText(game.developpeur),
+    publisher:ssExtraPlainText(game.editeur),players:ssExtraPlainText(game.joueurs),
+    rating:game.note !== undefined && game.note !== null && Number.isFinite(Number(game.note)) ? Number(game.note) : null,
+    releaseDate:ssExtraLocalized(game.dates),genres};
+}
+function ssExtraPublic(extras) {
+  if (!extras) return null;
+  return {...extras,images:extras.images.map(item=>({...item,
+    url:(item.kind==='manual'?'/api/screenscraper-manual?token=':'/api/screenscraper-image?token=')+ssExtraImageToken(extras.system,extras.gameId,item.type,item.region)}))};
+}
 function ssPreviewSearchReason(response) {
   const status = Number(response && response.status || 0);
   const text = String(response && response.text || '').slice(0,1500).toLowerCase();
@@ -2286,11 +2375,76 @@ function ssPreviewSetCached(key, payload) {
   while (ssPreviewCache.size > SS_PREVIEW_MAX_CACHE) ssPreviewCache.delete(ssPreviewCache.keys().next().value);
 }
 
-function ssPreviewLookup(name, systemId) {
-  const key = `${systemId}:${normalizeSsPreviewTitle(name)}`;
-  const cached = ssPreviewGetCached(key);
-  if (cached) return Promise.resolve(cached);
-  if (ssPreviewInflight.has(key)) return ssPreviewInflight.get(key);
+// Postgres saves the stable game/video identity, not the expiring signed playback URL.
+// ScreenScraper results survive Render restarts; one normalized key serves regional IDs.
+const SS_PREVIEW_DB_DAYS = 30;
+const SS_PREVIEW_DB_NO_VIDEO_DAYS = 1;
+const SS_PREVIEW_DB_MAX_ROWS = 4000;
+let ssPreviewDbPruneAfter = 0;
+async function ssPreviewLoadDatabase(key, systemId) {
+  try {
+    const row = (await pool.query(`
+      SELECT game_id, media_type, api_host, extras
+      FROM screenscraper_game_cache
+      WHERE cache_key = $1 AND system_id = $2 AND expires_at > NOW()
+      LIMIT 1`, [key, systemId])).rows[0];
+    if (!row) return null;
+    const gameId = Number(row.game_id);
+    // For Ports the lookup key uses system 0, but the saved media keeps the
+    // actual original platform returned by ScreenScraper.
+    const extras = row.extras && typeof row.extras === 'object' ? row.extras : null;
+    const mediaSystem = systemId === 0 ? Number(extras?.system) : systemId;
+    if (!ssPreviewValidMediaSystem(mediaSystem)) return null;
+    const type = String(row.media_type || '');
+    if (!Number.isSafeInteger(gameId) || gameId <= 0 || !['', 'video', 'video-normalized'].includes(type)) return null;
+    const apiHost = ssPreviewAllowedMediaHost(row.api_host) ? row.api_host : 'api.screenscraper.fr';
+    const video = type ? {
+      system:mediaSystem, gameId, type, apiHost,
+      url:`https://www.screenscraper.fr/medias/${mediaSystem}/${gameId}/${type}.mp4`
+    } : null;
+    if (!video && !extras) return null;
+    const payload = video
+      ? {found:true, url:video.url, video, extras, provider:'screenscraper'}
+      : {found:false, extras, provider:'screenscraper', reason:'no_video'};
+    ssPreviewSetCached(key, payload);
+    return payload;
+  } catch (_) {
+    // Cache read failures must never prevent the existing ScreenScraper lookup.
+    return null;
+  }
+}
+function ssPreviewPersistDatabase(key, systemId, result) {
+  if (!result || (!result.video && !result.extras)) return;
+  const video = result.video || null;
+  const gameId = Number(video?.gameId || result.extras?.gameId);
+  if (!Number.isSafeInteger(gameId) || gameId <= 0) return;
+  const type = video?.type || '';
+  if (type && !['video', 'video-normalized'].includes(type)) return;
+  const host = video && ssPreviewAllowedMediaHost(video.apiHost)
+    ? video.apiHost : 'api.screenscraper.fr';
+  // Nonblocking: the first hover does not wait for a database write.
+  pool.query(`
+    INSERT INTO screenscraper_game_cache
+      (cache_key, system_id, game_id, media_type, api_host, extras, refreshed_at, expires_at)
+    VALUES ($1, $2, $3, $4, $5, $6::jsonb, NOW(), NOW() + ($7::int * INTERVAL '1 day'))
+    ON CONFLICT (cache_key) DO UPDATE SET
+      system_id=EXCLUDED.system_id, game_id=EXCLUDED.game_id,
+      media_type=EXCLUDED.media_type, api_host=EXCLUDED.api_host,
+      extras=EXCLUDED.extras, refreshed_at=NOW(), expires_at=EXCLUDED.expires_at`,
+    [key, systemId, gameId, type, host, JSON.stringify(result.extras || null), video ? SS_PREVIEW_DB_DAYS : SS_PREVIEW_DB_NO_VIDEO_DAYS]
+  ).then(() => {
+    const now = Date.now();
+    if (now < ssPreviewDbPruneAfter) return;
+    ssPreviewDbPruneAfter = now + 6 * 60 * 60 * 1000;
+    // Bounded to avoid another Aiven full-disk incident; at most once per 6 hours.
+    pool.query(`DELETE FROM screenscraper_game_cache WHERE expires_at <= NOW()`).then(() =>
+      pool.query(`DELETE FROM screenscraper_game_cache WHERE cache_key IN
+        (SELECT cache_key FROM screenscraper_game_cache ORDER BY refreshed_at DESC
+         OFFSET $1)`, [SS_PREVIEW_DB_MAX_ROWS])
+    ).catch(() => {});
+  }).catch(() => {});
+}
+function ssPreviewFetchUpstream(name, systemId, key) {
   // One upstream request at a time, spaced apart; a hover storm cannot flood the API.
   if (ssPreviewQueued >= 4) {
     const busy = new Error('ScreenScraper preview queue full.');
@@ -2300,98 +2454,102 @@ function ssPreviewLookup(name, systemId) {
   }
   ssPreviewQueued++;
   const work = ssPreviewQueueTail.then(async () => {
-    const pause = ssPreviewNextRequestAt - Date.now();
-    if (pause > 0) await waitMs(pause);
-    const now = Date.now();
-    if (now - ssPreviewMinuteWindow >= 60000) { ssPreviewMinuteWindow = now; ssPreviewMinuteUsed = 0; }
-    if (now - ssPreviewDailyWindow >= 86400000) { ssPreviewDailyWindow = now; ssPreviewDailyUsed = 0; }
-    if (ssPreviewMinuteUsed >= SS_PREVIEW_MINUTE_MAX || ssPreviewDailyUsed >= SS_PREVIEW_DAILY_MAX) {
-      const limited = new Error('ScreenScraper preview quota reached.');
-      limited.status = 429;
-      limited.code = 'local_rate_limit';
-      throw limited;
-    }
-    ssPreviewMinuteUsed++;
-    ssPreviewDailyUsed++;
-    ssPreviewNextRequestAt = now + 1600;
-    const url = new URL('https://api.screenscraper.fr/api2/jeuRecherche.php');
-    url.searchParams.set('devid', SS_PREVIEW_DEVID);
-    url.searchParams.set('devpassword', SS_PREVIEW_DEVPASSWORD);
-    url.searchParams.set('softname', 'PSN-Content');
-    url.searchParams.set('output', 'json');
-    url.searchParams.set('systemeid', String(systemId));
-    url.searchParams.set('recherche', name);
-    if (SS_PREVIEW_USER && SS_PREVIEW_PASSWORD) {
-      url.searchParams.set('ssid', SS_PREVIEW_USER);
-      url.searchParams.set('sspassword', SS_PREVIEW_PASSWORD);
-    }
-    const response = await requestMetadataJson(url, { timeoutMs:9000, headers:{ 'User-Agent':'PSN-Content/1.0 ScreenScraper-Preview' } });
-    if (!response.ok || !response.data || typeof response.data !== 'object') {
-      const error = new Error('ScreenScraper search unavailable.');
-      error.status = Number(response.status) === 429 ? 429 : 502;
-      error.code = ssPreviewSearchReason(response);
-      error.upstreamStatus = Number(response.status) || 0;
-      throw error;
-    }
-    const header = response.data.header;
-    if (header && ['false', '0'].includes(String(header.success ?? '').toLowerCase())) {
-      const error = new Error('ScreenScraper rejected the search.');
-      error.status = 502;
-      error.code = 'api_rejected';
-      error.upstreamStatus = Number(response.status) || 0;
-      throw error;
-    }
-    const data = response.data.response || {};
-    const rawGames = data.jeux || data.jeu || [];
-    const games = Array.isArray(rawGames) ? rawGames : (Array.isArray(rawGames.jeu) ? rawGames.jeu : (rawGames.jeu ? [rawGames.jeu] : (rawGames.id ? [rawGames] : [])));
+    const searches = ssPreviewSearchVariants(name);
     const wanted = normalizeSsPreviewTitle(name);
     let bestGame = null;
     let bestScore = 0;
-    for (const game of games.slice(0, 30)) {
-      if (Number(game && (game.systemeid || (game.systeme && game.systeme.id))) !== systemId) continue;
-      const score = Math.max(0, ...ssPreviewNames(game).map(title => ssPreviewTitleSimilarity(wanted, normalizeSsPreviewTitle(title))));
-      if (score > bestScore) {
-        bestGame = game;
-        bestScore = score;
+    let candidates = 0;
+    for (const searchName of searches) {
+      // Charge each upstream attempt against the existing limits and spacing.
+      const pause = ssPreviewNextRequestAt - Date.now();
+      if (pause > 0) await waitMs(pause);
+      const now = Date.now();
+      if (now - ssPreviewMinuteWindow >= 60000) { ssPreviewMinuteWindow = now; ssPreviewMinuteUsed = 0; }
+      if (now - ssPreviewDailyWindow >= 86400000) { ssPreviewDailyWindow = now; ssPreviewDailyUsed = 0; }
+      if (ssPreviewMinuteUsed >= SS_PREVIEW_MINUTE_MAX || ssPreviewDailyUsed >= SS_PREVIEW_DAILY_MAX) {
+        const limited = new Error('ScreenScraper preview quota reached.');
+        limited.status = 429;
+        limited.code = 'local_rate_limit';
+        throw limited;
       }
-      if (bestScore === 1) break;
+      ssPreviewMinuteUsed++;
+      ssPreviewDailyUsed++;
+      ssPreviewNextRequestAt = now + 1600;
+      const url = new URL('https://api.screenscraper.fr/api2/jeuRecherche.php');
+      url.searchParams.set('devid', SS_PREVIEW_DEVID);
+      url.searchParams.set('devpassword', SS_PREVIEW_DEVPASSWORD);
+      url.searchParams.set('softname', 'PSN-Content');
+      url.searchParams.set('output', 'json');
+      // For Ports omit systemeid: searching PS3 would miss original PC/console games.
+      if (systemId !== 0) url.searchParams.set('systemeid', String(systemId));
+      url.searchParams.set('recherche', searchName);
+      if (SS_PREVIEW_USER && SS_PREVIEW_PASSWORD) {
+        url.searchParams.set('ssid', SS_PREVIEW_USER);
+        url.searchParams.set('sspassword', SS_PREVIEW_PASSWORD);
+      }
+      const response = await requestMetadataJson(url, { timeoutMs:9000, headers:{ 'User-Agent':'PSN-Content/1.0 ScreenScraper-Preview' } });
+      if (!response.ok || !response.data || typeof response.data !== 'object') {
+        const error = new Error('ScreenScraper search unavailable.');
+        error.status = Number(response.status) === 429 ? 429 : 502;
+        error.code = ssPreviewSearchReason(response);
+        error.upstreamStatus = Number(response.status) || 0;
+        throw error;
+      }
+      const header = response.data.header;
+      if (header && ['false', '0'].includes(String(header.success ?? '').toLowerCase())) {
+        const error = new Error('ScreenScraper rejected the search.');
+        error.status = 502;
+        error.code = 'api_rejected';
+        error.upstreamStatus = Number(response.status) || 0;
+        throw error;
+      }
+      const data = response.data.response || {};
+      const rawGames = data.jeux || data.jeu || [];
+      const games = Array.isArray(rawGames) ? rawGames : (Array.isArray(rawGames.jeu) ? rawGames.jeu : (rawGames.jeu ? [rawGames.jeu] : (rawGames.id ? [rawGames] : [])));
+      candidates += games.length;
+      const minScore = systemId === 0 ? 0.95 : 0.78; // Cross-platform matches must be unambiguous.
+      for (const game of games.slice(0, 30)) {
+        const mediaSystem = Number(game && (game.systemeid || (game.systeme && game.systeme.id)));
+        if (!ssPreviewValidMediaSystem(mediaSystem) || (systemId !== 0 && mediaSystem !== systemId)) continue;
+        const score = Math.max(0, ...ssPreviewNames(game).map(title => ssPreviewTitleSimilarity(wanted, normalizeSsPreviewTitle(title))));
+        const videoAvailable = systemId === 0 && score >= minScore && !!ssPreviewFindVideo(game, 0);
+        const previousHasVideo = systemId === 0 && bestGame && !!ssPreviewFindVideo(bestGame, 0);
+        // For a Port, prefer an exact-title entry that has real gameplay media.
+        if (score > bestScore || (videoAvailable && !previousHasVideo && score >= bestScore - 0.01)) {
+          bestGame = game;
+          bestScore = score;
+        }
+        if (bestScore === 1 && (systemId !== 0 || !!ssPreviewFindVideo(bestGame, 0))) break;
+      }
+      // The second title variant is needed only when the first was not a reliable match.
+      if (bestScore >= minScore && (systemId !== 0 || !!ssPreviewFindVideo(bestGame, 0))) break;
     }
-    const video = bestGame && bestScore >= 0.78 ? ssPreviewFindVideo(bestGame, systemId) : null;
+    const minScore = systemId === 0 ? 0.95 : 0.78;
+    const mediaSystem = Number(bestGame && (bestGame.systemeid || (bestGame.systeme && bestGame.systeme.id)));
+    const validMatch = !!bestGame && bestScore >= minScore && ssPreviewValidMediaSystem(mediaSystem);
+    const video = validMatch ? ssPreviewFindVideo(bestGame, systemId) : null;
+    const extras = validMatch ? ssPreviewExtractExtras(bestGame, mediaSystem) : null;
     const result = video
-      ? { found:true, url:video.url, video, provider:'screenscraper' }
-      : { found:false, provider:'screenscraper', reason: !games.length ? 'no_match' : !bestGame || bestScore < 0.78 ? 'no_close_match' : 'no_video', candidates:games.length };
-    // Safe, small diagnostic summary for /screenscraper-teste; never send API credentials or upstream media URLs.
-    result.diagnostics = {
-      candidates: games.length,
-      responseKeys: Object.keys(data).slice(0, 12),
-      matchedGameId: bestGame && Number(bestGame.id) || null,
-      matchedName: bestGame && ssPreviewNames(bestGame)[0] || null,
-      matchScore: Number(bestScore.toFixed(3)),
-      matches: games.slice(0, 8).map(game => ({
-        id: Number(game && game.id) || null,
-        name: ssPreviewNames(game)[0] || null,
-        score: Number(Math.max(0, ...ssPreviewNames(game).map(title => ssPreviewTitleSimilarity(wanted, normalizeSsPreviewTitle(title)))).toFixed(3)),
-        mediaTypes: [...new Set(ssPreviewMediaList(game).map(media => String(media && media.type || '').slice(0, 35)).filter(Boolean))].slice(0, 12)
-      }))
-    };
+      ? { found:true, url:video.url, video, extras, provider:'screenscraper' }
+      : { found:false, extras, provider:'screenscraper', reason: !candidates ? 'no_match' : !validMatch ? 'no_close_match' : 'no_video', candidates };
     ssPreviewSetCached(key, result);
+    ssPreviewPersistDatabase(key, systemId, result);
     return result;
   });
   ssPreviewQueueTail = work.catch(() => null);
-  const pending = work.finally(() => { ssPreviewQueued--; ssPreviewInflight.delete(key); });
+  return work.finally(() => { ssPreviewQueued--; });
+}
+function ssPreviewLookup(name, systemId) {
+  const key = `${systemId}:${normalizeSsPreviewTitle(name)}`;
+  const cached = ssPreviewGetCached(key);
+  if (cached) return Promise.resolve(cached);
+  if (ssPreviewInflight.has(key)) return ssPreviewInflight.get(key);
+  const work = ssPreviewLoadDatabase(key, systemId).then(result =>
+    result || ssPreviewFetchUpstream(name, systemId, key));
+  const pending = work.finally(() => ssPreviewInflight.delete(key));
   ssPreviewInflight.set(key, pending);
   return pending;
 }
-
-app.get('/api/gameplay-preview/status', (req, res) => {
-  setMetadataCors(res);
-  res.setHeader('Cache-Control','no-store');
-  return res.json({ok:true,enabled:SS_PREVIEW_ENABLED,backend:'screenscraper-v2',
-    cached: ssPreviewCache.size, inflight:ssPreviewInflight.size,
-    searchesToday:ssPreviewDailyUsed,searchLimit:SS_PREVIEW_DAILY_MAX,
-    videoCacheItems:ssVideoCache.size,videoCacheBytes:ssVideoCacheBytes,
-    videoDownloadsActive:ssVideoActive,videoDownloadsToday:ssVideoDayDownloads});
-});
 
 // Authenticated ScreenScraper MP4 cache. Only the FIRST request downloads a
 // complete validated MP4; browsers' subsequent Range requests use the local file.
@@ -2659,35 +2817,166 @@ app.get('/api/gameplay-video', async (req,res) => {
   media.pipe(res);
 });
 
-// Standalone ScreenScraper diagnostic page. Same-origin for reliable API/video tests.
-const SS_PREVIEW_TEST_HTML = "<!DOCTYPE html>\n<html lang=\"pt-BR\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<meta name=\"robots\" content=\"noindex,nofollow\">\n<title>PSN-Content · Teste ScreenScraper</title>\n<style>\n:root{color-scheme:dark;--bg:#0c1019;--panel:#161d2b;--panel2:#111824;--border:#303c50;--text:#f1f5fe;--muted:#9baac1;--blue:#65aaff;--good:#62dba7;--bad:#ff8d92;--warn:#ffcd77}\n*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 20% -15%,#203f68 0%,transparent 42%),var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}\nmain{max-width:900px;margin:0 auto;padding:34px 20px 65px}.eyebrow{color:var(--blue);font-weight:750;font-size:11px;letter-spacing:.19em;text-transform:uppercase}.heading{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}h1{margin:8px 0 6px;font-size:clamp(25px,4vw,37px);letter-spacing:-.025em}p{margin:0;color:var(--muted)}.panel{background:var(--panel);border:1px solid var(--border);border-radius:17px;padding:21px;margin-top:21px;box-shadow:0 15px 50px #0002}h2{font-size:17px;margin:0 0 15px}.formgrid{display:grid;grid-template-columns:minmax(0,1fr) 180px;gap:13px}.full{grid-column:1/-1}label{display:block;font-size:12px;color:#c5d1e2;font-weight:700;margin-bottom:6px}input,select{width:100%;background:#0b1220;border:1px solid #35445b;border-radius:10px;color:var(--text);padding:12px 13px;font:inherit;outline:none}input:focus-visible,select:focus-visible,button:focus-visible{outline:2px solid var(--blue);outline-offset:2px}input::placeholder{color:#667790}.actions{display:flex;flex-wrap:wrap;gap:9px;margin-top:18px}button{background:var(--blue);color:#061b30;border:0;border-radius:10px;padding:11px 16px;font:inherit;font-weight:760;cursor:pointer}button:disabled{opacity:.55;cursor:not-allowed}.secondary{background:#28364b;color:#e8f0fc;border:1px solid #384b65}.subtle{background:#202a3b;color:#cbd7e7}.badge{border:1px solid #52637a;border-radius:50px;padding:5px 10px;background:#1a2738;color:#b9cbe0;font-size:12px}.badge.good{border-color:#26694e;color:var(--good)}.badge.bad{border-color:#85404b;color:var(--bad)}.badge.warn{border-color:#80643b;color:var(--warn)}.steps{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin:15px 0}.step{border:1px solid #2e3c51;background:var(--panel2);border-radius:12px;padding:11px;min-height:69px}.step .n{font-size:11px;color:var(--muted);display:block}.step strong{font-size:12px;font-weight:700}.step.ok{border-color:#28785b}.step.error{border-color:#af5963}.step.loading{border-color:#587fae}.state{font-size:15px;line-height:1.6;padding:13px 15px;border-radius:11px;background:var(--panel2);border:1px solid var(--border);min-height:49px}.state.success{color:var(--good);border-color:#28785b}.state.failure{color:var(--bad);border-color:#954d56}.state.notice{color:var(--warn);border-color:#725933}.statusdetails{display:flex;flex-wrap:wrap;gap:10px;margin-top:13px;color:var(--muted);font-size:12px}.statusdetails span{padding:4px 8px;background:#121b2a;border-radius:8px}video{display:block;max-width:100%;width:100%;aspect-ratio:16/9;background:#04070d;border:1px solid #33415a;border-radius:12px;margin-top:13px;object-fit:contain}.hidden{display:none!important}.video-label{font-size:13px;color:var(--muted);margin-top:13px}details{margin-top:14px}summary{cursor:pointer;color:#bcd4f4;font-size:13px;font-weight:700}pre{overflow:auto;background:#0b1220;color:#c8dcf4;padding:15px;border-radius:12px;border:1px solid #304158;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;max-height:410px}.log{min-height:100px}.log div{padding:5px 0;border-bottom:1px solid #ffffff10;word-break:break-word;font:12px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;color:#bfcae1}.log time{color:#8193af}.help{margin-top:12px;font-size:12px}.help code{color:#d2e7ff}.footer{margin-top:20px;color:#8193ac;font-size:12px}a{color:#8dbfff}#matched{margin-top:15px}#matched table{width:100%;border-collapse:collapse;font-size:12px}#matched td,#matched th{padding:8px;text-align:left;border-bottom:1px solid var(--border)}#matched th{color:#abbdd5}#matched td{color:#d9e5f5}@media(max-width:570px){.formgrid,.steps{grid-template-columns:1fr}.full{grid-column:auto}.panel{padding:17px}main{padding:25px 13px 40px}}\n</style>\n</head>\n<body><main>\n<div class=\"heading\"><div><div class=\"eyebrow\">PSN-Content / Diagnóstico</div><h1>Teste de gameplay · ScreenScraper</h1><p>Digite um jogo e veja se o Render encontra e reproduz o vídeo.</p></div><span class=\"badge\" id=\"serverBadge\">Servidor: aguardando</span></div>\n<section class=\"panel\"><h2>1 · Pesquisar jogo</h2><form id=\"searchForm\"><div class=\"formgrid\">\n<div><label for=\"game\">Nome do jogo</label><input id=\"game\" name=\"game\" required minlength=\"3\" maxlength=\"140\" value=\"LittleBigPlanet 3\" placeholder=\"Ex.: God of War III\" autocomplete=\"off\"></div>\n<div><label for=\"system\">Console</label><select id=\"system\"><option value=\"59\" selected>PlayStation 3</option><option value=\"58\">PlayStation 2</option><option value=\"57\">PlayStation 1</option><option value=\"61\">PSP</option><option value=\"62\">PS Vita</option><option value=\"60\">PlayStation 4</option></select></div>\n<div class=\"full\"><label for=\"server\">Endereço do servidor Render</label><input id=\"server\" type=\"url\" value=\"https://psn-content-fd6j.onrender.com\" spellcheck=\"false\" required></div>\n</div><div class=\"actions\"><button id=\"searchBtn\" type=\"submit\">Pesquisar vídeo</button><button class=\"secondary\" type=\"button\" id=\"statusBtn\">Verificar servidor</button><button class=\"subtle\" type=\"button\" id=\"copyBtn\">Copiar diagnóstico</button></div></form><p class=\"help\">As credenciais de desenvolvedor ficam no Server. Esta página não solicita senhas e usa sua API <code>/api/gameplay-preview</code>.</p></section>\n<section class=\"panel\"><h2>2 · Resultado real da requisição</h2><div class=\"steps\"><div id=\"stepServer\" class=\"step\"><span class=\"n\">01 · Servidor</span><strong>Não verificado</strong></div><div id=\"stepSearch\" class=\"step\"><span class=\"n\">02 · Busca</span><strong>Aguardando pesquisa</strong></div><div id=\"stepPlayback\" class=\"step\"><span class=\"n\">03 · Reprodução</span><strong>Aguardando vídeo</strong></div></div><div id=\"result\" class=\"state\" aria-live=\"polite\">Informe um título e clique em “Pesquisar vídeo”.</div><div class=\"statusdetails\" id=\"stats\"></div><div id=\"matched\" class=\"hidden\"></div><div id=\"videoArea\" class=\"hidden\"><div class=\"video-label\" id=\"videoLabel\">Tentando reproduzir…</div><video id=\"player\" controls muted playsinline preload=\"metadata\"></video><div class=\"actions\"><button id=\"retryFallback\" type=\"button\" class=\"secondary hidden\">Testar vídeo pelo Render</button></div></div><details><summary>Ver resposta JSON da API</summary><pre id=\"json\">Nenhuma pesquisa ainda.</pre></details></section>\n<section class=\"panel\"><h2>3 · Registro do teste</h2><div id=\"log\" class=\"log\" role=\"log\" aria-live=\"polite\"></div><p class=\"help\">Se não achar o vídeo, use “Copiar diagnóstico” e cole o resultado na conversa. O token temporário do proxy não é incluído.</p></section>\n<div class=\"footer\">Ferramenta de diagnóstico independente do hover do Modern. Resultado ao vivo depende do servidor Render e da disponibilidade do ScreenScraper. Não mostra nem transmite senhas do ScreenScraper.</div>\n</main><script>\n(() => {\n'use strict';\nconst $ = id => document.getElementById(id);\nconst state = {status:null,lookup:null,http:null,problem:null,tookMs:null,logs:[],name:'',system:59,base:'',fallbackUsed:false,session:0,videoProbe:null};\nconst reasons = {\n  no_match:'Nenhum jogo encontrado pelo ScreenScraper nesse console.',\n  no_close_match:'A API trouxe resultados, mas nenhum título passou no filtro de correspondência.',\n  no_video:'Jogo encontrado, mas a resposta não trouxe um vídeo reconhecido pelo Server.',\n  api_auth:'Credenciais recusadas pelo ScreenScraper.',\n  api_rate_limit:'ScreenScraper limitou as consultas.',\n  api_unavailable:'ScreenScraper indisponível, resposta não interpretada ou tempo esgotado.',\n  api_rejected:'ScreenScraper rejeitou a consulta.',\n  local_rate_limit:'Limite local de consultas do Render atingido.',\n  local_queue_full:'Fila de consultas do Render cheia.'\n};\nfunction log(msg){const item={at:new Date().toLocaleTimeString('pt-BR'),message:String(msg)};state.logs.push(item);state.logs=state.logs.slice(-30);const row=document.createElement('div');const time=document.createElement('time');time.textContent=`[${item.at}] `;row.append(time,document.createTextNode(item.message));$('log').prepend(row);while($('log').children.length>30)$('log').lastElementChild.remove();}\nfunction setStep(id,kind,message){const el=$(id);el.className=`step ${kind||''}`;el.querySelector('strong').textContent=message;}\nfunction setResult(message,type){const el=$('result');el.className=`state ${type||''}`;el.textContent=message;}\nfunction base(){let text=$('server').value.trim().replace(/\\/+$/,'');let url;try{url=new URL(text);}catch{throw new Error('Endereço do Render inválido.');}if(url.protocol!=='https:' && !(url.hostname==='localhost' && url.protocol==='http:'))throw new Error('Use um endereço HTTPS do Render.');if(url.username||url.password||url.search||url.hash)throw new Error('Use apenas o endereço base do servidor.');return url.origin;}\nfunction showStats(...parts){$('stats').replaceChildren();for(const v of parts.filter(Boolean)){const span=document.createElement('span');span.textContent=v;$('stats').appendChild(span);}}\nfunction presentJson(data){$('json').textContent=JSON.stringify(data,(key,value)=>key==='fallbackUrl'&&typeof value==='string'?'[token temporário omitido]':value,2);}\nfunction showMatches(items){const holder=$('matched');holder.replaceChildren();holder.classList.add('hidden');if(!Array.isArray(items)||!items.length)return;const title=document.createElement('div');title.textContent='Candidatos encontrados pela API:';title.style.fontWeight='700';title.style.marginBottom='7px';holder.appendChild(title);const table=document.createElement('table');const head=document.createElement('tr');for(const label of ['Jogo','ID','Similaridade','Mídias']){const th=document.createElement('th');th.textContent=label;head.appendChild(th);}table.appendChild(head);for(const item of items){const row=document.createElement('tr');for(const v of [item.name || '-',item.id || '-',typeof item.score==='number'?`${Math.round(item.score*100)}%`:'-',Array.isArray(item.mediaTypes)?item.mediaTypes.join(', ')||'nenhuma':'-']){const td=document.createElement('td');td.textContent=String(v);row.appendChild(td);}table.appendChild(row);}holder.appendChild(table);holder.classList.remove('hidden');}\nasync function requestJson(url,timeout=23000){const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),timeout);const start=performance.now();try{const response=await fetch(url,{cache:'no-store',signal:controller.signal,headers:{Accept:'application/json'}});const raw=await response.text();let data;try{data=JSON.parse(raw);}catch{throw new Error(`HTTP ${response.status}, resposta não é JSON (${raw.slice(0,140).replace(/<[^>]+>/g,'')}). Provável endpoint ausente ou erro do Render.`);}return {http:response.status,ok:response.ok,data,elapsed:Math.round(performance.now()-start)};}catch(error){if(error.name==='AbortError')throw new Error('Tempo de resposta excedido (23 segundos). O Render pode estar iniciando ou o ScreenScraper demorando.');if(error instanceof TypeError)throw new Error('Não foi possível conectar. Confira se o Render está online e se o navegador permite CORS.');throw error;}finally{clearTimeout(timer);}}\nasync function checkServer(quiet=false){let origin;try{origin=base();}catch(e){setResult(e.message,'failure');return false;}state.base=origin;$('serverBadge').className='badge';$('serverBadge').textContent='Servidor: verificando';setStep('stepServer','loading','Conectando…');try{const result=await requestJson(`${origin}/api/gameplay-preview/status`,15000);state.status=result.data;let status=result.data;if(!result.ok||!status||status.enabled!==true){setStep('stepServer','error',status&&status.enabled===false?'Integração desativada':`HTTP ${result.http}`);$('serverBadge').className='badge bad';$('serverBadge').textContent='Servidor: problema';log(`Status: HTTP ${result.http} — enabled=${status&&status.enabled}`);if(!quiet)setResult('Status retornou falha ou ScreenScraper desativado. Confirme se o Server mais recente foi publicado.','failure');return false;}setStep('stepServer','ok','Online / configurado');$('serverBadge').className='badge good';$('serverBadge').textContent='Servidor: conectado';log(`Status: OK (${result.elapsed} ms). Buscas hoje: ${status.searchesToday??'?'}/${status.searchLimit??'?'}. Vídeos no cache: ${status.videoCacheItems??'?'}. Downloads novos hoje: ${status.videoDownloadsToday??'?'}.`);if(!quiet){setResult('Servidor conectado e ScreenScraper habilitado. Agora pesquise um jogo.','success');presentJson(status);}return true;}catch(error){state.problem=error.message;setStep('stepServer','error','Sem conexão / status');$('serverBadge').className='badge bad';$('serverBadge').textContent='Servidor: sem resposta';log(`Falha no status: ${error.message}`);if(!quiet)setResult(error.message,'failure');return false;}}\nfunction validPublic(raw){try{const u=new URL(raw);return u.protocol==='https:'&&['www.screenscraper.fr','screenscraper.fr'].includes(u.hostname)&&/^\\/medias\\/\\d+\\/\\d+\\/video(?:-normalized)?\\.mp4$/.test(u.pathname)&&!u.search?u.href:null;}catch{return null;}}\nfunction validFallback(raw){try{const u=new URL(raw,state.base);return u.origin===new URL(state.base).origin&&u.pathname==='/api/gameplay-video'&&u.searchParams.has('token')?u.href:null;}catch{return null;}}\nasync function probeRenderVideo(session){\n  const target=validFallback(state.lookup&&state.lookup.fallbackUrl);\n  if(!target||session!==state.session)return;\n  const controller=new AbortController();\n  const timer=setTimeout(()=>controller.abort(),12000);\n  try{\n    const r=await fetch(target,{cache:'no-store',signal:controller.signal,headers:{Range:'bytes=0-1023'}});\n    const reason=r.headers.get('X-PSN-Video-Error')||null;\n    const upstream=r.headers.get('X-PSN-Video-Upstream')||null;\n    const type=r.headers.get('Content-Type')||null;\n    const cache=r.headers.get('X-PSN-Video-Cache')||null;\n    const contentRange=r.headers.get('Content-Range')||null;\n    if(r.body){try{await r.body.cancel();}catch(_){}}\n    if(session!==state.session)return;\n    state.videoProbe={http:r.status,upstream,error:reason,contentType:type,cache,contentRange};\n    log(`Diagnóstico da mídia: Render HTTP ${r.status}, ScreenScraper HTTP ${upstream||'?'}, cache ${cache||'?'}, tipo ${type||'?'}, motivo ${reason||'não informado'}.`);\n    if(!r.ok)setResult(`Falha na entrega do vídeo: Render HTTP ${r.status}; ScreenScraper HTTP ${upstream||'não informado'}; motivo ${reason||'não informado'}.`,'failure');\n    else setResult(`O Render enviou uma resposta ${type||'sem tipo informado'} (HTTP ${r.status}), mas o navegador recusou a reprodução. Pode ser codec ou dados incompletos.`,'failure');\n  }catch(e){if(session===state.session){state.videoProbe={error:e.name==='AbortError'?'timeout':e.message};log('Não foi possível consultar o HTTP do vídeo: '+state.videoProbe.error);}}\n  finally{clearTimeout(timer);}\n}\nfunction videoErrorMessage(player){return ({1:'Reprodução cancelada.',2:'Erro de rede ao baixar o vídeo.',3:'O navegador não conseguiu decodificar o vídeo.',4:'Formato de vídeo não suportado.'})[player.error&&player.error.code]||'O vídeo não pôde ser carregado.';}\nfunction playback(src,via,session){const player=$('player');if(!src)return false;player.pause();player.removeAttribute('src');player.load();state.fallbackUsed=via==='Render';$('videoLabel').textContent=`Tentando vídeo ${via==='Render'?'pelo Render':'direto do ScreenScraper'}…`;setStep('stepPlayback','loading',`Tentando ${via}…`);log(`Tentativa de reprodução: ${via}.`);player.onloadedmetadata=()=>{if(session!==state.session)return;log(`Metadados MP4 recebidos (${Number.isFinite(player.duration)?Math.round(player.duration)+'s':'duração desconhecida'}).`);};player.onplaying=()=>{if(session!==state.session)return;setStep('stepPlayback','ok','Vídeo reproduzindo');setResult(`Vídeo encontrado e reproduzindo via ${via}!`,'success');log(`Vídeo reproduzindo via ${via}.`);};player.onerror=()=>{if(session!==state.session)return;const message=videoErrorMessage(player);log(`Falha ${via}: ${message}`);if(via==='direto'&&validFallback(state.lookup&&state.lookup.fallbackUrl)){log('Tentando o caminho alternativo autenticado.');playback(validFallback(state.lookup.fallbackUrl),'Render',session);}else{setStep('stepPlayback','error','Vídeo falhou');setResult(`O jogo foi encontrado, mas o vídeo não reproduziu: ${message}`,'failure');$('retryFallback').classList.toggle('hidden',!validFallback(state.lookup&&state.lookup.fallbackUrl));if(via==='Render')probeRenderVideo(session);}};player.src=src;player.load();const playPromise=player.play();if(playPromise&&typeof playPromise.catch==='function')playPromise.catch(e=>{if(session!==state.session)return;if(e&&e.name==='NotAllowedError'){log('O navegador exige clique para iniciar a reprodução. Use ▶ no player.');$('videoLabel').textContent='Vídeo disponível; clique em ▶ para reproduzir.';}else if(e&&e.name!=='AbortError')log(`play() recusado: ${e.message}`);});return true;}\nasync function search(e){e.preventDefault();const session=++state.session;state.lookup=null;state.problem=null;state.videoProbe=null;state.name=$('game').value.trim();state.system=Number($('system').value);if(state.name.length<3){setResult('Digite ao menos 3 caracteres.','failure');return;}try{state.base=base();}catch(error){setResult(error.message,'failure');return;}$('searchBtn').disabled=true;setStep('stepSearch','loading','Consultando API…');setStep('stepPlayback','','Aguardando resultado');setResult('Consultando o ScreenScraper pelo Render…');$('videoArea').classList.add('hidden');$('retryFallback').classList.add('hidden');$('matched').classList.add('hidden');$('player').pause();$('player').removeAttribute('src');$('player').load();showStats();log(`Pesquisando \"${state.name}\" no sistema ${state.system}…`);try{const url=new URL(`${state.base}/api/gameplay-preview`);url.searchParams.set('name',state.name);url.searchParams.set('system',String(state.system));url.searchParams.set('debug','1');const result=await requestJson(url.href);if(session!==state.session)return;state.lookup=result.data;state.http=result.http;state.tookMs=result.elapsed;presentJson({http:result.http,durationMs:result.elapsed,...result.data});const data=result.data;showStats(`HTTP ${result.http}`,`${result.elapsed} ms`,`Candidatos: ${data.candidates??data.diagnostics?.candidates??'?'}`,`Console: ${$('system').selectedOptions[0].text}`);showMatches(data.diagnostics&&data.diagnostics.matches);if(!result.ok||!data.ok){const reason=String(data.reason||data.error||`HTTP ${result.http}`);state.problem=reason;setStep('stepSearch','error',reason);setResult(`${reasons[reason]||reason} (HTTP ${result.http})`,'failure');log(`Busca falhou: ${reason}, HTTP ${result.http}${data.upstreamStatus?' (ScreenScraper HTTP '+data.upstreamStatus+')':''}`);return;}if(!data.found){const reason=data.reason||'no_video';setStep('stepSearch','error','Sem vídeo');setResult(reasons[reason]||`Sem vídeo: ${reason}`,'notice');log(`Busca respondeu: ${reason}.`);return;}setStep('stepSearch','ok','Vídeo localizado');log('API retornou found=true. Verificando reprodução…');const direct=validPublic(data.url);const fallback=validFallback(data.fallbackUrl);$('videoArea').classList.remove('hidden');$('retryFallback').classList.toggle('hidden',!fallback);if(fallback)playback(fallback,'Render',session);else if(direct)playback(direct,'direto',session);else{setStep('stepPlayback','error','URL inválida');setResult('A API disse found=true, mas não forneceu URL de vídeo utilizável.','failure');log('URL inválida ou formato inesperado.');}}catch(error){if(session!==state.session)return;state.problem=error.message;setStep('stepSearch','error','Falha de conexão');setResult(error.message,'failure');log(`Erro na pesquisa: ${error.message}`);}finally{if(session===state.session)$('searchBtn').disabled=false;}}\nfunction copy(){const diagnostic={checkedAt:new Date().toISOString(),server:state.base,game:state.name,system:state.system,serverStatus:state.status,searchHttp:state.http,searchTimeMs:state.tookMs,result:state.lookup?JSON.parse(JSON.stringify(state.lookup,(key,value)=>key==='fallbackUrl'?'[token omitido]':value)):null,problem:state.problem,videoProbe:state.videoProbe,logs:state.logs};const raw=JSON.stringify(diagnostic,null,2);if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(raw).then(()=>log('Diagnóstico copiado.'),()=>fallbackCopy(raw));}else fallbackCopy(raw);}\nfunction fallbackCopy(raw){const ta=document.createElement('textarea');ta.value=raw;document.body.appendChild(ta);ta.select();try{document.execCommand('copy');log('Diagnóstico copiado.');}catch{log('Não foi possível copiar automaticamente; selecione o JSON na seção acima.');}ta.remove();}\n$('searchForm').addEventListener('submit',search);$('statusBtn').addEventListener('click',()=>checkServer(false));$('copyBtn').addEventListener('click',copy);$('retryFallback').addEventListener('click',()=>{const url=validFallback(state.lookup&&state.lookup.fallbackUrl);if(url)playback(url,'Render',state.session);});$('server').addEventListener('change',()=>{$('serverBadge').className='badge';$('serverBadge').textContent='Servidor: alterado';});log('Ferramenta de teste pronta.');checkServer(true);\n})();\n</script></body></html>\n";
-app.get('/screenscraper-teste', (req,res) => {
-  res.setHeader('Cache-Control','no-store');
-  res.setHeader('X-Robots-Tag','noindex, nofollow');
-  res.type('html').send(SS_PREVIEW_TEST_HTML);
-});
-
 app.options('/api/gameplay-preview', (req, res) => { setMetadataCors(res); res.status(204).end(); });
 app.get('/api/gameplay-preview', async (req, res) => {
   setMetadataCors(res);
   res.setHeader('Cache-Control', 'no-store');
   if (!SS_PREVIEW_ENABLED) return res.status(503).json({ ok:false, configured:false });
   const name = String(req.query && req.query.name || '').trim().slice(0, 140);
-  const systemId = Number(req.query && req.query.system);
-  if (name.length < 3 || !SS_PREVIEW_SYSTEM_IDS.has(systemId) || !normalizeSsPreviewTitle(name)) {
+  const isPort = String(req.query && req.query.port || '') === '1';
+  const systemId = isPort ? 0 : Number(req.query && req.query.system);
+  if (name.length < 3 || (!isPort && !SS_PREVIEW_SYSTEM_IDS.has(systemId)) || !normalizeSsPreviewTitle(name)) {
     return res.status(400).json({ ok:false, error:'Invalid game or system.' });
   }
   try {
     const result = await ssPreviewLookup(name, systemId);
-    const diagnostic = req.query && req.query.debug === '1' ? { diagnostics:result.diagnostics || null } : {};
-    if (!result.found) return res.json({ok:true,configured:true,found:false,provider:'screenscraper',reason:result.reason,candidates:result.candidates || 0,...diagnostic});
+    if (!result.found) return res.json({ok:true,configured:true,found:false,provider:'screenscraper',reason:result.reason,candidates:result.candidates || 0});
     return res.json({ok:true,configured:true,found:true,url:result.url,
-      fallbackUrl:`/api/gameplay-video?token=${ssPreviewVideoToken(result.video)}`,provider:'screenscraper',...diagnostic});
+      fallbackUrl:`/api/gameplay-video?token=${ssPreviewVideoToken(result.video)}`,provider:'screenscraper'});
   } catch (error) {
     // Keep provider secrets and raw API URLs out of logs and client responses.
     const reason = ['api_auth','api_rate_limit','api_unavailable','api_rejected','local_rate_limit','local_queue_full'].includes(error && error.code) ? error.code : 'api_unavailable';
     return res.status(error && error.status === 429 ? 429 : 502).json({ ok:false, configured:true, retry:true, reason, upstreamStatus:Number(error && error.upstreamStatus) || 0 });
   }
+});
+
+app.options('/api/screenscraper-extras', (req,res) => {setMetadataCors(res); res.status(204).end();});
+app.get('/api/screenscraper-extras', async (req,res) => {
+  setMetadataCors(res);
+  res.setHeader('Cache-Control','private,max-age=120');
+  if (!SS_PREVIEW_ENABLED) return res.status(503).json({ok:false,reason:'not_configured'});
+  const name = String(req.query && req.query.name || '').trim().slice(0,140);
+  const isPort = String(req.query && req.query.port || '') === '1';
+  const system = isPort ? 0 : Number(req.query && req.query.system);
+  if ((!isPort && !SS_PREVIEW_SYSTEM_IDS.has(system)) || name.length < 3 || !normalizeSsPreviewTitle(name)) return res.status(400).json({ok:false});
+  try {
+    const result = await ssPreviewLookup(name,system);
+    return res.json({ok:true,found:!!result.extras,extras:ssExtraPublic(result.extras)});
+  } catch (e) {return res.status(e.status === 429 ? 429 : 502).json({ok:false,reason:e.code || 'unavailable'});}
+});
+
+// Small bounded RAM cache for supplemental artwork, never database, never untrusted upstream hosts.
+async function ssExtraFetchLimited(data) {
+  // Reserve the released slot for the next waiter so concurrent arrivals
+  // never exceed the two-download limit on ScreenScraper.
+  if (ssExtraImageActive < 2) ssExtraImageActive++;
+  else {
+    if (ssExtraImageWaiters.length >= 10) throw new Error('image_queue_full');
+    await new Promise(resolve => ssExtraImageWaiters.push(resolve));
+  }
+  try {return await ssExtraFetchImage(data);}
+  finally {
+    const next=ssExtraImageWaiters.shift();
+    if (next) next();
+    else ssExtraImageActive--;
+  }
+}
+async function ssExtraFetchImage(data) {
+  const url=new URL('https://api.screenscraper.fr/api2/mediaJeu.php');
+  url.searchParams.set('devid',SS_PREVIEW_DEVID);
+  url.searchParams.set('devpassword',SS_PREVIEW_DEVPASSWORD);
+  url.searchParams.set('softname','PSN-Content');
+  url.searchParams.set('systemeid',String(data.s));
+  url.searchParams.set('jeuid',String(data.g));
+  url.searchParams.set('media',data.t+(data.r?'('+data.r+')':''));
+  url.searchParams.set('outputformat','jpg');
+  url.searchParams.set('maxwidth','1050');
+  url.searchParams.set('maxheight','720');
+  if (SS_PREVIEW_USER && SS_PREVIEW_PASSWORD) {url.searchParams.set('ssid',SS_PREVIEW_USER);url.searchParams.set('sspassword',SS_PREVIEW_PASSWORD);}
+  // The existing secure redirect handler enforces HTTPS screenscraper.fr hosts only.
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),18000);
+  try {
+    const response=await ssVideoRequestImage(url.href,controller.signal);
+    const chunks=[]; let size=0;
+    for await (const chunk of response) {
+      size += chunk.length;
+      if (size > 4 * 1024 * 1024) {response.destroy();throw new Error('image_too_large');}
+      chunks.push(chunk);
+    }
+    const body=Buffer.concat(chunks);
+    const isJpeg=body[0]===0xff&&body[1]===0xd8;
+    const isPng=body.subarray(1,4).toString('ascii')==='PNG';
+    const isWebp=body.subarray(8,12).toString('ascii')==='WEBP';
+    if (body.length<48||(!isJpeg&&!isPng&&!isWebp)) throw new Error('not_image');
+    return {body,type:isJpeg?'image/jpeg':isPng?'image/png':'image/webp'};
+  } finally {clearTimeout(timer);}
+}
+async function ssVideoRequestImage(raw,signal,redirects=0,maxBytes=4*1024*1024) {
+  const url=ssVideoValidateUrl(raw);
+  const response=await new Promise((resolve,reject)=>{
+    const r=https.get(url,{signal,headers:{'User-Agent':'PSN-Content/1.0'}},resolve);
+    r.on('error',reject);r.setTimeout(15000,()=>r.destroy(new Error('image_timeout')));
+  });
+  const status=Number(response.statusCode)||0;
+  if ([301,302,303,307,308].includes(status)) {
+    if (redirects>=4||!response.headers.location) {response.destroy();throw new Error('image_redirect');}
+    const next=new URL(response.headers.location,url).href;
+    ssVideoValidateUrl(next);response.resume();return ssVideoRequestImage(next,signal,redirects+1,maxBytes);
+  }
+  if (status!==200) {response.destroy();throw new Error('image_upstream_'+status);}
+  if (Number(response.headers['content-length']||0)>maxBytes) {response.destroy();throw new Error('image_too_large');}
+  return response;
+}
+app.get('/api/screenscraper-manual',async(req,res)=>{
+  const data=ssExtraVerifyToken(req.query&&req.query.token);
+  if(!data||!['manual','manuel'].includes(data.t)||!SS_PREVIEW_ENABLED)return res.status(403).end();
+  const url=new URL('https://api.screenscraper.fr/api2/mediaManuelJeu.php');
+  url.searchParams.set('devid',SS_PREVIEW_DEVID);
+  url.searchParams.set('devpassword',SS_PREVIEW_DEVPASSWORD);
+  url.searchParams.set('softname','PSN-Content');
+  url.searchParams.set('systemeid',String(data.s));
+  url.searchParams.set('jeuid',String(data.g));
+  url.searchParams.set('media',data.t+(data.r?'('+data.r+')':''));
+  if(SS_PREVIEW_USER && SS_PREVIEW_PASSWORD){url.searchParams.set('ssid',SS_PREVIEW_USER);url.searchParams.set('sspassword',SS_PREVIEW_PASSWORD);}
+  const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),18000);
+  try {
+    const upstream=await ssVideoRequestImage(url.href,controller.signal,0,9*1024*1024);
+    let size=0;const parts=[];
+    for await(const chunk of upstream){size+=chunk.length;if(size>9*1024*1024){upstream.destroy();throw Error('pdf_too_large');}parts.push(chunk);}
+    const pdf=Buffer.concat(parts);
+    if(pdf.subarray(0,5).toString('ascii')!=='%PDF-')throw Error('not_pdf');
+    res.setHeader('Content-Type','application/pdf');
+    res.setHeader('Content-Disposition','inline; filename="screenscraper-manual.pdf"');
+    res.setHeader('Cache-Control','private,max-age=900');
+    res.setHeader('X-Content-Type-Options','nosniff');
+    return res.send(pdf);
+  }catch(_){return res.status(404).end();}
+  finally{clearTimeout(timer);}
+});
+app.get('/api/screenscraper-image',async(req,res)=>{
+  const data=ssExtraVerifyToken(req.query&&req.query.token);
+  if (!data||!SS_PREVIEW_ENABLED) return res.status(403).end();
+  const key=`${data.s}:${data.g}:${data.t}:${data.r}`;
+  let cached=ssExtraImageCache.get(key);
+  if(cached&&cached.until<Date.now()) {ssExtraImageCache.delete(key);ssExtraImageBytes-=cached.body.length;cached=null;}
+  if (cached) {
+    // Refresh LRU position: frequently opened artwork survives cache eviction.
+    ssExtraImageCache.delete(key);
+    ssExtraImageCache.set(key,cached);
+  }
+  if (!cached) {
+    try {
+      let pending=ssExtraImagePending.get(key);
+      if (!pending) {
+        pending=ssExtraFetchLimited(data).finally(()=>ssExtraImagePending.delete(key));
+        ssExtraImagePending.set(key,pending);
+      }
+      cached=await pending;
+      if (!ssExtraImageCache.has(key)) {
+        while (ssExtraImageBytes+cached.body.length>SS_EXTRA_IMAGE_LIMIT && ssExtraImageCache.size) {
+          const oldest=ssExtraImageCache.keys().next().value;
+          ssExtraImageBytes-=ssExtraImageCache.get(oldest).body.length;ssExtraImageCache.delete(oldest);
+        }
+        ssExtraImageCache.set(key,{...cached,until:Date.now()+15*60*1000});
+        ssExtraImageBytes+=cached.body.length;
+      }
+    } catch (_) {return res.status(404).end();}
+  }
+  res.setHeader('Cache-Control','private,max-age=900');
+  res.setHeader('Content-Type',cached.type);
+  res.setHeader('X-Content-Type-Options','nosniff');
+  return res.send(cached.body);
 });
 
 app.options('/api/metadata/igdb', (req, res) => { setMetadataCors(res); res.status(204).end(); });
@@ -3613,6 +3902,17 @@ async function initDb() {
       expires_at TIMESTAMPTZ NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_metadata_provider_cache_expires ON metadata_provider_cache(expires_at);
+    -- Persistent ScreenScraper game/media metadata only (never MP4 bytes or API credentials).
+    CREATE TABLE IF NOT EXISTS screenscraper_game_cache (
+      cache_key TEXT PRIMARY KEY,
+      system_id SMALLINT NOT NULL,
+      game_id INTEGER NOT NULL,
+      media_type TEXT NOT NULL DEFAULT '',
+      api_host TEXT NOT NULL DEFAULT 'api.screenscraper.fr',
+      extras JSONB,
+      refreshed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      expires_at TIMESTAMPTZ NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS content_metadata_suggestions (
       id BIGSERIAL PRIMARY KEY,
       metadata_key TEXT NOT NULL,

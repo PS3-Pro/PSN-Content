@@ -939,6 +939,23 @@ html.ios-webkit #object-particles { contain:strict; }
 .game-img[data-loaded="true"] { opacity: 1; }
 .game-img-container > .psn-gameplay-preview-video { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; z-index:1; pointer-events:none; opacity:0; transition:opacity .18s ease; }
 .game-img-container > .psn-gameplay-preview-video.is-ready { opacity:1; }
+/* ScreenScraper only supplements our existing providers; fanart is opt-in for preview. */
+#game-modal .psn-ss-extras { margin: 10px 0 0; padding-top: 10px; border-top: 1px solid rgba(255,255,255,.09); }
+#game-modal .psn-ss-extras-title { color:var(--text-muted);font-size:10px;font-weight:800;letter-spacing:.7px;text-transform:uppercase;margin-bottom:8px; }
+#game-modal .psn-ss-extra-row { display:flex;align-items:center;gap:8px;overflow-x:auto;padding:2px 0 5px;scrollbar-width:none; }
+#game-modal .psn-ss-extra-row::-webkit-scrollbar { display:none; }
+#game-modal .psn-ss-extra-img { position:relative;flex:0 0 78px;display:flex;flex-direction:column;gap:4px;border:0;background:transparent;color:var(--text-muted);font:inherit;font-size:9px;text-align:center;cursor:pointer;padding:0; }
+#game-modal .psn-ss-extra-img img { display:block;width:78px;height:70px;object-fit:contain;border-radius:7px;background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.09); }
+#game-modal .psn-ss-extra-img:hover img { border-color:rgba(255,255,255,.35); }
+#game-modal .psn-ss-bg-toggle { margin:8px 0 4px;border-radius:999px;padding:6px 11px;border:1px solid rgba(255,255,255,.20);background:rgba(255,255,255,.06);color:#fff;font-size:10px;cursor:pointer; }
+#game-modal .psn-ss-bg-toggle[aria-pressed="true"] { border-color:rgba(102,204,255,.68);background:rgba(102,204,255,.13); }
+#game-modal .psn-ss-extras-details { display:flex;flex-wrap:wrap;gap:6px;margin:5px 0 7px;font-size:10px;color:#b6c6d6; }
+#game-modal .psn-ss-extras-details span { border:1px solid rgba(255,255,255,.10);border-radius:8px;padding:4px 7px;background:rgba(0,0,0,.16); }
+#game-modal .sys-modal-content.psn-ss-bg-preview { isolation:isolate;position:relative; }
+#game-modal .sys-modal-content.psn-ss-bg-preview::before { content:"";position:absolute;inset:0;z-index:0;pointer-events:none;background:linear-gradient(to bottom,rgba(7,12,22,.46),rgba(7,12,22,.84)),var(--psn-ss-modal-bg) center/cover no-repeat;opacity:.85; }
+#game-modal .sys-modal-content.psn-ss-bg-preview > .sys-modal-header,
+#game-modal .sys-modal-content.psn-ss-bg-preview > .sys-modal-body { position:relative;z-index:1; }
+
 
 .game-card:hover .game-img { transform: scale(1.02); filter: brightness(1.1); }
 @media (hover: hover) and (pointer: fine) { .game-card:hover .game-img { transform: scale(1.06); } }
@@ -42341,6 +42358,7 @@ P
 			}
 			setGameModalNoScreenshots(modal, false);
 		}
+		modal.querySelector('.sys-modal-content')?.classList.remove('psn-ss-bg-preview');
 		const modalBody = modal.querySelector('.sys-modal-body');
 		const modalHeader = modal.querySelector('.sys-modal-header h2');
 		
@@ -44358,6 +44376,8 @@ P
 			await Promise.resolve();
 			if (!isCurrentRequest()) return;
 			applyGameModalResolvedMetadataSnapshot(modalRoot, resolvedMetadataSnapshot);
+			if (!collectSummaryCandidates && typeof window.__psnApplyScraperSupplement === 'function')
+				window.__psnApplyScraperSupplement(modalRoot, gameName, gameId, requestToken);
 			if (typeof window.scheduleInterfaceTranslationAfterUiChange === 'function') window.scheduleInterfaceTranslationAfterUiChange(modalRoot);
 			return;
 		}
@@ -44753,7 +44773,11 @@ P
 			screenshotsWrapper.style.display = 'none';
 			if (modalRoot) setGameModalNoScreenshots(modalRoot, true);
 		}
-		if (isCurrentRequest() && !collectSummaryCandidates) setGameModalResolvedMetadataSnapshot(resolvedMetadataCacheKey, captureGameModalResolvedMetadataSnapshot(modalRoot));
+		if (isCurrentRequest() && !collectSummaryCandidates) {
+			setGameModalResolvedMetadataSnapshot(resolvedMetadataCacheKey, captureGameModalResolvedMetadataSnapshot(modalRoot));
+			if (typeof window.__psnApplyScraperSupplement === 'function')
+				window.__psnApplyScraperSupplement(modalRoot, gameName, gameId, requestToken);
+		}
 	};
 
 
@@ -120368,180 +120392,219 @@ function getVisibleChatStackEl(id) {
 
 <script>
 (() => {
-  // Gameplay preview: desktop hover only; never change existing card animations.
-  const platformIds = { ps3:59, ps2:58, ps1:57, psx:57, psp:61, psv:62, psvita:62, vita:62, ps4:60 };
-  const cache = new Map();
-  const failures = new Map();
-  const delayMs = 400;
-  let active = null;
-  const supported = !!(window.matchMedia && matchMedia('(hover: hover) and (pointer: fine)').matches && !matchMedia('(prefers-reduced-motion: reduce)').matches);
-  const baseServer = () => {
-    const url = typeof getMetadataServerBaseCompat === 'function' ? getMetadataServerBaseCompat() : '';
-    return String(url || 'https://psn-content-fd6j.onrender.com').replace(/\/+$/, '');
-  };
-  function note(event, info = {}) {
-    window.__psnGameplayStatus = { event, ...info, at: new Date().toISOString() };
-    if (window.__psnGameplayDebug) console.debug('[GAMEPLAY PREVIEW]',event,info);
+  const platformIds = {ps3:59,ps2:58,ps1:57,psx:57,psp:61,psv:62,psvita:62,vita:62,ps4:60};
+  const memory = new Map();
+  const pending = new Map();
+  const baseServer = () => String(typeof getMetadataServerBaseCompat === 'function' ? getMetadataServerBaseCompat() : 'https://psn-content-fd6j.onrender.com').replace(/\/+$/,'');
+  const cleanName = value => String(value || '').replace(/[™®©]/g,' ').replace(/\b(?:tm|registered)\b/gi,' ').replace(/\s*[[(](?:usa|eur|europe|japan|ps3|ps2|psp|ps1|ps4)[)\]]/gi,'').replace(/\b(?:digital version)\b/gi,'').trim();
+  const normalize = value => cleanName(value).normalize('NFKD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+  const escapeText = value => String(value || '').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+  function getAssets(name,system,isPort=false) {
+    const key = (isPort?'port':system)+':'+normalize(name), now=Date.now();
+    const cached=memory.get(key);
+    if(cached && now-cached.at<30*60*1000) return Promise.resolve(cached.data);
+    if(pending.has(key)) return pending.get(key);
+    const url=baseServer()+'/api/screenscraper-extras?name='+encodeURIComponent(cleanName(name))+'&system='+system+(isPort?'&port=1':'');
+    const promise=fetch(url,{cache:'default'}).then(r=>r.ok?r.json():null).then(data=>{
+      if(data&&data.ok) {memory.set(key,{at:Date.now(),data});while(memory.size>90) memory.delete(memory.keys().next().value);}
+      return data;
+    }).catch(()=>null).finally(()=>pending.delete(key));
+    pending.set(key,promise);return promise;
   }
-  window.__psnGameplayCheck = async () => {
-    const response = await fetch(`${baseServer()}/api/gameplay-preview/status`,{cache:'no-store'});
-    return response.json();
+  function validImg(raw) {
+    try {const u=new URL(raw,baseServer());return u.origin===new URL(baseServer()).origin && u.pathname==='/api/screenscraper-image' && u.searchParams.has('token') ? u.href : '';}
+    catch (_) {return '';}
+  }
+  window.__psnApplyScraperSupplement = async function(root,name,titleId,requestToken) {
+    if(!root || !root.isConnected || !root.classList.contains('show')) return;
+    const category=String(root.dataset.storeCategory||'').toLowerCase();
+    if(!['games','prototypes','ports'].includes(category)) return;
+    const img=root.querySelector('img.modal-img');
+    const consoleTag=String(img?.dataset.console||root.__psnLastOpenedGame?.cTag||'').toLowerCase().replace(/[^a-z0-9]/g,'');
+    const isPort=category==='ports';
+    const system=platformIds[consoleTag] || (isPort?59:0);
+    if(!system||!name||name.length<3) return;
+    const match=()=>root.isConnected&&root.classList.contains('show')&&String(root.dataset.titleId||'')===String(titleId||'')&&(!requestToken||String(root.dataset.openHydrationToken||'')===String(requestToken));
+    const data=await getAssets(name,system,isPort);
+    if(!match()||!data?.found||!data.extras) return;
+    const ext=data.extras, wrapper=root.querySelector('#modal-screenshots-wrapper');
+    if(!wrapper || !wrapper.parentNode) return;
+    let panel=root.querySelector('.psn-ss-extras');
+    if(panel) panel.remove();
+    panel=document.createElement('section');panel.className='psn-ss-extras';
+    wrapper.insertAdjacentElement('afterend',panel);
+    const details=[];
+    const summary=root.querySelector('#modal-summary');
+    if(summary && (/No description available\.?/i.test(summary.textContent||'') || !String(summary.textContent||'').trim()) && ext.summary) {
+      summary.innerHTML='<span style="font-size:10px;color:var(--text-muted);font-weight:bold;letter-spacing:1px;display:block;margin-bottom:8px"><i class="fas fa-align-left"></i> Summary</span>'+escapeText(ext.summary).replace(/\n/g,'<br>');
+    }
+    const badges=root.querySelector('#modal-badges');
+    const hasStudio=!!(badges&&badges.querySelector('.rawg-alt2-studio:not(.rawg-alt2-placeholder)'));
+    if(!hasStudio && (ext.developer||ext.publisher)) details.push('Studio: '+(ext.developer||ext.publisher));
+    if(ext.genres && !root.__resolvedProviderMetadata?.genres?.length) details.push('Genre: '+ext.genres);
+    if(ext.releaseDate && !root.__resolvedProviderMetadata?.year) details.push('Released: '+ext.releaseDate);
+    if(ext.players) details.push('Players: '+ext.players);
+    if(ext.rating!==null && ext.rating!==undefined && !root.__resolvedProviderMetadata?.score) details.push('Rating: '+ext.rating+'/20');
+    if(details.length) {
+      const detailRow=document.createElement('div');detailRow.className='psn-ss-extras-details';
+      details.forEach(value=>{const el=document.createElement('span');el.textContent=value;detailRow.appendChild(el);});
+      panel.appendChild(detailRow);
+    }
+    // Screenshots come after all existing providers, never before or instead of them.
+    const screenshots=root.querySelector('#modal-screenshots');
+    const existingImages=screenshots?Array.from(screenshots.querySelectorAll('img.screenshot-item')):[];
+    const existingUrls=existingImages.map(el=>el.currentSrc||el.src);
+    const newShotUrls=(ext.images||[]).filter(item=>item.kind==='screenshot').map(item=>validImg(item.url)).filter(src=>src&&!existingUrls.includes(src));
+    if(screenshots && newShotUrls.length) {
+      for(const url of newShotUrls.slice(0,3)) {
+        const tile=document.createElement('span');tile.className='modal-screenshot-tile';
+        const shot=document.createElement('img');shot.className='screenshot-item';shot.loading='lazy';shot.decoding='async';shot.src=url;shot.alt='ScreenScraper screenshot';
+        tile.appendChild(shot);screenshots.appendChild(tile);
+      }
+      wrapper.style.display='flex';root.classList.remove('modal-no-screenshots');
+      if(typeof window.scheduleCarouselArrowSync==='function')window.scheduleCarouselArrowSync(screenshots);
+      const urls=Array.from(screenshots.querySelectorAll('img.screenshot-item')).map(el=>el.currentSrc||el.src);
+      Array.from(screenshots.querySelectorAll('img.screenshot-item')).forEach((el,i)=>{
+        if(typeof openImageModal==='function')el.onclick=()=>openImageModal(i,urls,{gallery:true,sourceElement:el});
+      });
+    }
+    const arts=(ext.images||[]).filter(item=>item.kind==='artwork').slice(0,5).map(item=>({...item,src:validImg(item.url)})).filter(item=>item.src);
+    if(arts.length) {
+      const heading=document.createElement('div');heading.className='psn-ss-extras-title';heading.textContent='Additional artwork · ScreenScraper';panel.appendChild(heading);
+      const row=document.createElement('div');row.className='psn-ss-extra-row';
+      arts.forEach(item=>{
+        const button=document.createElement('button');button.type='button';button.className='psn-ss-extra-img';
+        const im=document.createElement('img');im.loading='lazy';im.decoding='async';im.src=item.src;im.alt=item.type;
+        const label=document.createElement('span');label.textContent=item.type;button.append(im,label);
+        button.addEventListener('click',()=>{if(typeof openImageModal==='function')openImageModal(0,[item.src],{gallery:true,sourceElement:im});});
+        row.appendChild(button);
+      });
+      panel.appendChild(row);
+    }
+    const manual=(ext.images||[]).find(item=>item.kind==='manual');
+    if(manual){
+      try {
+        const link=new URL(manual.url,baseServer());
+        if(link.origin===new URL(baseServer()).origin&&link.pathname==='/api/screenscraper-manual'){
+          const anchor=document.createElement('a');anchor.href=link.href;anchor.target='_blank';anchor.rel='noopener noreferrer';
+          anchor.textContent='View game manual (PDF) · ScreenScraper';
+          anchor.style.cssText='display:block;margin-top:8px;color:var(--ps-blue);font-size:11px;';
+          panel.appendChild(anchor);
+        }
+      }catch(_){}
+    }
+    const fanart=(ext.images||[]).find(item=>item.kind==='background'&&validImg(item.url));
+    if(fanart) {
+      const url=validImg(fanart.url);
+      const testBtn=document.createElement('button');testBtn.type='button';testBtn.className='psn-ss-bg-toggle';
+      testBtn.setAttribute('aria-pressed','false');testBtn.textContent='Test fanart background';
+      testBtn.addEventListener('click',()=>{
+        const content=root.querySelector('.sys-modal-content');if(!content)return;
+        if(content.classList.contains('psn-ss-bg-preview')) {
+          content.classList.remove('psn-ss-bg-preview');
+          testBtn.setAttribute('aria-pressed','false');
+          testBtn.textContent='Test fanart background';
+          return;
+        }
+        testBtn.disabled=true;
+        testBtn.textContent='Loading fanart…';
+        const image=new Image();
+        image.onload=()=>{
+          if(match()) {
+            content.style.setProperty('--psn-ss-modal-bg',`url("${url}")`);
+            content.classList.add('psn-ss-bg-preview');
+            testBtn.setAttribute('aria-pressed','true');
+            testBtn.textContent='Restore original background';
+          }
+          testBtn.disabled=false;
+        };
+        image.onerror=()=>{testBtn.disabled=false;testBtn.textContent='Fanart unavailable · Retry';};
+        image.src=url;
+      });panel.appendChild(testBtn);
+    }
+    if(!panel.children.length) panel.remove();
   };
-  if (!supported) { note('desktop_only'); return; }
+})();
+</script>
 
-  function videoCardFrom(target) {
-    const card = target && target.closest && target.closest('.game-card');
-    if (!card || !card.isConnected || card.matches('.recently-visited-placeholder, .store-item-unavailable, [data-missing="true"]')) return null;
-    if (!card.closest('#database-grid, #view-explore, #view-trending, #wishlist-grid, #ps3-local-grid, #ps3-favs-grid')) return null;
-    if (!card.querySelector('.game-img-container > img.game-img')) return null;
-    return card;
+<script>
+(() => {
+  // Fast hover previews with a shared title cache (regional IDs and trademark variants).
+  if (!window.matchMedia || !matchMedia('(hover: hover) and (pointer: fine)').matches || matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  const systems = {ps3:59,ps2:58,ps1:57,psx:57,psp:61,psv:62,psvita:62,vita:62,ps4:60};
+  const cache = new Map(), pending = new Map(), failures = new Map();
+  const base = () => String(typeof getMetadataServerBaseCompat === 'function' ? getMetadataServerBaseCompat() : 'https://psn-content-fd6j.onrender.com').replace(/\/+$/,'');
+  const cleanName = value => String(value||'').replace(/[™®©]/g,' ').replace(/\b(?:tm|registered)\b/gi,' ').replace(/\s*[[(](?:usa|eur|europe|japan|jpn|ps3|ps2|psp|ps1|ps4)[)\]]/gi,'').replace(/\b(?:digital version)\b/gi,'').trim();
+  const normalized = value => cleanName(value).normalize('NFKD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/&/g,' and ').replace(/\b(?:the|a|an)\b/g,' ').replace(/[^a-z0-9]+/g,' ').trim();
+  let active = null;
+  function cardFrom(target) {
+    const card=target?.closest?.('.game-card');
+    if(!card||!card.isConnected||card.matches('.recently-visited-placeholder,.store-item-unavailable,[data-missing="true"]'))return null;
+    if(!card.closest('#database-grid,#view-explore,#view-trending,#wishlist-grid,#ps3-local-grid,#ps3-favs-grid'))return null;
+    return card.querySelector('.game-img-container > img.game-img')?card:null;
   }
   function identity(card) {
-    const image = card.querySelector('.game-img-container > img.game-img');
-    if (!image) return null;
-    const platform = String(image.dataset.console || card.dataset.console || '').toLowerCase().replace(/[^a-z0-9]/g,'');
-    const system = platformIds[platform];
-    if (!system) return null;
-    const category = String(image.dataset.coverCategory || card.dataset.storeCategory || '').toLowerCase();
-    // Exclude unrelated DLC, themes and apps, not normal Library / Wishlist cards.
-    if (/^(?:dlcs?|updates?|avatars?|themes?|tools?|apps?|demos?|homebrew_games)$/.test(category)) return null;
-    const name = String(image.dataset.name || image.getAttribute('alt') || '').trim();
-    if (name.length < 3 || name.length > 140) return null;
-    return {key:`${system}:${name.toLowerCase()}`,name,system};
+    const img=card.querySelector('.game-img-container > img.game-img');
+    const platform=String(img.dataset.console||card.dataset.console||'').toLowerCase().replace(/[^a-z0-9]/g,'');
+    const category=String(img.dataset.coverCategory||card.dataset.storeCategory||'').toLowerCase();
+    if(!['games','prototypes','ports'].includes(category))return null;
+    const isPort=category==='ports';
+    const system=systems[platform] || (isPort?59:0);if(!system)return null;
+    const name=cleanName(img.dataset.name||img.getAttribute('alt')||'');
+    if(name.length<3||name.length>140)return null;
+    return {name,system,isPort,key:(isPort?'port':system)+':'+normalized(name)};
   }
-  function remember(key,data,ttlMs) {
-    cache.delete(key);
-    cache.set(key,{data,until:Date.now()+ttlMs});
-    while(cache.size>250) cache.delete(cache.keys().next().value);
+  function getResult(info) {
+    const entry=cache.get(info.key);if(entry&&entry.until>Date.now())return Promise.resolve(entry.value);
+    if(pending.has(info.key))return pending.get(info.key);
+    const promise=fetch(base()+'/api/gameplay-preview?name='+encodeURIComponent(info.name)+'&system='+info.system+(info.isPort?'&port=1':''))
+      .then(async response=>({ok:response.ok,data:await response.json()}))
+      .then(({ok,data})=>{
+        const until=Date.now()+(ok&&data?.found?10*60*1000:ok?2*60*1000:20000);
+        cache.set(info.key,{value:ok?data:null,until});while(cache.size>250)cache.delete(cache.keys().next().value);
+        return ok?data:null;
+      }).catch(()=>null).finally(()=>pending.delete(info.key));
+    pending.set(info.key,promise);return promise;
+  }
+  function validProxy(raw) {
+    try{const url=new URL(raw,base());return url.origin===new URL(base()).origin&&url.pathname==='/api/gameplay-video'&&url.searchParams.has('token')?url.href:'';}
+    catch(_){return '';}
   }
   function stop() {
-    if (!active) return;
-    const old = active;
-    active = null;
-    clearTimeout(old.timer);
-    if(old.controller) old.controller.abort();
-    if(old.video) {
-      old.video.pause();
-      old.video.removeAttribute('src');
-      old.video.load();
-      old.video.remove();
-    }
+    if(!active)return;
+    const old=active;active=null;clearTimeout(old.timer);clearTimeout(old.lookupTimer);
+    if(old.video){old.video.pause();old.video.removeAttribute('src');old.video.load();old.video.remove();}
   }
-  function validPublicVideo(raw) {
-    try {
-      const url = new URL(raw);
-      if (url.protocol === 'https:' && ['www.screenscraper.fr','screenscraper.fr'].includes(url.hostname) &&
-          /^\/medias\/(57|58|59|60|61|62)\/\d+\/video(?:-normalized)?\.mp4$/.test(url.pathname) && !url.search) return url.href;
-    } catch (_) {}
-    return '';
+  async function play(current,info) {
+    const data=await (current.lookup||getResult(info));
+    if(!data?.found||active!==current||!current.card.isConnected||!current.card.matches(':hover')||document.hidden)return;
+    const url=validProxy(data.fallbackUrl);
+    if(!url)return;
+    const parent=current.card.querySelector('.game-img-container');if(!parent)return;
+    const video=document.createElement('video');current.video=video;
+    video.className='psn-gameplay-preview-video';video.muted=true;video.defaultMuted=true;video.playsInline=true;
+    video.loop=true;video.preload='auto';video.setAttribute('aria-hidden','true');video.setAttribute('disablepictureinpicture','');
+    video.addEventListener('playing',()=>{if(active===current)video.classList.add('is-ready');});
+    video.addEventListener('error',()=>{failures.set(info.key,Date.now()+20000);if(active===current)stop();});
+    parent.appendChild(video);video.src=url;
+    video.play().catch(()=>{if(active===current&&!video.classList.contains('is-ready'))stop();});
   }
-  function fallbackVideo(raw) {
-    try {
-      const url = new URL(raw,baseServer());
-      return url.origin === new URL(baseServer()).origin && url.pathname === '/api/gameplay-video' && url.searchParams.has('token') ? url.href : '';
-    } catch (_) { return ''; }
-  }
-  async function start(current,info) {
-    if(active!==current || !current.card.isConnected || !current.card.matches(':hover') || document.hidden) return;
-    const failedUntil = failures.get(info.key) || 0;
-    if (Date.now() < failedUntil) return;
-    if (failedUntil) failures.delete(info.key);
-    let entry = cache.get(info.key);
-    if (entry && Date.now()>entry.until) { cache.delete(info.key); entry=null; }
-    let data = entry && entry.data;
-    if (!data) {
-      current.controller = new AbortController();
-      try {
-        const response = await fetch(`${baseServer()}/api/gameplay-preview?name=${encodeURIComponent(info.name)}&system=${info.system}`,{signal:current.controller.signal,cache:'no-store'});
-        data = await response.json();
-        if (!response.ok) {
-          note('api_error',{name:info.name,http:response.status,reason:data.reason || 'unknown',upstreamStatus:data.upstreamStatus || 0});
-          failures.set(info.key,Date.now()+20000);
-          if (failures.size > 250) failures.delete(failures.keys().next().value);
-          return;
-        }
-        if (!data || data.configured !== true) { note('not_configured',{name:info.name}); return; }
-        if (!data.found) {
-          note('no_video',{name:info.name,reason:data.reason || 'unknown'});
-          remember(info.key,data,3*60*1000);
-          return;
-        }
-        remember(info.key,data,12*60*1000); // Signed proxy URLs last only 15 min.
-      } catch(error) {
-        if (error && error.name !== 'AbortError') note('network_error',{name:info.name});
-        return;
-      }
-    }
-    if(active!==current || !current.card.isConnected || !current.card.matches(':hover') || document.hidden || !data.found) return;
-    const direct = validPublicVideo(data.url);
-    const fallback = fallbackVideo(data.fallbackUrl);
-    if (!direct && !fallback) { note('invalid_video_url',{name:info.name}); return; }
-    const parent = current.card.querySelector('.game-img-container');
-    if (!parent) return;
-    const video = document.createElement('video');
-    video.className = 'psn-gameplay-preview-video';
-    video.muted = true;
-    video.defaultMuted = true;
-    video.loop = true;
-    video.playsInline = true;
-    video.preload = 'metadata';
-    video.setAttribute('aria-hidden','true');
-    video.setAttribute('disablepictureinpicture','');
-    current.video = video;
-    let fallbackTried = false;
-    let isPlaying = false;
-    const switchToFallback = () => {
-      if (fallbackTried || !fallback || active!==current) return false;
-      fallbackTried = true;
-      isPlaying = false;
-      note('trying_fallback',{name:info.name});
-      video.classList.remove('is-ready');
-      video.src = fallback;
-      video.load();
-      video.play().catch(() => { if (active===current && !isPlaying) { note('fallback_play_rejected',{name:info.name}); stop(); } });
-      return true;
-    };
-    video.addEventListener('playing',() => {
-      if (active===current) { isPlaying = true; video.classList.add('is-ready'); note('playing',{name:info.name,via:fallbackTried?'fallback':'direct'}); }
-    });
-    video.addEventListener('error',() => {
-      if (switchToFallback()) return;
-      note('video_error',{name:info.name,via:fallbackTried?'fallback':'direct',mediaError:video.error&&video.error.code||0});
-      failures.set(info.key,Date.now()+30000);
-      if (failures.size > 250) failures.delete(failures.keys().next().value);
-      if(active===current) stop();
-    });
-    parent.appendChild(video);
-    // Use the authorized media endpoint first; the public static path may return HTTP 403.
-    video.src = fallback || direct;
-    fallbackTried = !!fallback;
-    try { await video.play(); }
-    catch(error) {
-      if (active===current && !isPlaying && !fallbackTried && !switchToFallback()) note('play_rejected',{name:info.name});
-    }
-  }
-  document.addEventListener('pointerover',event => {
-    const card = videoCardFrom(event.target);
-    if(!card || (active && active.card===card)) return;
-    stop();
-    const info = identity(card);
-    if(!info) return;
-    note('hover',{name:info.name,system:info.system});
-    const current = {card,timer:null,controller:null,video:null};
-    active = current;
-    current.timer = setTimeout(() => start(current,info),delayMs);
+  document.addEventListener('pointerover',event=>{
+    const card=cardFrom(event.target);if(!card||(active&&active.card===card))return;
+    stop();const info=identity(card);if(!info)return;
+    if((failures.get(info.key)||0)>Date.now())return;
+    const current={card,timer:null,lookupTimer:null,lookup:null,video:null};active=current;
+    // Keep the original 400 ms hover, while starting the metadata lookup slightly earlier.
+    current.lookupTimer=setTimeout(()=>{if(active===current)current.lookup=getResult(info);},250);
+    current.timer=setTimeout(()=>play(current,info),400);
   },{passive:true});
-  document.addEventListener('pointerout',event => {
-    if(!active || !active.card.contains(event.target)) return;
-    if(event.relatedTarget && active.card.contains(event.relatedTarget)) return;
-    stop();
+  document.addEventListener('pointerout',event=>{
+    if(active&&active.card.contains(event.target)&&(!event.relatedTarget||!active.card.contains(event.relatedTarget)))stop();
   },{passive:true});
-  document.addEventListener('visibilitychange',() => { if(document.hidden) stop(); });
+  document.addEventListener('visibilitychange',()=>{if(document.hidden)stop();});
   window.addEventListener('blur',stop);
   document.addEventListener('pointerdown',stop,{passive:true});
-  document.addEventListener('scroll',() => {
-    if(active && (!active.card.isConnected || !active.card.matches(':hover'))) stop();
-  },{passive:true,capture:true});
+  document.addEventListener('scroll',()=>{if(active&&(!active.card.isConnected||!active.card.matches(':hover')))stop();},{passive:true,capture:true});
 })();
 </script>
 
