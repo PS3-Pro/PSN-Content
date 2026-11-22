@@ -2117,12 +2117,108 @@ const ssPreviewValidMediaSystem = value => Number.isSafeInteger(value) && value 
 const SS_PREVIEW_POSITIVE_MS = 24 * 60 * 60 * 1000;
 const SS_PREVIEW_NEGATIVE_MS = 3 * 60 * 1000;
 const SS_PREVIEW_MAX_CACHE = 500;
-const SS_PREVIEW_MINUTE_MAX = Math.max(1, Math.min(30, Number(process.env.SCREENSCRAPER_PREVIEW_MINUTE_MAX) || 10));
-const SS_PREVIEW_DAILY_MAX = Math.max(10, Math.min(20000, Number(process.env.SCREENSCRAPER_PREVIEW_DAILY_MAX) || 500));
-let ssPreviewMinuteWindow = Date.now();
-let ssPreviewDailyWindow = Date.now();
+// These are cautious fallback limits, NOT a claim about the ScreenScraper account.
+// When ScreenScraper reports its member quota, the reported limits take priority.
+const SS_PREVIEW_FALLBACK_MINUTE_MAX = Math.max(1, Math.min(120, Number(process.env.SCREENSCRAPER_PREVIEW_MINUTE_MAX) || 10));
+const SS_PREVIEW_FALLBACK_DAILY_MAX = Math.max(10, Math.min(200000, Number(process.env.SCREENSCRAPER_PREVIEW_DAILY_MAX) || 500));
+const ssPreviewMinuteTimes = [];
 let ssPreviewMinuteUsed = 0;
 let ssPreviewDailyUsed = 0;
+let ssPreviewDailyDate = '';
+const ssPreviewQuota = { minuteMax:SS_PREVIEW_FALLBACK_MINUTE_MAX,
+  dayMax:SS_PREVIEW_FALLBACK_DAILY_MAX, source:'fallback', reportedToday:null,
+  reportedAtLocalUsed:0, checkedAt:0, nextCheck:0, blockedUntil:0 };
+let ssPreviewQuotaPending = null;
+function ssPreviewParisDay() {
+  return new Intl.DateTimeFormat('en-CA', {timeZone:'Europe/Paris', year:'numeric', month:'2-digit', day:'2-digit'}).format(new Date());
+}
+function ssPreviewQuotaRoll() {
+  const now = Date.now();
+  while (ssPreviewMinuteTimes.length && now - ssPreviewMinuteTimes[0] >= 60000) ssPreviewMinuteTimes.shift();
+  ssPreviewMinuteUsed = ssPreviewMinuteTimes.length;
+  const day = ssPreviewParisDay();
+  if (ssPreviewDailyDate !== day) {
+    ssPreviewDailyDate=day; ssPreviewDailyUsed=0;
+    ssPreviewQuota.reportedToday=null; ssPreviewQuota.reportedAtLocalUsed=0;
+    ssPreviewQuota.nextCheck=0; ssPreviewQuota.source='fallback';
+    ssPreviewQuota.minuteMax=SS_PREVIEW_FALLBACK_MINUTE_MAX;
+    ssPreviewQuota.dayMax=SS_PREVIEW_FALLBACK_DAILY_MAX;
+    ssPreviewQuota.blockedUntil=0;
+  }
+}
+function ssPreviewQuotaInteger(value, maximum) {
+  if (value === null || value === undefined || value === '') return null;
+  const num=Number(value);
+  return Number.isSafeInteger(num) && num>=0 && num<=maximum ? num : null;
+}
+function ssPreviewQuotaFromResponse(data) {
+  const root=data && typeof data==='object' ? data : {};
+  const response=root.response && typeof root.response==='object' ? root.response : {};
+  for (const entry of [response.ssuser, response.ssusers?.ssuser, root.ssuser, root.ssusers?.ssuser]) {
+    const user=Array.isArray(entry) ? entry[0] : entry;
+    if (!user || typeof user!=='object') continue;
+    const perMin=ssPreviewQuotaInteger(user.maxrequestspermin ?? user.maxrequestsperdmin, 100000);
+    const perDay=ssPreviewQuotaInteger(user.maxrequestsperday, 1000000);
+    if (!perMin && !perDay) continue;
+    ssPreviewQuotaRoll();
+    if (perMin) ssPreviewQuota.minuteMax=perMin;
+    if (perDay) ssPreviewQuota.dayMax=perDay;
+    const used=ssPreviewQuotaInteger(user.requeststoday, 1000000);
+    if (used!==null) {
+      // The upstream count includes this very request, so do not count it twice.
+      ssPreviewQuota.reportedToday=used;
+      ssPreviewQuota.reportedAtLocalUsed=ssPreviewDailyUsed;
+    }
+    ssPreviewQuota.source='screenscraper';
+    ssPreviewQuota.checkedAt=Date.now();
+    return true;
+  }
+  return false;
+}
+function ssPreviewQuotaReserve() {
+  ssPreviewQuotaRoll();
+  const now=Date.now();
+  const providerUsed=ssPreviewQuota.reportedToday===null ? 0 :
+    ssPreviewQuota.reportedToday + Math.max(0,ssPreviewDailyUsed-ssPreviewQuota.reportedAtLocalUsed);
+  if (now < ssPreviewQuota.blockedUntil ||
+      ssPreviewMinuteUsed>=ssPreviewQuota.minuteMax ||
+      Math.max(providerUsed,ssPreviewDailyUsed)>=ssPreviewQuota.dayMax) {
+    const limited=new Error('ScreenScraper quota/rate limit reached.');
+    limited.status=429; limited.code='local_rate_limit';
+    throw limited;
+  }
+  ssPreviewMinuteTimes.push(now);
+  ssPreviewMinuteUsed = ssPreviewMinuteTimes.length;
+  ssPreviewDailyUsed++;
+}
+function ssPreviewQuotaNoteRate(status) {
+  // Respect the provider's actual throttling even if counters are delayed.
+  if (status===429) ssPreviewQuota.blockedUntil=Math.max(ssPreviewQuota.blockedUntil,Date.now()+90000);
+  if (status===430) ssPreviewQuota.blockedUntil=Math.max(ssPreviewQuota.blockedUntil,Date.now()+86400000);
+}
+async function ssPreviewMaybeRefreshQuota() {
+  // ssuserInfos needs member credentials, separate from developer credentials.
+  // Without them, learn the quota from the ssuser data on regular search replies.
+  if (!SS_PREVIEW_USER || !SS_PREVIEW_PASSWORD) return;
+  ssPreviewQuotaRoll();
+  if (Date.now()<ssPreviewQuota.nextCheck) return;
+  if (ssPreviewQuotaPending) return ssPreviewQuotaPending;
+  ssPreviewQuota.nextCheck=Date.now()+20*60*1000;
+  ssPreviewQuotaPending=(async()=>{
+    ssPreviewQuotaReserve();
+    const url=new URL('https://api.screenscraper.fr/api2/ssuserInfos.php');
+    url.searchParams.set('devid',SS_PREVIEW_DEVID);
+    url.searchParams.set('devpassword',SS_PREVIEW_DEVPASSWORD);
+    url.searchParams.set('softname','PSN-Content');
+    url.searchParams.set('output','json');
+    url.searchParams.set('ssid',SS_PREVIEW_USER);
+    url.searchParams.set('sspassword',SS_PREVIEW_PASSWORD);
+    const response=await requestMetadataJson(url,{timeoutMs:6000,headers:{'User-Agent':'PSN-Content/1.0 ScreenScraper-Preview'}});
+    if (!response.ok) {ssPreviewQuotaNoteRate(Number(response.status));return;}
+    ssPreviewQuotaFromResponse(response.data);
+  })().catch(()=>{}).finally(()=>{ssPreviewQuotaPending=null;});
+  return ssPreviewQuotaPending;
+}
 const ssPreviewCache = new Map();
 const ssPreviewInflight = new Map();
 let ssPreviewQueueTail = Promise.resolve();
@@ -2355,7 +2451,7 @@ function ssPreviewSearchReason(response) {
   const status = Number(response && response.status || 0);
   const text = String(response && response.text || '').slice(0,1500).toLowerCase();
   if (status === 401 || status === 403 || /invalid.*(devid|devpassword)|authentification|identifiant incorrect/.test(text)) return 'api_auth';
-  if (status === 429 || /too many|quota|maximum.*request|limite.*requ/.test(text)) return 'api_rate_limit';
+  if (status === 429 || status === 430 || /too many|quota|maximum.*request|limite.*requ/.test(text)) return 'api_rate_limit';
   if (status === 503 || status === 502 || status === 504) return 'api_unavailable';
   return 'api_unavailable';
 }
@@ -2377,9 +2473,10 @@ function ssPreviewSetCached(key, payload) {
 
 // Postgres saves the stable game/video identity, not the expiring signed playback URL.
 // ScreenScraper results survive Render restarts; one normalized key serves regional IDs.
-const SS_PREVIEW_DB_DAYS = 30;
+// A confirmed match has stable ScreenScraper game/media IDs, so preserve it across deploys.
+// Only misses and matches without video expire quickly, allowing new media to appear.
 const SS_PREVIEW_DB_NO_VIDEO_DAYS = 1;
-const SS_PREVIEW_DB_MAX_ROWS = 4000;
+const SS_PREVIEW_DB_MAX_ROWS = 12000;
 let ssPreviewDbPruneAfter = 0;
 async function ssPreviewLoadDatabase(key, systemId) {
   try {
@@ -2390,6 +2487,12 @@ async function ssPreviewLoadDatabase(key, systemId) {
       LIMIT 1`, [key, systemId])).rows[0];
     if (!row) return null;
     const gameId = Number(row.game_id);
+    // Negative lookups are cached for a day, not permanently.
+    if (gameId === 0 && row.extras?.negative === true) {
+      const payload = {found:false,provider:'screenscraper',reason:row.extras.reason || 'no_match'};
+      ssPreviewSetCached(key,payload);
+      return payload;
+    }
     // For Ports the lookup key uses system 0, but the saved media keeps the
     // actual original platform returned by ScreenScraper.
     const extras = row.extras && typeof row.extras === 'object' ? row.extras : null;
@@ -2414,24 +2517,29 @@ async function ssPreviewLoadDatabase(key, systemId) {
   }
 }
 function ssPreviewPersistDatabase(key, systemId, result) {
-  if (!result || (!result.video && !result.extras)) return;
+  if (!result) return;
   const video = result.video || null;
-  const gameId = Number(video?.gameId || result.extras?.gameId);
-  if (!Number.isSafeInteger(gameId) || gameId <= 0) return;
+  const isNegative = !video && !result.extras;
+  const gameId = isNegative ? 0 : Number(video?.gameId || result.extras?.gameId);
+  if (!Number.isSafeInteger(gameId) || gameId < 0) return;
   const type = video?.type || '';
   if (type && !['video', 'video-normalized'].includes(type)) return;
   const host = video && ssPreviewAllowedMediaHost(video.apiHost)
     ? video.apiHost : 'api.screenscraper.fr';
-  // Nonblocking: the first hover does not wait for a database write.
+  const metadata = isNegative ? {negative:true,reason:result.reason || 'no_match'} : result.extras;
+  // Store identifiers and supplemental metadata, never the actual MP4/image or signed URL.
+  // Confirmed videos stay cached until explicitly invalidated (or LRU capacity is reached).
+  // No-video/miss results are refreshed next day.
   pool.query(`
     INSERT INTO screenscraper_game_cache
       (cache_key, system_id, game_id, media_type, api_host, extras, refreshed_at, expires_at)
-    VALUES ($1, $2, $3, $4, $5, $6::jsonb, NOW(), NOW() + ($7::int * INTERVAL '1 day'))
+    VALUES ($1, $2, $3, $4, $5, $6::jsonb, NOW(),
+      CASE WHEN $7::boolean THEN 'infinity'::timestamptz ELSE NOW() + ($8::int * INTERVAL '1 day') END)
     ON CONFLICT (cache_key) DO UPDATE SET
       system_id=EXCLUDED.system_id, game_id=EXCLUDED.game_id,
       media_type=EXCLUDED.media_type, api_host=EXCLUDED.api_host,
       extras=EXCLUDED.extras, refreshed_at=NOW(), expires_at=EXCLUDED.expires_at`,
-    [key, systemId, gameId, type, host, JSON.stringify(result.extras || null), video ? SS_PREVIEW_DB_DAYS : SS_PREVIEW_DB_NO_VIDEO_DAYS]
+    [key, systemId, gameId, type, host, JSON.stringify(metadata || null), !!video, SS_PREVIEW_DB_NO_VIDEO_DAYS]
   ).then(() => {
     const now = Date.now();
     if (now < ssPreviewDbPruneAfter) return;
@@ -2439,7 +2547,8 @@ function ssPreviewPersistDatabase(key, systemId, result) {
     // Bounded to avoid another Aiven full-disk incident; at most once per 6 hours.
     pool.query(`DELETE FROM screenscraper_game_cache WHERE expires_at <= NOW()`).then(() =>
       pool.query(`DELETE FROM screenscraper_game_cache WHERE cache_key IN
-        (SELECT cache_key FROM screenscraper_game_cache ORDER BY refreshed_at DESC
+        (SELECT cache_key FROM screenscraper_game_cache
+         ORDER BY CASE WHEN media_type <> '' THEN 0 ELSE 1 END, refreshed_at DESC
          OFFSET $1)`, [SS_PREVIEW_DB_MAX_ROWS])
     ).catch(() => {});
   }).catch(() => {});
@@ -2463,17 +2572,10 @@ function ssPreviewFetchUpstream(name, systemId, key) {
       // Charge each upstream attempt against the existing limits and spacing.
       const pause = ssPreviewNextRequestAt - Date.now();
       if (pause > 0) await waitMs(pause);
+      await ssPreviewMaybeRefreshQuota();
+      ssPreviewQuotaReserve();
       const now = Date.now();
-      if (now - ssPreviewMinuteWindow >= 60000) { ssPreviewMinuteWindow = now; ssPreviewMinuteUsed = 0; }
-      if (now - ssPreviewDailyWindow >= 86400000) { ssPreviewDailyWindow = now; ssPreviewDailyUsed = 0; }
-      if (ssPreviewMinuteUsed >= SS_PREVIEW_MINUTE_MAX || ssPreviewDailyUsed >= SS_PREVIEW_DAILY_MAX) {
-        const limited = new Error('ScreenScraper preview quota reached.');
-        limited.status = 429;
-        limited.code = 'local_rate_limit';
-        throw limited;
-      }
-      ssPreviewMinuteUsed++;
-      ssPreviewDailyUsed++;
+      // Keep the original fast spacing; the shared quota gate enforces the actual minute allowance.
       ssPreviewNextRequestAt = now + 1600;
       const url = new URL('https://api.screenscraper.fr/api2/jeuRecherche.php');
       url.searchParams.set('devid', SS_PREVIEW_DEVID);
@@ -2488,9 +2590,11 @@ function ssPreviewFetchUpstream(name, systemId, key) {
         url.searchParams.set('sspassword', SS_PREVIEW_PASSWORD);
       }
       const response = await requestMetadataJson(url, { timeoutMs:9000, headers:{ 'User-Agent':'PSN-Content/1.0 ScreenScraper-Preview' } });
+      ssPreviewQuotaNoteRate(Number(response.status));
+      if (response.ok) ssPreviewQuotaFromResponse(response.data);
       if (!response.ok || !response.data || typeof response.data !== 'object') {
         const error = new Error('ScreenScraper search unavailable.');
-        error.status = Number(response.status) === 429 ? 429 : 502;
+        error.status = [429,430].includes(Number(response.status)) ? 429 : 502;
         error.code = ssPreviewSearchReason(response);
         error.upstreamStatus = Number(response.status) || 0;
         throw error;
@@ -2616,8 +2720,9 @@ async function ssVideoRequest(raw, signal, redirects = 0) {
     return ssVideoRequest(destination.href, signal, redirects + 1);
   }
   if (status !== 200) {
+    ssPreviewQuotaNoteRate(status);
     response.destroy();
-    throw ssVideoHttpError(status === 429 ? 429 : status === 404 ? 404 : 502, 'upstream_http', status);
+    throw ssVideoHttpError(status === 429 || status === 430 ? 429 : status === 404 ? 404 : 502, 'upstream_http', status);
   }
   const contentType = String(response.headers['content-type'] || '').toLowerCase();
   const declared = Number(response.headers['content-length'] || 0);
@@ -2665,6 +2770,8 @@ async function ssVideoDownload(video, key) {
     await ssVideoFs.promises.mkdir(ssVideoDir, {recursive:true, mode:0o700});
     // Random suffix prevents different downloads from sharing a temporary file.
     file = ssVideoPath.join(ssVideoDir, crypto.randomBytes(12).toString('hex') + '.part');
+    await ssPreviewMaybeRefreshQuota();
+    ssPreviewQuotaReserve();
     const response = await ssVideoRequest(upstreamUrl.href, controller.signal);
     let size = 0;
     let signature = Buffer.alloc(0);
@@ -2723,6 +2830,16 @@ async function ssVideoGetOrDownload(video) {
   const work = ssVideoQueueTail.then(() => ssVideoDownload(video, key));
   ssVideoQueueTail = work.catch(() => {});
   const pending = work.catch(error => {
+    if ([404,410].includes(Number(error && error.upstreamStatus))) {
+      // A confirmed missing media is grounds to revalidate the saved provider ID
+      // on the next lookup. Never invalidate because of throttling or a timeout.
+      for (const [cacheKey, entry] of ssPreviewCache) {
+        if (entry?.payload?.video?.gameId === video.g && entry.payload.video.system === video.s)
+          ssPreviewCache.delete(cacheKey);
+      }
+      pool.query('DELETE FROM screenscraper_game_cache WHERE game_id=$1 AND (system_id=$2 OR system_id=0)',
+        [video.g,video.s]).catch(()=>{});
+    }
     ssVideoFailures.set(key, {error, until:Date.now() + (error.upstreamStatus === 429 ? 120000 :
       [401,403].includes(error.upstreamStatus) ? 300000 : 30000)});
     throw error;
@@ -2887,6 +3004,8 @@ async function ssExtraFetchImage(data) {
   const controller=new AbortController();
   const timer=setTimeout(()=>controller.abort(),18000);
   try {
+    await ssPreviewMaybeRefreshQuota();
+    ssPreviewQuotaReserve();
     const response=await ssVideoRequestImage(url.href,controller.signal);
     const chunks=[]; let size=0;
     for await (const chunk of response) {
@@ -2914,7 +3033,7 @@ async function ssVideoRequestImage(raw,signal,redirects=0,maxBytes=4*1024*1024) 
     const next=new URL(response.headers.location,url).href;
     ssVideoValidateUrl(next);response.resume();return ssVideoRequestImage(next,signal,redirects+1,maxBytes);
   }
-  if (status!==200) {response.destroy();throw new Error('image_upstream_'+status);}
+  if (status!==200) {ssPreviewQuotaNoteRate(status);response.destroy();throw new Error('image_upstream_'+status);}
   if (Number(response.headers['content-length']||0)>maxBytes) {response.destroy();throw new Error('image_too_large');}
   return response;
 }
@@ -2931,6 +3050,8 @@ app.get('/api/screenscraper-manual',async(req,res)=>{
   if(SS_PREVIEW_USER && SS_PREVIEW_PASSWORD){url.searchParams.set('ssid',SS_PREVIEW_USER);url.searchParams.set('sspassword',SS_PREVIEW_PASSWORD);}
   const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),18000);
   try {
+    await ssPreviewMaybeRefreshQuota();
+    ssPreviewQuotaReserve();
     const upstream=await ssVideoRequestImage(url.href,controller.signal,0,9*1024*1024);
     let size=0;const parts=[];
     for await(const chunk of upstream){size+=chunk.length;if(size>9*1024*1024){upstream.destroy();throw Error('pdf_too_large');}parts.push(chunk);}
@@ -2971,7 +3092,7 @@ app.get('/api/screenscraper-image',async(req,res)=>{
         ssExtraImageCache.set(key,{...cached,until:Date.now()+15*60*1000});
         ssExtraImageBytes+=cached.body.length;
       }
-    } catch (_) {return res.status(404).end();}
+    } catch (error) {return res.status(error && error.code==='local_rate_limit'?429:404).end();}
   }
   res.setHeader('Cache-Control','private,max-age=900');
   res.setHeader('Content-Type',cached.type);
@@ -3913,6 +4034,10 @@ async function initDb() {
       refreshed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       expires_at TIMESTAMPTZ NOT NULL
     );
+    -- Preserve previously cached, confirmed video matches on upgrade, too.
+    UPDATE screenscraper_game_cache SET expires_at='infinity'::timestamptz
+      WHERE media_type IN ('video','video-normalized')
+        AND expires_at <> 'infinity'::timestamptz;
     CREATE TABLE IF NOT EXISTS content_metadata_suggestions (
       id BIGSERIAL PRIMARY KEY,
       metadata_key TEXT NOT NULL,
