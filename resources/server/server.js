@@ -469,7 +469,7 @@ const CHAT_SYNC_INTERVAL_MS = 3000;
 const KEEP_ALIVE_INTERVAL_MS = Math.max(60000, parseInt(process.env.KEEP_ALIVE_INTERVAL_MS || "600000", 10) || 600000);
 const KEEP_ALIVE_TIMEOUT_MS = Math.max(1000, parseInt(process.env.KEEP_ALIVE_TIMEOUT_MS || "10000", 10) || 10000);
 const KEEP_ALIVE_URLS = [
-  "https://psn-content-s2k2.onrender.com",
+  "https://psn-content-fd6j.onrender.com",
 ];
 const PROFILE_SYNC_INTERVAL_MS = Math.max(10000, parseInt(process.env.PROFILE_SYNC_INTERVAL_MS || "15000", 10) || 15000);
 const ENABLE_PROFILE_PERIODIC_SYNC = process.env.ENABLE_PROFILE_PERIODIC_SYNC === "1";
@@ -2099,8 +2099,8 @@ app.get('/api/metadata/live', async (req, res) => {
 });
 
 // ScreenScraper hover previews: developer credentials never reach the browser.
-const SS_PREVIEW_DEVID = String(process.env.SCREENSCRAPER_DEV_ID || '').trim();
-const SS_PREVIEW_DEVPASSWORD = String(process.env.SCREENSCRAPER_DEV_PASSWORD || '').trim();
+const SS_PREVIEW_DEVID = String(process.env.SCREENSCRAPER_DEV_ID || 'LuanTeles').trim();
+const SS_PREVIEW_DEVPASSWORD = String(process.env.SCREENSCRAPER_DEV_PASSWORD || '69bjUwTdqXA').trim();
 const SS_PREVIEW_USER = String(process.env.SCREENSCRAPER_USER || '').trim();
 const SS_PREVIEW_PASSWORD = String(process.env.SCREENSCRAPER_PASSWORD || '').trim();
 const SS_PREVIEW_ENABLED = process.env.SCREENSCRAPER_PREVIEWS_ENABLED !== '0' && !!SS_PREVIEW_DEVID && !!SS_PREVIEW_DEVPASSWORD;
