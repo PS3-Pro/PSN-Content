@@ -941,7 +941,7 @@ html.ios-webkit #object-particles { contain:strict; }
 .game-img-container > .psn-gameplay-preview-video.is-ready { opacity:1; }
 /* ScreenScraper fanart is a background-only supplement; no extra modal controls. */
 #game-modal .sys-modal-content.psn-ss-fanart { isolation:isolate; position:relative; }
-#game-modal .sys-modal-content.psn-ss-fanart::before { content:""; position:absolute; inset:0; z-index:0; pointer-events:none; background-image:linear-gradient(to bottom,rgba(7,12,22,.38),rgba(7,12,22,.54)),var(--psn-ss-modal-bg); background-position:center; background-size:cover; background-repeat:no-repeat; opacity:1; -webkit-mask-image:linear-gradient(to bottom,#000 0,#000 var(--psn-ss-fade-start,64%),transparent var(--psn-ss-fade-end,82%)); mask-image:linear-gradient(to bottom,#000 0,#000 var(--psn-ss-fade-start,64%),transparent var(--psn-ss-fade-end,82%)); }
+#game-modal .sys-modal-content.psn-ss-fanart::before { content:""; position:absolute; inset:0; z-index:0; pointer-events:none; background-image:linear-gradient(to bottom,rgba(7,12,22,.38),rgba(7,12,22,.54)),var(--psn-ss-modal-bg); background-position:center; background-size:cover; background-repeat:no-repeat; opacity:1; -webkit-mask-image:linear-gradient(to bottom,#000 0,#000 var(--psn-ss-fade-start,66%),transparent var(--psn-ss-fade-end,88%)); mask-image:linear-gradient(to bottom,#000 0,#000 var(--psn-ss-fade-start,66%),transparent var(--psn-ss-fade-end,88%)); }
 #game-modal .sys-modal-content.psn-ss-fanart > .sys-modal-header,
 #game-modal .sys-modal-content.psn-ss-fanart > .sys-modal-body { position:relative; z-index:1; }
 
@@ -120524,32 +120524,11 @@ function getVisibleChatStackEl(id) {
   window.__psnStopFanartFade = stopFanartFade;
   function followSummaryFade(root,content,generation) {
     stopFanartFade(root);
-    const summary=root.querySelector('#modal-summary');
-    const state={frame:0,observer:null,queue:null};
-    const update=()=>{
-      state.frame=0;
-      if(!root.classList.contains('show')||root.__psnFanartGeneration!==generation)return;
-      const contentBox=content.getBoundingClientRect();
-      const summaryBox=summary?.getBoundingClientRect();
-      if(!contentBox.height)return;
-      // Keep the first-open coverage on every reopen, even if summary measurement
-      // runs before the modal's staged entrance animation has settled.
-      const summaryEnd=summaryBox && summaryBox.height>20
-        ? summaryBox.bottom-contentBox.top+16 : 0;
-      const start=Math.min(contentBox.height-12,Math.max(contentBox.height*.64,summaryEnd));
-      const end=Math.min(contentBox.height+1,start+Math.max(118,Math.min(162,contentBox.height*.18)));
-      content.style.setProperty('--psn-ss-fade-start',Math.round(start)+'px');
-      content.style.setProperty('--psn-ss-fade-end',Math.round(end)+'px');
-    };
-    state.queue=()=>{if(!state.frame)state.frame=requestAnimationFrame(update);};
-    if(typeof ResizeObserver!=='undefined'){
-      state.observer=new ResizeObserver(state.queue);
-      [content,summary,root.querySelector('#modal-extra-meta'),root.querySelector('#modal-badges'),root.querySelector('.sys-modal-header')]
-        .filter(Boolean).forEach(element=>state.observer.observe(element));
-    }
-    window.addEventListener('resize',state.queue,{passive:true});
-    root.__psnSsFadeState=state;
-    state.queue();
+    if(!root.classList.contains('show') || root.__psnFanartGeneration!==generation)return;
+    // The backdrop uses fixed percentage stops: opening transitions, summary
+    // hydration and reopens must never resize its coverage.
+    content.style.setProperty('--psn-ss-fade-start','66%');
+    content.style.setProperty('--psn-ss-fade-end','88%');
   }
   window.__psnGetScraperSummary = async function(name, consoleTag) {
     const platform = String(consoleTag || '').toLowerCase().replace(/[^a-z0-9]/g,'');
@@ -120700,6 +120679,26 @@ function getVisibleChatStackEl(id) {
   if (!window.matchMedia || !matchMedia('(hover: hover) and (pointer: fine)').matches || matchMedia('(prefers-reduced-motion: reduce)').matches) return;
   const systems = {ps3:59,ps2:58,ps1:57,psx:57,psp:61,psv:62,psvita:62,vita:62,ps4:60};
   const cache = new Map(), pending = new Map(), failures = new Map();
+  const sessionPrefix='psn-ss-gameplay-v2:';
+  function sessionResult(info,clear=false) {
+    try {
+      const key=sessionPrefix+info.key;
+      if(clear){sessionStorage.removeItem(key);return null;}
+      const saved=JSON.parse(sessionStorage.getItem(key)||'null');
+      if(saved?.expires>Date.now() && saved?.base===base() && saved.data?.found &&
+          validProxy(saved.data.fallbackUrl))return saved.data;
+      if(saved)sessionStorage.removeItem(key);
+    }catch(_){}
+    return null;
+  }
+  function saveSessionResult(info,data) {
+    if(!data?.found||!validProxy(data.fallbackUrl))return;
+    try {
+      sessionStorage.setItem(sessionPrefix+info.key,JSON.stringify({
+        expires:Date.now()+30*60*1000,base:base(),data:{found:true,fallbackUrl:data.fallbackUrl}
+      }));
+    }catch(_){}
+  }
   const base = () => String(typeof getMetadataServerBaseCompat === 'function' ? getMetadataServerBaseCompat() : 'https://psn-content-fd6j.onrender.com').replace(/\/+$/,'');
   const cleanName = value => String(value||'').replace(/[™®©]/g,' ').replace(/\b(?:tm|registered)\b/gi,' ').replace(/\s*[[(](?:usa|eur|europe|japan|jpn|ps3|ps2|psp|ps1|ps4)[)\]]/gi,'').replace(/\b(?:digital version)\b/gi,'').trim();
   const normalized = value => cleanName(value).normalize('NFKD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/&/g,' and ').replace(/\b(?:the|a|an)\b/g,' ').replace(/[^a-z0-9]+/g,' ').trim();
@@ -120722,14 +120721,15 @@ function getVisibleChatStackEl(id) {
     return {name,system,isPort,key:(isPort?'port':system)+':'+normalized(name)};
   }
   function getResult(info,renew=false) {
-    if(renew)cache.delete(info.key);
+    if(renew){cache.delete(info.key);sessionResult(info,true);}
     const entry=cache.get(info.key);if(entry&&entry.until>Date.now())return Promise.resolve(entry.value);
+    if(!renew){const saved=sessionResult(info);if(saved)return Promise.resolve(saved);}
     if(pending.has(info.key))return pending.get(info.key);
     const promise=fetch(base()+'/api/gameplay-preview?name='+encodeURIComponent(info.name)+'&system='+info.system+(info.isPort?'&port=1':''),{cache:'no-store'})
       .then(async response=>({ok:response.ok,data:await response.json()}))
       .then(({ok,data})=>{
         // Cache real matches and misses, never persist temporary HTTP errors.
-        if(ok){cache.delete(info.key);cache.set(info.key,{value:data,until:Date.now()+(data?.found?10*60*1000:2*60*1000)});while(cache.size>250)cache.delete(cache.keys().next().value);}
+        if(ok){cache.delete(info.key);cache.set(info.key,{value:data,until:Date.now()+(data?.found?10*60*1000:2*60*1000)});while(cache.size>250)cache.delete(cache.keys().next().value);saveSessionResult(info,data);}
         return ok?data:null;
       }).catch(()=>null).finally(()=>pending.delete(info.key));
     pending.set(info.key,promise);return promise;
