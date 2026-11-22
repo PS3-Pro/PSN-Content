@@ -120583,23 +120583,73 @@ function getVisibleChatStackEl(id) {
     try{const url=new URL(raw,base());return url.origin===new URL(base()).origin&&url.pathname==='/api/gameplay-video'&&url.searchParams.has('token')?url.href:'';}
     catch(_){return '';}
   }
+  // Reuse buffered videos; evict detached cards and bound memory use.
+  const modalVideos = new WeakMap();
+  const cardVideos = new Map();
+  function dispose(video) {
+    if(!video)return;
+    video.pause();video.removeAttribute('src');video.load();video.remove();
+  }
+  function rememberCardVideo(parent,video) {
+    for(const [node,old] of cardVideos) {
+      if(node.isConnected&&old.isConnected)continue;
+      cardVideos.delete(node);if(old!==active?.video)dispose(old);
+    }
+    cardVideos.delete(parent);cardVideos.set(parent,video);
+    while(cardVideos.size>12) {
+      const [node,old]=cardVideos.entries().next().value;
+      cardVideos.delete(node);
+      if(old!==active?.video)dispose(old);
+    }
+  }
   function stop() {
     if(!active)return;
-    const old=active;active=null;clearTimeout(old.timer);clearTimeout(old.lookupTimer);
-    if(old.video){old.video.pause();old.video.removeAttribute('src');old.video.load();old.video.remove();}
+    const old=active;active=null;
+    clearTimeout(old.timer);clearTimeout(old.lookupTimer);
+    if(old.video){old.video.pause();old.video.classList.remove('is-ready');}
+  }
+  function reuseVideo(current,info,parent) {
+    const video=current.modal?modalVideos.get(parent):cardVideos.get(parent);
+    if(!video||!video.isConnected||video.dataset.previewKey!==info.key)return false;
+    // The token may expire on the server; do not reuse a stale URL indefinitely.
+    if(Date.now()-Number(video.dataset.preparedAt||0)>120000)return false;
+    if(video.readyState<2)return false;
+    current.video=video;
+    if(!current.modal)rememberCardVideo(parent,video);
+    video.classList.add('is-ready');
+    video.play().catch(()=>{if(active===current)stop();});
+    return true;
   }
   async function play(current,info) {
+    const parent=current.modal?current.card:current.card.querySelector('.game-img-container');
+    if(!parent)return;
+    if(reuseVideo(current,info,parent))return;
     const data=await (current.lookup||getResult(info));
     if(!data?.found||active!==current||!current.card.isConnected||!current.card.matches(':hover')||document.hidden)return;
-    const url=validProxy(data.fallbackUrl);
-    if(!url)return;
-    const parent=current.modal?current.card:current.card.querySelector('.game-img-container');if(!parent)return;
-    const video=document.createElement('video');current.video=video;
-    video.className='psn-gameplay-preview-video';video.muted=true;video.defaultMuted=true;video.playsInline=true;
-    video.loop=true;video.preload='auto';video.setAttribute('aria-hidden','true');video.setAttribute('disablepictureinpicture','');
-    video.addEventListener('playing',()=>{if(active===current)video.classList.add('is-ready');});
-    video.addEventListener('error',()=>{failures.set(info.key,Date.now()+20000);if(active===current)stop();});
-    parent.appendChild(video);video.src=url;
+    const url=validProxy(data.fallbackUrl);if(!url)return;
+    let video=current.modal?modalVideos.get(parent):cardVideos.get(parent);
+    if(video&&(video.dataset.previewUrl!==url||video.dataset.previewKey!==info.key||Date.now()-Number(video.dataset.preparedAt||0)>120000)) {
+      if(current.modal)modalVideos.delete(parent);else cardVideos.delete(parent);
+      dispose(video);video=null;
+    }
+    if(!video) {
+      video=document.createElement('video');
+      video.className='psn-gameplay-preview-video';video.muted=true;video.defaultMuted=true;video.playsInline=true;
+      video.loop=true;video.preload='auto';video.setAttribute('aria-hidden','true');video.setAttribute('disablepictureinpicture','');
+      video.dataset.previewUrl=url;video.dataset.previewKey=info.key;video.dataset.preparedAt=String(Date.now());
+      video.addEventListener('playing',()=>{if(active?.video===video)video.classList.add('is-ready');});
+      video.addEventListener('error',()=>{
+        failures.set(info.key,Date.now()+20000);
+        if(current.modal){if(modalVideos.get(parent)===video)modalVideos.delete(parent);}
+        else if(cardVideos.get(parent)===video)cardVideos.delete(parent);
+        if(active?.video===video)stop();dispose(video);
+      });
+      parent.appendChild(video);video.src=url;
+      if(current.modal)modalVideos.set(parent,video);else rememberCardVideo(parent,video);
+    }
+    current.video=video;
+    if(!current.modal)rememberCardVideo(parent,video);
+    if(video.readyState>=2)video.classList.add('is-ready');
     video.play().catch(()=>{if(active===current&&!video.classList.contains('is-ready'))stop();});
   }
   document.addEventListener('pointerover',event=>{
@@ -120608,9 +120658,13 @@ function getVisibleChatStackEl(id) {
     stop();const info=modal?modalIdentity(modal):identity(card);if(!info)return;
     if((failures.get(info.key)||0)>Date.now())return;
     const current={card,modal:!!modal,timer:null,lookupTimer:null,lookup:null,video:null};active=current;
-    // Keep the original 400 ms hover, while starting the metadata lookup slightly earlier.
-    current.lookupTimer=setTimeout(()=>{if(active===current)current.lookup=getResult(info);},250);
-    current.timer=setTimeout(()=>play(current,info),400);
+    const parent=modal?card:card.querySelector('.game-img-container');
+    if(parent&&reuseVideo(current,info,parent))return;
+    if(modal)play(current,info);
+    else {
+      current.lookupTimer=setTimeout(()=>{if(active===current)current.lookup=getResult(info);},250);
+      current.timer=setTimeout(()=>play(current,info),400);
+    }
   },{passive:true});
   document.addEventListener('pointerout',event=>{
     if(active&&active.card.contains(event.target)&&(!event.relatedTarget||!active.card.contains(event.relatedTarget)))stop();
