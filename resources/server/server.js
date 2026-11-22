@@ -2122,6 +2122,8 @@ const SS_PREVIEW_MAX_CACHE = 500;
 const SS_PREVIEW_FALLBACK_MINUTE_MAX = Math.max(1, Math.min(120, Number(process.env.SCREENSCRAPER_PREVIEW_MINUTE_MAX) || 10));
 const SS_PREVIEW_FALLBACK_DAILY_MAX = Math.max(10, Math.min(200000, Number(process.env.SCREENSCRAPER_PREVIEW_DAILY_MAX) || 500));
 const ssPreviewMinuteTimes = [];
+const ssPreviewSearchMinuteTimes = [];
+const ssPreviewBackgroundMinuteTimes = [];
 let ssPreviewMinuteUsed = 0;
 let ssPreviewDailyUsed = 0;
 let ssPreviewDailyDate = '';
@@ -2134,7 +2136,9 @@ function ssPreviewParisDay() {
 }
 function ssPreviewQuotaRoll() {
   const now = Date.now();
-  while (ssPreviewMinuteTimes.length && now - ssPreviewMinuteTimes[0] >= 60000) ssPreviewMinuteTimes.shift();
+  for (const bucket of [ssPreviewMinuteTimes,ssPreviewSearchMinuteTimes,ssPreviewBackgroundMinuteTimes]) {
+    while (bucket.length && now - bucket[0] >= 60000) bucket.shift();
+  }
   ssPreviewMinuteUsed = ssPreviewMinuteTimes.length;
   const day = ssPreviewParisDay();
   if (ssPreviewDailyDate !== day) {
@@ -2175,19 +2179,29 @@ function ssPreviewQuotaFromResponse(data) {
   }
   return false;
 }
-function ssPreviewQuotaReserve() {
+function ssPreviewQuotaReserve(kind='video') {
   ssPreviewQuotaRoll();
   const now=Date.now();
   const providerUsed=ssPreviewQuota.reportedToday===null ? 0 :
     ssPreviewQuota.reportedToday + Math.max(0,ssPreviewDailyUsed-ssPreviewQuota.reportedAtLocalUsed);
-  if (now < ssPreviewQuota.blockedUntil ||
+  // A burst of new covers/fanart/searches must not use every request slot
+  // before an already-known gameplay clip gets its HTTP Range request.
+  const maxSearch=Math.max(1,Math.floor(ssPreviewQuota.minuteMax*.4));
+  const maxBackground=Math.max(1,Math.floor(ssPreviewQuota.minuteMax*.7));
+  const noRoom=kind==='search' && ssPreviewSearchMinuteTimes.length>=maxSearch ||
+    kind!=='video' && ssPreviewBackgroundMinuteTimes.length>=maxBackground;
+  if (now < ssPreviewQuota.blockedUntil || noRoom ||
       ssPreviewMinuteUsed>=ssPreviewQuota.minuteMax ||
       Math.max(providerUsed,ssPreviewDailyUsed)>=ssPreviewQuota.dayMax) {
     const limited=new Error('ScreenScraper quota/rate limit reached.');
     limited.status=429; limited.code='local_rate_limit';
+    const minuteExpiry=ssPreviewMinuteTimes[0] ? ssPreviewMinuteTimes[0]+60000-now : 60000;
+    limited.retryAfter=Math.max(1,Math.ceil(Math.max(minuteExpiry,ssPreviewQuota.blockedUntil-now,1000)/1000));
     throw limited;
   }
   ssPreviewMinuteTimes.push(now);
+  if (kind==='search') ssPreviewSearchMinuteTimes.push(now);
+  if (kind!=='video') ssPreviewBackgroundMinuteTimes.push(now);
   ssPreviewMinuteUsed = ssPreviewMinuteTimes.length;
   ssPreviewDailyUsed++;
 }
@@ -2205,7 +2219,7 @@ async function ssPreviewMaybeRefreshQuota() {
   if (ssPreviewQuotaPending) return ssPreviewQuotaPending;
   ssPreviewQuota.nextCheck=Date.now()+20*60*1000;
   ssPreviewQuotaPending=(async()=>{
-    ssPreviewQuotaReserve();
+    ssPreviewQuotaReserve('search');
     const url=new URL('https://api.screenscraper.fr/api2/ssuserInfos.php');
     url.searchParams.set('devid',SS_PREVIEW_DEVID);
     url.searchParams.set('devpassword',SS_PREVIEW_DEVPASSWORD);
@@ -2336,9 +2350,18 @@ const { Transform: SsVideoTransform } = require('node:stream');
 const { isIP: ssIsIP } = require('node:net');
 const SS_PREVIEW_VIDEO_MAX_BYTES = 32 * 1024 * 1024;
 const SS_PREVIEW_VIDEO_EGRESS_DAILY_MAX_BYTES = 768 * 1024 * 1024;
-const SS_PREVIEW_VIDEO_IP_WINDOW_BYTES = 96 * 1024 * 1024;
+const SS_PREVIEW_VIDEO_IP_WINDOW_BYTES = 192 * 1024 * 1024;
 const ssVideoFailures = new Map();
 const ssVideoClients = new Map();
+const ssVideoLimitLoggedAt = new Map();
+function ssVideoLogLimit(reason) {
+  const now=Date.now();
+  if(now-(ssVideoLimitLoggedAt.get(reason)||0)<30000)return;
+  ssVideoLimitLoggedAt.set(reason,now);
+  console.warn('[SCREENSCRAPER VIDEO]',reason,'active='+ssVideoActive,
+    'apiMinute='+ssPreviewMinuteUsed+'/'+ssPreviewQuota.minuteMax,
+    'egressMiB='+Math.round(ssVideoDailyEgress/1048576));
+}
 let ssVideoActive = 0;
 let ssVideoDayStart = Date.now();
 let ssVideoDailyEgress = 0;
@@ -2376,7 +2399,9 @@ let ssExtraImageBytes = 0;
 const SS_EXTRA_IMAGE_LIMIT = 16 * 1024 * 1024;
 const SS_EXTRA_IMAGE_TTL_MS = 60 * 60 * 1000;
 function ssExtraImageToken(system, gameId, type, region) {
-  const raw = Buffer.from(JSON.stringify({s:system,g:gameId,t:type,r:region || '',e:Math.floor(Date.now()/1000)+3600})).toString('base64url');
+  // Stable within each hour so browser HTTP caching survives repeated metadata fetches.
+  const expires=(Math.floor(Date.now()/3600000)+2)*3600;
+  const raw = Buffer.from(JSON.stringify({s:system,g:gameId,t:type,r:region || '',e:expires})).toString('base64url');
   return raw + '.' + crypto.createHmac('sha256',ssPreviewVideoSecret).update(raw).digest('hex');
 }
 function ssExtraVerifyToken(token) {
@@ -2566,7 +2591,7 @@ function ssPreviewPersistDatabase(key, systemId, result) {
 }
 function ssPreviewFetchUpstream(name, systemId, key) {
   // One upstream request at a time, spaced apart; a hover storm cannot flood the API.
-  if (ssPreviewQueued >= 4) {
+  if (ssPreviewQueued >= 10) {
     const busy = new Error('ScreenScraper preview queue full.');
     busy.status = 429;
     busy.code = 'local_queue_full';
@@ -2584,7 +2609,7 @@ function ssPreviewFetchUpstream(name, systemId, key) {
       const pause = ssPreviewNextRequestAt - Date.now();
       if (pause > 0) await waitMs(pause);
       await ssPreviewMaybeRefreshQuota();
-      ssPreviewQuotaReserve();
+      ssPreviewQuotaReserve('search');
       const now = Date.now();
       // Keep the original fast spacing; the shared quota gate enforces the actual minute allowance.
       ssPreviewNextRequestAt = now + 1600;
@@ -2815,7 +2840,10 @@ app.get('/api/gameplay-video', async (req,res) => {
       res.removeHeader(header);
     res.setHeader('Cache-Control','no-store');
     res.setHeader('X-PSN-Video-Error',reason);
-    if (status === 429) res.setHeader('Retry-After','60');
+    if (status === 429 || status === 503) {
+      res.setHeader('Retry-After',String(Math.min(3600,Math.max(2,ssPreviewQuota.blockedUntil>Date.now()?Math.ceil((ssPreviewQuota.blockedUntil-Date.now())/1000):60))));
+      ssVideoLogLimit(reason);
+    }
     if (upstreamStatus) res.setHeader('X-PSN-Video-Upstream',String(upstreamStatus));
     res.status(status).end();
   };
@@ -2829,7 +2857,18 @@ app.get('/api/gameplay-video', async (req,res) => {
   if (failure && failure.until > Date.now()) return fail(failure.error.status || 502,
     failure.error.code || 'upstream_unavailable',failure.error.upstreamStatus || 0);
   ssVideoRollWindows();
-  if (ssVideoActive >= 3) return fail(429, 'video_stream_limit');
+  // A short wait is preferable to a 429 burst when switching hover cards.
+  if(ssVideoActive>=3) {
+    let closed=false;
+    const onClose=()=>{closed=true;};
+    res.once('close',onClose);
+    const until=Date.now()+3500;
+    while(!closed && !res.destroyed && ssVideoActive>=3 && Date.now()<until)
+      await new Promise(resolve=>setTimeout(resolve,100));
+    res.off('close',onClose);
+    if(closed||res.destroyed)return;
+    if(ssVideoActive>=3)return fail(503,'video_stream_busy');
+  }
   const ip = ssVideoClientAddress(req);
   let client = ssVideoClients.get(ip);
   if (!client || Date.now()-client.start >= 600000) {
@@ -2937,7 +2976,7 @@ app.get('/api/gameplay-video', async (req,res) => {
       pool.query('DELETE FROM screenscraper_game_cache WHERE game_id=$1 AND (system_id=$2 OR system_id=0)',
         [video.g,video.s]).catch(()=>{});
     }
-    if (!error || error.name !== 'AbortError')
+    if (error && error.code !== 'local_rate_limit' && error.name !== 'AbortError')
       ssVideoFailures.set(key,{error,until:Date.now()+(error?.upstreamStatus === 429 ? 120000 :
         [401,403].includes(error?.upstreamStatus) ? 300000 : 30000)});
     fail(error?.status || 502,error?.code || 'video_stream_failed',error?.upstreamStatus || 0);
@@ -2963,6 +3002,7 @@ app.get('/api/gameplay-preview', async (req, res) => {
   } catch (error) {
     // Keep provider secrets and raw API URLs out of logs and client responses.
     const reason = ['api_auth','api_rate_limit','api_unavailable','api_rejected','local_rate_limit','local_queue_full'].includes(error && error.code) ? error.code : 'api_unavailable';
+    if(error?.status===429)res.setHeader('Retry-After',String(reason==='local_queue_full'?5:Math.min(3600,Math.max(2,Number(error.retryAfter)||60))));
     return res.status(error && error.status === 429 ? 429 : 502).json({ ok:false, configured:true, retry:true, reason, upstreamStatus:Number(error && error.upstreamStatus) || 0 });
   }
 });
@@ -2979,7 +3019,7 @@ app.get('/api/screenscraper-extras', async (req,res) => {
   try {
     const result = await ssPreviewLookup(name,system,{englishSummary:true,artwork:true});
     return res.json({ok:true,found:!!result.extras,extras:ssExtraPublic(result.extras)});
-  } catch (e) {return res.status(e.status === 429 ? 429 : 502).json({ok:false,reason:e.code || 'unavailable'});}
+  } catch (e) {if(e?.status===429)res.setHeader('Retry-After',String(Math.min(3600,Math.max(2,Number(e.retryAfter)||60))));return res.status(e.status === 429 ? 429 : 502).json({ok:false,reason:e.code || 'unavailable'});}
 });
 
 // Small bounded RAM cache for supplemental artwork, never database, never untrusted upstream hosts.
@@ -3015,7 +3055,7 @@ async function ssExtraFetchImage(data) {
   const timer=setTimeout(()=>controller.abort(),18000);
   try {
     await ssPreviewMaybeRefreshQuota();
-    ssPreviewQuotaReserve();
+    ssPreviewQuotaReserve('image');
     const response=await ssVideoRequestImage(url.href,controller.signal);
     const chunks=[]; let size=0;
     for await (const chunk of response) {
@@ -3047,7 +3087,9 @@ async function ssVideoRequestImage(raw,signal,redirects=0,maxBytes=4*1024*1024) 
   if (Number(response.headers['content-length']||0)>maxBytes) {response.destroy();throw new Error('image_too_large');}
   return response;
 }
+app.options('/api/screenscraper-manual',(req,res)=>{setMetadataCors(res);res.status(204).end();});
 app.get('/api/screenscraper-manual',async(req,res)=>{
+  setMetadataCors(res);
   const data=ssExtraVerifyToken(req.query&&req.query.token);
   if(!data||!['manual','manuel'].includes(data.t)||!SS_PREVIEW_ENABLED)return res.status(403).end();
   const url=new URL('https://api.screenscraper.fr/api2/mediaManuelJeu.php');
@@ -3061,7 +3103,7 @@ app.get('/api/screenscraper-manual',async(req,res)=>{
   const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),18000);
   try {
     await ssPreviewMaybeRefreshQuota();
-    ssPreviewQuotaReserve();
+    ssPreviewQuotaReserve('image');
     const upstream=await ssVideoRequestImage(url.href,controller.signal,0,9*1024*1024);
     let size=0;const parts=[];
     for await(const chunk of upstream){size+=chunk.length;if(size>9*1024*1024){upstream.destroy();throw Error('pdf_too_large');}parts.push(chunk);}
@@ -3075,7 +3117,10 @@ app.get('/api/screenscraper-manual',async(req,res)=>{
   }catch(_){return res.status(404).end();}
   finally{clearTimeout(timer);}
 });
+app.options('/api/screenscraper-image',(req,res)=>{setMetadataCors(res);res.status(204).end();});
 app.get('/api/screenscraper-image',async(req,res)=>{
+  setMetadataCors(res);
+  res.setHeader('Access-Control-Expose-Headers','Retry-After');
   const data=ssExtraVerifyToken(req.query&&req.query.token);
   if (!data||!SS_PREVIEW_ENABLED) return res.status(403).end();
   const key=`${data.s}:${data.g}:${data.t}:${data.r}`;
@@ -3103,7 +3148,12 @@ app.get('/api/screenscraper-image',async(req,res)=>{
         ssExtraImageCache.set(key,{...cached,until:Date.now()+SS_EXTRA_IMAGE_TTL_MS});
         ssExtraImageBytes+=cached.body.length;
       }
-    } catch (error) {return res.status(error && error.code==='local_rate_limit'?429:404).end();}
+    } catch (error) {
+      const limited=error?.code==='local_rate_limit'||error?.message==='image_upstream_429';
+      const busy=error?.message==='image_queue_full';
+      if(limited||busy)res.setHeader('Retry-After',String(busy?5:Math.min(3600,Math.max(2,Number(error.retryAfter)||60))));
+      return res.status(limited?429:busy?503:404).end();
+    }
   }
   res.setHeader('Cache-Control','private,max-age=3600');
   res.setHeader('Content-Type',cached.type);

@@ -120419,6 +120419,7 @@ function getVisibleChatStackEl(id) {
   const platformIds = {ps3:59,ps2:58,ps1:57,psx:57,psp:61,psv:62,psvita:62,vita:62,ps4:60};
   const memory = new Map();
   const pending = new Map();
+  let extrasBlockedUntil=0;
   const baseServer = () => String(typeof getMetadataServerBaseCompat === 'function' ? getMetadataServerBaseCompat() : 'https://psn-content-fd6j.onrender.com').replace(/\/+$/,'');
   const cleanName = value => String(value || '').replace(/[™®©]/g,' ').replace(/\b(?:tm|registered)\b/gi,' ').replace(/\s*[[(](?:usa|eur|europe|japan|ps3|ps2|psp|ps1|ps4)[)\]]/gi,'').replace(/\b(?:digital version)\b/gi,'').trim();
   const normalize = value => cleanName(value).normalize('NFKD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
@@ -120429,8 +120430,12 @@ function getVisibleChatStackEl(id) {
     const cached=memory.get(key);
     if(cached && now-cached.at<15*60*1000) return Promise.resolve(cached.data);
     if(pending.has(key)) return pending.get(key);
+    if(now<extrasBlockedUntil)return Promise.resolve(null);
     const url=baseServer()+'/api/screenscraper-extras?name='+encodeURIComponent(cleanName(name))+'&system='+system+(isPort?'&port=1':'');
-    const promise=fetch(url,{cache:'no-store'}).then(r=>r.ok?r.json():null).then(data=>{
+    const promise=fetch(url,{cache:'no-store'}).then(r=>{
+      if(r.status===429){extrasBlockedUntil=Date.now()+Math.min(120000,Math.max(10000,(Number(r.headers.get('Retry-After'))||60)*1000));return null;}
+      return r.ok?r.json():null;
+    }).then(data=>{
       if(data?.ok){memory.delete(key);memory.set(key,{at:Date.now(),data});while(memory.size>90)memory.delete(memory.keys().next().value);}
       return data;
     }).catch(()=>null).finally(()=>pending.delete(key));
@@ -120679,6 +120684,7 @@ function getVisibleChatStackEl(id) {
   if (!window.matchMedia || !matchMedia('(hover: hover) and (pointer: fine)').matches || matchMedia('(prefers-reduced-motion: reduce)').matches) return;
   const systems = {ps3:59,ps2:58,ps1:57,psx:57,psp:61,psv:62,psvita:62,vita:62,ps4:60};
   const cache = new Map(), pending = new Map(), failures = new Map();
+  let lookupBlockedUntil=0, videoBlockedUntil=0, recentVideoErrors=[];
   const sessionPrefix='psn-ss-gameplay-v2:';
   function sessionResult(info,clear=false) {
     try {
@@ -120725,8 +120731,12 @@ function getVisibleChatStackEl(id) {
     const entry=cache.get(info.key);if(entry&&entry.until>Date.now())return Promise.resolve(entry.value);
     if(!renew){const saved=sessionResult(info);if(saved)return Promise.resolve(saved);}
     if(pending.has(info.key))return pending.get(info.key);
+    if(Date.now()<lookupBlockedUntil)return Promise.resolve(null);
     const promise=fetch(base()+'/api/gameplay-preview?name='+encodeURIComponent(info.name)+'&system='+info.system+(info.isPort?'&port=1':''),{cache:'no-store'})
-      .then(async response=>({ok:response.ok,data:await response.json()}))
+      .then(async response=>{
+        if(response.status===429){lookupBlockedUntil=Date.now()+Math.min(120000,Math.max(10000,(Number(response.headers.get('Retry-After'))||60)*1000));return {ok:false,data:null};}
+        return {ok:response.ok,data:await response.json()};
+      })
       .then(({ok,data})=>{
         // Cache real matches and misses, never persist temporary HTTP errors.
         if(ok){cache.delete(info.key);cache.set(info.key,{value:data,until:Date.now()+(data?.found?10*60*1000:2*60*1000)});while(cache.size>250)cache.delete(cache.keys().next().value);saveSessionResult(info,data);}
@@ -120745,7 +120755,7 @@ function getVisibleChatStackEl(id) {
   }
   async function play(current,info,renew=false) {
     const data=await (renew?getResult(info,true):(current.lookup||getResult(info)));
-    if(!data?.found||active!==current||!current.card.isConnected||!current.card.matches(':hover')||document.hidden)return;
+    if(!data?.found||active!==current||Date.now()<videoBlockedUntil||!current.card.isConnected||!current.card.matches(':hover')||document.hidden)return;
     const url=validProxy(data.fallbackUrl);
     if(!url)return;
     const parent=current.card.querySelector('.game-img-container');if(!parent)return;
@@ -120753,13 +120763,20 @@ function getVisibleChatStackEl(id) {
     const video=document.createElement('video');current.video=video;
     video.className='psn-gameplay-preview-video';video.muted=true;video.defaultMuted=true;video.playsInline=true;
     video.loop=true;video.preload='auto';video.setAttribute('aria-hidden','true');video.setAttribute('disablepictureinpicture','');
-    video.addEventListener('playing',()=>{if(active===current)video.classList.add('is-ready');});
+    video.addEventListener('playing',()=>{if(active===current){video.classList.add('is-ready');recentVideoErrors=[];videoBlockedUntil=0;}});
     let handledError=false;
     const handleError=()=>{
       if(handledError||active!==current||current.video!==video)return;
       handledError=true;
-      if(!renew){play(current,info,true);return;}
-      failures.set(info.key,Date.now()+3500);stop();
+      // Media elements do not expose the HTTP status. Never retry immediately:
+      // it may be a 429, and a second request would only make the limit worse.
+      const now=Date.now();
+      recentVideoErrors=recentVideoErrors.filter(t=>now-t<30000);
+      recentVideoErrors.push(now);
+      if(recentVideoErrors.length>=3)
+        videoBlockedUntil=Math.max(videoBlockedUntil,now+Math.min(60000,5000*2**Math.min(4,recentVideoErrors.length-3)));
+      failures.set(info.key,now+15000);
+      stop();
     };
     video.addEventListener('error',handleError);
     parent.appendChild(video);video.src=url;
@@ -120775,7 +120792,7 @@ function getVisibleChatStackEl(id) {
     const card=cardFrom(target);
     if(!card || (active&&active.card===card))return false;
     stop();const info=identity(card);if(!info)return false;
-    if((failures.get(info.key)||0)>Date.now())return false;
+    if((failures.get(info.key)||0)>Date.now()||Date.now()<videoBlockedUntil)return false;
     rearmAfterModal=false;
     const current={card,timer:null,lookupTimer:null,lookup:getResult(info),video:null};active=current;
     // No artificial hover delay: card animation and video lookup begin together.
@@ -120787,7 +120804,7 @@ function getVisibleChatStackEl(id) {
   window.addEventListener('psn-game-modal-closed',()=>{
     rearmAfterModal=true;
     const hovered=document.querySelector('.game-card:hover');
-    if(hovered){const info=identity(hovered);if(info)failures.delete(info.key);startPreview(hovered);}
+    if(hovered)startPreview(hovered);
   });
   document.addEventListener('pointermove',event=>{
     if(rearmAfterModal && !active && event.pointerType==='mouse')startPreview(event.target);
