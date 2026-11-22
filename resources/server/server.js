@@ -2112,7 +2112,7 @@ const SS_PREVIEW_PASSWORD = String(process.env.SCREENSCRAPER_PASSWORD || '').tri
 const SS_PREVIEW_ENABLED = process.env.SCREENSCRAPER_PREVIEWS_ENABLED !== '0' && !!SS_PREVIEW_DEVID && !!SS_PREVIEW_DEVPASSWORD;
 const SS_PREVIEW_SYSTEM_IDS = new Set([57, 58, 59, 61, 62, 60]); // PS1, PS2, PS3, PSP, Vita, PS4
 const SS_PREVIEW_POSITIVE_MS = 24 * 60 * 60 * 1000;
-const SS_PREVIEW_NEGATIVE_MS = 6 * 60 * 60 * 1000;
+const SS_PREVIEW_NEGATIVE_MS = 20 * 60 * 1000;
 const SS_PREVIEW_MAX_CACHE = 500;
 const SS_PREVIEW_MINUTE_MAX = Math.max(1, Math.min(30, Number(process.env.SCREENSCRAPER_PREVIEW_MINUTE_MAX) || 10));
 const SS_PREVIEW_DAILY_MAX = Math.max(10, Math.min(20000, Number(process.env.SCREENSCRAPER_PREVIEW_DAILY_MAX) || 500));
@@ -2136,33 +2136,56 @@ function normalizeSsPreviewTitle(value) {
 function ssPreviewNames(game) {
   const names = game && game.noms;
   const rows = Array.isArray(names) ? names : (names && Array.isArray(names.nom) ? names.nom : (names && names.nom ? [names.nom] : (names ? [names] : [])));
-  return rows.map(item => String(item && (item.text || item.nom || item.name) || '').trim()).filter(Boolean);
+  const found = rows.map(item => String(typeof item === 'string' ? item : item && (item.text || item.nom || item.name) || '').trim()).filter(Boolean);
+  for (const fallback of [game && game.nom, game && game.name, game && game.title]) {
+    if (typeof fallback === 'string' && fallback.trim()) found.push(fallback.trim());
+  }
+  return [...new Set(found)];
 }
 
 function ssPreviewTitleSimilarity(a, b) {
   if (!a || !b) return 0;
   if (a === b) return 1;
-  // Reject differing sequel numbers; only permit minor punctuation/wording differences.
+  // Never mix numbered sequels; tolerate regional punctuation and subtitle variants.
   const nums = value => (value.match(/\b\d+\b/g) || []).join('|');
   if (nums(a) !== nums(b)) return 0;
   const left = a.split(' '), right = b.split(' ');
   const leftSet = new Set(left), rightSet = new Set(right);
   const common = [...leftSet].filter(value => rightSet.has(value)).length;
   const coverage = 2 * common / (leftSet.size + rightSet.size);
-  return coverage >= 0.92 && Math.abs(a.length - b.length) <= 6 ? coverage : 0;
+  return coverage >= 0.87 && Math.abs(a.length - b.length) <= 12 ? coverage : 0;
+}
+
+function ssPreviewMediaList(game) {
+  const medias = game && game.medias;
+  return Array.isArray(medias) ? medias : (medias && Array.isArray(medias.media) ? medias.media : (medias && medias.media ? [medias.media] : (medias ? [medias] : [])));
 }
 
 function ssPreviewFindVideo(game) {
-  const medias = game && game.medias;
-  const list = Array.isArray(medias) ? medias : (medias && Array.isArray(medias.media) ? medias.media : (medias && medias.media ? [medias.media] : (medias ? [medias] : [])));
   const id = Number(game && game.id);
   const system = Number(game && (game.systemeid || (game.systeme && game.systeme.id)));
   if (!Number.isSafeInteger(id) || id <= 0 || !SS_PREVIEW_SYSTEM_IDS.has(system)) return null;
-  const chosen = ['video-normalized', 'video'].find(type => list.some(media => media && media.type === type));
-  if (!chosen) return null;
-  // Official ScreenScraper media paths are public media URLs. Never return API
-  // query URLs, tokens or developer credentials to the frontend.
-  return `https://www.screenscraper.fr/medias/${system}/${id}/${chosen}.mp4`;
+  const medias = ssPreviewMediaList(game);
+  for (const type of ['video-normalized', 'video']) {
+    const media = medias.find(item => item && String(item.type || '').toLowerCase() === type);
+    if (!media) continue;
+    // Prefer the URL returned by ScreenScraper v2. The video is still served
+    // directly from ScreenScraper, so the Render server does not relay MP4 bytes.
+    let raw = String(media.url || media.href || '').trim();
+    if (raw.startsWith('#screenscraperserveur#')) raw = raw.replace('#screenscraperserveur#', 'https://www.screenscraper.fr/');
+    try {
+      const candidate = new URL(raw);
+      const expected = `/medias/${system}/${id}/${type}.mp4`;
+      if (candidate.protocol === 'https:' && candidate.hostname === 'www.screenscraper.fr' &&
+          candidate.pathname === expected && !candidate.search && !candidate.username && !candidate.password) {
+        return candidate.href;
+      }
+    } catch (_) {}
+    // Public media paths are also used by established ScreenScraper clients.
+    // Never expose /api2 URLs or dev credentials from the metadata response.
+    return `https://www.screenscraper.fr/medias/${system}/${id}/${type}.mp4`;
+  }
+  return null;
 }
 
 function ssPreviewGetCached(key) {
@@ -2189,6 +2212,7 @@ function ssPreviewLookup(name, systemId) {
   if (ssPreviewQueued >= 4) {
     const busy = new Error('ScreenScraper preview queue full.');
     busy.status = 429;
+    busy.code = 'local_queue_full';
     return Promise.reject(busy);
   }
   ssPreviewQueued++;
@@ -2201,6 +2225,7 @@ function ssPreviewLookup(name, systemId) {
     if (ssPreviewMinuteUsed >= SS_PREVIEW_MINUTE_MAX || ssPreviewDailyUsed >= SS_PREVIEW_DAILY_MAX) {
       const limited = new Error('ScreenScraper preview quota reached.');
       limited.status = 429;
+      limited.code = 'local_rate_limit';
       throw limited;
     }
     ssPreviewMinuteUsed++;
@@ -2221,32 +2246,35 @@ function ssPreviewLookup(name, systemId) {
     if (!response.ok || !response.data || typeof response.data !== 'object') {
       const error = new Error('ScreenScraper search unavailable.');
       error.status = Number(response.status) === 429 ? 429 : 502;
+      error.code = [401, 403].includes(Number(response.status)) ? 'api_auth' : Number(response.status) === 429 ? 'api_rate_limit' : 'api_unavailable';
       throw error;
     }
     const header = response.data.header;
     if (header && ['false', '0'].includes(String(header.success ?? '').toLowerCase())) {
       const error = new Error('ScreenScraper rejected the search.');
       error.status = 502;
+      error.code = 'api_rejected';
       throw error;
     }
     const data = response.data.response || {};
     const rawGames = data.jeux || data.jeu || [];
     const games = Array.isArray(rawGames) ? rawGames : (Array.isArray(rawGames.jeu) ? rawGames.jeu : (rawGames.jeu ? [rawGames.jeu] : (rawGames.id ? [rawGames] : [])));
     const wanted = normalizeSsPreviewTitle(name);
-    let best = null;
+    let bestGame = null;
     let bestScore = 0;
     for (const game of games.slice(0, 30)) {
       if (Number(game && (game.systemeid || (game.systeme && game.systeme.id))) !== systemId) continue;
-      const videoUrl = ssPreviewFindVideo(game);
-      if (!videoUrl) continue;
       const score = Math.max(0, ...ssPreviewNames(game).map(title => ssPreviewTitleSimilarity(wanted, normalizeSsPreviewTitle(title))));
       if (score > bestScore) {
-        best = { found:true, url:videoUrl, provider:'screenscraper' };
+        bestGame = game;
         bestScore = score;
       }
       if (bestScore === 1) break;
     }
-    const result = best || { found:false, provider:'screenscraper' };
+    const videoUrl = bestGame && bestScore >= 0.87 ? ssPreviewFindVideo(bestGame) : null;
+    const result = videoUrl
+      ? { found:true, url:videoUrl, provider:'screenscraper' }
+      : { found:false, provider:'screenscraper', reason: !games.length ? 'no_match' : !bestGame || bestScore < 0.87 ? 'no_close_match' : 'no_video' };
     ssPreviewSetCached(key, result);
     return result;
   });
@@ -2270,7 +2298,8 @@ app.get('/api/gameplay-preview', async (req, res) => {
     return res.json({ ok:true, configured:true, ...await ssPreviewLookup(name, systemId) });
   } catch (error) {
     // Keep provider secrets and raw API URLs out of logs and client responses.
-    return res.status(error && error.status === 429 ? 429 : 502).json({ ok:false, configured:true, retry:true });
+    const reason = ['api_auth','api_rate_limit','api_unavailable','api_rejected','local_rate_limit','local_queue_full'].includes(error && error.code) ? error.code : 'api_unavailable';
+    return res.status(error && error.status === 429 ? 429 : 502).json({ ok:false, configured:true, retry:true, reason });
   }
 });
 

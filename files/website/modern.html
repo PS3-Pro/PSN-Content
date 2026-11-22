@@ -120372,14 +120372,14 @@ function getVisibleChatStackEl(id) {
   const maxCache = 250;
   const delayMs = 400;
   let active = null;
-  let disabled = false;
+  let disabledUntil = 0;
   const supported = !!(window.matchMedia && matchMedia('(hover: hover) and (pointer: fine)').matches && !matchMedia('(prefers-reduced-motion: reduce)').matches);
   if (!supported) return;
 
   function videoCardFrom(target) {
     const card = target && target.closest && target.closest('.game-card');
     if (!card || !card.isConnected || card.matches('.recently-visited-placeholder, .store-item-unavailable, [data-missing="true"]')) return null;
-    if (!card.closest('#database-grid, #view-explore, #wishlist-grid, #ps3-local-grid, #ps3-favs-grid')) return null;
+    if (!card.closest('#database-grid, #view-explore, #view-trending, #wishlist-grid, #ps3-local-grid, #ps3-favs-grid')) return null;
     if (!card.querySelector('.game-img-container > img.game-img')) return null;
     return card;
   }
@@ -120428,12 +120428,16 @@ function getVisibleChatStackEl(id) {
       current.controller = new AbortController();
       try {
         const response = await fetch(`${base}/api/gameplay-preview?name=${encodeURIComponent(info.name)}&system=${info.system}`, { signal:current.controller.signal });
-        if (response.status === 503) { disabled = true; return; }
+        if (response.status === 503) { disabledUntil = Date.now() + 30000; return; }
         if (response.status === 429) { remember(info.key, { found:false }, 60000); return; }
-        if (!response.ok) return;
+        if (!response.ok) {
+          if (window.__psnGameplayDebug) console.debug('[GAMEPLAY PREVIEW] HTTP', response.status);
+          return;
+        }
         data = await response.json();
         if (!data || data.configured !== true) return;
-        remember(info.key, data, data.found ? 24*60*60*1000 : 60*60*1000);
+        remember(info.key, data, data.found ? 24*60*60*1000 : 10*60*1000);
+        if (window.__psnGameplayDebug && !data.found) console.debug('[GAMEPLAY PREVIEW]', info.name, data.reason || 'no_video');
       } catch (error) { return; }
     }
     if (active !== current || !current.card.isConnected || !current.card.matches(':hover') || document.hidden || !data.found) return;
@@ -120462,7 +120466,7 @@ function getVisibleChatStackEl(id) {
 
   document.addEventListener('pointerover', event => {
     const card = videoCardFrom(event.target);
-    if (!card || disabled || (active && active.card === card)) return;
+    if (!card || Date.now() < disabledUntil || (active && active.card === card)) return;
     stop();
     const info = identity(card);
     if (!info) return;
