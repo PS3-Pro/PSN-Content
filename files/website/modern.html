@@ -121061,8 +121061,9 @@ function getVisibleChatStackEl(id) {
       const url = new URL(value);
       const host = url.hostname.toLowerCase();
       return url.protocol === 'https:' &&
-        (host === 'archive.org' || host.endsWith('.archive.org') || host === 'vgmsite.com' || host.endsWith('.vgmsite.com') || host === 'vgmtreasurechest.com' || host.endsWith('.vgmtreasurechest.com')) &&
-        /\.(?:mp3|m4a|ogg|opus|aac)$/i.test(url.pathname);
+        ((host === 'api.audius.co' && /^\/v1\/tracks\/[a-z0-9_-]{3,64}\/stream$/i.test(url.pathname)) ||
+        ((host === 'archive.org' || host.endsWith('.archive.org') || host === 'vgmsite.com' || host.endsWith('.vgmsite.com') || host === 'vgmtreasurechest.com' || host.endsWith('.vgmtreasurechest.com')) &&
+        /\.(?:mp3|m4a|ogg|opus|aac)$/i.test(url.pathname)));
     } catch (_) { return false; }
   };
   function fade(element, target, duration, done) {
@@ -121123,6 +121124,7 @@ function getVisibleChatStackEl(id) {
       audio.volume = 0;
     }
     const token = generation, result = active.result;
+    active.attemptedUrls.add(result.url);
     try {
       await audio.play();
       if (token !== generation || active?.result !== result) return;
@@ -121131,23 +121133,24 @@ function getVisibleChatStackEl(id) {
       if (bg) { bg.pause(); bg.volume = 0.35; }
       fade(audio, 0.28, 360);
       updateButton('playing', active.result);
-    } catch (_) {
-      if (token !== generation) return;
-      updateButton('blocked', active?.result);
-      resumeBackground();
+    } catch (error) {
+      if (token !== generation || active?.result !== result) return;
+      if (error?.name !== 'NotAllowedError' && error?.name !== 'AbortError') recoverPlayback();
+      else { updateButton('blocked', active?.result); resumeBackground(); }
     }
   }
-  async function load(name, key, token) {
-    const saved = lookupCache.get(key);
+  async function load(name, key, token, skip = '') {
+    const cacheKey = key + '|skip:' + skip;
+    const saved = lookupCache.get(cacheKey);
     if (saved && saved.expires > Date.now()) return saved.result;
     const base = String(typeof getMetadataServerBaseCompat === 'function'
       ? getMetadataServerBaseCompat() : 'https://psn-content-fd6j.onrender.com').replace(/\/+$/, '');
-    const response = await fetch(base + '/api/game-theme?v=gts7&name=' + encodeURIComponent(name), { cache:'default' });
+    const response = await fetch(base + '/api/game-theme?v=gts9&name=' + encodeURIComponent(name) + (skip ? '&skip=' + encodeURIComponent(skip) : ''), { cache:'default' });
     if (!response.ok) throw new Error('Game theme lookup unavailable');
     const result = await response.json();
     if (token !== generation) return null;
     if (result?.ok && typeof result.found === 'boolean') {
-      lookupCache.set(key, { result, expires:Date.now() + (result.found ? 60*60*1000 : 90*1000) });
+      lookupCache.set(cacheKey, { result, expires:Date.now() + (result.found ? 60*60*1000 : 90*1000) });
       while (lookupCache.size > maxCache) lookupCache.delete(lookupCache.keys().next().value);
     }
     return result;
@@ -121162,7 +121165,7 @@ function getVisibleChatStackEl(id) {
     if (active?.key === key && active?.result && !audio.paused) { updateButton('playing', active.result); return; }
     stop(false);
     const token = generation;
-    active = { key, name:currentName, result:null };
+    active = { key, name:currentName, result:null, failedProviders:new Set(), attemptedUrls:new Set(), recovering:false };
     if (!enabled()) { updateButton('off'); resumeBackground(); return; }
     updateButton('loading');
     load(currentName,key,token).then(result => {
@@ -121185,6 +121188,55 @@ function getVisibleChatStackEl(id) {
     }).catch(() => {
       if (token !== generation) return;
       updateButton('blocked');
+      resumeBackground();
+    });
+  }
+  // After exhausting a provider's tracks, request the next provider without
+  // reselecting the same broken source. Each skipped combination has a separate cache key.
+  function recoverPlayback() {
+    if (!active?.result?.found || active.recovering || !enabled() || !visible() || suspended) return;
+    active.recovering = true;
+    const remaining = active.alternatives || [];
+    let next = null;
+    while (remaining.length) {
+      const candidate = remaining.shift();
+      if (candidate && validUrl(candidate.url) && !active.attemptedUrls.has(candidate.url)) { next=candidate; break; }
+    }
+    audio.pause();
+    audio.removeAttribute('src');
+    audio.load();
+    if (next) {
+      active.result = {...active.result,title:next.title || active.result.title,url:next.url};
+      active.recovering = false;
+      play();
+      return;
+    }
+    const previous = String(active.result.provider || '').toLowerCase().replace(/[^a-z]/g,'');
+    if (previous) active.failedProviders.add(previous);
+    const skip = [...active.failedProviders].sort().join(',');
+    if (active.failedProviders.size >= 3) {
+      active.recovering=false;
+      updateButton('blocked',active.result);
+      resumeBackground();
+      return;
+    }
+    updateButton('loading',active.result);
+    const token = generation, session = active;
+    load(session.name,session.key,token,skip).then(result=>{
+      if (token !== generation || active !== session) return;
+      session.recovering = false;
+      if (!result?.found || !validUrl(result.url) || session.attemptedUrls.has(result.url)) {
+        updateButton(result?.ok ? 'missing' : 'blocked',session.result);
+        resumeBackground();
+        return;
+      }
+      session.result = result;
+      session.alternatives = Array.isArray(result.alternatives) ? result.alternatives.slice(0,3) : [];
+      if (!suspended && !trailerOpen()) play();
+    }).catch(()=>{
+      if (token !== generation || active !== session) return;
+      session.recovering=false;
+      updateButton('blocked',session.result);
       resumeBackground();
     });
   }
@@ -121220,19 +121272,7 @@ function getVisibleChatStackEl(id) {
   }
   audio.addEventListener('error', () => {
     if (!active || !audio.getAttribute('src')) return;
-    const remaining = active.alternatives || [];
-    const next = remaining.shift();
-    if (next && validUrl(next.url) && enabled() && visible()) {
-      active.result = { ...active.result, title:next.title || active.result.title, url:next.url };
-      audio.pause();
-      audio.removeAttribute('src');
-      audio.load();
-      play();
-      return;
-    }
-    updateButton('blocked', active.result);
-    audio.pause();
-    resumeBackground();
+    recoverPlayback();
   });
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) audio.pause();
