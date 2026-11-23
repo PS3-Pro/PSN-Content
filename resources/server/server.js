@@ -8,6 +8,7 @@ const { Server } = require("socket.io");
 const { Pool, Client } = require('pg');
 const bcrypt = require('bcrypt');
 const crypto = require('crypto');
+const { Worker } = require('node:worker_threads');
 const zlib = require('zlib');
 const { spawn } = require('child_process');
 const { isDeepStrictEqual } = require('node:util');
@@ -3055,7 +3056,7 @@ app.get('/api/game-trophies/cache', async (req,res) => {
   let pending = gameTrophyCacheReads.get(key);
   if (!pending) {
     pending = pool.query({
-      text:'SELECT has_trophies,game_data FROM game_trophy_cache WHERE platform=$1 AND title_norm=$2 AND expires_at>NOW() LIMIT 1',
+      text:'SELECT has_trophies,game_data FROM game_trophy_cache WHERE platform=$1 AND title_norm=$2 AND verified_source=TRUE AND expires_at>NOW() LIMIT 1',
       values:['ps3',title],query_timeout:1500
     }).then(result => {
       const row=result.rows[0];
@@ -3095,6 +3096,139 @@ function sanitizedGameTrophyRecord(data, localTitle) {
     totalItemCount:parsed.length,iconKey:tidy(data.iconKey,130),isPS5:false,isSample:id === 'NPWR20790',trophies:parsed};
   return Buffer.byteLength(JSON.stringify(result)) <= 225000 ? result : null;
 }
+const gameTrophyAuthoritativeUrl = 'https://raw.githubusercontent.com/FlexBy420/psn-trophy-scraper/main/all.json.gz';
+let gameTrophySourceIndex = null;
+let gameTrophySourceLoading = null;
+let gameTrophySourceLastFailure = 0;
+let gameTrophyVerificationsActive = 0;
+function buildGameTrophySourceIndex() {
+  const source = [
+    "const {parentPort}=require('node:worker_threads');",
+    "const https=require('https');const zlib=require('zlib');const crypto=require('crypto');",
+    normalizeGameTrophyCacheTitle.toString(),
+    isGameTrophyMatchTitle.toString(),
+    sanitizedGameTrophyRecord.toString(),
+    `const address=${JSON.stringify(gameTrophyAuthoritativeUrl)};`,
+    String.raw`
+    let nesting=0,insideString=false,escaping=false,collectKey=false,keyPart='',lastKey='',record='',recordId='';
+    let unpacked=0,packed=0;
+    const items=[];
+    function takeRecord(id,body){
+      if(!/^NPWR\d{4,8}(?:_00)?$/.test(id))return;
+      const item=JSON.parse(body);
+      const title=String(item.tt||item.title||'');
+      const platform=String(item.pt||item.platform||'');
+      if(!/ps3|playstation 3/i.test(platform))return;
+      const game={npCommunicationId:id,title,platform,trophySetVersion:item.v||item.trophySetVersion||'',
+        iconKey:item.ik||item.iconKey||'',trophies:Array.isArray(item.tr)?item.tr:item.trophies};
+      const norm=normalizeGameTrophyCacheTitle(title);
+      if(!norm||norm.length<3)return;
+      const cleaned=sanitizedGameTrophyRecord(game,norm);
+      const signature=cleaned?crypto.createHash('sha256').update(JSON.stringify(cleaned)).digest('hex'):'';
+      items.push([norm,id,signature]);
+      if(items.length>90000)throw Error('Trophy catalog entry limit reached');
+    }
+    function consume(text){
+      for(let j=0;j<text.length;j++){
+        const c=text[j];
+        if(record){record+=c;if(record.length>1600000)throw Error('Trophy entry too large');}
+        if(insideString){
+          if(escaping){escaping=false;if(collectKey)keyPart+=c;continue;}
+          if(c==='\\'){escaping=true;continue;}
+          if(c==='"'){insideString=false;if(collectKey){lastKey=keyPart;collectKey=false;}continue;}
+          if(collectKey)keyPart+=c;
+          continue;
+        }
+        if(c==='"'){insideString=true;if(nesting===1&&!record){collectKey=true;keyPart='';}continue;}
+        if(c==='{'){
+          nesting++;
+          if(nesting===2&&!record){record='{';recordId=lastKey;}
+        }else if(c==='}'){
+          if(nesting===2&&record){takeRecord(recordId,record);record='';recordId='';}
+          nesting--;
+          if(nesting<0)throw Error('Invalid trophy source');
+        }
+      }
+    }
+    const req=https.get(address,{timeout:15000,headers:{'Accept-Encoding':'identity','User-Agent':'PSN-Content-trophy-cache/1'}},res=>{
+      if(res.statusCode!==200){res.resume();throw Error('Trophy source HTTP '+res.statusCode);}
+      const unzip=zlib.createGunzip();
+      const {StringDecoder}=require('node:string_decoder');
+      const decoder=new StringDecoder('utf8');
+      res.on('data',chunk=>{packed+=chunk.length;if(packed>64*1024*1024)res.destroy(Error('Compressed trophy catalog too large'));});
+      unzip.on('data',chunk=>{
+        try{
+          unpacked+=chunk.length;
+          if(unpacked>800*1024*1024)throw Error('Trophy catalog too large');
+          consume(decoder.write(chunk));
+        }catch(error){res.destroy(error);unzip.destroy(error);}
+      });
+      unzip.on('end',()=>{
+        try{consume(decoder.end());if(nesting!==0||!items.length)throw Error('Invalid trophy source data');parentPort.postMessage({ok:true,items});}
+        catch(error){parentPort.postMessage({ok:false,error:String(error.message||error)});}
+      });
+      unzip.on('error',error=>parentPort.postMessage({ok:false,error:String(error.message||error)}));
+      res.on('error',error=>parentPort.postMessage({ok:false,error:String(error.message||error)}));
+      res.pipe(unzip);
+    });
+    req.on('timeout',()=>req.destroy(Error('Trophy source timeout')));
+    req.on('error',error=>parentPort.postMessage({ok:false,error:String(error.message||error)}));
+    `
+  ].join('\n');
+  return new Promise((resolve,reject) => {
+    let finished=false;
+    const worker=new Worker(source,{eval:true,resourceLimits:{maxOldGenerationSizeMb:96,maxYoungGenerationSizeMb:24}});
+    const timer=setTimeout(()=>finish(new Error('Trophy source verification timeout')),180000);
+    function finish(error,items){
+      if(finished)return;
+      finished=true;clearTimeout(timer);worker.terminate().catch(()=>{});
+      if(error){gameTrophySourceLastFailure=Date.now();reject(error);return;}
+      const index=new Map();
+      for(const [title,id,signature] of items){
+        let candidates=index.get(title);
+        if(!candidates){candidates=new Map();index.set(title,candidates);}
+        candidates.set(id,signature);
+      }
+      gameTrophySourceIndex=index;resolve(index);
+      zlib.gzip(JSON.stringify(items),{level:1},(error,compressed)=>{
+        if(error||!compressed)return;
+        pool.query({text:`INSERT INTO game_trophy_source_index(index_version,payload) VALUES(1,$1)
+          ON CONFLICT(index_version) DO UPDATE SET payload=EXCLUDED.payload,updated_at=NOW()`,
+          values:[compressed],query_timeout:20000}).catch(()=>{});
+      });
+    }
+    worker.on('message',data=>{
+      if(!data?.ok)return finish(new Error(data?.error||'Trophy catalog unavailable'));
+      finish(null,data.items);
+    });
+    worker.on('error',finish);
+    worker.on('exit',code=>{if(!finished)finish(new Error('Trophy verifier stopped: '+code));});
+  });
+}
+function getVerifiedGameTrophySource() {
+  if(gameTrophySourceIndex)return Promise.resolve(gameTrophySourceIndex);
+  if(gameTrophySourceLoading)return gameTrophySourceLoading;
+  if(Date.now()-gameTrophySourceLastFailure<60000)return Promise.reject(new Error('Trophy source temporarily unavailable'));
+  gameTrophySourceLoading=(async()=>{
+    try{
+      const result=await pool.query({text:'SELECT payload FROM game_trophy_source_index WHERE index_version=1',query_timeout:3000});
+      const blob=result.rows?.[0]?.payload;
+      const rows=Buffer.isBuffer(blob)?JSON.parse(zlib.gunzipSync(blob,{maxOutputLength:24*1024*1024}).toString('utf8')):null;
+      if(Array.isArray(rows)&&rows.length){
+        const index=new Map();
+        for(const item of rows){
+          if(!Array.isArray(item)||item.length!==3||typeof item[0]!=='string'||typeof item[1]!=='string'||typeof item[2]!=='string')throw Error('Invalid trophy source index');
+          if(!index.has(item[0]))index.set(item[0],new Map());
+          index.get(item[0]).set(item[1],item[2]);
+        }
+        gameTrophySourceIndex=index;return index;
+      }
+    }catch(err){}
+    try{return await buildGameTrophySourceIndex();}
+    catch(err){gameTrophySourceLastFailure=Date.now();throw err;}
+  })().finally(()=>{gameTrophySourceLoading=null;});
+  return gameTrophySourceLoading;
+}
 app.post('/api/game-trophies/cache',express.json({limit:'240kb'}),async (req,res) => {
   gameTrophyCacheCors(req,res);
   const origin = String(req.headers.origin || '');
@@ -3110,12 +3244,25 @@ app.post('/api/game-trophies/cache',express.json({limit:'240kb'}),async (req,res
   const positive=req.body.hasTrophies;
   const game=positive?sanitizedGameTrophyRecord(req.body.game,title):null;
   if (positive&&!game) return res.status(400).json({ok:false});
+  if (gameTrophyVerificationsActive>=16) return res.status(503).json({ok:false,retry:true});
+  gameTrophyVerificationsActive++;
   try {
-    const result=await queryDbWithRetry(`INSERT INTO game_trophy_cache(platform,title_norm,has_trophies,game_data,expires_at)
-      VALUES('ps3',$1,$2,$3::jsonb,CASE WHEN $2 THEN 'infinity'::timestamptz ELSE NOW()+INTERVAL '7 days' END)
+    const source=await getVerifiedGameTrophySource();
+    const matches=source.get(title);
+    if(matches && matches.size>1) return res.status(409).json({ok:false,ambiguous:true});
+    if(positive){
+      const expected=matches?.get(game.npCommunicationId);
+      const submitted=crypto.createHash('sha256').update(JSON.stringify(game)).digest('hex');
+      if(!expected||expected!==submitted||matches.size!==1) return res.status(422).json({ok:false,verified:false});
+    }else if(matches?.size) return res.status(409).json({ok:false,verified:false});
+  }catch(error){return res.status(503).json({ok:false,retry:true});}
+  finally{gameTrophyVerificationsActive--;}
+  try {
+    const result=await queryDbWithRetry(`INSERT INTO game_trophy_cache(platform,title_norm,has_trophies,game_data,expires_at,verified_source)
+      VALUES('ps3',$1,$2,$3::jsonb,CASE WHEN $2 THEN 'infinity'::timestamptz ELSE NOW()+INTERVAL '7 days' END,TRUE)
       ON CONFLICT(platform,title_norm) DO UPDATE SET has_trophies=EXCLUDED.has_trophies,
-        game_data=EXCLUDED.game_data,expires_at=EXCLUDED.expires_at,checked_at=NOW()
-      WHERE NOT game_trophy_cache.has_trophies OR (EXCLUDED.has_trophies AND game_trophy_cache.game_data->>'npCommunicationId'=EXCLUDED.game_data->>'npCommunicationId')
+        game_data=EXCLUDED.game_data,expires_at=EXCLUDED.expires_at,checked_at=NOW(),verified_source=TRUE
+      WHERE NOT game_trophy_cache.verified_source OR NOT game_trophy_cache.has_trophies OR (EXCLUDED.has_trophies AND game_trophy_cache.game_data->>'npCommunicationId'=EXCLUDED.game_data->>'npCommunicationId')
       RETURNING has_trophies,game_data`,[title,positive,positive?JSON.stringify(game):null],
       {attempts:2,label:'GAME TROPHY CACHE WRITE'});
     const row=result.rows[0];
@@ -4226,11 +4373,18 @@ async function initDb() {
       title_norm TEXT NOT NULL,
       has_trophies BOOLEAN NOT NULL,
       game_data JSONB,
+      verified_source BOOLEAN NOT NULL DEFAULT FALSE,
       checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       expires_at TIMESTAMPTZ NOT NULL,
       PRIMARY KEY (platform,title_norm)
     );
+    ALTER TABLE game_trophy_cache ADD COLUMN IF NOT EXISTS verified_source BOOLEAN NOT NULL DEFAULT FALSE;
     CREATE INDEX IF NOT EXISTS idx_game_trophy_cache_expiring ON game_trophy_cache(expires_at) WHERE has_trophies=FALSE;
+    CREATE TABLE IF NOT EXISTS game_trophy_source_index (
+      index_version SMALLINT PRIMARY KEY,
+      payload BYTEA NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
     CREATE TABLE IF NOT EXISTS metadata_provider_cache (
       cache_key TEXT PRIMARY KEY,
       payload JSONB NOT NULL,

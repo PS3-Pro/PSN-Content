@@ -38540,20 +38540,6 @@ P
 			.trim();
 	}
 
-	function gameTrophyTokenScore(a, b) {
-		if (!a || !b) return 0;
-		if (a === b) return 100;
-		const shorter = a.length <= b.length ? a : b;
-		const longer = a.length > b.length ? a : b;
-		if (longer.includes(shorter) && shorter.length >= 5) return Math.max(78, 92 - Math.min(14, Math.abs(longer.length - shorter.length) / 2));
-		const aTokens = [...new Set(a.split(' ').filter(token => token.length > 1))];
-		const bTokens = [...new Set(b.split(' ').filter(token => token.length > 1))];
-		if (!aTokens.length || !bTokens.length) return 0;
-		const shared = aTokens.filter(token => bTokens.includes(token)).length;
-		const coverage = shared / Math.max(aTokens.length, bTokens.length);
-		return coverage >= 0.72 ? 58 + (coverage * 24) : 0;
-	}
-
 	function normalizeExternalTrophyGame(rawId, rawGame = {}) {
 		const platform = String(rawGame.pt || rawGame.platform || '');
 		const isPS5 = platform.toLowerCase().includes('ps5');
@@ -38759,36 +38745,27 @@ P
 	}
 
 
+	let externalTrophyExactIndex = null;
 	function findExternalTrophyGame(localGame = {}) {
 		if (!Array.isArray(externalTrophyDbGames) || !externalTrophyDbGames.length) return null;
 		const localTitle = normalizeGameTrophyTitle(localGame.cleanName || localGame.name || localGame.title || '');
 		const localConsole = String(localGame.cTag || '').toLowerCase();
 		const cacheKey = `${localConsole}|${localTitle}`;
-		if (cacheKey && externalTrophyMatchCache.has(cacheKey)) {
-			const cached = externalTrophyMatchCache.get(cacheKey);
-			externalTrophyMatchCache.delete(cacheKey);
-			externalTrophyMatchCache.set(cacheKey, cached);
-			return cached;
+		if (externalTrophyMatchCache.has(cacheKey)) return externalTrophyMatchCache.get(cacheKey);
+		if (!externalTrophyExactIndex) {
+			externalTrophyExactIndex = new Map();
+			for (const entry of externalTrophyDbGames) {
+				if (!/ps3|playstation 3/i.test(String(entry.platform || ''))) continue;
+				const title = normalizeGameTrophyTitle(entry.title);
+				if (!title) continue;
+				if (!externalTrophyExactIndex.has(title)) externalTrophyExactIndex.set(title, new Map());
+				externalTrophyExactIndex.get(title).set(entry.npCommunicationId, entry);
+			}
 		}
-		let best = null;
-		let bestScore = 0;
-
-		externalTrophyDbGames.forEach(game => {
-			const dbTitle = normalizeGameTrophyTitle(game.title);
-			let score = gameTrophyTokenScore(localTitle, dbTitle);
-			const dbPlatform = String(game.platform || '').toLowerCase();
-			if (!score || (localConsole.startsWith('ps3') && !/ps3|playstation 3/.test(dbPlatform))) return;
-			if (localConsole && dbPlatform.includes(localConsole)) score += 10;
-			else if (localConsole === 'ps3' && dbPlatform.includes('ps4')) score -= 7;
-			if (game.totalItemCount) score += Math.min(4, game.totalItemCount / 30);
-			if (score > bestScore) { best = game; bestScore = score; }
-		});
-
-		const resolved = bestScore >= 78 ? best : null;
-		if (cacheKey) {
-			externalTrophyMatchCache.set(cacheKey, resolved);
-			while (externalTrophyMatchCache.size > EXTERNAL_TROPHY_MATCH_CACHE_MAX) externalTrophyMatchCache.delete(externalTrophyMatchCache.keys().next().value);
-		}
+		const matches = externalTrophyExactIndex.get(localTitle);
+		const resolved = !matches ? null : matches.size === 1 ? matches.values().next().value : undefined;
+		externalTrophyMatchCache.set(cacheKey, resolved);
+		while (externalTrophyMatchCache.size > EXTERNAL_TROPHY_MATCH_CACHE_MAX) externalTrophyMatchCache.delete(externalTrophyMatchCache.keys().next().value);
 		return resolved;
 	}
 
@@ -38818,7 +38795,7 @@ P
 	}
 	function keepTrophyDbKnown(key, match) {
 		trophyDbKnown.delete(key);
-		trophyDbKnown.set(key, match || null);
+		trophyDbKnown.set(key, match === undefined ? undefined : (match || null));
 		if (match && match.npCommunicationId) trophyDbGameById.set(match.npCommunicationId,match);
 		while (trophyDbKnown.size>80) trophyDbKnown.delete(trophyDbKnown.keys().next().value);
 		while (trophyDbGameById.size>80) trophyDbGameById.delete(trophyDbGameById.keys().next().value);
@@ -38843,7 +38820,7 @@ P
 					});
 					if(response.ok){
 						const data=await response.json();
-						if(data.ok)return;
+						if(data.ok&&data.saved)return;
 					}
 					if(response.status>=400&&response.status<500&&response.status!==429)return;
 				}catch(err){}
@@ -38863,8 +38840,10 @@ P
 		const task=(async()=>{
 			if (externalTrophyDbGames) {
 				const match=findExternalTrophyGame(game);
-				keepTrophyDbKnown(key,match);
-				saveGameTrophyDbMatch(game,match);
+				if (match !== undefined) {
+					keepTrophyDbKnown(key,match);
+					saveGameTrophyDbMatch(game,match);
+				}
 				return match;
 			}
 			try {
@@ -38896,8 +38875,10 @@ P
 			}
 			await loadExternalTrophyDb();
 			const match=findExternalTrophyGame(game);
-			keepTrophyDbKnown(key,match);
-			saveGameTrophyDbMatch(game,match);
+			if (match !== undefined) {
+				keepTrophyDbKnown(key,match);
+				saveGameTrophyDbMatch(game,match);
+			}
 			return match;
 		})();
 		trophyMatchPending.set(key,task);
@@ -39022,6 +39003,11 @@ P
 		prepareGameTrophyMatch(localGame,currentCat,true)
 			.then(match => {
 				if (token !== modalTrophyLookupToken || !document.getElementById('modal-trophies-status')) return;
+				if (match === undefined) {
+					statusEl.className = 'modal-trophies-no';
+					statusEl.textContent = '—';
+					return;
+				}
 				if (!match) {
 					statusEl.className = 'modal-trophies-no';
 					translateModalTrophyAvailability(statusEl, 'No');
