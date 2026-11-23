@@ -2245,7 +2245,6 @@ async function ssPreviewMaybeRefreshQuota() {
 }
 const ssPreviewCache = new Map();
 const ssPreviewInflight = new Map();
-let ssPreviewQueueTail = Promise.resolve();
 let ssPreviewQueued = 0;
 
 function ssPreviewSearchName(value) {
@@ -2572,7 +2571,7 @@ function ssPreviewFetchUpstream(name, systemId, key) {
     return Promise.reject(busy);
   }
   ssPreviewQueued++;
-  const work = ssPreviewQueueTail.then(async () => {
+  const work = (async () => {
     const searches = ssPreviewSearchVariants(name);
     const wanted = normalizeSsPreviewTitle(name);
     let bestGame = null;
@@ -2644,8 +2643,7 @@ function ssPreviewFetchUpstream(name, systemId, key) {
     ssPreviewSetCached(key, result);
     ssPreviewPersistDatabase(key, systemId, result);
     return result;
-  });
-  ssPreviewQueueTail = work.catch(() => null);
+  })();
   return work.finally(() => { ssPreviewQueued--; });
 }
 function ssPreviewLookup(name, systemId, options = null) {
@@ -2667,6 +2665,20 @@ function ssPreviewLookup(name, systemId, options = null) {
   const pending = work.finally(() => ssPreviewInflight.delete(key));
   ssPreviewInflight.set(key, pending);
   return pending;
+}
+
+async function ssPreviewLookupMinis(name, options = null) {
+  const ps3=await ssPreviewLookup(name,59,options);
+  if (options?.artwork) {
+    if (ps3?.extras?.images?.some(item=>item.kind==='artwork')) return ps3;
+  } else if (ps3?.found) return ps3;
+  const psp=await ssPreviewLookup(name,61,options);
+  if (options?.artwork) {
+    if (!ps3?.extras) return psp?.extras?psp:ps3;
+    if (!psp?.extras) return ps3;
+    return (psp.extras.images?.length||0)>(ps3.extras.images?.length||0)?psp:ps3;
+  }
+  return psp?.found?psp:ps3;
 }
 
 function ssVideoHttpError(http, code, upstream = 0) {
@@ -2925,12 +2937,13 @@ app.get('/api/gameplay-preview', async (req, res) => {
   if (!SS_PREVIEW_ENABLED) return res.status(503).json({ ok:false, configured:false });
   const name = String(req.query && req.query.name || '').trim().slice(0, 140);
   const isPort = String(req.query && req.query.port || '') === '1';
+  const isMinis = !isPort && String(req.query && req.query.minis || '') === '1';
   const systemId = isPort ? 0 : Number(req.query && req.query.system);
-  if (name.length < 3 || (!isPort && !SS_PREVIEW_SYSTEM_IDS.has(systemId)) || !normalizeSsPreviewTitle(name)) {
+  if (name.length < 3 || (!isPort && !SS_PREVIEW_SYSTEM_IDS.has(systemId)) || (isMinis && systemId !== 59) || !normalizeSsPreviewTitle(name)) {
     return res.status(400).json({ ok:false, error:'Invalid game or system.' });
   }
   try {
-    const result = await ssPreviewLookup(name, systemId);
+    const result = await (isMinis ? ssPreviewLookupMinis(name) : ssPreviewLookup(name, systemId));
     if (!result.found) return res.json({ok:true,configured:true,found:false,provider:'screenscraper',reason:result.reason,candidates:result.candidates || 0});
     return res.json({ok:true,configured:true,found:true,url:result.url,
       fallbackUrl:`/api/gameplay-video?token=${ssPreviewVideoToken(result.video)}`,provider:'screenscraper'});
@@ -2949,10 +2962,11 @@ app.get('/api/screenscraper-extras', async (req,res) => {
   if (!SS_PREVIEW_ENABLED) return res.status(503).json({ok:false,reason:'not_configured'});
   const name = String(req.query && req.query.name || '').trim().slice(0,140);
   const isPort = String(req.query && req.query.port || '') === '1';
+  const isMinis = !isPort && String(req.query && req.query.minis || '') === '1';
   const system = isPort ? 0 : Number(req.query && req.query.system);
-  if ((!isPort && !SS_PREVIEW_SYSTEM_IDS.has(system)) || name.length < 3 || !normalizeSsPreviewTitle(name)) return res.status(400).json({ok:false});
+  if ((!isPort && !SS_PREVIEW_SYSTEM_IDS.has(system)) || (isMinis && system !== 59) || name.length < 3 || !normalizeSsPreviewTitle(name)) return res.status(400).json({ok:false});
   try {
-    const result = await ssPreviewLookup(name,system,{englishSummary:true,artwork:true});
+    const result = await (isMinis ? ssPreviewLookupMinis(name,{englishSummary:true,artwork:true}) : ssPreviewLookup(name,system,{englishSummary:true,artwork:true}));
     return res.json({ok:true,found:!!result.extras,extras:ssExtraPublic(result.extras)});
   } catch (e) {if([429,503].includes(Number(e?.status)))res.setHeader('Retry-After',String(Math.min(3600,Math.max(2,Number(e.retryAfter)||60))));return res.status([429,503].includes(Number(e?.status)) ? e.status : 502).json({ok:false,reason:e.code || 'unavailable'});}
 });
