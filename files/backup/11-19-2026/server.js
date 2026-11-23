@@ -14,7 +14,6 @@ const { isDeepStrictEqual } = require('node:util');
 const { monitorEventLoopDelay, performance } = require('node:perf_hooks');
 
 const app = express();
-// Compress public metadata off the event loop; keep HTTP content negotiation intact.
 app.use((req, res, next) => {
   if (req.method !== 'GET' || !req.path.startsWith('/api/metadata/')) return next();
   const gzipPreference = String(req.headers['accept-encoding'] || '').split(',')
@@ -60,7 +59,11 @@ const MAX_CHAT_HISTORY = 1000;
 const CHAT_SYNC_CHANGE_LOG_MAX = Math.max(1000, Math.min(20000, parseInt(process.env.CHAT_SYNC_CHANGE_LOG_MAX || "5000", 10) || 5000));
 const CHAT_SYNC_MAX_DELTA = Math.max(100, Math.min(5000, parseInt(process.env.CHAT_SYNC_MAX_DELTA || "1500", 10) || 1500));
 const CHAT_BATCH_DELETE_MAX = 100;
-const CHAT_SEEN_BATCH_MAX = MAX_CHAT_HISTORY;
+const CHAT_SEEN_BATCH_MAX = 48;
+const CHAT_SEEN_RETENTION_DAYS = Math.max(1, Math.min(90, parseInt(process.env.CHAT_SEEN_RETENTION_DAYS || '30', 10) || 30));
+const CHAT_SEEN_MAX_EVENTS = Math.max(2000, Math.min(50000, parseInt(process.env.CHAT_SEEN_MAX_EVENTS || '25000', 10) || 25000));
+const CHAT_SEEN_PRUNE_BATCH = 2500;
+const STORAGE_MAINTENANCE_MS = 10 * 60 * 1000;
 const CHAT_MESSAGE_TEXT_MAX = 64 * 1024;
 const CHAT_MESSAGE_MEDIA_MAX = 20;
 const CHAT_MESSAGE_URL_MAX = 4096;
@@ -86,8 +89,6 @@ const DIRECT_MESSAGE_RETENTION_TRACK_MAX = 2048;
 const directMessageRetentionLastRun = new Map();
 const directMessageRetentionTimers = new Map();
 
-// Per-user repeated-message protection. The repeat scan reuses the bounded in-memory
-// chat history; only active cooldowns need their own tiny runtime map.
 const CHAT_SPAM_REPEAT_WINDOW_MS = Math.max(10000, Math.min(5 * 60 * 1000, parseInt(process.env.CHAT_SPAM_REPEAT_WINDOW_MS || "60000", 10) || 60000));
 const CHAT_SPAM_WARNING_COUNT = 3;
 const CHAT_SPAM_TRIGGER_COUNT = 5;
@@ -469,7 +470,7 @@ const CHAT_SYNC_INTERVAL_MS = 3000;
 const KEEP_ALIVE_INTERVAL_MS = Math.max(60000, parseInt(process.env.KEEP_ALIVE_INTERVAL_MS || "600000", 10) || 600000);
 const KEEP_ALIVE_TIMEOUT_MS = Math.max(1000, parseInt(process.env.KEEP_ALIVE_TIMEOUT_MS || "10000", 10) || 10000);
 const KEEP_ALIVE_URLS = [
-  "https://psn-content-s2k2.onrender.com",
+  "https://psn-content-fd6j.onrender.com",
 ];
 const PROFILE_SYNC_INTERVAL_MS = Math.max(10000, parseInt(process.env.PROFILE_SYNC_INTERVAL_MS || "15000", 10) || 15000);
 const ENABLE_PROFILE_PERIODIC_SYNC = process.env.ENABLE_PROFILE_PERIODIC_SYNC === "1";
@@ -518,9 +519,6 @@ const ADMIN_STATE_KEYS = {
 // ============================================================================
 // PostgreSQL pool & shared server limits
 // ============================================================================
-// This pool is per server instance, and each instance also holds one dedicated
-// LISTEN/NOTIFY connection. Keep headroom during zero-downtime deploys when
-// old and new instances overlap; PG_POOL_MAX/DB_POOL_MAX can override this.
 const PG_POOL_MAX = Math.max(1, Math.min(10, parseInt(process.env.PG_POOL_MAX || process.env.DB_POOL_MAX || "5", 10) || 5));
 const PG_CONNECTION_TIMEOUT_MS = Math.max(3000, parseInt(process.env.PG_CONNECTION_TIMEOUT_MS || "10000", 10) || 10000);
 const PG_IDLE_TIMEOUT_MS = Math.max(30000, parseInt(process.env.PG_IDLE_TIMEOUT_MS || "120000", 10) || 120000);
@@ -562,8 +560,6 @@ const poolOptions = {
 if (PG_MAX_USES > 0) poolOptions.maxUses = PG_MAX_USES;
 const pool = new Pool(poolOptions);
 
-// One-time, admin-issued download tokens for native pg_dump backups.
-// The SQL stream never passes through Socket.IO and is never buffered as a whole in memory.
 const ADMIN_POSTGRES_BACKUP_TOKEN_TTL_MS = 60 * 1000;
 const adminPostgresBackupTokens = new Map();
 let adminPostgresBackupActive = false;
@@ -782,9 +778,6 @@ function buildRoleChangeNoticeForTransition(targetName, nextRole, immediatePrevi
   const previousRole = normalizeRoleNoticeRole(immediatePreviousRole, 'user');
   const normalizedNextRole = normalizeRoleNoticeRole(nextRole, 'user');
 
-  /* The user's last acknowledged role is the semantic baseline. If a role change is
-     reversed before its notice is acknowledged, the net state returns to that baseline
-     and no stale promotion/demotion notice should survive. */
   const baselineRole = acknowledgedRole || (pending && pending.previousRole) || previousRole;
   if (normalizedNextRole === baselineRole) return null;
 
@@ -903,8 +896,6 @@ function isPgTransientConnectionError(err) {
   const code = String(err.code || '').toUpperCase();
   const message = String(err.message || err).toLowerCase();
   if (['08000','08001','08003','08004','08006','08007','08P01','57P01','57P02','57P03','53300','55P03','40001','40P01'].includes(code)) return true;
-  // A canceled/over-budget SQL statement is not a broken connection. Retrying it
-  // immediately doubles load on a struggling free PostgreSQL instance.
   if (code === '57014' || /query read timeout|query timeout|statement timeout|canceling statement/.test(message)) return false;
   return /read timeout|connection terminated|connection timeout|timeout exceeded when trying to connect|connection reset|econnreset|etimedout|ehostunreach|enetunreach|socket hang up|broken pipe|server closed the connection|terminating connection|the database system is starting up|too many clients|remaining connection slots/.test(message);
 }
@@ -913,21 +904,15 @@ function waitMs(ms) {
   return new Promise(resolve => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
 }
 
-// Lightweight, bounded PostgreSQL timing summaries. Disable with DB_PERF_ENABLED=0.
-// Only labels and timings are logged; SQL and private user data are never logged.
 const DB_PERF_ENABLED = process.env.DB_PERF_ENABLED !== '0';
 const DB_PERF_SLOW_MS = Math.max(300, Math.min(10000, parseInt(process.env.DB_PERF_SLOW_MS || '1200', 10) || 1200));
 const DB_PERF_INTERVAL_MS = Math.max(60000, Math.min(600000, parseInt(process.env.DB_PERF_INTERVAL_MS || '300000', 10) || 300000));
 const dbQueryPerf = new Map();
-// Low-overhead event loop diagnostics explain correlated query stalls, without
-// attributing time inside client.query() incorrectly to PostgreSQL execution.
 const dbEventLoopDelay = DB_PERF_ENABLED ? monitorEventLoopDelay({ resolution: 20 }) : null;
 if (dbEventLoopDelay) dbEventLoopDelay.enable();
 let dbLastLoopUtilization = DB_PERF_ENABLED ? performance.eventLoopUtilization() : null;
 let dbLastCpuUsage = DB_PERF_ENABLED ? process.cpuUsage() : null;
 let profileNoopSavesAvoided = 0;
-// Revision-only updates are intentionally allowed only for ACKed, unchanged
-// sections. Counters explain why the bandwidth-saving path is rarely used.
 const profileDeliveryMetrics = { full: 0, gzip: 0, revision: 0, revisionAccepted: 0, revisionRejected: 0, revisionNoBaseline: 0, revisionContentChanged: 0, revisionEligible: 0, explicitHydration: 0, gzipFallback: 0, ackTimeout: 0, rawBytes: 0, gzipBytes: 0, gzipBase64Bytes: 0 };
 const profileAckTimeoutSections = Object.create(null);
 const serverPhaseMetrics = new Map();
@@ -1041,8 +1026,6 @@ function flushDbQueryPerformance() {
   dbPerfPeakConnections = 0;
 }
 
-// Keep expensive, nonessential reads from occupying the whole connection
-// pool while new sessions are authenticating. Only read-only labels participate.
 const DB_READ_ADMISSION_ENABLED = process.env.DB_READ_ADMISSION !== '0';
 const DB_OPTIONAL_READ_MAX = Math.max(1, Math.min(2, PG_POOL_MAX - 1));
 const DB_BULK_READ_WAIT_MAX_MS = Math.max(0, Math.min(4000, parseInt(process.env.DB_BULK_READ_WAIT_MAX_MS || '1800', 10) || 1800));
@@ -1138,8 +1121,6 @@ async function queryDbWithRetryCore(text, params = [], options = {}) {
         return result;
       } catch (err) {
         if (DB_PERF_ENABLED) queryMs += Date.now() - queryStartedAt;
-        // node-postgres can reject a local query_timeout while the backend is
-        // still busy. Do not return that connection to the free-tier pool.
         discardClient = /query read timeout|query timeout/i.test(String(err && err.message || ''));
         throw err;
       }
@@ -1152,12 +1133,9 @@ async function queryDbWithRetryCore(text, params = [], options = {}) {
         throw err;
       }
     } finally {
-      // A locally timed-out query may still be executing server-side. Retire
-      // that socket instead of handing it to another waiting request.
       if (client) client.release(discardClient ? lastError : undefined);
     }
     if (shouldRetry) {
-      // Spread reconnect attempts to avoid a thundering herd on small Aiven tiers.
       const delayMs = (attempt === 1 ? 180 : 650) + Math.floor(Math.random() * 101);
       console.warn(`[${label}] Temporary PostgreSQL connection failure. Retrying ${attempt + 1}/${attempts} in ${delayMs}ms.`);
       await waitMs(delayMs);
@@ -1233,8 +1211,6 @@ async function runDbTransactionWithRetry(label, taskFn, options = {}) {
       retryDelayMs = attempt === 1 ? 40 : attempt === 2 ? 100 : attempt === 3 ? 220 : 450;
       console.warn(`[${label}] Temporary PostgreSQL lock/connection contention. Retrying ${attempt + 1}/${attempts} in ${retryDelayMs}ms.`);
     } finally {
-      // Always return the connection BEFORE backing off; otherwise retries
-      // occupy scarce Aiven pool slots while doing no database work.
       if (client) client.release(discardClient ? lastError || new Error('ROLLBACK failed') : undefined);
     }
     if (retryDelayMs) await waitMs(retryDelayMs);
@@ -1360,8 +1336,6 @@ function startKeepAlivePings() {
   if (typeof keepAliveInterval.unref === 'function') keepAliveInterval.unref();
 }
 
-// Streams a native, readable PostgreSQL plain-SQL backup using pg_dump.
-// Access is granted only by a short-lived, single-use token issued to an authenticated admin socket.
 app.get('/api/admin/postgres-backup', (req, res) => {
   cleanupAdminPostgresBackupTokens();
   const token = String(req.query && req.query.token || '').trim();
@@ -1588,8 +1562,6 @@ async function readSharedMetadataProviderCache(cacheKey) {
 
 function saveSharedMetadataProviderCache(cacheKey, payload) {
   if (!cacheKey || !payload) return;
-  // This persistent cache is optional: don't queue metadata writes ahead of
-  // logins, social comments and chat requests when all DB clients are busy.
   if (pool.waitingCount > 0 && pool.idleCount === 0) return;
   const serialized = JSON.stringify(payload);
   if (Buffer.byteLength(serialized) > 150000) return;
@@ -2098,6 +2070,1049 @@ app.get('/api/metadata/live', async (req, res) => {
   return res.json(payload);
 });
 
+const SS_PREVIEW_DEVID = String(process.env.SCREENSCRAPER_DEV_ID || 'LuanTeles').trim();
+const SS_PREVIEW_DEVPASSWORD = String(process.env.SCREENSCRAPER_DEV_PASSWORD || '69bjUwTdqXA').trim();
+const SS_PREVIEW_USER = String(process.env.SCREENSCRAPER_USER || '').trim();
+const SS_PREVIEW_PASSWORD = String(process.env.SCREENSCRAPER_PASSWORD || '').trim();
+const SS_PREVIEW_ENABLED = process.env.SCREENSCRAPER_PREVIEWS_ENABLED !== '0' && !!SS_PREVIEW_DEVID && !!SS_PREVIEW_DEVPASSWORD;
+if (SS_PREVIEW_ENABLED && !(SS_PREVIEW_USER && SS_PREVIEW_PASSWORD))
+  console.warn('[ScreenScraper] No member login configured; set SCREENSCRAPER_USER and SCREENSCRAPER_PASSWORD on Render to use member quota.');
+const SS_PREVIEW_SYSTEM_IDS = new Set([57, 58, 59, 61, 62, 60]); // Explicit PlayStation categories
+const ssPreviewValidMediaSystem = value => Number.isSafeInteger(value) && value >= 1 && value <= 2000;
+const SS_PREVIEW_POSITIVE_MS = 24 * 60 * 60 * 1000;
+const SS_PREVIEW_NEGATIVE_MS = 3 * 60 * 1000;
+const SS_PREVIEW_MAX_CACHE = 500;
+const SS_PREVIEW_FALLBACK_MINUTE_MAX = null;
+const SS_PREVIEW_FALLBACK_DAILY_MAX = null;
+const ssPreviewMinuteTimes = [];
+let ssPreviewMinuteUsed = 0;
+let ssPreviewDailyUsed = 0;
+let ssPreviewDailyDate = '';
+const ssPreviewQuota = { minuteMax:SS_PREVIEW_FALLBACK_MINUTE_MAX,
+  dayMax:SS_PREVIEW_FALLBACK_DAILY_MAX, threadsMax:1, source:'unknown', reportedToday:null,
+  reportedAtLocalUsed:0, checkedAt:0, nextCheck:0, blockedUntil:0 };
+let ssPreviewQuotaPending = null;
+let ssProviderActive = 0;
+const ssProviderWaiters = [];
+function ssProviderPump() {
+  const max = Math.min(4,Math.max(1,ssPreviewQuota.threadsMax || 1));
+  while (ssProviderActive < max && ssProviderWaiters.length) {
+    const job = ssProviderWaiters.shift();
+    if (job.done) continue;
+    job.done=true;
+    clearTimeout(job.timeout);
+    if (job.signal) job.signal.removeEventListener('abort',job.cancel);
+    ssProviderActive++;
+    let released=false;
+    job.resolve(()=>{
+      if (released) return;
+      released=true;
+      ssProviderActive--;
+      ssProviderPump();
+    });
+  }
+}
+function ssProviderAcquire(kind='search',signal) {
+  if (signal?.aborted) return Promise.reject(Object.assign(new Error('aborted'),{name:'AbortError'}));
+  if (ssProviderWaiters.length >= 40)
+    return Promise.reject(Object.assign(new Error('ScreenScraper queue busy'),{status:503,code:'provider_queue_full'}));
+  return new Promise((resolve,reject)=>{
+    const job={kind,signal,resolve,reject,done:false,timeout:null,cancel:null};
+    const cancel=(reason)=>{
+      if (job.done) return;
+      job.done=true;
+      clearTimeout(job.timeout);
+      if (signal) signal.removeEventListener('abort',job.cancel);
+      const idx=ssProviderWaiters.indexOf(job);
+      if (idx!==-1) ssProviderWaiters.splice(idx,1);
+      reject(Object.assign(new Error(reason),{status:503,code:'provider_queue_timeout',
+        name:reason==='aborted'?'AbortError':'Error'}));
+    };
+    job.cancel=()=>cancel('aborted');
+    if (signal) signal.addEventListener('abort',job.cancel,{once:true});
+    job.timeout=setTimeout(()=>cancel('queue_timeout'),kind==='video'?18000:12000);
+    const weight={video:0,search:1,info:1,image:2};
+    const priority=weight[kind]??2;
+    const idx=ssProviderWaiters.findIndex(other=>(weight[other.kind]??2)>priority);
+    if (idx<0) ssProviderWaiters.push(job);
+    else ssProviderWaiters.splice(idx,0,job);
+    ssProviderPump();
+  });
+}
+
+function ssPreviewParisDay() {
+  return new Intl.DateTimeFormat('en-CA', {timeZone:'Europe/Paris', year:'numeric', month:'2-digit', day:'2-digit'}).format(new Date());
+}
+function ssPreviewQuotaRoll() {
+  const now = Date.now();
+  while (ssPreviewMinuteTimes.length && now - ssPreviewMinuteTimes[0] >= 60000)
+    ssPreviewMinuteTimes.shift();
+  ssPreviewMinuteUsed = ssPreviewMinuteTimes.length;
+  const day = ssPreviewParisDay();
+  if (ssPreviewDailyDate !== day) {
+    ssPreviewDailyDate=day; ssPreviewDailyUsed=0;
+    ssPreviewQuota.reportedToday=null; ssPreviewQuota.reportedAtLocalUsed=0;
+    ssPreviewQuota.nextCheck=0; ssPreviewQuota.source='unknown';
+    ssPreviewQuota.minuteMax=SS_PREVIEW_FALLBACK_MINUTE_MAX;
+    ssPreviewQuota.dayMax=SS_PREVIEW_FALLBACK_DAILY_MAX;
+    ssPreviewQuota.blockedUntil=0;
+  }
+}
+function ssPreviewQuotaInteger(value, maximum) {
+  if (value === null || value === undefined || value === '') return null;
+  const num=Number(value);
+  return Number.isSafeInteger(num) && num>=0 && num<=maximum ? num : null;
+}
+function ssPreviewQuotaFromResponse(data) {
+  const root=data && typeof data==='object' ? data : {};
+  const response=root.response && typeof root.response==='object' ? root.response : {};
+  for (const entry of [response.ssuser, response.ssusers?.ssuser, root.ssuser, root.ssusers?.ssuser]) {
+    const user=Array.isArray(entry) ? entry[0] : entry;
+    if (!user || typeof user!=='object') continue;
+    const perMin=ssPreviewQuotaInteger(user.maxrequestspermin ?? user.maxrequestsperdmin, 100000);
+    const perDay=ssPreviewQuotaInteger(user.maxrequestsperday, 1000000);
+    const threads=ssPreviewQuotaInteger(user.maxthreads, 100);
+    if (!perMin && !perDay && !threads) continue;
+    ssPreviewQuotaRoll();
+    if (perMin) ssPreviewQuota.minuteMax=perMin;
+    if (perDay) ssPreviewQuota.dayMax=perDay;
+    if (threads) {ssPreviewQuota.threadsMax=Math.min(4,threads);ssProviderPump();}
+    const used=ssPreviewQuotaInteger(user.requeststoday, 1000000);
+    if (used!==null) {
+      ssPreviewQuota.reportedToday=used;
+      ssPreviewQuota.reportedAtLocalUsed=ssPreviewDailyUsed;
+    }
+    ssPreviewQuota.source='screenscraper';
+    ssPreviewQuota.checkedAt=Date.now();
+    return true;
+  }
+  return false;
+}
+function ssPreviewQuotaReserve(kind='video') {
+  ssPreviewQuotaRoll();
+  const now=Date.now();
+  if (now < ssPreviewQuota.blockedUntil) {
+    const error = new Error('ScreenScraper requested a temporary cooldown.');
+    error.status=429;
+    error.code='provider_cooldown';
+    error.retryAfter=Math.max(1,Math.ceil((ssPreviewQuota.blockedUntil-now)/1000));
+    throw error;
+  }
+  ssPreviewMinuteTimes.push(now);
+  ssPreviewMinuteUsed=ssPreviewMinuteTimes.length;
+  ssPreviewDailyUsed++;
+}
+function ssPreviewQuotaNoteRate(status) {
+  if (status===429)
+    ssPreviewQuota.blockedUntil=Math.max(ssPreviewQuota.blockedUntil,Date.now()+30000);
+  if (status===430) {
+    const today=ssPreviewParisDay();
+    let lo=Date.now(),hi=lo+27*60*60*1000;
+    while (hi-lo>1000) {
+      const mid=lo+Math.floor((hi-lo)/2);
+      if (new Intl.DateTimeFormat('en-CA',{timeZone:'Europe/Paris',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(mid))===today) lo=mid;
+      else hi=mid;
+    }
+    ssPreviewQuota.blockedUntil=Math.max(ssPreviewQuota.blockedUntil,hi+5000);
+  }
+}
+async function ssPreviewMaybeRefreshQuota() {
+  if (!SS_PREVIEW_USER || !SS_PREVIEW_PASSWORD) return;
+  ssPreviewQuotaRoll();
+  if (Date.now()<ssPreviewQuota.nextCheck) return;
+  if (ssPreviewQuotaPending) return ssPreviewQuotaPending;
+  ssPreviewQuota.nextCheck=Date.now()+20*60*1000;
+  ssPreviewQuotaPending=(async()=>{
+    const release = await ssProviderAcquire('info');
+    try {
+      ssPreviewQuotaReserve('search');
+      const url=new URL('https://api.screenscraper.fr/api2/ssuserInfos.php');
+    url.searchParams.set('devid',SS_PREVIEW_DEVID);
+    url.searchParams.set('devpassword',SS_PREVIEW_DEVPASSWORD);
+    url.searchParams.set('softname','PSN-Content');
+    url.searchParams.set('output','json');
+    url.searchParams.set('ssid',SS_PREVIEW_USER);
+    url.searchParams.set('sspassword',SS_PREVIEW_PASSWORD);
+    const response=await requestMetadataJson(url,{timeoutMs:6000,headers:{'User-Agent':'PSN-Content/1.0 ScreenScraper-Preview'}});
+      if (!response.ok) {ssPreviewQuotaNoteRate(Number(response.status));ssPreviewQuota.nextCheck=Date.now()+60000;return;}
+      if (!ssPreviewQuotaFromResponse(response.data)) ssPreviewQuota.nextCheck=Date.now()+60000;
+      else console.info('[ScreenScraper quota]',JSON.stringify({
+        threads:ssPreviewQuota.threadsMax,perMinute:ssPreviewQuota.minuteMax,
+        perDay:ssPreviewQuota.dayMax,usedToday:ssPreviewQuota.reportedToday}));
+    } finally { release(); }
+  })().catch(()=>{ssPreviewQuota.nextCheck=Date.now()+60000;}).finally(()=>{ssPreviewQuotaPending=null;});
+  return ssPreviewQuotaPending;
+}
+const ssPreviewCache = new Map();
+const ssPreviewInflight = new Map();
+let ssPreviewQueued = 0;
+
+function ssPreviewSearchName(value) {
+  return String(value || '').replace(/[™®©]/g, ' ').replace(/\b(?:tm|registered)\b/gi, ' ')
+    .replace(/\s*[[(](?:usa|eur|europe|japan|jpn|us|eu|ps3|ps2|psp|ps1|ps4|digital version)[)\]]/gi, '')
+    .replace(/\b(?:digital version|version digitale)\b/gi, '')
+    .replace(/\s*[:：;；‐‑‒–—−]\s*/g, ' - ').replace(/\s+-\s+/g, ' - ')
+    .replace(/\s+/g, ' ').trim();
+}
+function ssPreviewSearchVariants(value) {
+  const title = ssPreviewSearchName(value);
+  const plain = title.replace(/\s+-\s+/g, ' ').replace(/\s+/g, ' ').trim();
+  return [...new Set([title, plain])].filter(Boolean);
+}
+function normalizeSsPreviewTitle(value) {
+  return ssPreviewSearchName(value).normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/\b(?:the|a|an)\b/gi, ' ').replace(/&/g, ' and ')
+    .replace(/[^a-z0-9]+/gi, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function ssPreviewNames(game) {
+  const names = game && game.noms;
+  let rows = Array.isArray(names) ? names : (names && Array.isArray(names.nom) ? names.nom : (names && names.nom ? [names.nom] : []));
+  if (!rows.length && names && typeof names === 'object') rows = Object.values(names);
+  const found = rows.map(item => String(typeof item === 'string' ? item : item && (item.text || item.nom || item.name) || '').trim()).filter(Boolean);
+  for (const fallback of [game && game.nom, game && game.name, game && game.title]) {
+    if (typeof fallback === 'string' && fallback.trim()) found.push(fallback.trim());
+  }
+  return [...new Set(found)];
+}
+
+function ssPreviewTitleSimilarity(a, b) {
+  if (!a || !b) return 0;
+  if (a === b || a.replace(/\s+/g, '') === b.replace(/\s+/g, '')) return 1;
+  const nums = value => (value.match(/\b\d+\b/g) || []).join('|');
+  if (nums(a) !== nums(b)) return 0;
+  const leftSet = new Set(a.split(' ')), rightSet = new Set(b.split(' '));
+  const common = [...leftSet].filter(value => rightSet.has(value)).length;
+  const coverage = 2 * common / (leftSet.size + rightSet.size);
+  return coverage >= 0.78 && Math.abs(a.length - b.length) <= 22 ? coverage : 0;
+}
+
+function ssPreviewMediaList(game) {
+  const medias = game && game.medias;
+  if (Array.isArray(medias)) return medias;
+  if (!medias || typeof medias !== 'object') return [];
+  if (Array.isArray(medias.media)) return medias.media;
+  if (medias.media) return [medias.media];
+  const mapped = [];
+  for (const [key, value] of Object.entries(medias)) {
+    if (!value) continue;
+    const type = key.replace(/^media_/, '').replace(/_/g, '-');
+    for (const item of (Array.isArray(value) ? value : [value])) {
+      if (typeof item === 'string') mapped.push({type, url:item});
+      else if (item && typeof item === 'object') mapped.push({type,...item});
+    }
+  }
+  return mapped;
+}
+
+function ssPreviewAllowedMediaHost(hostname) {
+  const host = String(hostname || '').toLowerCase();
+  return host === 'screenscraper.fr' || host.endsWith('.screenscraper.fr');
+}
+
+function ssPreviewFindVideo(game, expectedSystem) {
+  const id = Number(game && game.id);
+  const system = Number(game && (game.systemeid || (game.systeme && game.systeme.id)) || expectedSystem);
+  if (!Number.isSafeInteger(id) || id <= 0 || !ssPreviewValidMediaSystem(system) ||
+      (expectedSystem && system !== expectedSystem)) return null;
+  const medias = ssPreviewMediaList(game);
+  for (const type of ['video-normalized', 'video']) {
+    const media = medias.find(item => item && String(item.type || '').toLowerCase().replace(/_/g,'-') === type);
+    if (!media) continue;
+    let raw = String(media.url || media.href || media.text || '').trim();
+    if (raw.startsWith('#screenscraperserveur#')) raw = raw.replace('#screenscraperserveur#', 'https://www.screenscraper.fr/');
+    let publicUrl = `https://www.screenscraper.fr/medias/${system}/${id}/${type}.mp4`;
+    let apiHost = 'api.screenscraper.fr';
+    try {
+      const candidate = new URL(raw);
+      if (candidate.protocol === 'https:' && ssPreviewAllowedMediaHost(candidate.hostname) &&
+          !candidate.username && !candidate.password && !candidate.port) {
+        if (candidate.pathname === '/api2/mediaVideoJeu.php') apiHost = candidate.hostname;
+        if (candidate.pathname === `/medias/${system}/${id}/${type}.mp4` && !candidate.search) {
+          publicUrl = candidate.href;
+        }
+      }
+    } catch (_) {}
+    return { url:publicUrl, gameId:id, system, type, apiHost };
+  }
+  return null;
+}
+
+const ssPreviewVideoSecret = crypto.createHmac('sha256',
+  String(process.env.SCREENSCRAPER_MEDIA_SIGNING_KEY || SS_PREVIEW_DEVPASSWORD))
+  .update('PSN-Content ScreenScraper media links v1').digest();
+const { Transform: SsVideoTransform } = require('node:stream');
+const SS_PREVIEW_VIDEO_MAX_BYTES = 32 * 1024 * 1024;
+const ssVideoFailures = new Map();
+const ssVideoLimitLoggedAt = new Map();
+function ssVideoLogLimit(reason) {
+  const now=Date.now();
+  if(now-(ssVideoLimitLoggedAt.get(reason)||0)<30000)return;
+  ssVideoLimitLoggedAt.set(reason,now);
+  console.warn('[SCREENSCRAPER VIDEO]',reason,'active='+ssVideoActive,
+    'apiMinute='+ssPreviewMinuteUsed+'/'+ssPreviewQuota.minuteMax,
+    'providerBackoffSec='+Math.max(0,Math.ceil((ssPreviewQuota.blockedUntil-Date.now())/1000)));
+}
+let ssVideoActive = 0;
+function ssPreviewVideoToken(video) {
+  const expires=(Math.floor(Date.now()/86400000)+2)*86400;
+  const payload = Buffer.from(JSON.stringify({s:video.system,g:video.gameId,t:video.type,h:video.apiHost || 'api.screenscraper.fr',e:expires})).toString('base64url');
+  const signature = crypto.createHmac('sha256',ssPreviewVideoSecret).update(payload).digest('hex');
+  return `${payload}.${signature}`;
+}
+function ssPreviewVerifyVideoToken(token) {
+  if (typeof token !== 'string' || token.length > 400 || !/^[A-Za-z0-9_-]+\.[a-f0-9]{64}$/.test(token)) return null;
+  const dot = token.indexOf('.');
+  const raw = token.slice(0,dot), sig = token.slice(dot+1);
+  const expected = crypto.createHmac('sha256',ssPreviewVideoSecret).update(raw).digest('hex');
+  if (!crypto.timingSafeEqual(Buffer.from(sig,'hex'),Buffer.from(expected,'hex'))) return null;
+  let parsed;
+  try { parsed = JSON.parse(Buffer.from(raw,'base64url').toString('utf8')); } catch (_) { return null; }
+  if (!parsed || !ssPreviewValidMediaSystem(parsed.s) || !Number.isSafeInteger(parsed.g) || parsed.g <= 0 ||
+      !['video','video-normalized'].includes(parsed.t) ||
+      !ssPreviewAllowedMediaHost(parsed.h || 'api.screenscraper.fr') ||
+      !Number.isSafeInteger(parsed.e) || parsed.e < Math.floor(Date.now()/1000)) return null;
+  return parsed;
+}
+
+const SS_EXTRA_MEDIA_TYPES = new Set(['ss','sstitle','fanart','box-2D','box-3D','box-2D-back',
+  'box-2D-front','wheel','wheel-hd','wheel-carbon','wheel-steel','steamgrid','screenmarquee','manuel','manual']);
+const ssExtraImageCache = new Map();
+const ssExtraImagePending = new Map();
+const ssExtraImageWaiters = [];
+let ssExtraImageActive = 0;
+let ssExtraImageBytes = 0;
+const SS_EXTRA_IMAGE_LIMIT = 16 * 1024 * 1024;
+const SS_EXTRA_IMAGE_TTL_MS = 60 * 60 * 1000;
+function ssExtraImageToken(system, gameId, type, region) {
+  const expires=(Math.floor(Date.now()/3600000)+2)*3600;
+  const raw = Buffer.from(JSON.stringify({s:system,g:gameId,t:type,r:region || '',e:expires})).toString('base64url');
+  return raw + '.' + crypto.createHmac('sha256',ssPreviewVideoSecret).update(raw).digest('hex');
+}
+function ssExtraVerifyToken(token) {
+  if (typeof token !== 'string' || token.length > 400 || !/^[A-Za-z0-9_-]+\.[a-f0-9]{64}$/.test(token)) return null;
+  const dot = token.indexOf('.'); const payload = token.slice(0,dot); const sig = token.slice(dot+1);
+  const expected = crypto.createHmac('sha256',ssPreviewVideoSecret).update(payload).digest('hex');
+  if (!crypto.timingSafeEqual(Buffer.from(sig,'hex'),Buffer.from(expected,'hex'))) return null;
+  let data;
+  try { data=JSON.parse(Buffer.from(payload,'base64url').toString('utf8')); } catch (_) { return null; }
+  if (!data || !ssPreviewValidMediaSystem(data.s) || !Number.isSafeInteger(data.g) || data.g<=0 ||
+      !SS_EXTRA_MEDIA_TYPES.has(data.t) || typeof data.r !== 'string' || !/^[a-z]{0,12}$/.test(data.r) ||
+      !Number.isSafeInteger(data.e) || data.e < Math.floor(Date.now()/1000)) return null;
+  return data;
+}
+function ssExtraPlainText(value) {
+  return typeof value === 'string' ? value.trim().slice(0,1200) : '';
+}
+function ssExtraLocalized(value) {
+  if (typeof value === 'string') return ssExtraPlainText(value);
+  if (!value || typeof value !== 'object') return '';
+  for (const lang of ['pt','en','us','wor','fr']) {
+    const v = value['synopsis_'+lang] || value['genre_'+lang] || value['date_'+lang] || value[lang];
+    if (typeof v === 'string' && v.trim()) return ssExtraPlainText(v);
+  }
+  for (const v of Object.values(value)) {
+    if (typeof v === 'string' && v.trim()) return ssExtraPlainText(v);
+  }
+  return '';
+}
+function ssExtraEnglishSynopsis(value) {
+  if (!value || typeof value !== 'object') return '';
+  const keys = ['synopsis_en','synopsis_us','en','us'];
+  for (const key of keys) {
+    const text = ssExtraPlainText(value[key]);
+    if (text) return text;
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      if (!entry || !['en','us'].includes(String(entry.langue || entry.lang || '').toLowerCase())) continue;
+      const text = ssExtraPlainText(entry.texte || entry.text || entry.value);
+      if (text) return text;
+    }
+  }
+  return '';
+}
+function ssPreviewExtractExtras(game, system) {
+  if (!game || !Number.isSafeInteger(Number(game.id))) return null;
+  const id = Number(game.id);
+  const media = ssPreviewMediaList(game).sort((a,b) => {
+    const rank = item => item?.type === 'box-2D-front' ? 0 : item?.type === 'box-2D' ? 1 : 2;
+    return rank(a)-rank(b);
+  });
+  const images = [];
+  const used = new Set();
+  for (const item of media) {
+    const type = String(item && item.type || '').trim();
+    if (!SS_EXTRA_MEDIA_TYPES.has(type)) continue;
+    const region = String(item.region || item.regionid || '').toLowerCase();
+    const safeRegion = /^[a-z]{2,8}$/.test(region) ? region : '';
+    const kind = type === 'ss' || type === 'sstitle' ? 'screenshot' : type === 'fanart' ? 'background' : ['manuel','manual'].includes(type) ? 'manual' : 'artwork';
+    if (kind === 'screenshot' && images.filter(v=>v.kind==='screenshot').length>=3) continue;
+    if (kind === 'artwork' && images.filter(v=>v.kind==='artwork').length>=5) continue;
+    if (kind === 'background' && images.some(v=>v.kind==='background')) continue;
+    if (kind === 'manual' && images.some(v=>v.kind==='manual')) continue;
+    const key = type+':'+safeRegion;
+    if (used.has(key)) continue;
+    used.add(key);
+    images.push({type,kind,region:safeRegion});
+  }
+  const genres = game.genres && typeof game.genres === 'object' ? ssExtraLocalized(game.genres) : '';
+  return {gameId:id, system, images, artworkChecked:true,
+    summary:ssExtraEnglishSynopsis(game.synopsis),summaryEnglishChecked:true,developer:ssExtraPlainText(game.developpeur),
+    publisher:ssExtraPlainText(game.editeur),players:ssExtraPlainText(game.joueurs),
+    rating:game.note !== undefined && game.note !== null && Number.isFinite(Number(game.note)) ? Number(game.note) : null,
+    releaseDate:ssExtraLocalized(game.dates),genres};
+}
+function ssExtraPublic(extras) {
+  if (!extras) return null;
+  return {...extras,images:extras.images.map(item=>({...item,
+    url:(item.kind==='manual'?'/api/screenscraper-manual?token=':'/api/screenscraper-image?token=')+ssExtraImageToken(extras.system,extras.gameId,item.type,item.region)}))};
+}
+function ssPreviewSearchReason(response) {
+  const status = Number(response && response.status || 0);
+  const text = String(response && response.text || '').slice(0,1500).toLowerCase();
+  if (status === 401 || status === 403 || /invalid.*(devid|devpassword)|authentification|identifiant incorrect/.test(text)) return 'api_auth';
+  if (status === 429 || status === 430 || /too many|quota|maximum.*request|limite.*requ/.test(text)) return 'api_rate_limit';
+  if (status === 503 || status === 502 || status === 504) return 'api_unavailable';
+  return 'api_unavailable';
+}
+
+function ssPreviewGetCached(key) {
+  const entry = ssPreviewCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.until) { ssPreviewCache.delete(key); return null; }
+  ssPreviewCache.delete(key);
+  ssPreviewCache.set(key, entry);
+  return entry.payload;
+}
+
+function ssPreviewSetCached(key, payload) {
+  ssPreviewCache.delete(key);
+  ssPreviewCache.set(key, { payload, until:Date.now() + (payload.found ? SS_PREVIEW_POSITIVE_MS : SS_PREVIEW_NEGATIVE_MS) });
+  while (ssPreviewCache.size > SS_PREVIEW_MAX_CACHE) ssPreviewCache.delete(ssPreviewCache.keys().next().value);
+}
+
+const SS_PREVIEW_DB_NO_VIDEO_DAYS = 1;
+const SS_PREVIEW_DB_MAX_ROWS = 12000;
+let ssPreviewDbPruneAfter = 0;
+async function ssPreviewLoadDatabase(key, systemId) {
+  try {
+    const row = (await pool.query(`
+      SELECT game_id, media_type, api_host, extras
+      FROM screenscraper_game_cache
+      WHERE cache_key = $1 AND system_id = $2 AND expires_at > NOW()
+      LIMIT 1`, [key, systemId])).rows[0];
+    if (!row) return null;
+    const gameId = Number(row.game_id);
+    if (gameId === 0 && row.extras?.negative === true) {
+      const payload = {found:false,provider:'screenscraper',reason:row.extras.reason || 'no_match'};
+      ssPreviewSetCached(key,payload);
+      return payload;
+    }
+    const extras = row.extras && typeof row.extras === 'object' ? row.extras : null;
+    const mediaSystem = systemId === 0 ? Number(extras?.system) : systemId;
+    if (!ssPreviewValidMediaSystem(mediaSystem)) return null;
+    const type = String(row.media_type || '');
+    if (!Number.isSafeInteger(gameId) || gameId <= 0 || !['', 'video', 'video-normalized'].includes(type)) return null;
+    const apiHost = ssPreviewAllowedMediaHost(row.api_host) ? row.api_host : 'api.screenscraper.fr';
+    const video = type ? {
+      system:mediaSystem, gameId, type, apiHost,
+      url:`https://www.screenscraper.fr/medias/${mediaSystem}/${gameId}/${type}.mp4`
+    } : null;
+    if (!video && !extras) return null;
+    const payload = video
+      ? {found:true, url:video.url, video, extras, provider:'screenscraper'}
+      : {found:false, extras, provider:'screenscraper', reason:'no_video'};
+    ssPreviewSetCached(key, payload);
+    return payload;
+  } catch (_) {
+    return null;
+  }
+}
+function ssPreviewPersistDatabase(key, systemId, result) {
+  if (!result) return;
+  const video = result.video || null;
+  const isNegative = !video && !result.extras;
+  const gameId = isNegative ? 0 : Number(video?.gameId || result.extras?.gameId);
+  if (!Number.isSafeInteger(gameId) || gameId < 0) return;
+  const type = video?.type || '';
+  if (type && !['video', 'video-normalized'].includes(type)) return;
+  const host = video && ssPreviewAllowedMediaHost(video.apiHost)
+    ? video.apiHost : 'api.screenscraper.fr';
+  const metadata = isNegative ? {negative:true,reason:result.reason || 'no_match'} : result.extras;
+  pool.query(`
+    INSERT INTO screenscraper_game_cache
+      (cache_key, system_id, game_id, media_type, api_host, extras, refreshed_at, expires_at)
+    VALUES ($1, $2, $3, $4, $5, $6::jsonb, NOW(),
+      CASE WHEN $7::boolean THEN 'infinity'::timestamptz ELSE NOW() + ($8::int * INTERVAL '1 day') END)
+    ON CONFLICT (cache_key) DO UPDATE SET
+      system_id=EXCLUDED.system_id, game_id=EXCLUDED.game_id,
+      media_type=EXCLUDED.media_type, api_host=EXCLUDED.api_host,
+      extras=EXCLUDED.extras, refreshed_at=NOW(), expires_at=EXCLUDED.expires_at`,
+    [key, systemId, gameId, type, host, JSON.stringify(metadata || null), !!video, SS_PREVIEW_DB_NO_VIDEO_DAYS]
+  ).then(() => {
+    const now = Date.now();
+    if (now < ssPreviewDbPruneAfter) return;
+    ssPreviewDbPruneAfter = now + 6 * 60 * 60 * 1000;
+    pool.query(`DELETE FROM screenscraper_game_cache WHERE expires_at <= NOW()`).then(() =>
+      pool.query(`DELETE FROM screenscraper_game_cache WHERE cache_key IN
+        (SELECT cache_key FROM screenscraper_game_cache
+         ORDER BY CASE WHEN media_type <> '' THEN 0 ELSE 1 END, refreshed_at DESC
+         OFFSET $1)`, [SS_PREVIEW_DB_MAX_ROWS])
+    ).catch(() => {});
+  }).catch(() => {});
+}
+function ssPreviewFetchUpstream(name, systemId, key) {
+  if (ssPreviewQueued >= 80) {
+    const busy = new Error('ScreenScraper search queue temporarily busy.');
+    busy.status = 503;
+    busy.code = 'provider_queue_full';
+    busy.retryAfter = 5;
+    return Promise.reject(busy);
+  }
+  ssPreviewQueued++;
+  const work = (async () => {
+    const searches = ssPreviewSearchVariants(name);
+    const wanted = normalizeSsPreviewTitle(name);
+    let bestGame = null;
+    let bestScore = 0;
+    let candidates = 0;
+    for (const searchName of searches) {
+      await ssPreviewMaybeRefreshQuota();
+      const release = await ssProviderAcquire('search');
+      let response;
+      try {
+        ssPreviewQuotaReserve('search');
+        const url = new URL('https://api.screenscraper.fr/api2/jeuRecherche.php');
+      url.searchParams.set('devid', SS_PREVIEW_DEVID);
+      url.searchParams.set('devpassword', SS_PREVIEW_DEVPASSWORD);
+      url.searchParams.set('softname', 'PSN-Content');
+      url.searchParams.set('output', 'json');
+      if (systemId !== 0) url.searchParams.set('systemeid', String(systemId));
+      url.searchParams.set('recherche', searchName);
+      if (SS_PREVIEW_USER && SS_PREVIEW_PASSWORD) {
+        url.searchParams.set('ssid', SS_PREVIEW_USER);
+        url.searchParams.set('sspassword', SS_PREVIEW_PASSWORD);
+      }
+        response = await requestMetadataJson(url, { timeoutMs:9000, headers:{ 'User-Agent':'PSN-Content/1.0 ScreenScraper-Preview' } });
+      } finally {release();}
+      ssPreviewQuotaNoteRate(Number(response.status));
+      if (response.ok) ssPreviewQuotaFromResponse(response.data);
+      if (!response.ok || !response.data || typeof response.data !== 'object') {
+        const error = new Error('ScreenScraper search unavailable.');
+        error.status = [429,430].includes(Number(response.status)) ? 429 : 502;
+        error.code = ssPreviewSearchReason(response);
+        error.upstreamStatus = Number(response.status) || 0;
+        throw error;
+      }
+      const header = response.data.header;
+      if (header && ['false', '0'].includes(String(header.success ?? '').toLowerCase())) {
+        const error = new Error('ScreenScraper rejected the search.');
+        error.status = 502;
+        error.code = 'api_rejected';
+        error.upstreamStatus = Number(response.status) || 0;
+        throw error;
+      }
+      const data = response.data.response || {};
+      const rawGames = data.jeux || data.jeu || [];
+      const games = Array.isArray(rawGames) ? rawGames : (Array.isArray(rawGames.jeu) ? rawGames.jeu : (rawGames.jeu ? [rawGames.jeu] : (rawGames.id ? [rawGames] : [])));
+      candidates += games.length;
+      const minScore = systemId === 0 ? 0.95 : 0.78; // Cross-platform matches must be unambiguous.
+      for (const game of games.slice(0, 30)) {
+        const mediaSystem = Number(game && (game.systemeid || (game.systeme && game.systeme.id)));
+        if (!ssPreviewValidMediaSystem(mediaSystem) || (systemId !== 0 && mediaSystem !== systemId)) continue;
+        const score = Math.max(0, ...ssPreviewNames(game).map(title => ssPreviewTitleSimilarity(wanted, normalizeSsPreviewTitle(title))));
+        const videoAvailable = systemId === 0 && score >= minScore && !!ssPreviewFindVideo(game, 0);
+        const previousHasVideo = systemId === 0 && bestGame && !!ssPreviewFindVideo(bestGame, 0);
+        if (score > bestScore || (videoAvailable && !previousHasVideo && score >= bestScore - 0.01)) {
+          bestGame = game;
+          bestScore = score;
+        }
+        if (bestScore === 1 && (systemId !== 0 || !!ssPreviewFindVideo(bestGame, 0))) break;
+      }
+      if (bestScore >= minScore && (systemId !== 0 || !!ssPreviewFindVideo(bestGame, 0))) break;
+    }
+    const minScore = systemId === 0 ? 0.95 : 0.78;
+    const mediaSystem = Number(bestGame && (bestGame.systemeid || (bestGame.systeme && bestGame.systeme.id)));
+    const validMatch = !!bestGame && bestScore >= minScore && ssPreviewValidMediaSystem(mediaSystem);
+    const video = validMatch ? ssPreviewFindVideo(bestGame, systemId) : null;
+    const extras = validMatch ? ssPreviewExtractExtras(bestGame, mediaSystem) : null;
+    const result = video
+      ? { found:true, url:video.url, video, extras, provider:'screenscraper' }
+      : { found:false, extras, provider:'screenscraper', reason: !candidates ? 'no_match' : !validMatch ? 'no_close_match' : 'no_video', candidates };
+    ssPreviewSetCached(key, result);
+    ssPreviewPersistDatabase(key, systemId, result);
+    return result;
+  })();
+  return work.finally(() => { ssPreviewQueued--; });
+}
+function ssPreviewLookup(name, systemId, options = null) {
+  const key = `${systemId}:${normalizeSsPreviewTitle(name)}`;
+  const requireEnglish = options?.englishSummary === true;
+  const requireArtwork = options?.artwork === true;
+  const ready = result => !!result &&
+    (!requireEnglish || !result.extras || result.extras.summaryEnglishChecked === true) &&
+    (!requireArtwork || (!result.found && !result.extras) || result.extras?.artworkChecked === true);
+  const cached = ssPreviewGetCached(key);
+  if (ready(cached)) return Promise.resolve(cached);
+  if (cached) ssPreviewCache.delete(key);
+  if (ssPreviewInflight.has(key)) return ssPreviewInflight.get(key);
+  const work = ssPreviewLoadDatabase(key, systemId).then(result =>
+    ready(result) ? result : ssPreviewFetchUpstream(name, systemId, key).catch(error => {
+      if (result) return result;
+      throw error;
+    }));
+  const pending = work.finally(() => ssPreviewInflight.delete(key));
+  ssPreviewInflight.set(key, pending);
+  return pending;
+}
+
+async function ssPreviewLookupMinis(name, options = null) {
+  const ps3=await ssPreviewLookup(name,59,options);
+  if (options?.artwork) {
+    if (ps3?.extras?.images?.some(item=>item.kind==='artwork')) return ps3;
+  } else if (ps3?.found) return ps3;
+  const psp=await ssPreviewLookup(name,61,options);
+  if (options?.artwork) {
+    if (!ps3?.extras) return psp?.extras?psp:ps3;
+    if (!psp?.extras) return ps3;
+    return (psp.extras.images?.length||0)>(ps3.extras.images?.length||0)?psp:ps3;
+  }
+  return psp?.found?psp:ps3;
+}
+
+function ssVideoHttpError(http, code, upstream = 0) {
+  const error = new Error(code);
+  error.status = http;
+  error.code = code;
+  error.upstreamStatus = upstream;
+  return error;
+}
+function ssVideoKey(video) {
+  return `${video.s}:${video.g}:${video.t}`;
+}
+function ssVideoPrune() {
+  const now=Date.now();
+  for (const [key,entry] of ssVideoFailures) if (entry.until<=now) ssVideoFailures.delete(key);
+}
+function ssVideoValidateUrl(raw) {
+  let url;
+  try { url = new URL(raw); } catch (_) { throw ssVideoHttpError(502, 'upstream_invalid_url'); }
+  if (url.protocol !== 'https:' || !ssPreviewAllowedMediaHost(url.hostname) ||
+      url.username || url.password || (url.port && url.port !== '443')) {
+    throw ssVideoHttpError(502, 'upstream_host_rejected');
+  }
+  return url;
+}
+function ssVideoValidRange(value) {
+  if (!value) return '';
+  const str = String(value).trim();
+  const match = /^bytes=(\d*)-(\d*)$/.exec(str);
+  if (!match || (!match[1] && !match[2]) || str.length > 80) return null;
+  const start = match[1] ? Number(match[1]) : null;
+  const end = match[2] ? Number(match[2]) : null;
+  if ((start !== null && !Number.isSafeInteger(start)) ||
+      (end !== null && !Number.isSafeInteger(end)) ||
+      (start !== null && end !== null && end < start) ||
+      (start === null && end < 1)) return null;
+  return str;
+}
+async function ssVideoRequest(raw, signal, range = '', redirects = 0) {
+  const url = ssVideoValidateUrl(raw);
+  const headers = {'User-Agent':'PSN-Content/1.0 ScreenScraper-Preview','Accept-Encoding':'identity'};
+  if (range) headers.Range = range;
+  const response = await new Promise((resolve, reject) => {
+    const request = https.get(url, {signal, headers}, resolve);
+    request.on('error',reject);
+    request.setTimeout(18000, () => request.destroy(new Error('video_upstream_timeout')));
+  });
+  const status = Number(response.statusCode) || 0;
+  if ([301,302,303,307,308].includes(status)) {
+    if (redirects >= 5 || !response.headers.location) {
+      response.destroy();
+      throw ssVideoHttpError(502, 'redirect_limit', status);
+    }
+    const destination = new URL(response.headers.location, url);
+    ssVideoValidateUrl(destination.href);
+    response.resume();
+    return ssVideoRequest(destination.href, signal, range, redirects + 1);
+  }
+  if (status !== 200 && status !== 206) {
+    ssPreviewQuotaNoteRate(status);
+    response.destroy();
+    throw ssVideoHttpError(status === 429 || status === 430 ? 429 :
+      status === 404 ? 404 : status === 416 ? 416 : 502, 'upstream_http', status);
+  }
+  const contentType = String(response.headers['content-type'] || '').toLowerCase();
+  const declared = Number(response.headers['content-length'] || 0);
+  if (response.headers['content-encoding'] && response.headers['content-encoding'] !== 'identity' ||
+      contentType && /^(?:text\/|application\/(?:json|xml|javascript|xhtml))/i.test(contentType) ||
+      !Number.isSafeInteger(declared) || declared > SS_PREVIEW_VIDEO_MAX_BYTES) {
+    response.destroy();
+    throw ssVideoHttpError(declared > SS_PREVIEW_VIDEO_MAX_BYTES ? 413 : 502,
+      declared > SS_PREVIEW_VIDEO_MAX_BYTES ? 'video_too_large' : 'upstream_not_video', status);
+  }
+  if (status === 206) {
+    const parsed = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(String(response.headers['content-range'] || ''));
+    const start = parsed && Number(parsed[1]), end = parsed && Number(parsed[2]);
+    const total = parsed && Number(parsed[3]);
+    const expected = /^bytes=(\d*)-(\d*)$/.exec(range);
+    if (!parsed || ![start,end,total].every(Number.isSafeInteger) ||
+        total <= 0 || total > SS_PREVIEW_VIDEO_MAX_BYTES || start > end || end >= total ||
+        (declared && declared !== end-start+1) ||
+        (expected && expected[1] && start !== Number(expected[1])) ||
+        (expected && expected[2] && expected[1] && end > Number(expected[2])) ||
+        (expected && !expected[1] && end !== total-1)) {
+      response.destroy();
+      throw ssVideoHttpError(502, 'upstream_invalid_range', status);
+    }
+  }
+  return response;
+}
+function ssVideoUpstreamUrl(video) {
+  const url = new URL(`https://${video.h || 'api.screenscraper.fr'}/api2/mediaVideoJeu.php`);
+  url.searchParams.set('devid', SS_PREVIEW_DEVID);
+  url.searchParams.set('devpassword', SS_PREVIEW_DEVPASSWORD);
+  url.searchParams.set('softname','PSN-Content');
+  url.searchParams.set('systemeid',String(video.s));
+  url.searchParams.set('jeuid',String(video.g));
+  url.searchParams.set('media',video.t);
+  if (SS_PREVIEW_USER && SS_PREVIEW_PASSWORD) {
+    url.searchParams.set('ssid',SS_PREVIEW_USER);
+    url.searchParams.set('sspassword',SS_PREVIEW_PASSWORD);
+  }
+  return url.href;
+}
+app.options('/api/gameplay-video', (req,res) => {
+  setMetadataCors(res);
+  res.setHeader('Access-Control-Allow-Headers','Range, Content-Type');
+  res.status(204).end();
+});
+app.get('/api/gameplay-video', async (req,res) => {
+  setMetadataCors(res);
+  res.setHeader('Access-Control-Expose-Headers',
+    'Content-Type, Content-Range, Content-Length, X-PSN-Video-Error, X-PSN-Video-Upstream, X-PSN-Video-Cache');
+  res.setHeader('Cache-Control','no-store');
+  const fail = (status, reason, upstreamStatus = 0) => {
+    if (res.headersSent || res.destroyed) return;
+    for (const header of ['Content-Length','Content-Range','Accept-Ranges','ETag','X-PSN-Video-Cache'])
+      res.removeHeader(header);
+    res.setHeader('Cache-Control','no-store');
+    res.setHeader('X-PSN-Video-Error',reason);
+    if (status === 429 || status === 503) {
+      res.setHeader('Retry-After',String(Math.min(3600,Math.max(2,ssPreviewQuota.blockedUntil>Date.now()?Math.ceil((ssPreviewQuota.blockedUntil-Date.now())/1000):60))));
+      ssVideoLogLimit(reason);
+    }
+    if (upstreamStatus) res.setHeader('X-PSN-Video-Upstream',String(upstreamStatus));
+    res.status(status).end();
+  };
+  const video = ssPreviewVerifyVideoToken(req.query && req.query.token);
+  if (!video || !SS_PREVIEW_ENABLED) return fail(403, 'invalid_or_expired_token');
+  const range = ssVideoValidRange(req.get('range'));
+  if (range === null) return fail(416,'unsupported_range');
+  ssVideoPrune();
+  const key = ssVideoKey(video);
+  const failure = ssVideoFailures.get(key);
+  if (failure && failure.until > Date.now()) return fail(failure.error.status || 502,
+    failure.error.code || 'upstream_unavailable',failure.error.upstreamStatus || 0);
+  if(ssVideoActive>=3) {
+    let closed=false;
+    const onClose=()=>{closed=true;};
+    res.once('close',onClose);
+    const until=Date.now()+3500;
+    while(!closed && !res.destroyed && ssVideoActive>=3 && Date.now()<until)
+      await new Promise(resolve=>setTimeout(resolve,100));
+    res.off('close',onClose);
+    if(closed||res.destroyed)return;
+    if(ssVideoActive>=3)return fail(503,'video_stream_busy');
+  }
+  ssVideoActive++;
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(),120000);
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    clearTimeout(deadline);
+    ssVideoActive--;
+  };
+  res.once('close',()=>{controller.abort();release();});
+  try {
+    await ssPreviewMaybeRefreshQuota();
+    if (res.destroyed) return;
+    const mediaUrl = ssVideoUpstreamUrl(video);
+    let upstream;
+    let releaseProvider=await ssProviderAcquire('video',controller.signal);
+    try {
+      ssPreviewQuotaReserve();
+      upstream = await ssVideoRequest(mediaUrl,controller.signal,range);
+    } catch (error) {
+      releaseProvider();
+      if (!range || ![403,416].includes(Number(error && error.upstreamStatus))) throw error;
+      releaseProvider=await ssProviderAcquire('video',controller.signal);
+      try {
+        ssPreviewQuotaReserve();
+        upstream=await ssVideoRequest(mediaUrl,controller.signal,'');
+      } catch (second) {releaseProvider();throw second;}
+    }
+    upstream.once('close',releaseProvider);
+    res.once('close',releaseProvider);
+    if (res.destroyed) {upstream.destroy();return;}
+    const length = Number(upstream.headers['content-length'] || 0);
+    const upstreamPartial = upstream.statusCode === 206;
+    res.status(upstreamPartial ? 206 : 200);
+    res.setHeader('Content-Type','video/mp4');
+    if (length) res.setHeader('Content-Length',String(length));
+    if (upstreamPartial) {
+      res.setHeader('Accept-Ranges','bytes');
+      res.setHeader('Content-Range',String(upstream.headers['content-range']));
+    }
+    res.setHeader('Cache-Control','private, max-age=86400');
+    res.setHeader('ETag','"psn-'+crypto.createHash('sha256').update(String(req.query.token)).digest('hex').slice(0,24)+'"');
+    res.setHeader('X-PSN-Video-Cache','STREAM');
+    let size = 0;
+    let prefix = Buffer.alloc(0);
+    const partialStart = upstreamPartial ? /^bytes (\d+)-(\d+)\//.exec(String(upstream.headers['content-range'])) : null;
+    const checkSignature = !upstreamPartial || (partialStart && Number(partialStart[1]) === 0 && Number(partialStart[2]) >= 11);
+    let validated = !checkSignature;
+    const filter = new SsVideoTransform({transform(chunk,encoding,callback) {
+      let data = chunk;
+      if (!validated) {
+        if (prefix.length + chunk.length < 12) {
+          prefix = Buffer.concat([prefix,chunk]);
+          callback();return;
+        }
+        data = prefix.length ? Buffer.concat([prefix,chunk]) : chunk;
+        prefix = Buffer.alloc(0);
+        if (data.toString('ascii',4,8) !== 'ftyp') {
+          callback(ssVideoHttpError(502,'upstream_invalid_mp4',upstream.statusCode));return;
+        }
+        validated = true;
+      }
+      size += data.length;
+      if (size > SS_PREVIEW_VIDEO_MAX_BYTES) {
+        callback(ssVideoHttpError(413,'video_too_large',upstream.statusCode));return;
+      }
+      callback(null,data);
+    },flush(callback) {
+      if (!validated) callback(ssVideoHttpError(502,'upstream_invalid_mp4',upstream.statusCode));
+      else callback();
+    }});
+    const onError = error => {
+      upstream.destroy();
+      filter.destroy();
+      release();
+      if (!res.headersSent) fail(error?.status || 502,error?.code || 'video_stream_failed',error?.upstreamStatus || 0);
+      else res.destroy();
+    };
+    filter.once('error',onError);
+    upstream.once('error',onError);
+    res.once('close',()=>{upstream.destroy();filter.destroy();});
+    upstream.pipe(filter).pipe(res);
+  } catch (error) {
+    release();
+    if (res.destroyed) return;
+    if (error && (error.name === 'AbortError' || error.message === 'video_upstream_timeout'))
+      return fail(504,'video_upstream_timeout');
+    if ([404,410].includes(Number(error && error.upstreamStatus))) {
+      for (const [cacheKey,entry] of ssPreviewCache) {
+        if (entry?.payload?.video?.gameId === video.g && entry.payload.video.system === video.s)
+          ssPreviewCache.delete(cacheKey);
+      }
+      pool.query('DELETE FROM screenscraper_game_cache WHERE game_id=$1 AND (system_id=$2 OR system_id=0)',
+        [video.g,video.s]).catch(()=>{});
+    }
+    if (error && error.code !== 'provider_cooldown' &&
+        ![429,430].includes(Number(error.upstreamStatus)) && error.name !== 'AbortError')
+      ssVideoFailures.set(key,{error,until:Date.now()+(error?.upstreamStatus === 429 ? 120000 :
+        [401,403].includes(error?.upstreamStatus) ? 300000 : 30000)});
+    fail(error?.status || 502,error?.code || 'video_stream_failed',error?.upstreamStatus || 0);
+  }
+});
+
+app.options('/api/gameplay-preview', (req, res) => { setMetadataCors(res); res.status(204).end(); });
+app.get('/api/gameplay-preview', async (req, res) => {
+  setMetadataCors(res);
+  res.setHeader('Cache-Control', 'no-store');
+  if (!SS_PREVIEW_ENABLED) return res.status(503).json({ ok:false, configured:false });
+  const name = String(req.query && req.query.name || '').trim().slice(0, 140);
+  const isPort = String(req.query && req.query.port || '') === '1';
+  const isMinis = !isPort && String(req.query && req.query.minis || '') === '1';
+  const systemId = isPort ? 0 : Number(req.query && req.query.system);
+  if (name.length < 3 || (!isPort && !SS_PREVIEW_SYSTEM_IDS.has(systemId)) || (isMinis && systemId !== 59) || !normalizeSsPreviewTitle(name)) {
+    return res.status(400).json({ ok:false, error:'Invalid game or system.' });
+  }
+  try {
+    const result = await (isMinis ? ssPreviewLookupMinis(name) : ssPreviewLookup(name, systemId));
+    if (!result.found) return res.json({ok:true,configured:true,found:false,provider:'screenscraper',reason:result.reason,candidates:result.candidates || 0});
+    return res.json({ok:true,configured:true,found:true,url:result.url,
+      fallbackUrl:`/api/gameplay-video?token=${ssPreviewVideoToken(result.video)}`,provider:'screenscraper'});
+  } catch (error) {
+    const reason = ['api_auth','api_rate_limit','api_unavailable','api_rejected','provider_cooldown','provider_queue_full'].includes(error && error.code) ? error.code : 'api_unavailable';
+    if(error?.status===429||error?.status===503)
+      res.setHeader('Retry-After',String(Math.min(3600,Math.max(2,Number(error.retryAfter)||60))));
+    return res.status([429,503].includes(Number(error?.status)) ? error.status : 502).json({ ok:false, configured:true, retry:true, reason, upstreamStatus:Number(error && error.upstreamStatus) || 0 });
+  }
+});
+
+app.options('/api/screenscraper-extras', (req,res) => {setMetadataCors(res); res.status(204).end();});
+app.get('/api/screenscraper-extras', async (req,res) => {
+  setMetadataCors(res);
+  res.setHeader('Cache-Control','private,max-age=120');
+  if (!SS_PREVIEW_ENABLED) return res.status(503).json({ok:false,reason:'not_configured'});
+  const name = String(req.query && req.query.name || '').trim().slice(0,140);
+  const isPort = String(req.query && req.query.port || '') === '1';
+  const isMinis = !isPort && String(req.query && req.query.minis || '') === '1';
+  const system = isPort ? 0 : Number(req.query && req.query.system);
+  if ((!isPort && !SS_PREVIEW_SYSTEM_IDS.has(system)) || (isMinis && system !== 59) || name.length < 3 || !normalizeSsPreviewTitle(name)) return res.status(400).json({ok:false});
+  try {
+    const result = await (isMinis ? ssPreviewLookupMinis(name,{englishSummary:true,artwork:true}) : ssPreviewLookup(name,system,{englishSummary:true,artwork:true}));
+    return res.json({ok:true,found:!!result.extras,extras:ssExtraPublic(result.extras)});
+  } catch (e) {if([429,503].includes(Number(e?.status)))res.setHeader('Retry-After',String(Math.min(3600,Math.max(2,Number(e.retryAfter)||60))));return res.status([429,503].includes(Number(e?.status)) ? e.status : 502).json({ok:false,reason:e.code || 'unavailable'});}
+});
+
+async function ssExtraFetchLimited(data) {
+  if (ssExtraImageActive < 2) ssExtraImageActive++;
+  else {
+    if (ssExtraImageWaiters.length >= 10) throw new Error('image_queue_full');
+    await new Promise(resolve => ssExtraImageWaiters.push(resolve));
+  }
+  try {return await ssExtraFetchImage(data);}
+  finally {
+    const next=ssExtraImageWaiters.shift();
+    if (next) next();
+    else ssExtraImageActive--;
+  }
+}
+async function ssExtraFetchImage(data) {
+  const url=new URL('https://api.screenscraper.fr/api2/mediaJeu.php');
+  url.searchParams.set('devid',SS_PREVIEW_DEVID);
+  url.searchParams.set('devpassword',SS_PREVIEW_DEVPASSWORD);
+  url.searchParams.set('softname','PSN-Content');
+  url.searchParams.set('systemeid',String(data.s));
+  url.searchParams.set('jeuid',String(data.g));
+  url.searchParams.set('media',data.t+(data.r?'('+data.r+')':''));
+  url.searchParams.set('outputformat','jpg');
+  url.searchParams.set('maxwidth','1050');
+  url.searchParams.set('maxheight','720');
+  if (SS_PREVIEW_USER && SS_PREVIEW_PASSWORD) {url.searchParams.set('ssid',SS_PREVIEW_USER);url.searchParams.set('sspassword',SS_PREVIEW_PASSWORD);}
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),18000);
+  try {
+    await ssPreviewMaybeRefreshQuota();
+    const release=await ssProviderAcquire('image',controller.signal);
+    let body;
+    try {
+      ssPreviewQuotaReserve('image');
+      const response=await ssVideoRequestImage(url.href,controller.signal);
+      const chunks=[]; let size=0;
+      for await (const chunk of response) {
+        size += chunk.length;
+        if (size > 4 * 1024 * 1024) {response.destroy();throw new Error('image_too_large');}
+        chunks.push(chunk);
+      }
+      body=Buffer.concat(chunks);
+    } finally {release();}
+    const isJpeg=body[0]===0xff&&body[1]===0xd8;
+    const isPng=body.subarray(1,4).toString('ascii')==='PNG';
+    const isWebp=body.subarray(8,12).toString('ascii')==='WEBP';
+    if (body.length<48||(!isJpeg&&!isPng&&!isWebp)) throw new Error('not_image');
+    return {body,type:isJpeg?'image/jpeg':isPng?'image/png':'image/webp'};
+  } finally {clearTimeout(timer);}
+}
+async function ssVideoRequestImage(raw,signal,redirects=0,maxBytes=4*1024*1024) {
+  const url=ssVideoValidateUrl(raw);
+  const response=await new Promise((resolve,reject)=>{
+    const r=https.get(url,{signal,headers:{'User-Agent':'PSN-Content/1.0'}},resolve);
+    r.on('error',reject);r.setTimeout(15000,()=>r.destroy(new Error('image_timeout')));
+  });
+  const status=Number(response.statusCode)||0;
+  if ([301,302,303,307,308].includes(status)) {
+    if (redirects>=4||!response.headers.location) {response.destroy();throw new Error('image_redirect');}
+    const next=new URL(response.headers.location,url).href;
+    ssVideoValidateUrl(next);response.resume();return ssVideoRequestImage(next,signal,redirects+1,maxBytes);
+  }
+  if (status!==200) {ssPreviewQuotaNoteRate(status);response.destroy();throw new Error('image_upstream_'+status);}
+  if (Number(response.headers['content-length']||0)>maxBytes) {response.destroy();throw new Error('image_too_large');}
+  return response;
+}
+app.options('/api/screenscraper-manual',(req,res)=>{setMetadataCors(res);res.status(204).end();});
+app.get('/api/screenscraper-manual',async(req,res)=>{
+  setMetadataCors(res);
+  const data=ssExtraVerifyToken(req.query&&req.query.token);
+  if(!data||!['manual','manuel'].includes(data.t)||!SS_PREVIEW_ENABLED)return res.status(403).end();
+  const url=new URL('https://api.screenscraper.fr/api2/mediaManuelJeu.php');
+  url.searchParams.set('devid',SS_PREVIEW_DEVID);
+  url.searchParams.set('devpassword',SS_PREVIEW_DEVPASSWORD);
+  url.searchParams.set('softname','PSN-Content');
+  url.searchParams.set('systemeid',String(data.s));
+  url.searchParams.set('jeuid',String(data.g));
+  url.searchParams.set('media',data.t+(data.r?'('+data.r+')':''));
+  if(SS_PREVIEW_USER && SS_PREVIEW_PASSWORD){url.searchParams.set('ssid',SS_PREVIEW_USER);url.searchParams.set('sspassword',SS_PREVIEW_PASSWORD);}
+  const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),18000);
+  try {
+    await ssPreviewMaybeRefreshQuota();
+    const release=await ssProviderAcquire('image',controller.signal);
+    let pdf;
+    try {
+      ssPreviewQuotaReserve('image');
+      const upstream=await ssVideoRequestImage(url.href,controller.signal,0,9*1024*1024);
+      let size=0;const parts=[];
+      for await(const chunk of upstream){size+=chunk.length;if(size>9*1024*1024){upstream.destroy();throw Error('pdf_too_large');}parts.push(chunk);}
+      pdf=Buffer.concat(parts);
+    } finally {release();}
+    if(pdf.subarray(0,5).toString('ascii')!=='%PDF-')throw Error('not_pdf');
+    res.setHeader('Content-Type','application/pdf');
+    res.setHeader('Content-Disposition','inline; filename="screenscraper-manual.pdf"');
+    res.setHeader('Cache-Control','private,max-age=900');
+    res.setHeader('X-Content-Type-Options','nosniff');
+    return res.send(pdf);
+  }catch(_){return res.status(404).end();}
+  finally{clearTimeout(timer);}
+});
+app.options('/api/screenscraper-image',(req,res)=>{setMetadataCors(res);res.status(204).end();});
+app.get('/api/screenscraper-image',async(req,res)=>{
+  setMetadataCors(res);
+  res.setHeader('Access-Control-Expose-Headers','Retry-After');
+  const data=ssExtraVerifyToken(req.query&&req.query.token);
+  if (!data||!SS_PREVIEW_ENABLED) return res.status(403).end();
+  const key=`${data.s}:${data.g}:${data.t}:${data.r}`;
+  let cached=ssExtraImageCache.get(key);
+  if(cached&&cached.until<Date.now()) {ssExtraImageCache.delete(key);ssExtraImageBytes-=cached.body.length;cached=null;}
+  if (cached) {
+    cached.until = Date.now() + SS_EXTRA_IMAGE_TTL_MS;
+    ssExtraImageCache.delete(key);
+    ssExtraImageCache.set(key,cached);
+  }
+  if (!cached) {
+    try {
+      let pending=ssExtraImagePending.get(key);
+      if (!pending) {
+        pending=ssExtraFetchLimited(data).finally(()=>ssExtraImagePending.delete(key));
+        ssExtraImagePending.set(key,pending);
+      }
+      cached=await pending;
+      if (!ssExtraImageCache.has(key)) {
+        while (ssExtraImageBytes+cached.body.length>SS_EXTRA_IMAGE_LIMIT && ssExtraImageCache.size) {
+          const oldest=ssExtraImageCache.keys().next().value;
+          ssExtraImageBytes-=ssExtraImageCache.get(oldest).body.length;ssExtraImageCache.delete(oldest);
+        }
+        ssExtraImageCache.set(key,{...cached,until:Date.now()+SS_EXTRA_IMAGE_TTL_MS});
+        ssExtraImageBytes+=cached.body.length;
+      }
+    } catch (error) {
+      const limited=error?.code==='provider_cooldown'||error?.message==='image_upstream_429'||error?.message==='image_upstream_430';
+      const busy=error?.message==='image_queue_full'||error?.code==='provider_queue_full';
+      if(limited||busy)res.setHeader('Retry-After',String(busy?5:Math.min(3600,Math.max(2,Number(error.retryAfter)||60))));
+      return res.status(limited?429:busy?503:404).end();
+    }
+  }
+  res.setHeader('Cache-Control','private,max-age=3600');
+  res.setHeader('Content-Type',cached.type);
+  res.setHeader('X-Content-Type-Options','nosniff');
+  return res.send(cached.body);
+});
+
 app.options('/api/metadata/igdb', (req, res) => { setMetadataCors(res); res.status(204).end(); });
 app.options('/api/metadata/steam/search', (req, res) => { setMetadataCors(res); res.status(204).end(); });
 app.options('/api/metadata/steam/details', (req, res) => { setMetadataCors(res); res.status(204).end(); });
@@ -2236,12 +3251,8 @@ const userProfileWriteInFlight = new Set();
 const fullUserCacheNames = new Set();
 let profileHydrationQueues = [Promise.resolve(), Promise.resolve()];
 let profileHydrationNextLane = 0;
-// Keep only two large profile packets prepared/in-flight, independently of
-// PostgreSQL hydration lanes: slow browser ACKs must not block account reads.
 const profileSectionDeliveryQueues = [Promise.resolve(), Promise.resolve()];
 let profileSectionDeliveryNextLane = 0;
-// Keep history transfers bounded, but do not let one slow user's ACK block everyone.
-// Two lanes keep memory/socket pressure low on the small Render instance.
 const chatHistoryEmitQueues = [Promise.resolve(), Promise.resolve()];
 const chatHistoryQueueDepth = [0, 0];
 let chatHistoryNextLane = 0;
@@ -2654,6 +3665,24 @@ const SERVER_LOG_FALLBACK_REFRESH_MS = 120000;
 const ADMIN_LOG_HISTORY_MAX = 100;
 const MODERATION_LOG_HISTORY_MAX = ADMIN_LOG_HISTORY_MAX;
 const SERVER_LOG_HISTORY_MAX = ADMIN_LOG_HISTORY_MAX;
+const SERVER_LOG_STORED_MAX = 200;
+let serverLogWritesSinceTrim = 0;
+let serverLogTrimBusy = false;
+
+async function pruneServerLog() {
+  if (serverLogTrimBusy || pool.waitingCount > 0) return;
+  serverLogTrimBusy = true;
+  try {
+    await queryDbWithRetry(
+      `DELETE FROM server_log
+       WHERE id < (SELECT id FROM server_log ORDER BY id DESC OFFSET $1 LIMIT 1)`,
+      [SERVER_LOG_STORED_MAX - 1],
+      { attempts: 1, label: 'SERVER LOG RETENTION', queryTimeoutMs: 8000 }
+    );
+  } finally {
+    serverLogTrimBusy = false;
+  }
+}
 
 function getAdminLogLimits() {
   return { moderation: MODERATION_LOG_HISTORY_MAX, server: SERVER_LOG_HISTORY_MAX };
@@ -2719,13 +3748,8 @@ async function refreshServerLogFromDb() {
   return serverLog;
 }
 
-// Global legacy retention scans entire history tables. Keep them out of the
-// startup path; per-user retention still runs after normal activity/events.
 let startupRetentionBusyDeferrals = 0;
 async function runStartupGlobalRetention() {
-  // Older inactive accounts are covered by this one-off legacy cleanup.
-  // When the free database is congested, postpone the scan rather than making
-  // fresh logins/feed/comments compete with it. Active users use batched trims.
   if (pool.waitingCount > 0 && startupRetentionBusyDeferrals < 4) {
     startupRetentionBusyDeferrals++;
     deferServerTask('STARTUP GLOBAL RETENTION BUSY RETRY', runStartupGlobalRetention, 60000);
@@ -2760,7 +3784,6 @@ async function runStartupGlobalRetention() {
 }
 
 function scheduleStartupGlobalRetention() {
-  // One-shot, not polling. Give incoming logins/chat/feed reads priority after boot.
   deferServerTask('STARTUP GLOBAL RETENTION', runStartupGlobalRetention, 60000);
 }
 
@@ -2799,6 +3822,19 @@ async function initDb() {
     );
     CREATE INDEX IF NOT EXISTS idx_chat_seen_events_sender_id ON chat_seen_events(sender, id);
     CREATE INDEX IF NOT EXISTS idx_chat_seen_events_reader_id ON chat_seen_events(reader, id);
+    CREATE TABLE IF NOT EXISTS chat_seen_ranges (
+      id BIGSERIAL PRIMARY KEY,
+      reader TEXT NOT NULL,
+      first_msg_id BIGINT NOT NULL,
+      last_msg_id BIGINT NOT NULL,
+      sender_names TEXT[] NOT NULL DEFAULT '{}'::text[],
+      seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (reader, first_msg_id, last_msg_id),
+      CHECK (first_msg_id <= last_msg_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_chat_seen_ranges_overlap ON chat_seen_ranges USING gist (int8range(first_msg_id, last_msg_id, '[]'));
+    CREATE INDEX IF NOT EXISTS idx_chat_seen_ranges_reader_id ON chat_seen_ranges(reader, id);
+    CREATE INDEX IF NOT EXISTS idx_chat_seen_ranges_senders ON chat_seen_ranges USING gin(sender_names);
     CREATE TABLE IF NOT EXISTS direct_messages (
       id BIGSERIAL PRIMARY KEY,
       sender_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
@@ -2990,6 +4026,21 @@ async function initDb() {
       expires_at TIMESTAMPTZ NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_metadata_provider_cache_expires ON metadata_provider_cache(expires_at);
+    -- Persistent ScreenScraper game/media metadata only (never MP4 bytes or API credentials).
+    CREATE TABLE IF NOT EXISTS screenscraper_game_cache (
+      cache_key TEXT PRIMARY KEY,
+      system_id SMALLINT NOT NULL,
+      game_id INTEGER NOT NULL,
+      media_type TEXT NOT NULL DEFAULT '',
+      api_host TEXT NOT NULL DEFAULT 'api.screenscraper.fr',
+      extras JSONB,
+      refreshed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      expires_at TIMESTAMPTZ NOT NULL
+    );
+    -- Preserve previously cached, confirmed video matches on upgrade, too.
+    UPDATE screenscraper_game_cache SET expires_at='infinity'::timestamptz
+      WHERE media_type IN ('video','video-normalized')
+        AND expires_at <> 'infinity'::timestamptz;
     CREATE TABLE IF NOT EXISTS content_metadata_suggestions (
       id BIGSERIAL PRIMARY KEY,
       metadata_key TEXT NOT NULL,
@@ -3238,8 +4289,6 @@ async function getSanitizedOnlineListFromDb(options = {}) {
   onlineListCacheAt = Date.now();
   return list;
 }
-// Indexed trophy rarity and wishlist trending. Kept separate from the download
-// projection: partial rollout always falls back to the original JSONB queries.
 const PSN_STATS_INDEX_VERSION = 1;
 const PSN_STATS_INDEX_BATCH = Math.max(10,Math.min(50,parseInt(process.env.PSN_STATS_INDEX_BATCH||'20',10)||20));
 let psnStatsIndexReady = false;
@@ -4298,8 +5347,6 @@ function runSharedProfileNotificationMutation(name,category,patch) {
 }
 
 
-// Serialize all local mutations of one users.data row; never hold this lane
-// while waiting for client ACKs, socket delivery, or unrelated background work.
 function runSerializedUserRowMutation(name, task) {
   const safeName = normalizeText(name, '');
   if (!safeName || typeof task !== 'function') return Promise.resolve(null);
@@ -4355,15 +5402,10 @@ async function updateProfileNotificationCategoryInDb(name, category, patch = {})
     }
 
     const nextState = updateProfileNotificationCategoryServer(currentState, category, { ...patch, mutationId });
-    // Count redundant intents without suppressing mutation IDs: skipping the
-    // write here would let a delayed retry replay an older operation later.
     const logicallyUnchanged = currentCategory.dot === nextState[category].dot &&
       JSON.stringify(currentCategory.pendingItems) === JSON.stringify(nextState[category].pendingItems) &&
       (category !== 'trophies' || currentCategory.color === nextState[category].color);
     const now = Math.max(Date.now(), normalizeTimestampValue(currentResult.rows[0].profile_updated_at) + 1);
-    // Update exactly one notification category in-place. Compare that category,
-    // not the whole state: concurrent changes to a different category must be
-    // preserved and must not cause a spurious optimistic-lock conflict.
     const rawCategory = Object.prototype.hasOwnProperty.call(rawCurrentState, category) ? rawCurrentState[category] : null;
     const updateResult = await runDbTransactionWithRetry(
       'PROFILE NOTIFICATION STATE SAVE',
@@ -4400,15 +5442,12 @@ async function updateProfileNotificationCategoryInDb(name, category, patch = {})
       if (logicallyUnchanged) profileNotificationMetrics.logicalNoChange++;
       const saved = updateResult.rows[0] || {};
       return {
-        // Return the authoritative combined state, including categories
-        // updated by other sockets while this write was in flight.
         notificationState: normalizeProfileNotificationStateServer(saved.notification_state || {}),
         profileUpdatedAt: normalizeTimestampValue(saved.profile_updated_at) || now,
         duplicate: false
       };
     }
 
-    // Another notification mutation won the race. Re-read, merge the delta, and try again.
     profileNotificationMetrics.categoryConflicts++;
     if (attempt < maxAttempts) await waitMs(attempt === 1 ? 20 : attempt === 2 ? 45 : 90);
   }
@@ -5345,9 +6384,6 @@ async function refreshSingleUserSummaryFromDb(name, options = {}) {
   return userDatabase[safeName];
 }
 
-// Multiple tabs (or notifications opening the same friend) share a single
-// authoritative profile-summary read. No settled results are cached here:
-// avatar, public counts and online presence keep their existing refresh path.
 const publicProfileSummaryPending = new Map();
 const PUBLIC_PROFILE_SUMMARY_PENDING_MAX = 64;
 function readPublicProfileSummaryShared(name) {
@@ -5551,8 +6587,6 @@ function searchUsersFromCache(query, includeAdminFields = false, includeAllMatch
 async function calculateTrendingFromDb() {
   const trendingStartedAt = Date.now();
   logMemoryTrace('trending:build:start', `cacheUsers=${Object.keys(userDatabase).length}`);
-  // The ready v39 membership index already contains one row per game/user.
-  // Retain the original JSON query until the backfill is complete or if disabled.
   const useIndexedGameDownloads = contentDownloadIndexReady &&
     process.env.CONTENT_DOWNLOAD_COUNT_INDEX !== '0' &&
     process.env.TRENDING_DOWNLOAD_INDEX !== '0';
@@ -5629,8 +6663,6 @@ const CONTENT_DOWNLOAD_COUNT_CACHE_MAX = Math.max(250, parseInt(process.env.CONT
 const CONTENT_DOWNLOAD_COUNT_REQUEST_MAX = Math.max(25, Math.min(500, parseInt(process.env.CONTENT_DOWNLOAD_COUNT_REQUEST_MAX || '400', 10) || 200));
 const contentDownloadCountCache = new Map();
 let contentDownloadCountQueryQueue = Promise.resolve();
-// Short-lived promises coalesce count requests from different sockets. A single
-// 35ms batch avoids scanning every user's downloads once per incoming card.
 const contentDownloadCountPendingKeys = new Map();
 let contentDownloadCountBatchTimer = null;
 
@@ -5705,7 +6737,6 @@ async function notifyContentDownloadCountsChangedAcrossInstances(rawKeys = [], o
     .filter(value => value && value.length <= 512))];
   if (!keys.length) return;
 
-  // Keep each PostgreSQL NOTIFY payload comfortably below its ~8 KB limit.
   for (let index = 0; index < keys.length; index += 10) {
     const payload = {
       keys: keys.slice(index, index + 10),
@@ -5742,8 +6773,6 @@ function setCachedContentDownloadCount(key, count) {
   }
 }
 
-// An indexed, deduplicated (user, content) projection replaces repeated JSONB
-// scans once populated. All profile writes maintain it in the same transaction.
 const CONTENT_DOWNLOAD_INDEX_VERSION = 1;
 const CONTENT_DOWNLOAD_INDEX_BATCH_SIZE = Math.max(10, Math.min(100, parseInt(process.env.CONTENT_DOWNLOAD_INDEX_BATCH_SIZE || '35', 10) || 35));
 let contentDownloadIndexSchemaReady = false;
@@ -5755,9 +6784,6 @@ let contentDownloadIndexTimer = null;
 let contentDownloadIndexLastErrorAt = 0;
 let contentDownloadIndexBuiltUsers = 0;
 
-// A previously completed index persists across Render restarts. Check the
-// authoritative ready marker once before falling back to the JSONB-wide scan.
-// Also verify the update trigger: a stale projection must never be trusted.
 async function restoreReadyContentDownloadIndexOnFirstRead() {
   if (process.env.CONTENT_DOWNLOAD_COUNT_INDEX === '0' || contentDownloadIndexReady || contentDownloadIndexReadinessChecked) return;
   if (contentDownloadIndexReadinessPromise) return contentDownloadIndexReadinessPromise;
@@ -5784,8 +6810,6 @@ async function restoreReadyContentDownloadIndexOnFirstRead() {
         console.log('[CONTENT DOWNLOAD INDEX] Reusing ready index from PostgreSQL.');
       }
     } catch (error) {
-      // First deployment may not have created the index tables yet. The normal
-      // background builder will create them and only enable indexed reads once ready.
       if (error && error.code === '42P01') contentDownloadIndexReadinessChecked = true;
     }
   })();
@@ -5814,7 +6838,6 @@ async function createContentDownloadIndexSchema() {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    // Two Render instances can overlap during a deploy. Serialize schema changes.
     await client.query("SELECT pg_advisory_xact_lock(hashtext('psn_content_download_index_schema_v1'))");
     await client.query(`
       CREATE TABLE IF NOT EXISTS psn_content_download_memberships (
@@ -5933,8 +6956,6 @@ async function backfillContentDownloadIndexBatch() {
     await client.query('BEGIN');
     await client.query("SET LOCAL lock_timeout = '1500ms'");
     await client.query("SET LOCAL statement_timeout = '10000ms'");
-    // Lock each source row while indexing it. Concurrent profile updates run
-    // after the backfill and refresh that same row through the trigger.
     const selected = await client.query(`
       SELECT u.name FROM users u
       WHERE NOT EXISTS (
@@ -5992,8 +7013,6 @@ async function maintainContentDownloadIndex() {
         console.log(`[CONTENT DOWNLOAD INDEX] Background build: ${contentDownloadIndexBuiltUsers} user profiles processed in this run.`);
       }
       if (!processed) {
-        // SKIP LOCKED may temporarily skip rows being updated by another
-        // connection; never enable indexed reads until every user has a marker.
         const completion = await pool.query(`
           UPDATE psn_content_download_index_meta
           SET ready = TRUE
@@ -6024,8 +7043,6 @@ async function maintainContentDownloadIndex() {
   }
 }
 
-// Filter by the inexpensive raw IDs before normalizing category/name for every
-// download. Name-only and unusual keys keep the original exact-count SQL.
 function getContentDownloadCountCandidateIds(keys = []) {
   const titleIds = new Set();
   const contentIds = new Set();
@@ -6040,8 +7057,6 @@ function getContentDownloadCountCandidateIds(keys = []) {
       contentIds.add(id);
     } else if (value.startsWith('T:')) {
       const id = value.slice(2);
-      // A literal '|N:' may be part of a raw ID, not a name delimiter.
-      // Fall back rather than risk excluding a matching download row.
       if (!id || id.includes('|')) return null;
       titleIds.add(id);
     } else {
@@ -6053,8 +7068,6 @@ function getContentDownloadCountCandidateIds(keys = []) {
     : null;
 }
 
-// Requests arriving together share a single full-table scan. Never retain
-// in-flight promises after completion; durable results use the existing LRU.
 function scheduleContentDownloadCountBatch() {
   if (contentDownloadCountBatchTimer !== null) return;
   contentDownloadCountBatchTimer = setTimeout(() => {
@@ -6067,8 +7080,6 @@ function scheduleContentDownloadCountBatch() {
       if (batch.length >= CONTENT_DOWNLOAD_COUNT_REQUEST_MAX) break;
     }
     if (!batch.length) return;
-    // A second batch may queue behind the first, but never uses another DB
-    // connection concurrently with it.
     if (contentDownloadCountPendingKeys.size > batch.length) scheduleContentDownloadCountBatch();
     runSerializedContentDownloadCountQuery(async () => {
       const now = Date.now();
@@ -6774,9 +7785,6 @@ async function refreshContentMetadataOverridesFromDb(options = {}) {
       nextByKey.set(entry.metadataKey, entry);
       nextOrdered.push(entry);
     }
-    // A realtime/admin mutation may land while this SELECT is in flight. Do not let an
-    // older snapshot overwrite the newer in-memory delta; the next explicit refresh can
-    // reconcile from PostgreSQL without causing a visible rollback in the meantime.
     if (contentMetadataOverridesMutationRevision !== refreshRevision) return getOrderedContentMetadataOverrides();
     if (contentMetadataOverrideMapEquals(contentMetadataOverridesByKey, nextByKey)) {
       contentMetadataOverridesLastDbRefreshAt = Date.now();
@@ -7031,8 +8039,6 @@ async function refreshBlockedStoreContentFromDb() {
   return blockedStoreContent;
 }
 
-// Short-lived per-user snapshots only; all writes and cross-instance notices invalidate them.
-// In-flight results cannot repopulate a snapshot after invalidation.
 const PERSONAL_READ_TTL_MS = Math.max(0, Math.min(5000, Number(process.env.PERSONAL_READ_TTL_MS ?? 1500) || 0));
 let readPersonalCacheStats = { rewards:{fresh:0,shared:0,db:0}, reports:{fresh:0,shared:0,db:0} };
 function createPersonalReadReuse(group) {
@@ -7228,9 +8234,6 @@ async function publishContentBlocksChanged(options = {}) {
   return blockedStoreContent;
 }
 
-// Group identical in-flight authoritative identity lookups (e.g. Seen By
-// opened from two tabs). Do not cache completed rows, and calculate live
-// online/last-seen fields separately for each requester after the DB read.
 const authoritativeFriendsPresencePending = new Map();
 const AUTHORITATIVE_FRIENDS_PENDING_MAX = 32;
 function readAuthoritativeFriendsPresenceShared(keys) {
@@ -7326,9 +8329,6 @@ async function getUserDataPayloadFromDb(targetName, type) {
   return payload;
 }
 
-// Share only overlapping own-profile section reads. A second login tab must not
-// trigger another large JSONB transfer while the first one is still in flight.
-// Never retain the resolved payload here: this also bounds RAM on free Render.
 const profileSyncReadsPending = new Map();
 const PROFILE_SYNC_READ_PENDING_MAX = 32;
 function readProfileSyncShared(name, scope, loader) {
@@ -7357,9 +8357,6 @@ function readSmallProfileSectionsShared(name, keys) {
   return readProfileSyncShared(name, `light:${fields.join(',')}`, () => readSmallProfileSectionsFromDb(name, fields));
 }
 
-// Remote profile lists: coalesce concurrent requests and keep a small, short-lived
-// in-memory snapshot. Cross-instance profile notifications and successful writes
-// invalidate it; never retain whole profile objects or credentials.
 const publicProfileListReadCache = new Map();
 const PUBLIC_PROFILE_LIST_CACHE_MS = 12000;
 const PUBLIC_PROFILE_LIST_CACHE_MAX = 24;
@@ -7378,10 +8375,7 @@ function evictPublicProfileListRead(key) {
 function invalidatePublicProfileListReads(name, changedKeys = null) {
   const safeName = normalizeText(name, '');
   if (!safeName) return;
-  // A write or cross-instance update must not join a read started before it.
   invalidateProfileSyncReads(safeName);
-  // A Downloads change must not throw away the already-loaded Library/Wishlist.
-  // No keys means an unknown/full-profile change: conservatively clear all.
   let affected = null;
   if (Array.isArray(changedKeys) && changedKeys.length) {
     affected = new Set();
@@ -7404,8 +8398,6 @@ function prunePublicProfileListReadCache(now = Date.now()) {
   for (const [key, entry] of publicProfileListReadCache) {
     if (!entry.promise && entry.expires <= now) evictPublicProfileListRead(key);
   }
-  // Pending reads have zero cached bytes and should not count against the
-  // settled-result LRU budget. Evicting them destroys single-flight sharing.
   let settledCount = 0;
   for (const entry of publicProfileListReadCache.values()) if (!entry.promise) settledCount++;
   while (settledCount > PUBLIC_PROFILE_LIST_CACHE_MAX || publicProfileListReadCacheBytes > PUBLIC_PROFILE_LIST_TOTAL_BYTES) {
@@ -7419,12 +8411,6 @@ function prunePublicProfileListReadCache(now = Date.now()) {
   }
 }
 
-// Fold different list requests for the same friend in one event-loop turn into
-// one selective PostgreSQL read. Only fetch the requested JSONB fields; do not
-// hydrate a full user profile or delay a single request with a debounce timer.
-// One event-loop tick gathers independent viewers of the same list fields.
-// SQL batches cap the user count and concurrent reads, leaving pool capacity
-// for authentication, chat and realtime updates.
 const publicProfileListDbBatches = new Map();
 const PUBLIC_PROFILE_LIST_DB_FIELDS = {
   favs: ['favoritesData'],
@@ -7493,8 +8479,6 @@ function flushPublicProfileListDbBatches() {
   }
   for (const group of groups.values()) {
     const projection = group.columns.map(field => `data -> '${field}' AS "${field}"`).join(', ');
-    // Large libraries/download histories can be megabytes per user; bound each
-    // DB result independently from the number of waiting browser requests.
     const batchSize = group.columns.includes('libraryData') ? 3 :
       group.columns.includes('downloadsData') ? 6 :
       (group.columns.includes('wishlistData') || group.columns.includes('favoritesData')) ? 8 :
@@ -7543,7 +8527,6 @@ function readPublicProfileListShared(targetName, type) {
   const now = Date.now();
   const cached = publicProfileListReadCache.get(key);
   if (cached && (cached.promise || cached.expires > now)) {
-    // LRU: keep frequently viewed lists; each promise is shared across viewers.
     publicProfileListReadCache.delete(key);
     publicProfileListReadCache.set(key, cached);
     return cached.promise || Promise.resolve(cached.value);
@@ -7556,10 +8539,6 @@ function readPublicProfileListShared(targetName, type) {
   ).then(value => {
     if (publicProfileListReadCache.get(key) === entry) {
       entry.promise = null;
-      // Never stringify a giant library merely to decide whether it fits in
-      // the tiny shared cache. The bounded estimate counts JS strings as
-      // UTF-16 bytes; allow 2x the JSON limit before exact measurement to
-      // avoid rejecting ordinary ASCII-rich collections.
       const estimate = value == null ? null : estimateValueBytes(value, {
         maxNodes: 15000, maxBytes: 1024 * 1024
       });
@@ -7718,8 +8697,6 @@ function getDownloadOwnershipTitleIds(downloadsData = []) {
     if (normalizeDownloadHistoryCategoryServer(item.category || item.rawCategory || 'games') !== 'games') continue;
     const titleId = normalizeGamePlayersTitleId(item.titleId || item.id);
     if (!titleId) {
-      // Incomplete records may merge into a named/content-matched game and
-      // alter the group's effective ID; preserve exact legacy semantics.
       const normalized = normalizeDownloadHistoryRecordsServer(source).history;
       const mergedIds = new Set();
       normalized.forEach(record => {
@@ -7903,8 +8880,6 @@ async function setGamePlayTogether(userName, rawTitleId, enabled, rawTitle, opti
     emitGamePlayersSummaryChanged([titleId], changeOptions);
     deferServerTask('GAME PLAYERS NOTIFY', () => notifyGamePlayersSummaryChangedAcrossInstances([titleId], changeOptions), 0);
   }
-  // INSERT ... ON CONFLICT / DELETE rowCount already tells us the requested state is settled.
-  // The handler immediately reads the authoritative summary, so avoid a second standalone DB read here.
   return { ok: true, enabled: enabled === true, changed };
 }
 
@@ -8310,11 +9285,7 @@ async function ensureGameOwnershipIndexReady() {
   return gameOwnershipIndexBuildPromise;
 }
 
-// Coalesce background index updates per account. Read the committed profile
-// inside the transaction: an earlier deferred request must never replay an old
-// Library/Downloads snapshot after a newer profile save or another instance.
 const gameOwnershipSyncJobs = new Map();
-// Background ownership writes are deferred; never let a burst exhaust the PostgreSQL pool.
 const GAME_OWNERSHIP_SYNC_CONCURRENCY = Math.max(1, Math.min(2, PG_POOL_MAX - 2));
 const gameOwnershipSyncReady = [];
 let gameOwnershipSyncActive = 0;
@@ -8328,8 +9299,6 @@ function scheduleUserGameOwnershipIndexSync(userName, options = {}) {
   if (existing) {
     gameOwnershipSyncMetrics.coalesced++;
     existing.dirty = true;
-    // When multiple clients change one list, notify all rather than excluding
-    // the last socket and potentially hiding an earlier change from it.
     if (existing.sourceSocketId !== (options.sourceSocketId || null)) existing.sourceSocketId = null;
     return;
   }
@@ -8381,14 +9350,9 @@ async function runGameOwnershipSyncJob(job) {
   } catch (err) {
     job.failures++;
     const errorCode = String(err && err.code || '').toUpperCase();
-    // A capacity error or canceled query should NOT be retried immediately by
-    // the global SQL helper, but the deferred index must remain pending until
-    // the database recovers. Dropping it after seven attempts leaves stale
-    // ownership counts until another Library/Downloads change happens.
     if (isPgTransientConnectionError(err) || errorCode === '53300' || errorCode === '57014') {
       gameOwnershipSyncMetrics.retries++;
       job.dirty = true;
-      // Capped exponential delay remains safe during long Aiven outages.
       retryDelayMs = Math.min(60000, 250 * (2 ** Math.min(job.failures - 1, 8)));
       if (errorCode === '53300') retryDelayMs = Math.max(15000, retryDelayMs);
       if (errorCode === '57014') retryDelayMs = Math.max(5000, retryDelayMs);
@@ -8413,13 +9377,6 @@ async function syncUserGameOwnershipIndex(userName, options = {}) {
   const safeName = normalizeText(userName, '');
   if (!safeName) return [];
 
-  // The profile handler filters out unchanged ownership memberships before
-  // queuing this job. Read the committed profile under the original row lock:
-  // two extra preflight queries would add latency for every real change.
-  // Coalesced jobs still safely return [] if the index already matches.
-  // Lock the account row first, consistently with ordinary profile writes and
-  // account deletion. This works across Render instances and ensures the index
-  // corresponds to a committed version of BOTH lists, not stale job payloads.
   const changedTitleIds = await runDbTransactionWithRetry('GAME OWNERSHIP INDEX SYNC', async client => {
     let phaseStarted = DB_PERF_ENABLED ? performance.now() : 0;
     const profileResult = await client.query(
@@ -8510,8 +9467,6 @@ async function syncUserGameOwnershipIndex(userName, options = {}) {
     actorName:safeName,
     excludeSocketId:options.sourceSocketId
   };
-  // The database commit has already succeeded. A local socket broadcast
-  // failure must not make the job retry SQL and then miss the original change.
   try {
     emitGamePlayersSummaryChanged(changedTitleIds, changeOptions);
   } catch (err) {
@@ -8832,9 +9787,6 @@ function runSerializedProfileHydration(task) {
   return run;
 }
 
-// A delivery slot is acquired BEFORE reading the section, so no extra large
-// JSONB payloads accumulate while another browser is acknowledging a packet.
-// Unlike the DB hydration lanes, delivery slots may wait for network ACKs.
 function runBoundedProfileSectionDelivery(task) {
   const lane = profileSectionDeliveryNextLane++ % profileSectionDeliveryQueues.length;
   const run = profileSectionDeliveryQueues[lane].catch(() => null).then(task);
@@ -8872,8 +9824,6 @@ const PROFILE_HEAVY_SECTION_META = {
   friendsData: { type: 'friends', countKey: 'friends', versionKeys: ['friendsUpdatedAt'], publicCount: false }
 };
 
-// Own-profile sync: fetch small related sections together, leaving large
-// Trophies/Downloads/Library in their existing memory-bounded streaming path.
 const PROFILE_LIGHT_BATCH_KEYS = new Set(['wishlistData', 'favoritesData', 'friendsData']);
 async function readSmallProfileSectionsFromDb(name, keys) {
   const selected = [...new Set(keys)].filter(key => PROFILE_LIGHT_BATCH_KEYS.has(key));
@@ -8902,8 +9852,6 @@ async function buildWorkingUserForProfileUpdate(name, incoming = {}) {
     .map(([dataKey]) => dataKey);
   if (!required.length) return base;
 
-  // One consistent snapshot replaces up to six sequential transatlantic DB
-  // round trips on large profile updates. Fetch only the sections being edited.
   const columns = [...required];
   if (required.includes('libraryData')) columns.push('libraryPlayHistoryData');
   const sqlFields = columns.map((key, i) => `data -> $${i + 2} AS section_${i}`).join(', ');
@@ -8998,8 +9946,6 @@ async function emitProfileSyncPacket(socket, payload, options = {}) {
   let outgoingPayload = payload;
   let compressedBytesInfo = null;
   let serializedBytes = 0;
-  // Legacy clients do not acknowledge compressed packets and use the plain
-  // payload path below. Avoid spending CPU on gzip that will be discarded.
   if (requireAck && socket && socket.connected && socket.profileSyncGzipV1 === true && payload && payload.userData) {
     try {
       const stringifyStartedAt = DB_PERF_ENABLED ? performance.now() : 0;
@@ -9022,8 +9968,6 @@ async function emitProfileSyncPacket(socket, payload, options = {}) {
     } catch (err) { outgoingPayload = payload; }
   }
   const requestedTimeoutMs = Math.max(3000, Number(options.timeoutMs || 15000));
-  // A large section may take longer to decompress/apply on a slow browser.
-  // Keep the normal deadline for small packets; never exceed 22 seconds.
   const timeoutMs = requireAck && serializedBytes > 512 * 1024
     ? Math.min(22000, Math.max(requestedTimeoutMs, requestedTimeoutMs + Math.ceil(serializedBytes / (1024 * 1024)) * 2000))
     : requestedTimeoutMs;
@@ -9144,14 +10088,11 @@ async function emitChunkedProfileSyncToSocket(socket, name, options = {}) {
         (!requestedKeys || requestedKeys.has(key) || requestedKeys.has(meta.countKey) ||
           (meta.versionKeys || []).some(version => requestedKeys.has(version))))
       .map(([key]) => key);
-    // Keep the grouped snapshot small on low-RAM Render instances; oversized
-    // collections continue on the existing section-by-section read path.
     const batchSmallSections = smallSectionKeys.length > 1 &&
       smallSectionKeys.reduce((total, key) => {
         const count = Number(compactUser[PROFILE_HEAVY_SECTION_META[key].countKey]);
         return total + (Number.isFinite(count) && count >= 0 ? count : 999999);
       }, 0) <= 1200;
-    // Short-lived, per-request snapshot; drop each section immediately after send.
     let smallSectionSnapshot = null;
 
     let corePayload = null;
@@ -9196,8 +10137,6 @@ async function emitChunkedProfileSyncToSocket(socket, name, options = {}) {
         let packet;
         let itemCount = 0;
         let estimate;
-        // Hold the DB/hydration lane only while preparing the payload. Socket
-        // delivery (including slow ACKs) happens outside that lane.
         await runSerializedProfileHydration(async () => {
           if (!socket.connected) { sectionCancelled = true; return; }
           logMemoryTrace('profile-sync:section:load', `user=${name} socket=${socket.id} section=${dataKey}`);
@@ -9205,8 +10144,6 @@ async function emitChunkedProfileSyncToSocket(socket, name, options = {}) {
           if (PROFILE_LIGHT_BATCH_KEYS.has(dataKey) && batchSmallSections) {
             if (!smallSectionSnapshot) {
               const sharedSections = await readSmallProfileSectionsShared(name, smallSectionKeys);
-              // Each socket owns its shallow snapshot, so sharing the read
-              // never lets another socket delete a delivered section.
               smallSectionSnapshot = sharedSections ? { ...sharedSections } : null;
               if (!smallSectionSnapshot) throw new Error('Could not load profile sections.');
             }
@@ -9232,12 +10169,6 @@ async function emitChunkedProfileSyncToSocket(socket, name, options = {}) {
         if (MEMORY_TRACE_ENABLED) {
           logMemoryTrace('profile-sync:section:send', `user=${name} socket=${socket.id} section=${dataKey} items=${itemCount} approx=${formatApproxBytes(estimate.bytes)}${estimate.truncated ? '+' : ''} buffer=${getSocketWriteBufferLength(socket)}`);
         }
-        // A confirmed section is reusable even if another profile field changed.
-        // Send the new revision/counts as a tiny patch; do not resend the same list.
-        // Only an ACK from this socket qualifies. Explicit hydration never dedupes.
-        // A successful full hydration establishes this socket's ACKed baseline.
-        // Without its signature the first unchanged delta would resend the
-        // entire section, increasing bandwidth and client work after login.
         const shouldHashSection = socket.profileSyncAckV1 === true &&
           socket.profileSyncRevisionOnlyV1 === true && !!packet.userData;
         const signatureStartedAt = shouldHashSection && DB_PERF_ENABLED ? performance.now() : 0;
@@ -9258,14 +10189,11 @@ async function emitChunkedProfileSyncToSocket(socket, name, options = {}) {
           const revisionPacket = { name, sourceSocketId: options.sourceSocketId || null, profileUpdatedAt, profileSyncRevisionOnlyV1: true, profileSyncRevisionSection: dataKey, userData: metadata };
           const reused = await emitProfileSyncPacket(socket, revisionPacket, { label: `${dataKey}-revision`, timeoutMs: 8000 });
           if (reused && reused.cancelled) { sectionCancelled = true; return; }
-          // The browser must confirm that the previously ACKed list is still
-          // hydrated and has no pending local edits. Otherwise resend the data.
           if (reused && reused.acked === true && reused.response && reused.response.revisionAccepted === true) {
             profileDeliveryMetrics.revisionAccepted++;
             return;
           }
           profileDeliveryMetrics.revisionRejected++;
-          // The previous ACK no longer proves the browser kept this section.
           if (socket.__profileSectionLastAck instanceof Map) socket.__profileSectionLastAck.delete(dataKey);
         }
         const result = await emitProfileSyncPacket(socket, packet, { label: dataKey, timeoutMs: 10000 });
@@ -9305,8 +10233,6 @@ function emitChatHistoryToSocket(socket) {
   if (!socket) return Promise.resolve();
   if (socket.__chatHistoryInFlight) return socket.__chatHistoryInFlight;
 
-  // Pick the shorter send queue so a busy transport lane does not stall a
-  // request while the other lane is free. Equal queues alternate fairly.
   const lane = chatHistoryQueueDepth[0] === chatHistoryQueueDepth[1]
     ? chatHistoryNextLane++ % chatHistoryEmitQueues.length
     : (chatHistoryQueueDepth[0] < chatHistoryQueueDepth[1] ? 0 : 1);
@@ -9324,10 +10250,6 @@ function emitChatHistoryToSocket(socket) {
     const startedAt = Date.now();
     socket.emit('chat_config', { maxHistory: MAX_CHAT_HISTORY });
     if (requiresAck) {
-      // Browser ACKs report that the snapshot was processed, not merely sent.
-      // Keep a per-socket completion promise to reject duplicate requests, but
-      // release the shared send lane once the transport buffer has drained.
-      // This prevents one slow browser's UI from delaying other users' history.
       const completion = new Promise(resolve => {
         let settled = false;
         const finish = value => {
@@ -9363,8 +10285,6 @@ function emitChatHistoryToSocket(socket) {
         return result;
       });
 
-      // Do not release the lane while the network still holds the heavy packet.
-      // If it cannot drain promptly, retain the original ACK backpressure.
       const drain = await waitForSocketWriteBufferDrain(socket, { maxPending: 0, timeoutMs: 1500 });
       if (!drain.drained && socket.connected) await completion;
       return { completion };
@@ -9376,8 +10296,6 @@ function emitChatHistoryToSocket(socket) {
     return { completion: Promise.resolve({ cancelled: !socket.connected }) };
   });
 
-  // Only the network delivery/backpressure occupies the shared lane. The ACK
-  // still controls the per-socket in-flight guard and error propagation.
   const releaseLane = () => { chatHistoryQueueDepth[lane] = Math.max(0, chatHistoryQueueDepth[lane] - 1); };
   chatHistoryEmitQueues[lane] = delivery.then(releaseLane, releaseLane);
   socket.__chatHistoryInFlight = delivery.then(async result => {
@@ -9390,8 +10308,6 @@ function emitChatHistoryToSocket(socket) {
   return socket.__chatHistoryInFlight;
 }
 
-// Administrative changes are sparse: merging only their explicit fields avoids
-// a stale full-profile cache overwriting newer client sections or notification state.
 async function saveUser(name, options = {}) {
   if (!name || !userDatabase[name]) return false;
   const user = userDatabase[name];
@@ -9418,7 +10334,6 @@ async function saveUser(name, options = {}) {
 
   if (!result.rows.length) return false;
   const saved = normalizeUserRecord(name, result.rows[0].data || {});
-  // Admin command handlers can still hold a reference to this object.
   user.profileUpdatedAt = saved.profileUpdatedAt;
   const currentPresence = userDatabase[name] || user;
   userDatabase[name] = {
@@ -9447,8 +10362,6 @@ async function patchUserData(name, patch = {}, label = 'USER DATA PATCH') {
   const keys = Object.keys(outgoing);
   if (!keys.length) return true;
 
-  // Share the per-account write lane with notification-state mutations.
-  // Each PostgreSQL JSONB patch still merges against the latest row value.
   const result = await runSerializedUserRowMutation(name, () => queryDbWithRetry(`
     UPDATE users
     SET data = COALESCE(data, '{}'::jsonb) || $1::jsonb
@@ -9505,100 +10418,92 @@ function getPublicChatHistoryForUser(userName = '') {
   return messageHistory.map(message => getPublicChatMessageForUser(message, userName));
 }
 
-// Compact Seen hydration: one indexed aggregate per current message; the full reader
-// list is fetched only for a user-requested popup. Realtime changes still stream instantly.
+const CHAT_SEEN_CURSOR_STEP = MAX_CHAT_HISTORY + 1;
 const compactChatSeenPendingByUser = new Map();
+function chatSeenEventCursor(rangeId, offset = MAX_CHAT_HISTORY) {
+  return Math.max(0, Number(rangeId) || 0) * CHAT_SEEN_CURSOR_STEP + Math.min(MAX_CHAT_HISTORY, Math.max(0, offset));
+}
+function getActiveChatMessageSpans() {
+  const entries = [];
+  for (let i = 0; i < messageHistory.length; i++) {
+    const m = messageHistory[i];
+    const id = m && m.time ? new Date(m.time).getTime() : NaN;
+    if (Number.isSafeInteger(id) && id > 0 && m.user) entries.push({ id, msgId:String(id), sender:String(m.user), position:i });
+  }
+  return entries;
+}
 async function getCompactChatSeenSnapshotForUser(userName = '') {
   const targetUser = String(userName || '');
   if (!targetUser) return { mode:'summary', cursor:0, events:[], summary:[] };
-  const pendingRead = compactChatSeenPendingByUser.get(targetUser);
-  if (pendingRead) return pendingRead;
-  const authoredIds = [], otherIds = [], uniqueIds = new Set();
-  for (const message of messageHistory) {
-    const stamp = message && message.time ? new Date(message.time).getTime() : NaN;
-    if (!Number.isFinite(stamp)) continue;
-    const id = String(stamp);
-    if (uniqueIds.has(id)) continue;
-    uniqueIds.add(id);
-    (String(message.user || '') === targetUser ? authoredIds : otherIds).push(id);
-  }
+  const pending = compactChatSeenPendingByUser.get(targetUser);
+  if (pending) return pending;
+  const authoredIds = [], otherIds = [];
+  for (const m of getActiveChatMessageSpans()) (m.sender === targetUser ? authoredIds : otherIds).push(m.id);
   const work = (async () => {
     const res = await queryDbWithRetry(
       `WITH authored AS (
-         SELECT e.message_id, COUNT(*)::integer AS seen_count
-         FROM chat_seen_events e
-         WHERE e.message_id = ANY($1::text[])
-         GROUP BY e.message_id
+         SELECT msg_id::text AS message_id, COUNT(DISTINCT r.reader)::integer AS seen_count
+         FROM unnest($1::bigint[]) AS messages(msg_id)
+         LEFT JOIN chat_seen_ranges r ON int8range(r.first_msg_id,r.last_msg_id,'[]') @> messages.msg_id
+         GROUP BY msg_id
        ), read_by_me AS (
-         SELECT e.message_id, e.seen_at
-         FROM chat_seen_events e
-         WHERE e.message_id = ANY($2::text[]) AND e.reader = $3
+         SELECT msg_id::text AS message_id, MIN(r.seen_at) AS seen_at
+         FROM unnest($2::bigint[]) AS messages(msg_id)
+         JOIN chat_seen_ranges r ON r.reader = $3 AND int8range(r.first_msg_id,r.last_msg_id,'[]') @> messages.msg_id
+         GROUP BY msg_id
        )
-       SELECT
-         (SELECT COALESCE(MAX(id),0)::bigint FROM chat_seen_events) AS cursor,
+       SELECT (SELECT COALESCE(MAX(id),0)::bigint FROM chat_seen_ranges) AS cursor,
          COALESCE((SELECT jsonb_agg(jsonb_build_object('msgId',message_id,'seenCount',seen_count)) FROM authored),'[]'::jsonb) AS authored,
          COALESCE((SELECT jsonb_agg(jsonb_build_object('msgId',message_id,'seenByMe',true,'seenAt',seen_at)) FROM read_by_me),'[]'::jsonb) AS read_by_me`,
       [authoredIds, otherIds, targetUser],
-      { attempts:1, label:'CHAT SEEN SUMMARY READ', queryTimeoutMs:8000 }
+      { attempts:1, label:'CHAT SEEN RANGES SUMMARY', queryTimeoutMs:8000 }
     );
     const row = res.rows[0] || {};
-    const authored = Array.isArray(row.authored) ? row.authored : [];
-    const readByMe = Array.isArray(row.read_by_me) ? row.read_by_me : [];
-    return { mode:'summary', cursor:Math.max(0,Number(row.cursor)||0), events:[], summary:authored.concat(readByMe) };
+    return { mode:'summary', cursor:Math.max(1,chatSeenEventCursor(row.cursor)), events:[],
+      summary:[...(Array.isArray(row.authored)?row.authored:[]), ...(Array.isArray(row.read_by_me)?row.read_by_me:[])] };
   })();
-  compactChatSeenPendingByUser.set(targetUser,work);
+  compactChatSeenPendingByUser.set(targetUser, work);
   try { return await work; }
-  finally { if (compactChatSeenPendingByUser.get(targetUser)===work) compactChatSeenPendingByUser.delete(targetUser); }
+  finally { if (compactChatSeenPendingByUser.get(targetUser) === work) compactChatSeenPendingByUser.delete(targetUser); }
 }
 
 async function getChatSeenSyncForUser(userName = '', cursor = 0) {
   const targetUser = String(userName || '');
   const safeCursor = Math.max(0, Number(cursor) || 0);
   if (!safeCursor) return getCompactChatSeenSnapshotForUser(targetUser);
-
-  // One round trip gets the current global cursor and the relevant delta.
-  // LEFT JOIN LATERAL keeps the cursor available even when there are no changes.
+  const minRangeId = Math.floor(safeCursor / CHAT_SEEN_CURSOR_STEP);
   const res = await queryDbWithRetry(
-    `WITH current_cursor AS (
-       SELECT COALESCE(MAX(id), 0)::bigint AS max_id FROM chat_seen_events
-     )
-     SELECT delta.id, delta.message_id, delta.sender, delta.reader, delta.seen_at,
-            current_cursor.max_id
-     FROM current_cursor
-     LEFT JOIN LATERAL (
-       SELECT id, message_id, sender, reader, seen_at
-       FROM chat_seen_events
-       WHERE id > $1 AND (sender = $2 OR reader = $2)
+    `WITH latest AS (SELECT COALESCE(MAX(id),0)::bigint AS max_id FROM chat_seen_ranges)
+     SELECT r.id, r.reader, r.first_msg_id, r.last_msg_id, r.seen_at, latest.max_id
+     FROM latest LEFT JOIN LATERAL (
+       SELECT id, reader, first_msg_id, last_msg_id, seen_at
+       FROM chat_seen_ranges
+       WHERE id >= $1 AND (reader = $2 OR sender_names @> ARRAY[$2]::text[])
        ORDER BY id ASC LIMIT 2001
-     ) delta ON TRUE
-     ORDER BY delta.id ASC`,
-    [safeCursor, targetUser],
-    { attempts: 2, label: 'CHAT SEEN DELTA READ' }
+     ) r ON TRUE ORDER BY r.id ASC`,
+    [minRangeId, targetUser], { attempts:2, label:'CHAT SEEN RANGES DELTA', queryTimeoutMs:8000 }
   );
   const maxId = Math.max(0, Number(res.rows[0]?.max_id) || 0);
-  if (safeCursor > maxId) {
-    return getCompactChatSeenSnapshotForUser(targetUser);
+  if (safeCursor > Math.max(1,chatSeenEventCursor(maxId)) || res.rows.length > 2000) return getCompactChatSeenSnapshotForUser(targetUser);
+  const active = getActiveChatMessageSpans();
+  const events = [];
+  for (const row of res.rows) {
+    if (row.id == null) continue;
+    const first = Number(row.first_msg_id), last = Number(row.last_msg_id);
+    let offset = 0;
+    for (const m of active) {
+      if (m.id < first || m.id > last) continue;
+      offset++;
+      const eventId = chatSeenEventCursor(row.id,offset);
+      if (eventId <= safeCursor || (m.sender !== targetUser && row.reader !== targetUser)) continue;
+      events.push({ eventId, msgId:m.msgId, sender:m.sender, reader:String(row.reader),
+        seenAt:row.seen_at ? new Date(row.seen_at).toISOString() : '' });
+      if (events.length > 2000) return getCompactChatSeenSnapshotForUser(targetUser);
+    }
   }
-  const rows = res.rows.filter(row => row.id != null);
-  if (rows.length > 2000) {
-    return getCompactChatSeenSnapshotForUser(targetUser);
-  }
-  return {
-    mode: 'changes',
-    cursor: maxId,
-    events: rows.map(row => ({
-      eventId: Math.max(0, Number(row.id) || 0),
-      msgId: String(row.message_id || ''),
-      sender: String(row.sender || ''),
-      reader: String(row.reader || ''),
-      seenAt: row.seen_at ? new Date(row.seen_at).toISOString() : ''
-    }))
-  };
+  return { mode:'changes', cursor:Math.max(1,chatSeenEventCursor(maxId)), events };
 }
 
-// Seen is optional metadata: a slow/failed Seen snapshot must not prevent
-// Global Chat messages from opening. Keep the client's cursor unchanged so
-// the next sync can retry without silently marking missing events as seen.
 let chatSeenSyncErrorLastLogAt = 0;
 async function getChatSeenSyncSafely(userName = '', cursor = 0) {
   try {
@@ -9613,48 +10518,52 @@ async function getChatSeenSyncSafely(userName = '', cursor = 0) {
 }
 
 async function recordChatSeenEventsBatch(entries = [], readerName = '') {
-  const reader = normalizeText(readerName, '').slice(0, 120);
-  if (!reader) return [];
-  const ids = [];
-  const senders = [];
-  const seen = new Set();
-  for (const entry of Array.isArray(entries) ? entries : []) {
-    const msgId = normalizeText(entry && (entry.msgId || entry.id), '').slice(0, 100);
-    const sender = normalizeText(entry && entry.sender, '').slice(0, 120);
-    if (!msgId || !sender || sender === reader || seen.has(msgId)) continue;
-    seen.add(msgId);
-    ids.push(msgId);
-    senders.push(sender);
-    if (ids.length >= CHAT_SEEN_BATCH_MAX) break;
-  }
-  if (!ids.length) return [];
-
-  const res = await queryDbWithRetry(
-    `WITH input AS (
-       SELECT msg_id, sender
-       FROM unnest($1::text[], $2::text[]) AS x(msg_id, sender)
-     ),
-     inserted AS (
-       INSERT INTO chat_seen_events (message_id, sender, reader, seen_at)
-       SELECT input.msg_id, input.sender, $3, NOW()
-       FROM input
-       ON CONFLICT (message_id, reader) DO NOTHING
-       RETURNING id, message_id, sender, reader, seen_at
-     )
-     SELECT id, message_id, sender, reader, seen_at
-     FROM inserted
-     ORDER BY id ASC`,
-    [ids, senders, reader],
-    { attempts: 2, label: ids.length > 1 ? 'CHAT SEEN BATCH SAVE' : 'CHAT SEEN EVENT SAVE' }
+  const reader = normalizeText(readerName, '').slice(0,120);
+  if (!reader || !entries.length) return [];
+  const ordered = entries.filter(e => Number.isSafeInteger(e.id) && e.id > 0 && e.sender !== reader)
+    .slice(0, CHAT_SEEN_BATCH_MAX);
+  if (!ordered.length) return [];
+  const firstId = Math.min(...ordered.map(e => e.id));
+  const lastId = Math.max(...ordered.map(e => e.id));
+  const existing = await queryDbWithRetry(
+    `SELECT first_msg_id, last_msg_id FROM chat_seen_ranges
+     WHERE reader = $1 AND int8range(first_msg_id,last_msg_id,'[]') && int8range($2::bigint,$3::bigint,'[]')`,
+    [reader, firstId, lastId], { attempts:1, label:'CHAT SEEN RANGES COVERAGE' }
   );
-
-  return (res.rows || []).map(row => ({
-    eventId: Math.max(0, Number(row.id) || 0),
-    msgId: String(row.message_id || ''),
-    sender: String(row.sender || ''),
-    reader: String(row.reader || reader),
-    seenAt: row.seen_at ? new Date(row.seen_at).toISOString() : ''
-  })).filter(event => event.eventId && event.msgId && event.reader);
+  const uncovered = ordered.filter(m => !(existing.rows || []).some(r => m.id >= Number(r.first_msg_id) && m.id <= Number(r.last_msg_id)));
+  if (!uncovered.length) return [];
+  const batches = [];
+  for (const m of uncovered) {
+    let batch = batches[batches.length - 1];
+    if (!batch || m.position !== batch.endPosition + 1 || m.id <= batch.last) {
+      batch = { first:m.id, last:m.id, endPosition:m.position, senders:[], messages:[] };
+      batches.push(batch);
+    }
+    batch.last = m.id;
+    batch.endPosition = m.position;
+    if (!batch.senders.includes(m.sender)) batch.senders.push(m.sender);
+    batch.messages.push(m);
+  }
+  const res = await queryDbWithRetry(
+    `INSERT INTO chat_seen_ranges (reader,first_msg_id,last_msg_id,sender_names)
+     SELECT $1, (item.value->>'first')::bigint, (item.value->>'last')::bigint,
+       ARRAY(SELECT jsonb_array_elements_text(item.value->'senders'))
+     FROM jsonb_array_elements($2::jsonb) AS item(value)
+     ON CONFLICT (reader,first_msg_id,last_msg_id) DO NOTHING
+     RETURNING id, first_msg_id, last_msg_id, seen_at`,
+    [reader, JSON.stringify(batches.map(b => ({first:b.first,last:b.last,senders:b.senders})))],
+    { attempts:2, label:'CHAT SEEN COMPACT BATCH SAVE' }
+  );
+  const events = [];
+  for (const row of res.rows || []) {
+    const batch = batches.find(b => b.first === Number(row.first_msg_id) && b.last === Number(row.last_msg_id));
+    if (!batch) continue;
+    batch.messages.forEach((m, i) => events.push({
+      eventId:chatSeenEventCursor(row.id,i+1), msgId:m.msgId, sender:m.sender, reader,
+      seenAt:row.seen_at ? new Date(row.seen_at).toISOString() : ''
+    }));
+  }
+  return events.sort((a,b) => a.eventId-b.eventId);
 }
 
 function emitChatSeenSyncEvents(events = []) {
@@ -9696,7 +10605,6 @@ function emitChatSeenSyncEvents(events = []) {
   }
 }
 
-// Coalesce identical, concurrent chat integrity checks without caching results.
 let chatSyncTailPending = null;
 function readChatSyncTailShared() {
   if (chatSyncTailPending) return chatSyncTailPending;
@@ -10072,6 +10980,7 @@ async function resetChatSyncEpoch() {
     await client.query('BEGIN');
     await client.query('UPDATE chat_sync_state SET epoch = $1, revision = 0, updated_at = NOW() WHERE id = 1', [nextEpoch]);
     await client.query('DELETE FROM chat_changes');
+    await client.query('TRUNCATE chat_seen_ranges RESTART IDENTITY');
     await client.query('TRUNCATE chat_seen_events RESTART IDENTITY');
     await client.query('SELECT pg_notify($1, $2)', ['chat_sync_notify', JSON.stringify({ instanceId: INSTANCE_ID, reason: 'reset' })]);
     await client.query('COMMIT');
@@ -10085,8 +10994,6 @@ async function resetChatSyncEpoch() {
   return chatSyncState;
 }
 
-// Share only the active SQL read across concurrent chat logins. Each viewer
-// still receives their own sanitized message objects, never another viewer’s.
 let chatSyncSnapshotRowsPending = null;
 function readChatSyncSnapshotRowsShared() {
   if (chatSyncSnapshotRowsPending) return chatSyncSnapshotRowsPending;
@@ -10103,7 +11010,6 @@ function readChatSyncSnapshotRowsShared() {
 }
 async function getChatSyncSnapshotForUser(userName = '') {
   const result = await readChatSyncSnapshotRowsShared();
-  // Reverse a copy: the shared result must not be mutated by any caller.
   const rows = (result.rows || []).slice().reverse();
   return {
     messages: rows.map(row => getPublicChatMessageForUser(attachChatDbId({ ...(row.message || {}) }, row.id), userName)),
@@ -10146,6 +11052,7 @@ async function getStableInitialChatSyncForUser(userName = '') {
           snapshotExpectedCount: expectedCount,
           snapshotComplete: true,
           seenSyncV1: true,
+          seenEncoding: 'ranges-v2',
           seenMode: seenSync.mode,
           seenCursor: seenSync.cursor,
           seenEvents: seenSync.events,
@@ -10357,6 +11264,10 @@ async function addServerLog(type, message, detail = {}, user = "Server") {
 
   try {
     await pool.query('INSERT INTO server_log (entry) VALUES ($1)', [entry]);
+    if (++serverLogWritesSinceTrim >= 50) {
+      serverLogWritesSinceTrim = 0;
+      deferServerTask('SERVER LOG RETENTION', pruneServerLog, 1000);
+    }
   } catch (err) {
     console.error('[SERVER LOG ERROR]:', err);
   }
@@ -10419,9 +11330,6 @@ function normalizeDirectMessageText(value) {
     .replace(/\u0000/g, '')
     .trim();
 
-  // Private-message formatting is intentionally a very small HTML subset. The client renders
-  // only this subset too, but normalizing here keeps stored data canonical and prevents crafted
-  // socket payloads from persisting attributes or executable markup.
   text = text
     .replace(/<!--[\s\S]*?-->/g, '')
     .replace(/<\s*(script|style|iframe|object|embed|link|meta|svg|math)\b[^>]*>[\s\S]*?<\s*\/\s*\1\s*>/gi, '')
@@ -10437,7 +11345,6 @@ function normalizeDirectMessageText(value) {
   return text.slice(0, DIRECT_MESSAGE_TEXT_MAX);
 }
 
-// Private group conversations are isolated from two-person direct-message history.
 const DIRECT_GROUP_MAX_MEMBERS = 16;
 const DIRECT_GROUP_HISTORY_MAX = 200;
 function directGroupId(value) { const id = String(value || '').trim().toLowerCase(); return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id) ? id : ''; }
@@ -10460,8 +11367,6 @@ async function getDirectGroupMember(groupId,userName,db=pool) {
   const result=await db.query('SELECT gm.joined_at,gm.last_read_id,g.title,g.created_by FROM direct_group_members gm JOIN direct_groups g ON g.id=gm.group_id WHERE gm.group_id=$1 AND gm.user_name=$2',[groupId,userName]);
   return result.rows?.[0] || null;
 }
-// Group fanout/read events can arrive together. Share only the in-flight
-// roster query; do not cache settled membership or transaction-local reads.
 const directGroupMembersPending=new Map();
 function invalidateDirectGroupMembersPending(groupId){
   directGroupMembersPending.delete(String(groupId));
@@ -10495,8 +11400,6 @@ async function emitDirectGroupReadLocal(groupId,reader,lastMessageId,knownMember
   for(const member of members)for(const client of getSocketsByUserName(member.user_name))if(client?.connected)client.emit('direct_group_read',event);
 }
 function invalidateDirectGroupListsForMembers(members) {
-  // Other viewers' in-flight group lists are unrelated to this group change.
-  // Retain their pending reads rather than starting redundant PostgreSQL queries.
   for (const member of members || []) {
     const name = normalizeDirectMessageUser(member && member.user_name);
     if (!name) continue;
@@ -10505,8 +11408,6 @@ function invalidateDirectGroupListsForMembers(members) {
   }
 }
 async function emitDirectGroupLocal(groupId,kind,payload,knownMembers=null) {
-  // A roster refresh follows a committed add/leave. Never reuse a read that
-  // began before the membership change committed.
   if(kind==='refresh')invalidateDirectGroupMembersPending(groupId);
   const members=knownMembers || await getDirectGroupMembers(groupId);
   invalidateDirectGroupListsForMembers(members);
@@ -10567,8 +11468,6 @@ async function getDirectGroupList(viewer) {
   });
 }
 
-// Fast group summaries render first; the full list still provides authoritative unread counts
-// and read receipts. Uses the existing membership and message indexes.
 async function getDirectGroupPreview(viewer) {
   const result = await queryDbWithRetry(`
     SELECT g.id, g.title, g.created_by, g.created_at,
@@ -10609,7 +11508,6 @@ function readDirectGroupPreviewShared(viewer) {
   return pending;
 }
 
-// Concurrent tabs for the same account share one pending query, never a stale result.
 const directGroupListPending=new Map();
 function readDirectGroupListShared(viewer){
   let pending=directGroupListPending.get(viewer);
@@ -10619,8 +11517,6 @@ function readDirectGroupListShared(viewer){
   pending.finally(()=>{if(directGroupListPending.get(viewer)===pending)directGroupListPending.delete(viewer);}).catch(()=>{});
   return pending;
 }
-// Multiple tabs opening the same group share only the in-flight history read.
-// Settled requests are never cached, so new group messages remain visible.
 const directGroupHistoryPending = new Map();
 function getDirectGroupHistory(groupId, viewer) {
   const key = `${groupId}\u0000${viewer}`;
@@ -10634,9 +11530,6 @@ function getDirectGroupHistory(groupId, viewer) {
   return pending;
 }
 async function loadDirectGroupHistory(groupId,viewer) {
-  // Read membership and the group roster together. The history query also
-  // verifies membership, so parallel requests cannot expose a group to a stranger.
-  // This removes one round trip for every group opened, including concurrent tabs.
   const [snapshot,result]=await Promise.all([
     queryDbWithRetry(`SELECT self.joined_at,self.last_read_id,g.title,g.created_by,
       member.user_name AS member_name,member.joined_at AS member_joined_at,
@@ -10668,8 +11561,6 @@ async function loadDirectGroupHistory(groupId,viewer) {
       deferServerTask('GROUP READ SYNC',()=>notifyDirectGroupChange(groupId,'read',{user:viewer,lastMessageId:lastId}),0);
     }
   }
-  // This roster belongs to the current request. Parse membership timestamps
-  // and read cursors once, rather than once per member per history message.
   const receiptRoster=members.map(m=>({
     userName:m.user_name,
     joinedAt:Date.parse(m.joined_at),
@@ -10690,7 +11581,6 @@ async function loadDirectGroupHistory(groupId,viewer) {
   return {success:true,group:{id:groupId,title:member.title,createdBy:member.created_by,members:members.map(m=>m.user_name)},messages:withReceipts,pinnedMessages:withReceipts.filter(m=>m.pinnedAt).slice(-10),lastReadId:String(lastId)};
 }
 
-// Preview just the game name + optional caption; no new database queries.
 function directMessagePreviewText(message, maxLength=280) {
   const caption=directMessagePlainText(message?.text).slice(0,maxLength);
   if(message?.type!=='playing')return caption;
@@ -10942,10 +11832,6 @@ async function notifyDirectMessageAcrossInstances(kind, payload) {
   }
 }
 
-// PostgreSQL can deliver several reaction/edit/pin notifications for one private
-// message while the same row is still being read. Share that in-flight work and
-// perform one final read if another change arrived during it. Completed reads
-// are never cached, so subsequent independent updates remain immediately visible.
 const directRemoteMessageSyncPending=new Map();
 async function syncRemoteDirectMessage(kind,payload) {
   const messageId=Math.max(0,Number(payload && payload.id)||0);
@@ -11072,7 +11958,6 @@ async function queryDirectConversationPayload(userName) {
   };
 }
 
-// Concurrent sessions share an in-flight read; messages still update through realtime events.
 const directConversationReads=new Map();
 function getDirectConversationPayload(userName){
   const viewer=normalizeDirectMessageUser(userName);
@@ -11301,8 +12186,6 @@ async function getDirectHistoryPayload(userName, peerName, options = {}) {
   let readStateChanged = false;
   let readAt = '';
 
-  // Pins are independent of marking this conversation read. Fetch them in
-  // parallel with the read cursor/seen ticks to save a network round trip.
   const pinnedMessagesPromise = queryDbWithRetry(`
       SELECT id, sender_name, recipient_name, text, message_type, content, reply_to, reactions, pinned_at, edited_at, created_at
       FROM direct_messages
@@ -11371,9 +12254,6 @@ function getDirectRetentionKey(senderName, recipientName) {
   return a < b ? `${a}\u0000${b}` : `${b}\u0000${a}`;
 }
 
-// Maintenance never consumes more than one database connection at once.
-// Each conversation has one queued cleanup; the rest of the pool remains
-// available to live messages, group events and presence updates.
 const directRetentionQueued = new Map();
 const directRetentionRunning = new Set();
 const directRetentionRerun = new Map();
@@ -11391,8 +12271,6 @@ function scheduleDirectRetentionDrain(delayMs = 0) {
 function drainDirectRetentionQueue() {
   if (directRetentionRunning.size || !directRetentionQueued.size) return;
   const [key, entry] = directRetentionQueued.entries().next().value;
-  // Give active user requests priority, but bound the wait so maintenance
-  // cannot be starved indefinitely by a busy server.
   if (pool.waitingCount > 0 && Date.now() - entry.enqueuedAt < 5000) {
     scheduleDirectRetentionDrain(250);
     return;
@@ -11423,7 +12301,6 @@ function queueDirectConversationRetention(key, sender, recipient, runAt) {
     return true;
   }
   if (directRetentionQueued.has(key)) {
-    // A later scheduled trim supersedes an earlier one for the same pair.
     directRetentionQueued.set(key, { ...entry, enqueuedAt:directRetentionQueued.get(key).enqueuedAt });
     return true;
   }
@@ -11471,7 +12348,6 @@ function scheduleDirectConversationRetention(senderName, recipientName, force = 
   }
 
   if (!queueDirectConversationRetention(key, senderName, recipientName, now)) {
-    // A saturated maintenance queue must not mark this pair as cleaned.
     directMessageRetentionLastRun.delete(key);
     return false;
   }
@@ -11684,8 +12560,6 @@ function emitProfileSyncPatchFromUser(name, user = {}, changedKeys = [], sourceS
   });
 }
 
-// A count can remain unchanged while the underlying list changes. Broadcast
-// only section names, after the committed write; old clients ignore this event.
 const PUBLIC_PROFILE_LIST_CHANGE_KEYS = {
   wishlistData: 'wishlist', downloadsData: 'downloads', favoritesData: 'favs',
   libraryData: 'library', libraryPlayHistoryData: 'library', trophiesData: 'trophies'
@@ -11745,16 +12619,11 @@ function buildPresenceUpdatePayload(name, user = null) {
   };
 }
 
-// Presence bandwidth: send the full public record once per socket/user; subsequent
-// updates carry only changed fields. Online heartbeat timestamps are not visible
-// as "last seen", so they alone must not trigger a broadcast.
 function emitPresenceUpdate(name, user = null) {
   const payload = buildPresenceUpdatePayload(name, user);
   if (!payload) return null;
   const keys = Object.keys(payload);
   const serializedFields = Object.fromEntries(keys.map(key => [key, JSON.stringify(payload[key])]));
-  // A heartbeat changes lastSeen in memory while online, but online lastSeen
-  // is not a user-visible change. Keep offline timestamps fully observable.
   const legacySignature = JSON.stringify(payload.online ? { ...payload, lastSeen: null } : payload);
   io.sockets.sockets.forEach(client => {
     if (!client.connected) return;
@@ -11772,8 +12641,6 @@ function emitPresenceUpdate(name, user = null) {
     const cache = client.__presenceSentByName;
     const previous = cache.get(name);
     const diff = { name, online: payload.online };
-    // The browser discards an offline user's baseline. When that user
-    // reconnects, deliver a full record instead of a delta with no base.
     if (!previous || (previous.online !== true && payload.online === true)) {
       trackBandwidthPayload('presence_update', payload, 1);
       client.emit('presence_update', payload);
@@ -11781,7 +12648,6 @@ function emitPresenceUpdate(name, user = null) {
       let changed = false;
       for (const key of keys) {
         if (key === 'name' || key === 'online') continue;
-        // Last-seen is meaningful only when offline or when the online state changes.
         if (key === 'lastSeen' && payload.online && previous.online === true) continue;
         if (serializedFields[key] !== (previous.__fieldSignatures && previous.__fieldSignatures[key])) {
           diff[key] = payload[key];
@@ -11795,8 +12661,6 @@ function emitPresenceUpdate(name, user = null) {
         client.emit('presence_update', diff);
       }
     }
-    // Bounded per-socket cache, reset on authentication/reconnect. A cold name
-    // receives a full payload again rather than a patch without a baseline.
     if (cache.size >= 64 && !cache.has(name)) cache.delete(cache.keys().next().value);
     cache.set(name, { ...payload, __fieldSignatures: serializedFields });
   });
@@ -11988,18 +12852,12 @@ async function initProfileSyncNotifications() {
         const gid=directGroupId(data.groupId);
         if (!gid) return;
         if(data.kind==='refresh'||data.kind==='left')invalidateDirectGroupMembersPending(gid);
-        // A departing member must receive its leave event even if it is no
-        // longer in the group's membership table.
         if (data.kind==='left') {
           invalidateDirectGroupListsForMembers([{ user_name:data.id }]);
           for (const sock of getSocketsByUserName(String(data.id||''))) {
             if (sock.connected) sock.emit('direct_group_changed',{groupId:gid,left:true});
           }
         }
-        // Every instance receives NOTIFY, but most instances have no connected
-        // member of this group. Check membership before reading message bodies.
-        // Reuse these fresh member rows for receipts and fanout, avoiding a
-        // second membership query on instances that do have recipients.
         if (!socketsByUserName.size) return;
         const members=await getDirectGroupMembers(gid);
         invalidateDirectGroupListsForMembers(members);
@@ -12315,8 +13173,6 @@ async function initProfileSyncNotifications() {
         invalidatePublicProfileListReads(name, sectionKeys);
         emitPublicProfileListChanged(name, sectionKeys, data.profileUpdatedAt);
       }
-      /* A role-notice acknowledgement only needs to close the same notice on other
-         sessions/instances. Do not refresh the profile or rebroadcast role metadata. */
       if (message.channel === 'profile_sync' && data.changes && data.changes.roleNoticeOnly === true) {
         emitRoleChangeNoticeState(name, null, { noticeId: data.changes.roleNoticeAckId });
         return;
@@ -12802,9 +13658,6 @@ function notifyFriendActivityClearedAcrossInstances(userName, throughId = 0, las
   });
 }
 
-// Coalesce history cleanup for busy accounts and busy posts. Both tables have
-// (owner, id DESC) indexes; cleaning once per short burst prevents one DELETE
-// roundtrip per reaction/mention/activity event on a small Aiven instance.
 const HISTORY_RETENTION_DELAY_MS = 1800;
 const HISTORY_RETENTION_BATCH_MAX = 24;
 const HISTORY_RETENTION_PENDING_MAX = 4096;
@@ -12849,7 +13702,6 @@ async function drainHistoryRetentionQueue() {
     historyRetentionQueuedAt = 0;
     return;
   }
-  // Give live reads the connection first, but do not starve maintenance forever.
   if (pool.waitingCount > 0 && Date.now() - historyRetentionQueuedAt < 6000) {
     scheduleHistoryRetentionDrain(700);
     return;
@@ -12865,8 +13717,6 @@ async function drainHistoryRetentionQueue() {
       if (!pending.size) continue;
       const names = Array.from(pending).slice(0, HISTORY_RETENTION_BATCH_MAX);
       names.forEach(name => pending.delete(name));
-      // All identifiers are hard-coded above; only user names are SQL params.
-      // New events while this query runs are queued for the next batch.
       try {
         await queryDbWithRetry(`
           WITH cutoffs AS MATERIALIZED (
@@ -13066,9 +13916,6 @@ async function clearFriendActivityForUser(userName, throughId = 0) {
     const state = await getFriendActivityState(name);
     return { throughId: safeThroughId, lastReadId: state.lastReadId, dismissedThroughId: state.dismissedThroughId };
   }
-  // Clearing is idempotent and the cursors are monotonic. Keep both writes
-  // atomic in one statement rather than holding a free-tier connection through
-  // BEGIN, advisory lock, two queries and COMMIT.
   const result = await queryDbWithRetry(`
     WITH state AS (
       INSERT INTO friend_activity_read_state (user_name, last_read_id, dismissed_through_id, updated_at)
@@ -13094,8 +13941,6 @@ async function clearFriendActivityForUser(userName, throughId = 0) {
   };
 }
 
-// Only share active friend/activity reads; new friendships, read cursors,
-// dismissals and posts are fetched freshly once the previous read settles.
 const friendActivityRecordsPending = new Map();
 const friendActivityHistoryPending = new Map();
 const friendActivitySnapshotIds = new WeakMap();
@@ -13117,8 +13962,6 @@ function readFriendActivityRecordsShared(name) {
 function readFriendActivityHistoryShared(name, afterId, friends) {
   const viewer = normalizeSocialUserName(name);
   const cursor = Math.max(0, Math.floor(Number(afterId) || 0));
-  // Friend relationship snapshots from different database reads cannot
-  // share an older result when a friendship changes mid-request.
   let snapshotId = 0;
   if (Array.isArray(friends)) {
     snapshotId = friendActivitySnapshotIds.get(friends) || 0;
@@ -13151,8 +13994,6 @@ async function getFriendActivityHistoryForUser(userName, afterId = 0, resolvedFr
     return { friendNames, items: [], lastReadId: state.lastReadId, dismissedThroughId: state.dismissedThroughId, delta: safeAfterId > 0 };
   }
 
-  // Read the cursor and the visible activity page in one database round trip.
-  // LEFT JOIN LATERAL returns the cursor even if the filtered page is empty.
   const activityCursorClause = safeAfterId ? 'AND fa.id > $4::bigint' : '';
   const activityLimitParam = safeAfterId ? '$5' : '$4';
   const result = await queryDbWithRetry(
@@ -13438,9 +14279,6 @@ async function notifyUserNotificationsDeletedAcrossInstances(userName, notificat
     .map(id=>String(id||'').trim()).filter(id=>/^\d+$/.test(id))));
   if (!name || !ids.length) return;
   const count=Math.max(0,Math.floor(Number(unreadCount)||0));
-  // Do not introduce a new cross-instance event type: older server instances
-  // and the existing browser continue receiving one standard deletion event
-  // per notification. Only the database roundtrips are grouped.
   for (let offset=0;offset<ids.length;offset+=100) {
     const payloads=ids.slice(offset,offset+100).map(notificationId=>JSON.stringify({
       deleted:{userName:name,notificationId,unreadCount:count},instanceId:INSTANCE_ID
@@ -13466,9 +14304,6 @@ async function notifyUserNotificationsClearedAcrossInstances(userName, throughId
   }
 }
 
-// Batch the notifications generated by one Social post. This avoids one
-// PostgreSQL retention query + one NOTIFY per friend while keeping the same
-// individual live event for each recipient on each server instance.
 async function notifyUserNotificationsCreatedAcrossInstances(events) {
   const items = (Array.isArray(events) ? events : []).map(serializeUserNotificationRow).filter(Boolean);
   if (!items.length) return;
@@ -13688,9 +14523,6 @@ async function recordCatalogNotification(userName, rawData = {}) {
   }
 }
 
-// Mark read and obtain the authoritative unread count in one PostgreSQL trip.
-// The count uses the cursor returned by the UPSERT, including a concurrent
-// session's newer cursor, instead of issuing a second round trip.
 async function setUserNotificationReadIdAndCount(userName, lastReadId) {
   const name = normalizeSocialUserName(userName);
   const safeId = Math.max(0, Math.floor(Number(lastReadId) || 0));
@@ -13733,12 +14565,7 @@ async function getUserNotificationUnreadCount(userName, lastReadId = null) {
   return Math.max(0, Number(result.rows[0] && result.rows[0].count) || 0);
 }
 
-// PostgreSQL data-changing CTEs use the statement snapshot for the outer
-// SELECT. Explicitly exclude removed IDs from that snapshot to compute the
-// post-delete unread count without a second round trip. Conditions here are
-// server-owned SQL constants; user input is always bound as query parameters.
 async function deleteUserNotificationsWithCount(name, condition, params, label, includeIds = true) {
-  // Clearing a long history needs only the affected count, never thousands of IDs.
   const removedIdsSql = includeIds
     ? "COALESCE((SELECT array_agg(id::text ORDER BY id) FROM removed), ARRAY[]::text[])"
     : 'ARRAY[]::text[]';
@@ -13785,8 +14612,6 @@ async function getUserNotificationHistory(userName, afterId = 0) {
   const name = normalizeSocialUserName(userName);
   const safeAfterId = Math.max(0, Math.floor(Number(afterId) || 0));
   if (!name) return { items: [], lastReadId: 0, unreadCount: 0, delta: safeAfterId > 0 };
-  // A single round trip reads the history, read cursor and unread count.
-  // Both the list and unread counter continue to use the (user_name,id) index.
   const deltaClause = safeAfterId > 0 ? 'AND n.id > $2::bigint' : '';
   const limitParam = safeAfterId > 0 ? '$3::int' : '$2::int';
   const result = await queryDbWithRetry(`
@@ -13819,9 +14644,6 @@ async function getUserNotificationHistory(userName, afterId = 0) {
   };
 }
 
-// Concurrent tabs/devices may request the same notification snapshot together.
-// Share only the in-flight read; never cache a completed personal notification
-// list, so new events/read-state changes are visible on the very next request.
 const userNotificationHistoryPending=new Map();
 const USER_NOTIFICATION_READ_PENDING_MAX=64;
 function getUserNotificationHistoryShared(userName, afterId=0){
@@ -14006,8 +14828,6 @@ function extractChatMentionTargets(text, senderName) {
   const senderLower = String(senderName || '').toLowerCase();
   const isBoundary = ch => !ch || /[\s.,!?;:()\[\]{}<>"'`]/.test(ch);
   const matches = [];
-  // Inspect actual @ positions, not every registered username. Include spaces
-  // in names and preserve longest-name precedence for overlapping mentions.
   for (let at = lowerSource.indexOf('@'); at >= 0; at = lowerSource.indexOf('@', at + 1)) {
     if (!isBoundary(at ? lowerSource[at - 1] : '')) continue;
     let candidate = '';
@@ -14340,7 +15160,6 @@ async function upsertPresenceForSocket(socket, name) {
     }
     if (shouldAnnouncePresence) socket.__presenceAnnounced = true;
 
-    // A second tab/session does not change public presence, so don't broadcast a redundant patch.
     if (shouldAnnouncePresence && isFirstActiveSession && userDatabase[name]) {
       invalidateOnlineListCache('presence-upsert');
       emitPresenceUpdate(name, userDatabase[name]);
@@ -14405,8 +15224,6 @@ async function markPresenceOfflineIfNoActiveSessions(name, lastSeen = Date.now()
 }
 
 async function syncPresenceOnlineFromDb() {
-  // One SQL roundtrip for expiry and active presence. Both views share a
-  // database snapshot; the existing per-user offline check handles races.
   const presenceSnapshot = await queryDbWithRetry(`
     WITH expired AS (
       DELETE FROM presence_sessions
@@ -14456,8 +15273,6 @@ async function syncPresenceOnlineFromDb() {
     userDatabase[username].lastSeen = row.last_seen ? new Date(row.last_seen).getTime() : Date.now();
   });
 
-  // Process distinct expired accounts in tiny batches after outages. This
-  // shortens recovery without flooding the shared Aiven connection pool.
   const expireBatchSize = pool.waitingCount > 0 ? 1 : 2;
   for (let offset = 0; offset < expiredRes.rows.length; offset += expireBatchSize) {
     await Promise.all(expiredRes.rows.slice(offset, offset + expireBatchSize).map(async row => {
@@ -14501,9 +15316,6 @@ async function syncPresenceOnlineFromDb() {
   return presenceChanged;
 }
 
-// Versioned transport optimization: only clients that explicitly support this
-// format receive tuples. Keep the full record semantics, including online and
-// lastSeen, so foreground resume and reconnections always reconstruct a snapshot.
 function packOnlineListForSocket(client, list) {
   if (!client || client.onlineListCompactV1 !== true || !Array.isArray(list)) return list;
   const withSince = client.onlineListSinceV1 === true;
@@ -14525,8 +15337,6 @@ function prepareOnlineListWire(list) {
   return legacy;
 }
 
-// Targeted and global sends use the same per-socket protocol. Prepared tuples
-// and signatures are shared, while each socket keeps its own versioned base.
 function sendOnlineListToSocket(client, list, prepared, signature, options = {}) {
   if (!client || !client.connected) return false;
   const now = Date.now();
@@ -14608,7 +15418,6 @@ async function emitOnlineList(targetSocket = null, options = {}) {
         recipientSequences.get(targetSocket) >= (targetSocket.__onlineListResolvedSequence || 0)) {
       targetSocket.__onlineListResolvedSequence = recipientSequences.get(targetSocket);
       const fallback = Array.isArray(lastKnownOnlineList) ? lastKnownOnlineList : [];
-      // On transient DB failure, never replace the user's list with an empty snapshot.
       if (fallback.length > 0) {
         sendOnlineListToSocket(targetSocket, fallback, prepareOnlineListWire(fallback),
           buildOnlineListSignature(fallback), { force: true });
@@ -14624,8 +15433,6 @@ async function heartbeatPresenceSessions() {
   const instanceIds = [];
   const heartbeatAt = Date.now();
 
-  // Presence only concerns authenticated/indexed users. Avoid walking pre-auth and maintenance
-  // sockets from the global Socket.IO map every heartbeat.
   for (const [indexedName, set] of socketsByUserName) {
     for (const client of set) {
       if (!client || !client.connected || client.userName !== indexedName) {
@@ -14641,8 +15448,6 @@ async function heartbeatPresenceSessions() {
   }
 
   if (socketIds.length > 0) {
-    // Session metadata is static enough to write on connect/recovery. Heartbeats only refresh
-    // presence timestamps, preserving the existing data JSON instead of resending user-agent data.
     await queryDbWithRetry(
       `WITH heartbeat AS MATERIALIZED (
          SELECT socket_id, name, instance_id
@@ -14702,8 +15507,6 @@ async function setUserRole(targetName, role, adminName) {
     targetUser.pendingRoleChangeNotice = roleChangeNotice;
   }
 
-  /* Role changes only need a tiny cross-instance patch. Avoid the broad profile sync that
-     saveUser() normally publishes, while still persisting the authoritative DB record. */
   await saveUser(targetName, { notify: false, fields: ['name', 'role', ...(roleChanged ? ['pendingRoleChangeNotice'] : [])] });
 
   const rolePayload = applyRealtimeRoleState(targetName, targetUser);
@@ -14880,8 +15683,6 @@ async function deleteUserAccount(targetName, reason, adminName, options = {}) {
       [targetName, deletedData]
     );
 
-    // Account deletion bypasses normal disconnect cleanup. Keep all account-owned DB
-    // removals in the same transaction so a transient failure cannot leave half a deletion.
     const deletedContentReports = await client.query('DELETE FROM content_reports WHERE reporter = $1 RETURNING report_key', [targetName]);
     const deletedMetadataSuggestions = await client.query('DELETE FROM content_metadata_suggestions WHERE submitted_by = $1 RETURNING id', [targetName]);
     await client.query('DELETE FROM presence_sessions WHERE name = $1', [targetName]);
@@ -14903,7 +15704,6 @@ async function deleteUserAccount(targetName, reason, adminName, options = {}) {
   if (dbDelete && dbDelete.missing) return { success: false, message: "User not found." };
   invalidateUserContentReportsRead(targetName);
   invalidateRewardNoticeRead(targetName);
-  // Removing a player changes global rarity even if no trophy was unlocked.
   invalidateGlobalTrophyStatsCache();
   scheduleTrophyStatsRefreshBroadcast(1200);
   if (dbDelete && dbDelete.deletedReportCount > 0) await publishContentReportsChanged();
@@ -14947,8 +15747,6 @@ async function createReport(data = {}, reporterName = "Unknown") {
     { attempts: 3, label: 'MESSAGE REPORT CREATE' }
   );
 
-  // Only publish/cache after PostgreSQL accepted the report so admins never see a ghost
-  // item that disappears on the next refresh after a failed write.
   adminReports.unshift(report);
   adminReports = adminReports.slice(0, ADMIN_REPORTS_HISTORY_MAX);
   emitToAdmins('admin_report_created', report);
@@ -14972,8 +15770,6 @@ async function syncAdminStateAcrossInstances() {
   const shouldRefreshAdminState = !profileSyncListenReady || !adminStateLastRefreshAt || now - adminStateLastRefreshAt >= ADMIN_STATE_LISTEN_FALLBACK_MS;
   const shouldRefreshServerLog = adminConnected && (!profileSyncListenReady || !serverLogFallbackRefreshAt || now - serverLogFallbackRefreshAt >= SERVER_LOG_FALLBACK_REFRESH_MS);
 
-  // Most 15-second ticks are only a safety check while LISTEN/NOTIFY is healthy. If neither
-  // fallback is due, there is no DB work or state reconciliation to perform at all.
   if (!shouldRefreshAdminState && !shouldRefreshServerLog) return;
 
   let previousMaintenance = '';
@@ -15066,6 +15862,31 @@ const presenceHeartbeatIntervalTask = runNonOverlappingTask('PRESENCE HEARTBEAT'
 const chatPollIntervalTask = runNonOverlappingTask('CHAT POLL', runChatSyncFallback);
 const profileSyncIntervalTask = runNonOverlappingTask('PROFILE SYNC', syncActiveProfilesAcrossInstances);
 
+async function pruneChatSeenEvents() {
+  if (pool.waitingCount > 0) return;
+  for (let pass = 0; pass < 5; pass++) {
+    if (pool.waitingCount > 0) break;
+    const result = await queryDbWithRetry(
+      `WITH boundary AS (SELECT id FROM chat_seen_ranges ORDER BY id DESC OFFSET $1 LIMIT 1),
+       oldest AS (SELECT id,seen_at FROM chat_seen_ranges ORDER BY id ASC LIMIT $2),
+       removed AS (DELETE FROM chat_seen_ranges r USING oldest
+         WHERE r.id = oldest.id AND
+           (oldest.seen_at < NOW() - ($3::integer * INTERVAL '1 day') OR r.id <= COALESCE((SELECT id FROM boundary),0))
+         RETURNING r.id)
+       SELECT COUNT(*)::integer AS removed FROM removed`,
+      [CHAT_SEEN_MAX_EVENTS, CHAT_SEEN_PRUNE_BATCH, CHAT_SEEN_RETENTION_DAYS],
+      { attempts:1, label:'CHAT SEEN COMPACT RETENTION', queryTimeoutMs:8000 }
+    );
+    if (Number(result.rows[0]?.removed||0) < CHAT_SEEN_PRUNE_BATCH) break;
+  }
+}
+
+const storageMaintenanceTask = runNonOverlappingTask('STORAGE RETENTION', async () => {
+  if (pool.waitingCount > 0) return;
+  await pruneServerLog();
+  if (pool.waitingCount === 0) await pruneChatSeenEvents();
+});
+
 let backgroundTasksStarted = false;
 function startBackgroundTasks() {
   if (backgroundTasksStarted) return;
@@ -15073,6 +15894,10 @@ function startBackgroundTasks() {
   setInterval(syncAdminStateIntervalTask, 15000);
   setInterval(presenceHeartbeatIntervalTask, PRESENCE_HEARTBEAT_MS);
   setInterval(chatPollIntervalTask, CHAT_SYNC_INTERVAL_MS);
+  const storageTimer = setInterval(storageMaintenanceTask, STORAGE_MAINTENANCE_MS);
+  if (typeof storageTimer.unref === 'function') storageTimer.unref();
+  const initialStorageTimer = setTimeout(storageMaintenanceTask, 60000);
+  if (typeof initialStorageTimer.unref === 'function') initialStorageTimer.unref();
   setInterval(() => logMemoryPressureIfNeeded('periodic'), 30000);
   if (DB_PERF_ENABLED) {
     const dbPerfTimer = setInterval(flushDbQueryPerformance, DB_PERF_INTERVAL_MS);
@@ -15170,8 +15995,6 @@ async function createContentShareTokenForUser(userName, rawDescriptor) {
   return { success:true, token };
 }
 
-// Several chat viewers can resolve the same legacy link at once. Coalesce only
-// requests still in flight; do not cache user profiles or authorization results.
 const contentShareResolveInFlight = new Map();
 async function resolveContentShareTokenForUser(token) {
   const safeToken = normalizeContentShareTokenServer(token);
@@ -15181,7 +16004,6 @@ async function resolveContentShareTokenForUser(token) {
   const pending = readContentShareTokenForUser(safeToken).finally(() => {
     if (contentShareResolveInFlight.get(safeToken) === pending) contentShareResolveInFlight.delete(safeToken);
   });
-  // Avoid retaining arbitrarily many unique in-flight tokens under heavy load.
   if (contentShareResolveInFlight.size < 128) contentShareResolveInFlight.set(safeToken, pending);
   return pending;
 }
@@ -15319,7 +16141,6 @@ function serializeSocialComment(row) {
 }
 
 async function socialReadFeed(actor, filter, before, focusId = null) {
-  // Only join friend names when explicitly requested. My Activity uses the author/id index.
   const audience=['all','friends','mine'].includes(filter)?filter:'all';
   const friendNames=audience==='friends'?`friend_names AS MATERIALIZED (
       SELECT CASE WHEN jsonb_typeof(friend.value)='object' THEN friend.value->>'name'
@@ -15332,12 +16153,7 @@ async function socialReadFeed(actor, filter, before, focusId = null) {
     ), `:'';
   const audienceCondition=audience==='mine'?'AND p.author_name=$1':
     audience==='friends'?'AND p.author_name IN (SELECT name FROM friend_names)':'';
-  // The requested post ID bypasses the filter for reports, notifications and shared links.
   const scope=focusId?'':audienceCondition.replace(/^AND\s+/, '');
-  // Construct only the predicates actually needed, avoiding nullable OR tests
-  // in the hot pagination query and preserving the existing focus semantics.
-  // Keep placeholders contiguous across unfiltered, paginated and focused reads.
-  // Sending unused $2/$4 makes PostgreSQL reject the initial Feed page with 42P18.
   const params = [actor, DEFAULT_AVATAR];
   const predicates = [];
   if (before) { params.push(before); predicates.push(`p.id < $${params.length}::bigint`); }
@@ -15387,8 +16203,6 @@ function invalidateSocialPostCountReads() {
   socialGlobalPostCountPending = null;
   socialFeedCountCache.clear();
 }
-// Reuse the author index for viewers joining an in-flight global COUNT.
-// Never run an extra COUNT(*) across the complete posts table here.
 function socialReadIndexedPostCounts(actor) {
   return queryDbWithRetry(`
     WITH friend_names AS MATERIALIZED (
@@ -15412,13 +16226,7 @@ async function socialReadPostCounts(actor){
   const now = Date.now();
   const cachedGlobal = socialGlobalPostCount && socialGlobalPostCount.expires > now
     ? socialGlobalPostCount.value : null;
-  // Let one viewer compute the exact global total while other viewers wait
-  // briefly, then use the author index instead of starting a second full scan.
   if (cachedGlobal === null && socialGlobalPostCountPending) {
-    // A second viewer needs only index-backed personal/friend counts. Start
-    // those while the shared global COUNT is running, unless the pool is
-    // already queued. This removes one cross-region RTT on a healthy pool.
-    // A failed global COUNT still fails every follower, not a DB stampede.
     const globalRead = socialGlobalPostCountPending;
     const revision = socialPostCountRevision;
     if (pool.waitingCount > 0 || socialPostCountParallelFollowers >= 2) {
@@ -15442,8 +16250,6 @@ async function socialReadPostCounts(actor){
     };
   }
   const revision = socialPostCountRevision;
-  // Keep the global COUNT separate from index-assisted author/friends counts.
-  // With a cached global count, PostgreSQL only reads the relevant authors.
   const dbQuery = cachedGlobal === null
     ? queryDbWithRetry(`
         WITH friend_names AS MATERIALIZED (
@@ -15502,9 +16308,6 @@ function readSocialPostCountsShared(actor){
   while(socialFeedCountCache.size>120)socialFeedCountCache.delete(socialFeedCountCache.keys().next().value);
   return entry.promise;
 }
-// Small cache only for the first Feed page. Every post/comment/reaction update
-// immediately invalidates it locally and via LISTEN/NOTIFY. Actor stays in the
-// key because each page contains their own reaction state.
 function peekSocialPostCounts(actor){
   const entry=socialFeedCountCache.get(actor);
   return entry&&entry.value&&entry.expires>Date.now()?entry.value:null;
@@ -15525,8 +16328,6 @@ function evictSocialFeedPage(key){
 }
 function invalidateSocialFeedPageReads(kind = '', postId = '') {
   socialFeedCacheRevision++;
-  // An in-flight page can contain the changed post even before its rows are
-  // known. Cancel shared pending references so a late result cannot be cached.
   socialFeedPending.clear();
   const id = String(postId || '');
   const targeted = ['edit','react','comment','comment-edit','comment-delete'].includes(kind) && /^\d{1,18}$/.test(id);
@@ -15537,7 +16338,6 @@ function invalidateSocialFeedPageReads(kind = '', postId = '') {
     }
     return;
   }
-  // Insertion/deletion changes pagination, so all first pages must refresh.
   socialFeedFirstPageCache.clear();
   socialFeedFirstPageBytes=0;
 }
@@ -15581,8 +16381,6 @@ function readSocialFeedShared(actor, filter, before, focusId){
 }
 
 async function socialReadComments(actor, postId, focusCommentId = '') {
-  // Ordinary openings need only the 30 newest roots. Do not build a recursive
-  // ancestor path or deduplicate UNION rows unless a specific reply is targeted.
   const pageQuery = focusCommentId ? `WITH RECURSIVE recent_roots AS MATERIALIZED (
       SELECT id,post_id,author_name,body,parent_id,images,created_at,edited_at
       FROM social_comments WHERE post_id=$2 AND parent_id IS NULL
@@ -15668,8 +16466,6 @@ async function socialReadCommentReplies(actor, postId, parentId, after = '') {
   return {success:true,comments:rows.map(serializeSocialComment),after:rows.length&&rows[0].has_more?String(rows[rows.length-1].id):null};
 }
 
-// Short cache for comments/replies. Per-viewer keys keep "my reaction" correct.
-// Live mutations and cross-instance NOTIFY invalidate the affected post immediately.
 const socialCommentsPending = new Map();
 const socialCommentRepliesCache = new Map();
 const SOCIAL_COMMENT_READ_CACHE_MS = 5000;
@@ -15698,8 +16494,6 @@ function readSocialCached(cache, key, limit, getValue) {
   const entry = { promise:null, value:null, expires:0 };
   entry.promise = Promise.resolve().then(getValue).then(value => {
     if (cache.get(key) === entry) {
-      // A page with many image captions/replies must not grow the server cache
-      // just because the entry-count limit has not been reached.
       const bytes = Buffer.byteLength(JSON.stringify(value), 'utf8');
       if (bytes <= SOCIAL_COMMENT_CACHE_MAX_ITEM_BYTES) {
         entry.value = value;
@@ -15746,9 +16540,6 @@ function readSocialCommentRepliesShared(actor,postId,parentId,after='') {
   return readSocialCached(socialCommentRepliesCache,key,SOCIAL_REPLIES_READ_CACHE_MAX,() => socialReadCommentReplies(actor,postId,parentId,after));
 }
 
-// Small, short-lived per-instance cache for public reactor pages. A concurrent
-// request shares the same database query; mutations/NOTIFY invalidate immediately.
-// This stays in RAM only, never in localStorage or the database.
 const socialReactorsCache = new Map();
 const SOCIAL_REACTORS_CACHE_MS = 6000;
 const SOCIAL_REACTORS_CACHE_MAX = 120;
@@ -15768,8 +16559,6 @@ async function readSocialReactorsShared(kind, id, emoji, after) {
     return cached.promise || cached.value;
   }
   if (cached) socialReactorsCache.delete(key);
-  // The existing reaction PK (target_id, user_name) supports this ordering;
-  // selecting only 31 users before looking up avatars avoids a large join.
   const table = kind === 'comment' ? 'social_comment_reactions' : 'social_post_reactions';
   const target = kind === 'comment' ? 'comment_id' : 'post_id';
   const conditions = [`r.${target} = $1::bigint`];
@@ -15835,7 +16624,6 @@ function socialPublish(kind, id, extra = null) {
 async function socialAnnounceNewPost(actor, id, text, playing = null) {
   const caption = normalizeText(socialPostPlainText(text), '').slice(0, 140);
   const preview = caption || (playing?.title ? `Playing ${playing.title}`.slice(0,140) : '');
-  // Friend Activity already supplies live subscription fanout and cross-instance notifications.
   await recordFriendActivity(actor, 'post', { postId:id, preview }, { dedupeKey:`social-post:${id}` });
   const result = await queryDbWithRetry(`
     INSERT INTO user_notifications (user_name,event_type,data,dedupe_key,created_at)
@@ -15857,10 +16645,6 @@ async function socialAnnounceNewPost(actor, id, text, playing = null) {
   publishStoredUserNotificationsBatch(result.rows || []);
 }
 
-// The Social sidebar checks its unread marker on each session. Read an existing
-// marker without attempting a conflicting INSERT on every login. Only first-
-// time users get an inserted marker, initialized to the current newest post.
-// Concurrent tabs share the active read; settled results are never cached.
 const socialUnseenReadsPending = new Map();
 const SOCIAL_UNSEEN_PENDING_MAX = 64;
 function readSocialUnseenStateShared(actor) {
@@ -15897,12 +16681,6 @@ io.on('connection', (socket) => {
   socket.once('disconnecting', () => { unindexSocketUser(socket); adminSockets.delete(socket); });
   deferServerTask('CONNECTION INIT', () => emitAdminState(socket), 0);
 
-  // --------------------------------------------------------------------------
-  // Authentication & account session
-  // --------------------------------------------------------------------------
-  // --------------------------------------------------------------------------
-  // Social public feed
-  // --------------------------------------------------------------------------
   socket.on('social_unseen_get', async (_data = {}, callback) => {
     const reply = typeof callback === 'function' ? callback : () => {};
     const actor = normalizeSocialUserName(socket.userName);
@@ -15940,8 +16718,6 @@ io.on('connection', (socket) => {
       const focusId = /^\d{1,18}$/.test(String(data.focusId || '')) ? String(data.focusId) : null;
       const startedAt = Date.now();
       const filter = ['all','friends','mine'].includes(data.filter) ? data.filter : (data.friendsOnly===true?'friends':'all');
-      // Do not hold back the first Feed page while COUNT(*) scans posts.
-      // The client refreshes missing counts asynchronously after rendering.
       const feed = await readSocialFeedShared(actor,filter,before,focusId);
       const counts = !before&&!focusId ? peekSocialPostCounts(actor) : null;
       const elapsedMs = Date.now() - startedAt;
@@ -16039,10 +16815,6 @@ io.on('connection', (socket) => {
     const id = String(data.id || '');
     if (!actor || !/^\d{1,18}$/.test(id)) return reply({ success:false });
     try {
-      // Owner deletion is the hot path. The author predicate verifies
-      // permission and deletes the post plus related records in one SQL round
-      // trip. Moderators use the original role-aware owner lookup only when
-      // their own-author deletion did not match.
       const removePost = owner => queryDbWithRetry(`
         WITH removed_post AS (
           DELETE FROM social_posts WHERE id=$1::bigint AND author_name=$2 RETURNING id
@@ -16073,7 +16845,6 @@ io.on('connection', (socket) => {
       socialPublish('delete',id);
       const recipients = Array.isArray(deletedRow.recipients) ? deletedRow.recipients.filter(Boolean) : [];
       if (recipients.length) deferServerTask('SOCIAL POST NOTIFICATION CLEANUP SYNC', async () => {
-        // Recalculate badge totals in one query, rather than one round trip per friend.
         const counts = await queryDbWithRetry(`
           SELECT t.user_name,COUNT(n.id)::int AS unread_count
           FROM unnest($1::text[]) t(user_name)
@@ -16164,7 +16935,6 @@ io.on('connection', (socket) => {
   });
 
 
-  // Reaction details are loaded only when someone opens a post/comment reaction list.
   socket.on('social_reactors_list', async (data = {}, callback) => {
     const reply = typeof callback === 'function' ? callback : () => {};
     const actor = normalizeSocialUserName(socket.userName);
@@ -16293,8 +17063,6 @@ io.on('connection', (socket) => {
     const id = String(data.id || '');
     if (!actor || !/^\d{1,18}$/.test(id)) return reply({success:false});
     try {
-      // Most deletions are by the comment author: delete + read metadata in one
-      // indexed statement. Moderation retains the existing target-role checks.
       let deleted = await queryDbWithRetry(
         'DELETE FROM social_comments WHERE id=$1 AND author_name=$2 RETURNING post_id,author_name,parent_id',
         [id,actor],{attempts:2,label:'SOCIAL COMMENT SELF DELETE'});
@@ -16650,7 +17418,6 @@ io.on('connection', (socket) => {
           'INSERT INTO users (name, data) VALUES ($1, $2)',
           [name, userDatabase[name]]
         ));
-        // Adding a player changes the denominator for global trophy rarity.
         invalidateGlobalTrophyStatsCache();
         scheduleTrophyStatsRefreshBroadcast(1200);
         invalidateOnlineListCache('auth-new-user');
@@ -16691,9 +17458,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --------------------------------------------------------------------------
-  // Opaque content share links
-  // --------------------------------------------------------------------------
   socket.on('create_content_share', async (payload = {}, ack) => {
     const respond = response => { if (typeof ack === 'function' && socket.connected) { try { ack(response); } catch (e) {} } };
     const name = normalizeText(socket.userName, '').slice(0, 120);
@@ -16719,9 +17483,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --------------------------------------------------------------------------
-  // Profile state, settings & realtime profile sync
-  // --------------------------------------------------------------------------
   socket.on('profile_notification_state_update', async (payload = {}, ack) => {
     const respond = response => {
       if (typeof ack !== 'function' || !socket.connected) return;
@@ -17025,8 +17786,6 @@ io.on('connection', (socket) => {
       return;
     }
     if (!workingUser) { respond({ ok: false, requestId: syncRequestId, error: 'Profile could not be prepared.' }); return; }
-    // Snapshot before reconciliation; changes to immutable small fields can be
-    // identified without writing the same JSONB user record again.
     const originalProfileForNoopCheck = { ...workingUser };
     const previousPs3StatusForActivity = workingUser.ps3Status && typeof workingUser.ps3Status === 'object' ? { ...workingUser.ps3Status } : null;
     const previousLibraryForSharedGameMatch = Array.isArray(workingUser.libraryData) ? workingUser.libraryData.slice() : [];
@@ -17039,7 +17798,6 @@ io.on('connection', (socket) => {
     let shouldForceProfileSyncToSource = false;
     let profileThemeMerge = { accepted: false, rejected: false };
     let settingsReplayStatus = null;
-    // A supplied list/version is not necessarily a changed download or wishlist.
     let shouldEmitTrendingUpdate = false;
     if (name && userDatabase[name]) {
 
@@ -17162,13 +17920,9 @@ io.on('connection', (socket) => {
         });
         if (requestedSyncSections.some(section => replaySectionStatus[section] === 'rejected')) shouldForceProfileSyncToSource = true;
         let publicCountsChanged = false;
-        // Global rarity depends only on which IDs are unlocked, not on XP,
-        // progress or unlock-date changes in an otherwise identical trophy set.
         const trophiesChanged = Object.prototype.hasOwnProperty.call(userData, 'trophiesData') &&
           unlockedTrophyIdsChanged(workingUser.trophiesData, userData.trophiesData);
 
-        // A profile patch may repeat a whole list with identical contents. Only
-        // genuine changes should notify every viewer to reload that public list.
         const compareStartedAt = DB_PERF_ENABLED ? performance.now() : 0;
         const changedPublicListKeys = Object.keys(PUBLIC_PROFILE_LIST_CHANGE_KEYS).filter(key =>
           Object.prototype.hasOwnProperty.call(userData, key) &&
@@ -17179,7 +17933,6 @@ io.on('connection', (socket) => {
         }
         if (DB_PERF_ENABLED) recordServerWorkPhase('PROFILE LIST COMPARE (JS)', performance.now() - compareStartedAt);
         shouldEmitTrendingUpdate = changedPublicListKeys.includes('downloadsData') || changedPublicListKeys.includes('wishlistData');
-        // Count-only profile updates are relevant only if the persisted count actually changes.
         const publicCountKeys = ['downloads', 'wishlist', 'favorites', 'trophies', 'library'];
         const effectivePublicCountsChanged = changedPublicListKeys.some(key => key !== 'libraryPlayHistoryData') ||
           publicCountKeys.some(key => Object.prototype.hasOwnProperty.call(userData, key) &&
@@ -17226,8 +17979,6 @@ io.on('connection', (socket) => {
         profileDbPatch.lastSeen = workingUser.lastSeen;
         profileDbPatch.profileUpdatedAt = workingUser.profileUpdatedAt;
 
-        // The authoritative heavy sections were fetched from PostgreSQL before merging.
-        // Don't rewrite multi-MB JSONB fields when a reconnect replays identical data.
         for (const dataKey of Object.keys(PROFILE_HEAVY_SECTION_META)) {
           if (!Object.prototype.hasOwnProperty.call(profileDbPatch, dataKey)) continue;
           if (dataKey === 'friendsData'
@@ -17246,10 +17997,6 @@ io.on('connection', (socket) => {
           if (Object.prototype.hasOwnProperty.call(profileDbPatch, sync.versionKey) &&
             normalizeTimestampValue(profileDbPatch[sync.versionKey]) === normalizeTimestampValue(originalProfileForNoopCheck[sync.versionKey])) delete profileDbPatch[sync.versionKey];
         });
-        // Skip redundant non-replay updates only when nothing remains to save. An in-memory
-        // profile is insufficient proof of a DB no-op on multi-instance deploys:
-        // another socket may have updated a small field since this cache loaded.
-        // Presence is updated by its own heartbeat, not by an empty patch.
         const patchKeys = Object.keys(profileDbPatch).filter(key => key !== 'lastSeen' && key !== 'profileUpdatedAt');
         const safeSmallNoop = patchKeys.length === 0 &&
           !syncRequestId && !syncReason && !requestedSyncSections.length &&
@@ -17303,8 +18050,6 @@ io.on('connection', (socket) => {
           emitContentDownloadCountsChanged(contentDownloadCountChangedKeys, { reason: 'downloads' });
           deferServerTask('CONTENT DOWNLOAD COUNTS NOTIFY', () => notifyContentDownloadCountsChangedAcrossInstances(contentDownloadCountChangedKeys, { reason: 'downloads' }), 0);
         }
-        // A metadata edit, repeat download or identical list does not alter
-        // user_game_ownership. Only schedule SQL when title-ID membership changes.
         const gameOwnershipChanged = ownershipMembershipChanged(
           previousLibraryForSharedGameMatch, workingUser.libraryData,
           previousDownloadsData, workingUser.downloadsData,
@@ -17403,9 +18148,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --------------------------------------------------------------------------
-  // Notifications, game ownership & friend activity
-  // --------------------------------------------------------------------------
   socket.on('catalog_notification_candidate', async (data = {}, ack) => {
     const respond = payload => { if (typeof ack === 'function' && socket.connected) { try { ack(payload); } catch (err) {} } };
     const name = socket.userName;
@@ -17791,24 +18533,18 @@ io.on('connection', (socket) => {
     deferServerTask('PS3 PLAYTIME NOTIFY', () => notifyPs3PlayTimeAcrossInstances(payload), 0);
   });
 
-  // --------------------------------------------------------------------------
-  // User data, search, presence & public statistics
-  // --------------------------------------------------------------------------
   socket.on('request_user_data', async (data = {}, ack) => {
     const { targetName, type, requestId } = data;
     const startedAt = Date.now();
     const respond = payload => {
       const elapsed = Date.now() - startedAt;
       if (elapsed >= 1200) {
-        // No target name or other private profile data in performance logs.
         console.warn(`[PUBLIC PROFILE LIST SLOW] type=${PUBLIC_PROFILE_LIST_TYPES.has(type) ? type : 'other'} total=${elapsed}ms poolWaiting=${pool.waitingCount} failed=${!!payload.error}`);
       }
       if (typeof ack === 'function') { ack(payload); return; }
       socket.emit('user_data_response', payload);
     };
     try {
-      // A slow PostgreSQL read must not masquerade as an empty collection.
-      // Keep below the client's 12-second request timeout.
       const readTimedOut = Symbol('profile-list-timeout');
       const result = await withTimeout(readPublicProfileListShared(targetName, type), 8000, readTimedOut);
       if (result === readTimedOut) {
@@ -17948,8 +18684,6 @@ io.on('connection', (socket) => {
   });
 
   socket.on('request_online_list', async () => {
-    // Reconnect/login paths can request the same snapshot several times before the
-    // post-auth delay expires. Keep one targeted send pending per socket.
     if (socket.__onlineListRequestPending === true) return;
     socket.__onlineListRequestPending = true;
 
@@ -17976,9 +18710,6 @@ io.on('connection', (socket) => {
     await sendOnlineList();
   });
 
-  // --------------------------------------------------------------------------
-  // Chat history & synchronization
-  // --------------------------------------------------------------------------
   socket.on('chat_render_error', (data = {}) => {
     try {
       const stage = normalizeText(data.stage, 'unknown').slice(0, 40);
@@ -18017,6 +18748,7 @@ io.on('connection', (socket) => {
         const withSeenSync = payload => ({
           ...payload,
           seenSyncV1: true,
+          seenEncoding: 'ranges-v2',
           seenMode: seenSync.mode,
           seenCursor: seenSync.cursor,
           seenEvents: seenSync.events,
@@ -18120,7 +18852,7 @@ io.on('connection', (socket) => {
     const userName = socket.userName;
     const seen = await getChatSeenSyncSafely(userName, 0);
     if (userName !== socket.userName || !socket.connected) return;
-    respond({ success:true, seenSyncV1:true, seenDegraded:seen.degraded === true,
+    respond({ success:true, seenSyncV1:true, seenEncoding:'ranges-v2', seenDegraded:seen.degraded === true,
       seenCursor:seen.cursor, seenEvents:seen.events, seenSummary:seen.summary || [] });
   });
 
@@ -18132,9 +18864,9 @@ io.on('connection', (socket) => {
     if (!owner || !message || String(message.user || '') !== owner) return respond({ success:false, error:'Not authorized.' });
     try {
       const rows = await queryDbWithRetry(
-        `SELECT reader, seen_at FROM chat_seen_events
-         WHERE message_id = $1::text
-         ORDER BY id ASC LIMIT 10000`,
+        `SELECT reader, MIN(seen_at) AS seen_at FROM chat_seen_ranges
+         WHERE int8range(first_msg_id,last_msg_id,'[]') @> $1::bigint
+         GROUP BY reader ORDER BY MIN(seen_at) ASC LIMIT 10000`,
         [msgId], { attempts:2, label:'CHAT SEEN DETAILS READ', queryTimeoutMs:10000 }
       );
       if (socket.userName !== owner || !socket.connected) return;
@@ -18257,9 +18989,6 @@ io.on('connection', (socket) => {
 
       let users = [];
       if (request && request.authoritative === true && socket.userName) {
-        // Seen By explicitly asks for current profile identity. Read all requested summaries in
-        // one DB query so a stale Render-process cache cannot return an old/default avatar. Keep
-        // live presence fields from memory; the DB read is only authoritative for profile data.
         const requestedKeys = uniqueNames.map(item => item.key);
         const result = requestedKeys.length ? await readAuthoritativeFriendsPresenceShared(requestedKeys) : { rows: [] };
 
@@ -18366,10 +19095,6 @@ io.on('connection', (socket) => {
     callback({ success: false, message: "Invalid code." });
   });
 
-  // --------------------------------------------------------------------------
-  // Direct messages
-  // --------------------------------------------------------------------------
-  // Group chats: never import private 1:1 message history into a group.
   socket.on('direct_group_list',async (_data={},callback)=>{
     const reply=typeof callback==='function'?callback:()=>{};
     const viewer=normalizeDirectMessageUser(socket.userName);
@@ -18377,15 +19102,11 @@ io.on('connection', (socket) => {
     try {
       const startedAt = Date.now();
       const requestId = Math.max(0, Math.floor(Number(_data && _data.requestId) || 0));
-      // Start the authoritative list immediately. A preview may arrive first to
-      // populate the UI, but must never overwrite a finished full list.
       const listPromise = readDirectGroupListShared(viewer);
       let fullListReady = false;
       listPromise.then(() => { fullListReady = true; }, () => { fullListReady = true; });
       let previewTimer = null;
       if (_data && _data.preview === true && requestId > 0) {
-        // Avoid a second PostgreSQL query for normally fast group lists.
-        // A slow list may still show the lightweight preview first.
         previewTimer = setTimeout(() => {
           previewTimer = null;
           if (fullListReady || !socket.connected || socket.userName !== viewer || pool.waitingCount > 0) return;
@@ -18491,8 +19212,6 @@ io.on('connection', (socket) => {
     const id=directGroupId(data?.groupId),viewer=normalizeDirectMessageUser(socket.userName),requested=Number(data?.lastMessageId)||0;
     if(!id||!viewer||!Number.isSafeInteger(requested)||requested<1)return reply({success:false,message:'Invalid read request.'});
     try{
-      // Membership and the newest eligible message are resolved in one indexed
-      // read. Duplicate receipts skip the LATERAL lookup entirely.
       const status=await pool.query(`SELECT member.last_read_id,newest.id AS newest_id
         FROM direct_group_members member
         LEFT JOIN LATERAL (
@@ -18602,7 +19321,6 @@ io.on('connection', (socket) => {
         poll.question=input.question;poll.options.forEach((o,i)=>{o.text=input.options[i].text;});
         updated=(await db.query('UPDATE direct_group_messages SET content=$2::jsonb,edited_at=NOW() WHERE id=$1 RETURNING *',[messageId,JSON.stringify(poll)])).rows?.[0];
       }
-      // RETURNING already has the committed message fields; no extra SELECT.
       await db.query('COMMIT');
       const message=serializeDirectGroupMessage(updated);
       try {await emitDirectGroupLocal(id,kind,kind==='delete'?{id:String(messageId)}:message);} catch(err) {console.error('[GROUP ACTION EMIT]',err?.message||err);}
@@ -19230,9 +19948,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --------------------------------------------------------------------------
-  // Chat messages & commands
-  // --------------------------------------------------------------------------
   socket.on('chat_message', async (msg, callback) => {
     const respond = typeof callback === 'function' ? callback : () => {};
     if (socket.__passwordResetRevoked === true) {
@@ -19506,8 +20221,6 @@ io.on('connection', (socket) => {
           respond(blocked);
           return;
         }
-        // Reserve the next 10-second slot before the async database write so rapid parallel
-        // sends cannot slip through the per-user cooldown.
         activeSpamCooldown.nextAllowedAt = spamNow + (CHAT_SPAM_COOLDOWN_SECONDS * 1000);
         setChatSpamCooldownState(senderName, activeSpamCooldown);
         emitChatSpamCooldownStateToUser(senderName, activeSpamCooldown, { continued:true });
@@ -19594,9 +20307,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --------------------------------------------------------------------------
-  // Administration & moderation controls
-  // --------------------------------------------------------------------------
   socket.on('admin_create_postgres_backup', async (data, callback) => {
     const respond = typeof callback === 'function' ? callback : () => {};
     try {
@@ -20088,9 +20798,6 @@ io.on('connection', (socket) => {
       const knownRevision = Number(data && data.knownRevision);
       const now = Date.now();
       const cacheFresh = profileSyncListenReady && contentMetadataOverridesLastDbRefreshAt && now - contentMetadataOverridesLastDbRefreshAt < CONTENT_METADATA_OVERRIDES_DB_FRESH_MS;
-      // Most silent Admin refreshes arrive seconds after admin_state/realtime sync. If the
-      // listener is healthy and the client already has this exact revision, answer without
-      // sorting the cache or touching PostgreSQL.
       if (!force && cacheFresh && knownInstanceId === INSTANCE_ID && Number.isFinite(knownRevision) && knownRevision === contentMetadataOverridesMutationRevision) {
         return respond({ success: true, unchanged: true, ...getContentMetadataOverridesSyncMeta() });
       }
@@ -20385,8 +21092,6 @@ io.on('connection', (socket) => {
       if (isStoreContentBlockedByKey(identity.reportKey)) return respond({ success: false, blocked: true, message: 'This content is already blocked from the Store.' });
 
       const saveResult = await runDbTransactionWithRetry('CONTENT REPORT UPSERT', async client => {
-        // Serialize the user's quota/account state, then serialize this content key with admin block/resolve.
-        // Rechecking the account inside the lock prevents an in-flight submit from surviving account deletion.
         const accountResult = await client.query('SELECT 1 FROM users WHERE name = $1 LIMIT 1', [reporter]);
         if (!accountResult.rows.length) return { accountMissing: true };
         await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`content-report-key:${identity.reportKey}`]);
@@ -20678,9 +21383,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --------------------------------------------------------------------------
-  // Reports, reactions, polls, seen state & editing
-  // --------------------------------------------------------------------------
   socket.on('report_message', async (data, callback) => {
     const respond = typeof callback === 'function' ? callback : () => {};
     try {
@@ -20854,43 +21556,37 @@ io.on('connection', (socket) => {
   });
 
   async function processChatSeenBatchForSocket(rawIds = []) {
-    const reader = normalizeText(socket.userName, '').slice(0, 120);
-    if (!reader) return { success: false, seen: 0, seenIds: [] };
-
-    const ids = [];
-    const requested = new Set();
-    for (const value of Array.isArray(rawIds) ? rawIds : [rawIds]) {
-      const id = normalizeText(value && typeof value === 'object' ? (value.msgId || value.id) : value, '').slice(0, 100);
+    const reader = normalizeText(socket.userName,'').slice(0,120);
+    if (!reader) return { success:false, seen:0, seenIds:[] };
+    const acknowledged = socket.__globalChatSeenAcknowledged || (socket.__globalChatSeenAcknowledged = new Set());
+    const accepted = [], requested = new Set(), needed = new Set();
+    for (const value of Array.isArray(rawIds) ? rawIds.slice(0, CHAT_SEEN_BATCH_MAX) : []) {
+      const id = normalizeText(value && typeof value === 'object' ? (value.msgId || value.id) : value,'').slice(0,100);
       if (!id || requested.has(id)) continue;
       requested.add(id);
-      ids.push(id);
-      if (ids.length >= CHAT_SEEN_BATCH_MAX) break;
+      if (acknowledged.has(id)) accepted.push(id);
+      else needed.add(id);
     }
-    if (!ids.length) return { success: true, seen: 0, seenIds: [] };
-
-    const targets = [];
-    for (const msg of messageHistory) {
-      if (!msg || !msg.time || !msg.user) continue;
-      const msgId = String(new Date(msg.time).getTime());
-      if (!requested.has(msgId) || String(msg.user) === reader) continue;
-      targets.push({ msgId, sender: String(msg.user) });
-    }
-    if (!targets.length) return { success: true, seen: 0, seenIds: [] };
-
+    if (!needed.size) return { success:true, seen:accepted.length, newSeen:0, seenIds:accepted };
+    const targets = getActiveChatMessageSpans().filter(m => needed.has(m.msgId) && m.sender !== reader);
+    if (!targets.length) return { success:true, seen:accepted.length, newSeen:0, seenIds:accepted };
     const events = await recordChatSeenEventsBatch(targets, reader);
-    if (events.length) {
-      emitChatSeenSyncEvents(events);
-    }
-    return { success: true, seen: targets.length, newSeen: events.length, seenIds: targets.map(target => target.msgId) };
+    for (const target of targets) acknowledged.add(target.msgId);
+    if (acknowledged.size > MAX_CHAT_HISTORY * 2) acknowledged.clear();
+    if (events.length) emitChatSeenSyncEvents(events);
+    return { success:true, seen:targets.length + accepted.length, newSeen:events.length,
+      seenIds:accepted.concat(targets.map(t => t.msgId)) };
   }
 
   socket.on('mark_messages_as_read', async (data = {}, callback) => {
     const respond = typeof callback === 'function' ? callback : () => {};
-    if (socket.__chatSeenBatchInFlight === true) return respond({ success: false, busy: true, seen: 0, seenIds: [] });
-    const ids = Array.isArray(data && data.msgIds) ? data.msgIds : [];
-    recordChatTraceTraffic('seenBatch', 1);
-    recordChatTraceTraffic('seenIds', ids.length);
-    const trace = createChatMemoryTrace('seen_batch', socket, CHAT_MEMORY_TRACE_ENABLED ? { ids:ids.length, request:formatChatTraceBytes(ids.reduce((sum, id) => sum + chatTraceByteLength(id), 0)) } : {});
+    if (!socket.userName || !data || data.visibleV2 !== true || !Array.isArray(data.msgIds) || data.msgIds.length > CHAT_SEEN_BATCH_MAX)
+      return respond({ success:false, seen:0, seenIds:[], upgradeRequired:true });
+    if (socket.__chatSeenBatchInFlight === true) return respond({ success:false, busy:true, seen:0, seenIds:[] });
+    const ids = data.msgIds;
+    recordChatTraceTraffic('seenBatch',1);
+    recordChatTraceTraffic('seenIds',ids.length);
+    const trace = createChatMemoryTrace('seen_batch',socket,CHAT_MEMORY_TRACE_ENABLED ? { ids:ids.length } : {});
     socket.__chatSeenBatchInFlight = true;
     try {
       trace.stage('before_process');
@@ -20898,12 +21594,10 @@ io.on('connection', (socket) => {
       trace.finish({ seen:Number(result && result.seen)||0, newSeen:Number(result && result.newSeen)||0 });
       respond(result);
     } catch (err) {
-      trace.finish({ error:1 });
-      console.error('[CHAT SEEN BATCH ERROR]:', err && err.message ? err.message : err);
-      respond({ success: false, seen: 0, seenIds: [] });
-    } finally {
-      socket.__chatSeenBatchInFlight = false;
-    }
+      trace.finish({error:1});
+      console.error('[CHAT SEEN COMPACT BATCH ERROR]:',err && err.message ? err.message : err);
+      respond({ success:false, seen:0, seenIds:[] });
+    } finally { socket.__chatSeenBatchInFlight = false; }
   });
 
   socket.on('edit_message', async (data) => {
@@ -20973,9 +21667,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --------------------------------------------------------------------------
-  // Chat deletion, clear, kick & pinning
-  // --------------------------------------------------------------------------
   socket.on('delete_messages', async (data = {}, callback) => {
     const respond = typeof callback === 'function' ? callback : () => {};
     if (socket.__chatBatchDeleteInFlight === true) return respond({ success: false, message: 'A message delete is already running.' });
@@ -21214,9 +21905,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --------------------------------------------------------------------------
-  // Typing presence & disconnect cleanup
-  // --------------------------------------------------------------------------
   socket.on('typing_start', () => {
     const name = socket.userName;
     if (name && userDatabase[name]) {
@@ -21240,7 +21928,6 @@ io.on('connection', (socket) => {
       socket.broadcast.emit('user_stopped_typing', { name });
 
       if (result.online === true && result.row) {
-        // Online state is unchanged, but publish the surviving socket so moderation never points at a closed session.
         userDatabase[name].online = true;
         userDatabase[name].id = result.row.socket_id || userDatabase[name].id;
         userDatabase[name].onlineSince = normalizeTimestampValue(result.row.connected_at) || null;
