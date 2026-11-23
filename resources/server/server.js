@@ -2110,28 +2110,197 @@ const SS_PREVIEW_DEVPASSWORD = String(process.env.SCREENSCRAPER_DEV_PASSWORD || 
 const SS_PREVIEW_USER = String(process.env.SCREENSCRAPER_USER || '').trim();
 const SS_PREVIEW_PASSWORD = String(process.env.SCREENSCRAPER_PASSWORD || '').trim();
 const SS_PREVIEW_ENABLED = process.env.SCREENSCRAPER_PREVIEWS_ENABLED !== '0' && !!SS_PREVIEW_DEVID && !!SS_PREVIEW_DEVPASSWORD;
-const SS_PREVIEW_SYSTEM_IDS = new Set([57, 58, 59, 61, 62, 60]); // PS1, PS2, PS3, PSP, Vita, PS4
+if (SS_PREVIEW_ENABLED && !(SS_PREVIEW_USER && SS_PREVIEW_PASSWORD))
+  console.warn('[ScreenScraper] No member login configured; set SCREENSCRAPER_USER and SCREENSCRAPER_PASSWORD on Render to use member quota.');
+const SS_PREVIEW_SYSTEM_IDS = new Set([57, 58, 59, 61, 62, 60]); // Explicit PlayStation categories
+// Ports can originate on PC or another console. Cross-system search is selected only
+// for Ports and the resulting media platform comes from ScreenScraper's game record.
+const ssPreviewValidMediaSystem = value => Number.isSafeInteger(value) && value >= 1 && value <= 2000;
 const SS_PREVIEW_POSITIVE_MS = 24 * 60 * 60 * 1000;
 const SS_PREVIEW_NEGATIVE_MS = 3 * 60 * 1000;
 const SS_PREVIEW_MAX_CACHE = 500;
-const SS_PREVIEW_MINUTE_MAX = Math.max(1, Math.min(30, Number(process.env.SCREENSCRAPER_PREVIEW_MINUTE_MAX) || 10));
-const SS_PREVIEW_DAILY_MAX = Math.max(10, Math.min(20000, Number(process.env.SCREENSCRAPER_PREVIEW_DAILY_MAX) || 500));
-let ssPreviewMinuteWindow = Date.now();
-let ssPreviewDailyWindow = Date.now();
+// ScreenScraper quota values are observed, not re-enforced locally.
+// Only a real upstream 429/430 triggers a temporary provider cooldown.
+const SS_PREVIEW_FALLBACK_MINUTE_MAX = null;
+const SS_PREVIEW_FALLBACK_DAILY_MAX = null;
+const ssPreviewMinuteTimes = [];
 let ssPreviewMinuteUsed = 0;
 let ssPreviewDailyUsed = 0;
+let ssPreviewDailyDate = '';
+const ssPreviewQuota = { minuteMax:SS_PREVIEW_FALLBACK_MINUTE_MAX,
+  dayMax:SS_PREVIEW_FALLBACK_DAILY_MAX, threadsMax:1, source:'unknown', reportedToday:null,
+  reportedAtLocalUsed:0, checkedAt:0, nextCheck:0, blockedUntil:0 };
+let ssPreviewQuotaPending = null;
+let ssProviderActive = 0;
+const ssProviderWaiters = [];
+function ssProviderPump() {
+  const max = Math.min(4,Math.max(1,ssPreviewQuota.threadsMax || 1));
+  while (ssProviderActive < max && ssProviderWaiters.length) {
+    const job = ssProviderWaiters.shift();
+    if (job.done) continue;
+    job.done=true;
+    clearTimeout(job.timeout);
+    if (job.signal) job.signal.removeEventListener('abort',job.cancel);
+    ssProviderActive++;
+    let released=false;
+    job.resolve(()=>{
+      if (released) return;
+      released=true;
+      ssProviderActive--;
+      ssProviderPump();
+    });
+  }
+}
+function ssProviderAcquire(kind='search',signal) {
+  if (signal?.aborted) return Promise.reject(Object.assign(new Error('aborted'),{name:'AbortError'}));
+  if (ssProviderWaiters.length >= 40)
+    return Promise.reject(Object.assign(new Error('ScreenScraper queue busy'),{status:503,code:'provider_queue_full'}));
+  return new Promise((resolve,reject)=>{
+    const job={kind,signal,resolve,reject,done:false,timeout:null,cancel:null};
+    const cancel=(reason)=>{
+      if (job.done) return;
+      job.done=true;
+      clearTimeout(job.timeout);
+      if (signal) signal.removeEventListener('abort',job.cancel);
+      const idx=ssProviderWaiters.indexOf(job);
+      if (idx!==-1) ssProviderWaiters.splice(idx,1);
+      reject(Object.assign(new Error(reason),{status:503,code:'provider_queue_timeout',
+        name:reason==='aborted'?'AbortError':'Error'}));
+    };
+    job.cancel=()=>cancel('aborted');
+    if (signal) signal.addEventListener('abort',job.cancel,{once:true});
+    job.timeout=setTimeout(()=>cancel('queue_timeout'),kind==='video'?18000:12000);
+    const weight={video:0,search:1,info:1,image:2};
+    const priority=weight[kind]??2;
+    const idx=ssProviderWaiters.findIndex(other=>(weight[other.kind]??2)>priority);
+    if (idx<0) ssProviderWaiters.push(job);
+    else ssProviderWaiters.splice(idx,0,job);
+    ssProviderPump();
+  });
+}
+
+function ssPreviewParisDay() {
+  return new Intl.DateTimeFormat('en-CA', {timeZone:'Europe/Paris', year:'numeric', month:'2-digit', day:'2-digit'}).format(new Date());
+}
+function ssPreviewQuotaRoll() {
+  const now = Date.now();
+  while (ssPreviewMinuteTimes.length && now - ssPreviewMinuteTimes[0] >= 60000)
+    ssPreviewMinuteTimes.shift();
+  ssPreviewMinuteUsed = ssPreviewMinuteTimes.length;
+  const day = ssPreviewParisDay();
+  if (ssPreviewDailyDate !== day) {
+    ssPreviewDailyDate=day; ssPreviewDailyUsed=0;
+    ssPreviewQuota.reportedToday=null; ssPreviewQuota.reportedAtLocalUsed=0;
+    ssPreviewQuota.nextCheck=0; ssPreviewQuota.source='unknown';
+    ssPreviewQuota.minuteMax=SS_PREVIEW_FALLBACK_MINUTE_MAX;
+    ssPreviewQuota.dayMax=SS_PREVIEW_FALLBACK_DAILY_MAX;
+    ssPreviewQuota.blockedUntil=0;
+  }
+}
+function ssPreviewQuotaInteger(value, maximum) {
+  if (value === null || value === undefined || value === '') return null;
+  const num=Number(value);
+  return Number.isSafeInteger(num) && num>=0 && num<=maximum ? num : null;
+}
+function ssPreviewQuotaFromResponse(data) {
+  const root=data && typeof data==='object' ? data : {};
+  const response=root.response && typeof root.response==='object' ? root.response : {};
+  for (const entry of [response.ssuser, response.ssusers?.ssuser, root.ssuser, root.ssusers?.ssuser]) {
+    const user=Array.isArray(entry) ? entry[0] : entry;
+    if (!user || typeof user!=='object') continue;
+    const perMin=ssPreviewQuotaInteger(user.maxrequestspermin ?? user.maxrequestsperdmin, 100000);
+    const perDay=ssPreviewQuotaInteger(user.maxrequestsperday, 1000000);
+    const threads=ssPreviewQuotaInteger(user.maxthreads, 100);
+    if (!perMin && !perDay && !threads) continue;
+    ssPreviewQuotaRoll();
+    if (perMin) ssPreviewQuota.minuteMax=perMin;
+    if (perDay) ssPreviewQuota.dayMax=perDay;
+    if (threads) {ssPreviewQuota.threadsMax=Math.min(4,threads);ssProviderPump();}
+    const used=ssPreviewQuotaInteger(user.requeststoday, 1000000);
+    if (used!==null) {
+      // The upstream count includes this very request, so do not count it twice.
+      ssPreviewQuota.reportedToday=used;
+      ssPreviewQuota.reportedAtLocalUsed=ssPreviewDailyUsed;
+    }
+    ssPreviewQuota.source='screenscraper';
+    ssPreviewQuota.checkedAt=Date.now();
+    return true;
+  }
+  return false;
+}
+function ssPreviewQuotaReserve(kind='video') {
+  ssPreviewQuotaRoll();
+  const now=Date.now();
+  // Never invent a local per-minute or daily ceiling. The account's
+  // 20,000 daily scrapes are enforced by ScreenScraper, not duplicated here.
+  // Pause only after an actual provider 429/430, avoiding request storms.
+  if (now < ssPreviewQuota.blockedUntil) {
+    const error = new Error('ScreenScraper requested a temporary cooldown.');
+    error.status=429;
+    error.code='provider_cooldown';
+    error.retryAfter=Math.max(1,Math.ceil((ssPreviewQuota.blockedUntil-now)/1000));
+    throw error;
+  }
+  ssPreviewMinuteTimes.push(now);
+  ssPreviewMinuteUsed=ssPreviewMinuteTimes.length;
+  ssPreviewDailyUsed++;
+}
+function ssPreviewQuotaNoteRate(status) {
+  if (status===429)
+    ssPreviewQuota.blockedUntil=Math.max(ssPreviewQuota.blockedUntil,Date.now()+30000);
+  if (status===430) {
+    // 430 is the provider's daily limit. Resume at the provider's next
+    // calendar day (Europe/Paris), not a rolling 24 hours later.
+    const today=ssPreviewParisDay();
+    let lo=Date.now(),hi=lo+27*60*60*1000;
+    while (hi-lo>1000) {
+      const mid=lo+Math.floor((hi-lo)/2);
+      if (new Intl.DateTimeFormat('en-CA',{timeZone:'Europe/Paris',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(mid))===today) lo=mid;
+      else hi=mid;
+    }
+    ssPreviewQuota.blockedUntil=Math.max(ssPreviewQuota.blockedUntil,hi+5000);
+  }
+}
+async function ssPreviewMaybeRefreshQuota() {
+  // ssuserInfos needs member credentials, separate from developer credentials.
+  // Without them, learn the quota from the ssuser data on regular search replies.
+  if (!SS_PREVIEW_USER || !SS_PREVIEW_PASSWORD) return;
+  ssPreviewQuotaRoll();
+  if (Date.now()<ssPreviewQuota.nextCheck) return;
+  if (ssPreviewQuotaPending) return ssPreviewQuotaPending;
+  ssPreviewQuota.nextCheck=Date.now()+20*60*1000;
+  ssPreviewQuotaPending=(async()=>{
+    const release = await ssProviderAcquire('info');
+    try {
+      ssPreviewQuotaReserve('search');
+      const url=new URL('https://api.screenscraper.fr/api2/ssuserInfos.php');
+    url.searchParams.set('devid',SS_PREVIEW_DEVID);
+    url.searchParams.set('devpassword',SS_PREVIEW_DEVPASSWORD);
+    url.searchParams.set('softname','PSN-Content');
+    url.searchParams.set('output','json');
+    url.searchParams.set('ssid',SS_PREVIEW_USER);
+    url.searchParams.set('sspassword',SS_PREVIEW_PASSWORD);
+    const response=await requestMetadataJson(url,{timeoutMs:6000,headers:{'User-Agent':'PSN-Content/1.0 ScreenScraper-Preview'}});
+      if (!response.ok) {ssPreviewQuotaNoteRate(Number(response.status));ssPreviewQuota.nextCheck=Date.now()+60000;return;}
+      if (!ssPreviewQuotaFromResponse(response.data)) ssPreviewQuota.nextCheck=Date.now()+60000;
+      else console.info('[ScreenScraper quota]',JSON.stringify({
+        threads:ssPreviewQuota.threadsMax,perMinute:ssPreviewQuota.minuteMax,
+        perDay:ssPreviewQuota.dayMax,usedToday:ssPreviewQuota.reportedToday}));
+    } finally { release(); }
+  })().catch(()=>{ssPreviewQuota.nextCheck=Date.now()+60000;}).finally(()=>{ssPreviewQuotaPending=null;});
+  return ssPreviewQuotaPending;
+}
 const ssPreviewCache = new Map();
 const ssPreviewInflight = new Map();
 let ssPreviewQueueTail = Promise.resolve();
 let ssPreviewQueued = 0;
-let ssPreviewNextRequestAt = 0;
 
 function ssPreviewSearchName(value) {
   return String(value || '').replace(/[™®©]/g, ' ').replace(/\b(?:tm|registered)\b/gi, ' ')
     .replace(/\s*[[(](?:usa|eur|europe|japan|jpn|us|eu|ps3|ps2|psp|ps1|ps4|digital version)[)\]]/gi, '')
     .replace(/\b(?:digital version|version digitale)\b/gi, '')
     // ScreenScraper often uses a hyphen where PSN game titles use a colon or dash.
-    .replace(/\s*[:：‐‑‒–—−]\s*/g, ' - ').replace(/\s+-\s+/g, ' - ')
+    .replace(/\s*[:：;；‐‑‒–—−]\s*/g, ' - ').replace(/\s+-\s+/g, ' - ')
     .replace(/\s+/g, ' ').trim();
 }
 function ssPreviewSearchVariants(value) {
@@ -2195,7 +2364,7 @@ function ssPreviewAllowedMediaHost(hostname) {
 function ssPreviewFindVideo(game, expectedSystem) {
   const id = Number(game && game.id);
   const system = Number(game && (game.systemeid || (game.systeme && game.systeme.id)) || expectedSystem);
-  if (!Number.isSafeInteger(id) || id <= 0 || !SS_PREVIEW_SYSTEM_IDS.has(system) ||
+  if (!Number.isSafeInteger(id) || id <= 0 || !ssPreviewValidMediaSystem(system) ||
       (expectedSystem && system !== expectedSystem)) return null;
   const medias = ssPreviewMediaList(game);
   for (const type of ['video-normalized', 'video']) {
@@ -2226,37 +2395,31 @@ function ssPreviewFindVideo(game, expectedSystem) {
 
 // Short-lived signed fallback: clients never see ScreenScraper developer credentials.
 // Proxy only when the public media URL failed, to limit Render egress.
-const ssPreviewVideoSecret = crypto.randomBytes(32);
-// Bounded temporary MP4 cache: one ScreenScraper download per game/media.
-// Range requests are served locally, not counted as new ScreenScraper downloads.
-const ssVideoFs = require('node:fs');
-const ssVideoPath = require('node:path');
-const ssVideoOs = require('node:os');
+// Stable signing key across Render restarts: previously every restart invalidated
+// cached artwork and playback URLs already held by connected browsers.
+// Keep the signing secret server-side. Changing it invalidates existing signed links.
+const ssPreviewVideoSecret = crypto.createHmac('sha256',
+  String(process.env.SCREENSCRAPER_MEDIA_SIGNING_KEY || SS_PREVIEW_DEVPASSWORD))
+  .update('PSN-Content ScreenScraper media links v1').digest();
+// Stream MP4 data directly to the browser: no local video files or byte cache.
 const { Transform: SsVideoTransform } = require('node:stream');
-const { pipeline: ssVideoPipeline } = require('node:stream/promises');
 const SS_PREVIEW_VIDEO_MAX_BYTES = 32 * 1024 * 1024;
-const SS_PREVIEW_VIDEO_CACHE_MAX_BYTES = 80 * 1024 * 1024;
-const SS_PREVIEW_VIDEO_CACHE_MS = 25 * 60 * 1000;
-const SS_PREVIEW_VIDEO_DOWNLOAD_MINUTE_MAX = 5;
-const SS_PREVIEW_VIDEO_DOWNLOAD_DAILY_MAX = 100;
-const SS_PREVIEW_VIDEO_EGRESS_DAILY_MAX_BYTES = 768 * 1024 * 1024;
-const SS_PREVIEW_VIDEO_IP_WINDOW_BYTES = 96 * 1024 * 1024;
-const ssVideoDir = ssVideoPath.join(ssVideoOs.tmpdir(), 'psn-content-gameplay-cache');
-const ssVideoCache = new Map();
-const ssVideoInflight = new Map();
 const ssVideoFailures = new Map();
-const ssVideoClients = new Map();
-let ssVideoCacheBytes = 0;
-let ssVideoQueueTail = Promise.resolve();
-let ssVideoQueued = 0;
+const ssVideoLimitLoggedAt = new Map();
+function ssVideoLogLimit(reason) {
+  const now=Date.now();
+  if(now-(ssVideoLimitLoggedAt.get(reason)||0)<30000)return;
+  ssVideoLimitLoggedAt.set(reason,now);
+  console.warn('[SCREENSCRAPER VIDEO]',reason,'active='+ssVideoActive,
+    'apiMinute='+ssPreviewMinuteUsed+'/'+ssPreviewQuota.minuteMax,
+    'providerBackoffSec='+Math.max(0,Math.ceil((ssPreviewQuota.blockedUntil-Date.now())/1000)));
+}
 let ssVideoActive = 0;
-let ssVideoMinuteStart = Date.now();
-let ssVideoMinuteDownloads = 0;
-let ssVideoDayStart = Date.now();
-let ssVideoDayDownloads = 0;
-let ssVideoDailyEgress = 0;
 function ssPreviewVideoToken(video) {
-  const payload = Buffer.from(JSON.stringify({s:video.system,g:video.gameId,t:video.type,h:video.apiHost || 'api.screenscraper.fr',e:Math.floor(Date.now()/1000)+900})).toString('base64url');
+  // One URL per media each UTC day: browser HTTP caching survives page reloads.
+  // The signature stays valid into the following day for in-flight/Range requests.
+  const expires=(Math.floor(Date.now()/86400000)+2)*86400;
+  const payload = Buffer.from(JSON.stringify({s:video.system,g:video.gameId,t:video.type,h:video.apiHost || 'api.screenscraper.fr',e:expires})).toString('base64url');
   const signature = crypto.createHmac('sha256',ssPreviewVideoSecret).update(payload).digest('hex');
   return `${payload}.${signature}`;
 }
@@ -2268,7 +2431,7 @@ function ssPreviewVerifyVideoToken(token) {
   if (!crypto.timingSafeEqual(Buffer.from(sig,'hex'),Buffer.from(expected,'hex'))) return null;
   let parsed;
   try { parsed = JSON.parse(Buffer.from(raw,'base64url').toString('utf8')); } catch (_) { return null; }
-  if (!parsed || !SS_PREVIEW_SYSTEM_IDS.has(parsed.s) || !Number.isSafeInteger(parsed.g) || parsed.g <= 0 ||
+  if (!parsed || !ssPreviewValidMediaSystem(parsed.s) || !Number.isSafeInteger(parsed.g) || parsed.g <= 0 ||
       !['video','video-normalized'].includes(parsed.t) ||
       !ssPreviewAllowedMediaHost(parsed.h || 'api.screenscraper.fr') ||
       !Number.isSafeInteger(parsed.e) || parsed.e < Math.floor(Date.now()/1000)) return null;
@@ -2284,8 +2447,11 @@ const ssExtraImageWaiters = [];
 let ssExtraImageActive = 0;
 let ssExtraImageBytes = 0;
 const SS_EXTRA_IMAGE_LIMIT = 16 * 1024 * 1024;
+const SS_EXTRA_IMAGE_TTL_MS = 60 * 60 * 1000;
 function ssExtraImageToken(system, gameId, type, region) {
-  const raw = Buffer.from(JSON.stringify({s:system,g:gameId,t:type,r:region || '',e:Math.floor(Date.now()/1000)+3600})).toString('base64url');
+  // Stable within each hour so browser HTTP caching survives repeated metadata fetches.
+  const expires=(Math.floor(Date.now()/3600000)+2)*3600;
+  const raw = Buffer.from(JSON.stringify({s:system,g:gameId,t:type,r:region || '',e:expires})).toString('base64url');
   return raw + '.' + crypto.createHmac('sha256',ssPreviewVideoSecret).update(raw).digest('hex');
 }
 function ssExtraVerifyToken(token) {
@@ -2295,7 +2461,7 @@ function ssExtraVerifyToken(token) {
   if (!crypto.timingSafeEqual(Buffer.from(sig,'hex'),Buffer.from(expected,'hex'))) return null;
   let data;
   try { data=JSON.parse(Buffer.from(payload,'base64url').toString('utf8')); } catch (_) { return null; }
-  if (!data || !SS_PREVIEW_SYSTEM_IDS.has(data.s) || !Number.isSafeInteger(data.g) || data.g<=0 ||
+  if (!data || !ssPreviewValidMediaSystem(data.s) || !Number.isSafeInteger(data.g) || data.g<=0 ||
       !SS_EXTRA_MEDIA_TYPES.has(data.t) || typeof data.r !== 'string' || !/^[a-z]{0,12}$/.test(data.r) ||
       !Number.isSafeInteger(data.e) || data.e < Math.floor(Date.now()/1000)) return null;
   return data;
@@ -2315,10 +2481,29 @@ function ssExtraLocalized(value) {
   }
   return '';
 }
+function ssExtraEnglishSynopsis(value) {
+  if (!value || typeof value !== 'object') return '';
+  const keys = ['synopsis_en','synopsis_us','en','us'];
+  for (const key of keys) {
+    const text = ssExtraPlainText(value[key]);
+    if (text) return text;
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      if (!entry || !['en','us'].includes(String(entry.langue || entry.lang || '').toLowerCase())) continue;
+      const text = ssExtraPlainText(entry.texte || entry.text || entry.value);
+      if (text) return text;
+    }
+  }
+  return '';
+}
 function ssPreviewExtractExtras(game, system) {
   if (!game || !Number.isSafeInteger(Number(game.id))) return null;
   const id = Number(game.id);
-  const media = ssPreviewMediaList(game);
+  const media = ssPreviewMediaList(game).sort((a,b) => {
+    const rank = item => item?.type === 'box-2D-front' ? 0 : item?.type === 'box-2D' ? 1 : 2;
+    return rank(a)-rank(b);
+  });
   const images = [];
   const used = new Set();
   for (const item of media) {
@@ -2337,8 +2522,8 @@ function ssPreviewExtractExtras(game, system) {
     images.push({type,kind,region:safeRegion});
   }
   const genres = game.genres && typeof game.genres === 'object' ? ssExtraLocalized(game.genres) : '';
-  return {gameId:id, system, images,
-    summary:ssExtraLocalized(game.synopsis),developer:ssExtraPlainText(game.developpeur),
+  return {gameId:id, system, images, artworkChecked:true,
+    summary:ssExtraEnglishSynopsis(game.synopsis),summaryEnglishChecked:true,developer:ssExtraPlainText(game.developpeur),
     publisher:ssExtraPlainText(game.editeur),players:ssExtraPlainText(game.joueurs),
     rating:game.note !== undefined && game.note !== null && Number.isFinite(Number(game.note)) ? Number(game.note) : null,
     releaseDate:ssExtraLocalized(game.dates),genres};
@@ -2352,7 +2537,7 @@ function ssPreviewSearchReason(response) {
   const status = Number(response && response.status || 0);
   const text = String(response && response.text || '').slice(0,1500).toLowerCase();
   if (status === 401 || status === 403 || /invalid.*(devid|devpassword)|authentification|identifiant incorrect/.test(text)) return 'api_auth';
-  if (status === 429 || /too many|quota|maximum.*request|limite.*requ/.test(text)) return 'api_rate_limit';
+  if (status === 429 || status === 430 || /too many|quota|maximum.*request|limite.*requ/.test(text)) return 'api_rate_limit';
   if (status === 503 || status === 502 || status === 504) return 'api_unavailable';
   return 'api_unavailable';
 }
@@ -2374,9 +2559,10 @@ function ssPreviewSetCached(key, payload) {
 
 // Postgres saves the stable game/video identity, not the expiring signed playback URL.
 // ScreenScraper results survive Render restarts; one normalized key serves regional IDs.
-const SS_PREVIEW_DB_DAYS = 30;
+// A confirmed match has stable ScreenScraper game/media IDs, so preserve it across deploys.
+// Only misses and matches without video expire quickly, allowing new media to appear.
 const SS_PREVIEW_DB_NO_VIDEO_DAYS = 1;
-const SS_PREVIEW_DB_MAX_ROWS = 4000;
+const SS_PREVIEW_DB_MAX_ROWS = 12000;
 let ssPreviewDbPruneAfter = 0;
 async function ssPreviewLoadDatabase(key, systemId) {
   try {
@@ -2387,14 +2573,24 @@ async function ssPreviewLoadDatabase(key, systemId) {
       LIMIT 1`, [key, systemId])).rows[0];
     if (!row) return null;
     const gameId = Number(row.game_id);
+    // Negative lookups are cached for a day, not permanently.
+    if (gameId === 0 && row.extras?.negative === true) {
+      const payload = {found:false,provider:'screenscraper',reason:row.extras.reason || 'no_match'};
+      ssPreviewSetCached(key,payload);
+      return payload;
+    }
+    // For Ports the lookup key uses system 0, but the saved media keeps the
+    // actual original platform returned by ScreenScraper.
+    const extras = row.extras && typeof row.extras === 'object' ? row.extras : null;
+    const mediaSystem = systemId === 0 ? Number(extras?.system) : systemId;
+    if (!ssPreviewValidMediaSystem(mediaSystem)) return null;
     const type = String(row.media_type || '');
     if (!Number.isSafeInteger(gameId) || gameId <= 0 || !['', 'video', 'video-normalized'].includes(type)) return null;
     const apiHost = ssPreviewAllowedMediaHost(row.api_host) ? row.api_host : 'api.screenscraper.fr';
     const video = type ? {
-      system:systemId, gameId, type, apiHost,
-      url:`https://www.screenscraper.fr/medias/${systemId}/${gameId}/${type}.mp4`
+      system:mediaSystem, gameId, type, apiHost,
+      url:`https://www.screenscraper.fr/medias/${mediaSystem}/${gameId}/${type}.mp4`
     } : null;
-    const extras = row.extras && typeof row.extras === 'object' ? row.extras : null;
     if (!video && !extras) return null;
     const payload = video
       ? {found:true, url:video.url, video, extras, provider:'screenscraper'}
@@ -2407,24 +2603,29 @@ async function ssPreviewLoadDatabase(key, systemId) {
   }
 }
 function ssPreviewPersistDatabase(key, systemId, result) {
-  if (!result || (!result.video && !result.extras)) return;
+  if (!result) return;
   const video = result.video || null;
-  const gameId = Number(video?.gameId || result.extras?.gameId);
-  if (!Number.isSafeInteger(gameId) || gameId <= 0) return;
+  const isNegative = !video && !result.extras;
+  const gameId = isNegative ? 0 : Number(video?.gameId || result.extras?.gameId);
+  if (!Number.isSafeInteger(gameId) || gameId < 0) return;
   const type = video?.type || '';
   if (type && !['video', 'video-normalized'].includes(type)) return;
   const host = video && ssPreviewAllowedMediaHost(video.apiHost)
     ? video.apiHost : 'api.screenscraper.fr';
-  // Nonblocking: the first hover does not wait for a database write.
+  const metadata = isNegative ? {negative:true,reason:result.reason || 'no_match'} : result.extras;
+  // Store identifiers and supplemental metadata, never the actual MP4/image or signed URL.
+  // Confirmed videos stay cached until explicitly invalidated (or LRU capacity is reached).
+  // No-video/miss results are refreshed next day.
   pool.query(`
     INSERT INTO screenscraper_game_cache
       (cache_key, system_id, game_id, media_type, api_host, extras, refreshed_at, expires_at)
-    VALUES ($1, $2, $3, $4, $5, $6::jsonb, NOW(), NOW() + ($7::int * INTERVAL '1 day'))
+    VALUES ($1, $2, $3, $4, $5, $6::jsonb, NOW(),
+      CASE WHEN $7::boolean THEN 'infinity'::timestamptz ELSE NOW() + ($8::int * INTERVAL '1 day') END)
     ON CONFLICT (cache_key) DO UPDATE SET
       system_id=EXCLUDED.system_id, game_id=EXCLUDED.game_id,
       media_type=EXCLUDED.media_type, api_host=EXCLUDED.api_host,
       extras=EXCLUDED.extras, refreshed_at=NOW(), expires_at=EXCLUDED.expires_at`,
-    [key, systemId, gameId, type, host, JSON.stringify(result.extras || null), video ? SS_PREVIEW_DB_DAYS : SS_PREVIEW_DB_NO_VIDEO_DAYS]
+    [key, systemId, gameId, type, host, JSON.stringify(metadata || null), !!video, SS_PREVIEW_DB_NO_VIDEO_DAYS]
   ).then(() => {
     const now = Date.now();
     if (now < ssPreviewDbPruneAfter) return;
@@ -2432,17 +2633,20 @@ function ssPreviewPersistDatabase(key, systemId, result) {
     // Bounded to avoid another Aiven full-disk incident; at most once per 6 hours.
     pool.query(`DELETE FROM screenscraper_game_cache WHERE expires_at <= NOW()`).then(() =>
       pool.query(`DELETE FROM screenscraper_game_cache WHERE cache_key IN
-        (SELECT cache_key FROM screenscraper_game_cache ORDER BY refreshed_at DESC
+        (SELECT cache_key FROM screenscraper_game_cache
+         ORDER BY CASE WHEN media_type <> '' THEN 0 ELSE 1 END, refreshed_at DESC
          OFFSET $1)`, [SS_PREVIEW_DB_MAX_ROWS])
     ).catch(() => {});
   }).catch(() => {});
 }
 function ssPreviewFetchUpstream(name, systemId, key) {
-  // One upstream request at a time, spaced apart; a hover storm cannot flood the API.
-  if (ssPreviewQueued >= 4) {
-    const busy = new Error('ScreenScraper preview queue full.');
-    busy.status = 429;
-    busy.code = 'local_queue_full';
+  // Bound pending work for Render Free without an artificial HTTP 429 quota.
+  // Duplicate game names are already combined by ssPreviewInflight.
+  if (ssPreviewQueued >= 80) {
+    const busy = new Error('ScreenScraper search queue temporarily busy.');
+    busy.status = 503;
+    busy.code = 'provider_queue_full';
+    busy.retryAfter = 5;
     return Promise.reject(busy);
   }
   ssPreviewQueued++;
@@ -2454,35 +2658,30 @@ function ssPreviewFetchUpstream(name, systemId, key) {
     let candidates = 0;
     for (const searchName of searches) {
       // Charge each upstream attempt against the existing limits and spacing.
-      const pause = ssPreviewNextRequestAt - Date.now();
-      if (pause > 0) await waitMs(pause);
-      const now = Date.now();
-      if (now - ssPreviewMinuteWindow >= 60000) { ssPreviewMinuteWindow = now; ssPreviewMinuteUsed = 0; }
-      if (now - ssPreviewDailyWindow >= 86400000) { ssPreviewDailyWindow = now; ssPreviewDailyUsed = 0; }
-      if (ssPreviewMinuteUsed >= SS_PREVIEW_MINUTE_MAX || ssPreviewDailyUsed >= SS_PREVIEW_DAILY_MAX) {
-        const limited = new Error('ScreenScraper preview quota reached.');
-        limited.status = 429;
-        limited.code = 'local_rate_limit';
-        throw limited;
-      }
-      ssPreviewMinuteUsed++;
-      ssPreviewDailyUsed++;
-      ssPreviewNextRequestAt = now + 1600;
-      const url = new URL('https://api.screenscraper.fr/api2/jeuRecherche.php');
+      await ssPreviewMaybeRefreshQuota();
+      const release = await ssProviderAcquire('search');
+      let response;
+      try {
+        ssPreviewQuotaReserve('search');
+        const url = new URL('https://api.screenscraper.fr/api2/jeuRecherche.php');
       url.searchParams.set('devid', SS_PREVIEW_DEVID);
       url.searchParams.set('devpassword', SS_PREVIEW_DEVPASSWORD);
       url.searchParams.set('softname', 'PSN-Content');
       url.searchParams.set('output', 'json');
-      url.searchParams.set('systemeid', String(systemId));
+      // For Ports omit systemeid: searching PS3 would miss original PC/console games.
+      if (systemId !== 0) url.searchParams.set('systemeid', String(systemId));
       url.searchParams.set('recherche', searchName);
       if (SS_PREVIEW_USER && SS_PREVIEW_PASSWORD) {
         url.searchParams.set('ssid', SS_PREVIEW_USER);
         url.searchParams.set('sspassword', SS_PREVIEW_PASSWORD);
       }
-      const response = await requestMetadataJson(url, { timeoutMs:9000, headers:{ 'User-Agent':'PSN-Content/1.0 ScreenScraper-Preview' } });
+        response = await requestMetadataJson(url, { timeoutMs:9000, headers:{ 'User-Agent':'PSN-Content/1.0 ScreenScraper-Preview' } });
+      } finally {release();}
+      ssPreviewQuotaNoteRate(Number(response.status));
+      if (response.ok) ssPreviewQuotaFromResponse(response.data);
       if (!response.ok || !response.data || typeof response.data !== 'object') {
         const error = new Error('ScreenScraper search unavailable.');
-        error.status = Number(response.status) === 429 ? 429 : 502;
+        error.status = [429,430].includes(Number(response.status)) ? 429 : 502;
         error.code = ssPreviewSearchReason(response);
         error.upstreamStatus = Number(response.status) || 0;
         throw error;
@@ -2499,23 +2698,31 @@ function ssPreviewFetchUpstream(name, systemId, key) {
       const rawGames = data.jeux || data.jeu || [];
       const games = Array.isArray(rawGames) ? rawGames : (Array.isArray(rawGames.jeu) ? rawGames.jeu : (rawGames.jeu ? [rawGames.jeu] : (rawGames.id ? [rawGames] : [])));
       candidates += games.length;
+      const minScore = systemId === 0 ? 0.95 : 0.78; // Cross-platform matches must be unambiguous.
       for (const game of games.slice(0, 30)) {
-        if (Number(game && (game.systemeid || (game.systeme && game.systeme.id))) !== systemId) continue;
+        const mediaSystem = Number(game && (game.systemeid || (game.systeme && game.systeme.id)));
+        if (!ssPreviewValidMediaSystem(mediaSystem) || (systemId !== 0 && mediaSystem !== systemId)) continue;
         const score = Math.max(0, ...ssPreviewNames(game).map(title => ssPreviewTitleSimilarity(wanted, normalizeSsPreviewTitle(title))));
-        if (score > bestScore) {
+        const videoAvailable = systemId === 0 && score >= minScore && !!ssPreviewFindVideo(game, 0);
+        const previousHasVideo = systemId === 0 && bestGame && !!ssPreviewFindVideo(bestGame, 0);
+        // For a Port, prefer an exact-title entry that has real gameplay media.
+        if (score > bestScore || (videoAvailable && !previousHasVideo && score >= bestScore - 0.01)) {
           bestGame = game;
           bestScore = score;
         }
-        if (bestScore === 1) break;
+        if (bestScore === 1 && (systemId !== 0 || !!ssPreviewFindVideo(bestGame, 0))) break;
       }
-      // No second API call if the first query already identified the title.
-      if (bestScore >= 0.78) break;
+      // The second title variant is needed only when the first was not a reliable match.
+      if (bestScore >= minScore && (systemId !== 0 || !!ssPreviewFindVideo(bestGame, 0))) break;
     }
-    const video = bestGame && bestScore >= 0.78 ? ssPreviewFindVideo(bestGame, systemId) : null;
-    const extras = bestGame && bestScore >= 0.78 ? ssPreviewExtractExtras(bestGame, systemId) : null;
+    const minScore = systemId === 0 ? 0.95 : 0.78;
+    const mediaSystem = Number(bestGame && (bestGame.systemeid || (bestGame.systeme && bestGame.systeme.id)));
+    const validMatch = !!bestGame && bestScore >= minScore && ssPreviewValidMediaSystem(mediaSystem);
+    const video = validMatch ? ssPreviewFindVideo(bestGame, systemId) : null;
+    const extras = validMatch ? ssPreviewExtractExtras(bestGame, mediaSystem) : null;
     const result = video
       ? { found:true, url:video.url, video, extras, provider:'screenscraper' }
-      : { found:false, extras, provider:'screenscraper', reason: !candidates ? 'no_match' : !bestGame || bestScore < 0.78 ? 'no_close_match' : 'no_video', candidates };
+      : { found:false, extras, provider:'screenscraper', reason: !candidates ? 'no_match' : !validMatch ? 'no_close_match' : 'no_video', candidates };
     ssPreviewSetCached(key, result);
     ssPreviewPersistDatabase(key, systemId, result);
     return result;
@@ -2523,21 +2730,32 @@ function ssPreviewFetchUpstream(name, systemId, key) {
   ssPreviewQueueTail = work.catch(() => null);
   return work.finally(() => { ssPreviewQueued--; });
 }
-function ssPreviewLookup(name, systemId) {
+function ssPreviewLookup(name, systemId, options = null) {
   const key = `${systemId}:${normalizeSsPreviewTitle(name)}`;
+  const requireEnglish = options?.englishSummary === true;
+  const requireArtwork = options?.artwork === true;
+  // Old persisted matches predate the fanart fallback. Refresh their media list
+  // once when the modal requests it, without changing hover/video cache behavior.
+  const ready = result => !!result &&
+    (!requireEnglish || !result.extras || result.extras.summaryEnglishChecked === true) &&
+    (!requireArtwork || (!result.found && !result.extras) || result.extras?.artworkChecked === true);
   const cached = ssPreviewGetCached(key);
-  if (cached) return Promise.resolve(cached);
+  if (ready(cached)) return Promise.resolve(cached);
+  if (cached) ssPreviewCache.delete(key);
   if (ssPreviewInflight.has(key)) return ssPreviewInflight.get(key);
   const work = ssPreviewLoadDatabase(key, systemId).then(result =>
-    result || ssPreviewFetchUpstream(name, systemId, key));
+    ready(result) ? result : ssPreviewFetchUpstream(name, systemId, key).catch(error => {
+      // A provider outage must not discard a previously known good match.
+      if (result) return result;
+      throw error;
+    }));
   const pending = work.finally(() => ssPreviewInflight.delete(key));
   ssPreviewInflight.set(key, pending);
   return pending;
 }
 
-// Authenticated ScreenScraper MP4 cache. Only the FIRST request downloads a
-// complete validated MP4; browsers' subsequent Range requests use the local file.
-// Do not send ScreenScraper credentials to the browser or store media in Postgres.
+// Authenticated, progressive media relay. Only metadata is cached in Postgres;
+// MP4 bytes are never buffered into a whole file or written to Render storage.
 function ssVideoHttpError(http, code, upstream = 0) {
   const error = new Error(code);
   error.status = http;
@@ -2548,29 +2766,9 @@ function ssVideoHttpError(http, code, upstream = 0) {
 function ssVideoKey(video) {
   return `${video.s}:${video.g}:${video.t}`;
 }
-function ssVideoRemove(key) {
-  const entry = ssVideoCache.get(key);
-  if (!entry) return;
-  ssVideoCache.delete(key);
-  ssVideoCacheBytes = Math.max(0, ssVideoCacheBytes - entry.size);
-  if (entry.readers > 0) { entry.removeAfterRead = true; return; }
-  ssVideoFs.promises.unlink(entry.file).catch(() => {});
-}
 function ssVideoPrune() {
-  const now = Date.now();
-  for (const [key, entry] of ssVideoCache) {
-    if (entry.expires <= now || !ssVideoFs.existsSync(entry.file)) ssVideoRemove(key);
-  }
-  for (const [key, entry] of ssVideoFailures) if (entry.until <= now) ssVideoFailures.delete(key);
-  for (const [key, entry] of ssVideoClients) if (entry.start + 600000 <= now) ssVideoClients.delete(key);
-}
-function ssVideoCached(key) {
-  ssVideoPrune();
-  const entry = ssVideoCache.get(key);
-  if (!entry) return null;
-  ssVideoCache.delete(key);
-  ssVideoCache.set(key, entry);
-  return entry;
+  const now=Date.now();
+  for (const [key,entry] of ssVideoFailures) if (entry.until<=now) ssVideoFailures.delete(key);
 }
 function ssVideoValidateUrl(raw) {
   let url;
@@ -2581,11 +2779,26 @@ function ssVideoValidateUrl(raw) {
   }
   return url;
 }
-async function ssVideoRequest(raw, signal, redirects = 0) {
+function ssVideoValidRange(value) {
+  if (!value) return '';
+  const str = String(value).trim();
+  const match = /^bytes=(\d*)-(\d*)$/.exec(str);
+  if (!match || (!match[1] && !match[2]) || str.length > 80) return null;
+  const start = match[1] ? Number(match[1]) : null;
+  const end = match[2] ? Number(match[2]) : null;
+  if ((start !== null && !Number.isSafeInteger(start)) ||
+      (end !== null && !Number.isSafeInteger(end)) ||
+      (start !== null && end !== null && end < start) ||
+      (start === null && end < 1)) return null;
+  return str;
+}
+async function ssVideoRequest(raw, signal, range = '', redirects = 0) {
   const url = ssVideoValidateUrl(raw);
+  const headers = {'User-Agent':'PSN-Content/1.0 ScreenScraper-Preview','Accept-Encoding':'identity'};
+  if (range) headers.Range = range;
   const response = await new Promise((resolve, reject) => {
-    const request = https.get(url, {signal, headers:{'User-Agent':'PSN-Content/1.0 ScreenScraper-Preview'}}, resolve);
-    request.on('error', reject);
+    const request = https.get(url, {signal, headers}, resolve);
+    request.on('error',reject);
     request.setTimeout(18000, () => request.destroy(new Error('video_upstream_timeout')));
   });
   const status = Number(response.statusCode) || 0;
@@ -2597,139 +2810,53 @@ async function ssVideoRequest(raw, signal, redirects = 0) {
     const destination = new URL(response.headers.location, url);
     ssVideoValidateUrl(destination.href);
     response.resume();
-    return ssVideoRequest(destination.href, signal, redirects + 1);
+    return ssVideoRequest(destination.href, signal, range, redirects + 1);
   }
-  if (status !== 200) {
+  if (status !== 200 && status !== 206) {
+    ssPreviewQuotaNoteRate(status);
     response.destroy();
-    throw ssVideoHttpError(status === 429 ? 429 : status === 404 ? 404 : 502, 'upstream_http', status);
+    throw ssVideoHttpError(status === 429 || status === 430 ? 429 :
+      status === 404 ? 404 : status === 416 ? 416 : 502, 'upstream_http', status);
   }
   const contentType = String(response.headers['content-type'] || '').toLowerCase();
   const declared = Number(response.headers['content-length'] || 0);
-  if ((contentType && /^(?:text\/|application\/(?:json|xml|javascript|xhtml))/i.test(contentType)) ||
-      declared > SS_PREVIEW_VIDEO_MAX_BYTES) {
+  if (response.headers['content-encoding'] && response.headers['content-encoding'] !== 'identity' ||
+      contentType && /^(?:text\/|application\/(?:json|xml|javascript|xhtml))/i.test(contentType) ||
+      !Number.isSafeInteger(declared) || declared > SS_PREVIEW_VIDEO_MAX_BYTES) {
     response.destroy();
     throw ssVideoHttpError(declared > SS_PREVIEW_VIDEO_MAX_BYTES ? 413 : 502,
       declared > SS_PREVIEW_VIDEO_MAX_BYTES ? 'video_too_large' : 'upstream_not_video', status);
   }
+  if (status === 206) {
+    const parsed = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(String(response.headers['content-range'] || ''));
+    const start = parsed && Number(parsed[1]), end = parsed && Number(parsed[2]);
+    const total = parsed && Number(parsed[3]);
+    const expected = /^bytes=(\d*)-(\d*)$/.exec(range);
+    if (!parsed || ![start,end,total].every(Number.isSafeInteger) ||
+        total <= 0 || total > SS_PREVIEW_VIDEO_MAX_BYTES || start > end || end >= total ||
+        (declared && declared !== end-start+1) ||
+        (expected && expected[1] && start !== Number(expected[1])) ||
+        (expected && expected[2] && expected[1] && end > Number(expected[2])) ||
+        (expected && !expected[1] && end !== total-1)) {
+      response.destroy();
+      throw ssVideoHttpError(502, 'upstream_invalid_range', status);
+    }
+  }
   return response;
 }
-function ssVideoRollWindows() {
-  const now = Date.now();
-  if (now - ssVideoMinuteStart >= 60000) {
-    ssVideoMinuteStart = now; ssVideoMinuteDownloads = 0;
-  }
-  if (now - ssVideoDayStart >= 86400000) {
-    ssVideoDayStart = now; ssVideoDayDownloads = 0; ssVideoDailyEgress = 0;
-  }
-}
-async function ssVideoDownload(video, key) {
-  ssVideoRollWindows();
-  if (ssVideoMinuteDownloads >= SS_PREVIEW_VIDEO_DOWNLOAD_MINUTE_MAX ||
-      ssVideoDayDownloads >= SS_PREVIEW_VIDEO_DOWNLOAD_DAILY_MAX) {
-    throw ssVideoHttpError(429, 'download_quota_reached');
-  }
-  ssVideoMinuteDownloads++;
-  ssVideoDayDownloads++;
-  ssVideoActive++;
-  const upstreamUrl = new URL(`https://${video.h || 'api.screenscraper.fr'}/api2/mediaVideoJeu.php`);
-  upstreamUrl.searchParams.set('devid', SS_PREVIEW_DEVID);
-  upstreamUrl.searchParams.set('devpassword', SS_PREVIEW_DEVPASSWORD);
-  upstreamUrl.searchParams.set('softname', 'PSN-Content');
-  upstreamUrl.searchParams.set('systemeid', String(video.s));
-  upstreamUrl.searchParams.set('jeuid', String(video.g));
-  upstreamUrl.searchParams.set('media', video.t);
+function ssVideoUpstreamUrl(video) {
+  const url = new URL(`https://${video.h || 'api.screenscraper.fr'}/api2/mediaVideoJeu.php`);
+  url.searchParams.set('devid', SS_PREVIEW_DEVID);
+  url.searchParams.set('devpassword', SS_PREVIEW_DEVPASSWORD);
+  url.searchParams.set('softname','PSN-Content');
+  url.searchParams.set('systemeid',String(video.s));
+  url.searchParams.set('jeuid',String(video.g));
+  url.searchParams.set('media',video.t);
   if (SS_PREVIEW_USER && SS_PREVIEW_PASSWORD) {
-    upstreamUrl.searchParams.set('ssid', SS_PREVIEW_USER);
-    upstreamUrl.searchParams.set('sspassword', SS_PREVIEW_PASSWORD);
+    url.searchParams.set('ssid',SS_PREVIEW_USER);
+    url.searchParams.set('sspassword',SS_PREVIEW_PASSWORD);
   }
-  let file = '';
-  const controller = new AbortController();
-  const deadline = setTimeout(() => controller.abort(), 50000);
-  try {
-    await ssVideoFs.promises.mkdir(ssVideoDir, {recursive:true, mode:0o700});
-    // Random suffix prevents different downloads from sharing a temporary file.
-    file = ssVideoPath.join(ssVideoDir, crypto.randomBytes(12).toString('hex') + '.part');
-    const response = await ssVideoRequest(upstreamUrl.href, controller.signal);
-    let size = 0;
-    let signature = Buffer.alloc(0);
-    let validated = false;
-    const filter = new SsVideoTransform({transform(chunk, encoding, callback) {
-      size += chunk.length;
-      if (size > SS_PREVIEW_VIDEO_MAX_BYTES) {
-        callback(ssVideoHttpError(413, 'video_too_large', 200)); return;
-      }
-      if (!validated) {
-        signature = Buffer.concat([signature, chunk.subarray(0, Math.max(0, 16 - signature.length))]);
-        if (signature.length >= 12) {
-          if (signature.toString('ascii', 4, 8) !== 'ftyp') {
-            callback(ssVideoHttpError(502, 'upstream_invalid_mp4', 200)); return;
-          }
-          validated = true;
-        }
-      }
-      callback(null, chunk);
-    }});
-    await ssVideoPipeline(response, filter, ssVideoFs.createWriteStream(file, {flags:'wx', mode:0o600}));
-    if (!validated || size < 64) throw ssVideoHttpError(502, 'upstream_empty_or_invalid_mp4', 200);
-    // The file is complete before it becomes visible to readers.
-    while (ssVideoCacheBytes + size > SS_PREVIEW_VIDEO_CACHE_MAX_BYTES && ssVideoCache.size) {
-      ssVideoRemove(ssVideoCache.keys().next().value);
-    }
-    const readyFile = file.replace(/\.part$/, '.mp4');
-    await ssVideoFs.promises.rename(file, readyFile);
-    file = '';
-    const entry = {file: readyFile, size, expires: Date.now() + SS_PREVIEW_VIDEO_CACHE_MS,
-      readers:0, removeAfterRead:false};
-    ssVideoCache.set(key, entry);
-    ssVideoCacheBytes += size;
-    return entry;
-  } catch (error) {
-    if (file) await ssVideoFs.promises.unlink(file).catch(() => {});
-    if (error && (error.name === 'AbortError' || error.message === 'video_upstream_timeout'))
-      throw ssVideoHttpError(504, 'video_upstream_timeout');
-    if (error && error.code && error.status) throw error;
-    throw ssVideoHttpError(502, 'video_download_failed');
-  } finally {
-    clearTimeout(deadline);
-    ssVideoActive--;
-  }
-}
-async function ssVideoGetOrDownload(video) {
-  const key = ssVideoKey(video);
-  const cached = ssVideoCached(key);
-  if (cached) return cached;
-  const failure = ssVideoFailures.get(key);
-  if (failure && failure.until > Date.now()) throw failure.error;
-  const existing = ssVideoInflight.get(key);
-  if (existing) return existing;
-  if (ssVideoQueued >= 3) throw ssVideoHttpError(429, 'video_download_queue_full');
-  ssVideoQueued++;
-  const work = ssVideoQueueTail.then(() => ssVideoDownload(video, key));
-  ssVideoQueueTail = work.catch(() => {});
-  const pending = work.catch(error => {
-    ssVideoFailures.set(key, {error, until:Date.now() + (error.upstreamStatus === 429 ? 120000 :
-      [401,403].includes(error.upstreamStatus) ? 300000 : 30000)});
-    throw error;
-  }).finally(() => {ssVideoQueued--; ssVideoInflight.delete(key);});
-  ssVideoInflight.set(key, pending);
-  return pending;
-}
-function ssVideoRange(header, size) {
-  if (!header) return {start:0, end:size-1, partial:false};
-  const match = /^bytes=(\d*)-(\d*)$/.exec(String(header).trim());
-  if (!match || (!match[1] && !match[2])) return null;
-  let start, end;
-  if (!match[1]) {
-    const count = Number(match[2]);
-    if (!Number.isSafeInteger(count) || count < 1) return null;
-    start = Math.max(0, size - count); end = size - 1;
-  } else {
-    start = Number(match[1]);
-    end = match[2] ? Number(match[2]) : size - 1;
-    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start >= size || end < start) return null;
-    end = Math.min(size - 1, end);
-  }
-  return {start,end,partial:true};
+  return url.href;
 }
 app.options('/api/gameplay-video', (req,res) => {
   setMetadataCors(res);
@@ -2740,65 +2867,149 @@ app.get('/api/gameplay-video', async (req,res) => {
   setMetadataCors(res);
   res.setHeader('Access-Control-Expose-Headers',
     'Content-Type, Content-Range, Content-Length, X-PSN-Video-Error, X-PSN-Video-Upstream, X-PSN-Video-Cache');
-  res.setHeader('Cache-Control','private, max-age=180');
+  res.setHeader('Cache-Control','no-store');
   const fail = (status, reason, upstreamStatus = 0) => {
     if (res.headersSent || res.destroyed) return;
+    // An upstream rejection may occur after provisional video headers were set.
+    for (const header of ['Content-Length','Content-Range','Accept-Ranges','ETag','X-PSN-Video-Cache'])
+      res.removeHeader(header);
     res.setHeader('Cache-Control','no-store');
     res.setHeader('X-PSN-Video-Error',reason);
-    if (status === 429) res.setHeader('Retry-After','60');
-    if (upstreamStatus) res.setHeader('X-PSN-Video-Upstream', String(upstreamStatus));
+    if (status === 429 || status === 503) {
+      res.setHeader('Retry-After',String(Math.min(3600,Math.max(2,ssPreviewQuota.blockedUntil>Date.now()?Math.ceil((ssPreviewQuota.blockedUntil-Date.now())/1000):60))));
+      ssVideoLogLimit(reason);
+    }
+    if (upstreamStatus) res.setHeader('X-PSN-Video-Upstream',String(upstreamStatus));
     res.status(status).end();
   };
   const video = ssPreviewVerifyVideoToken(req.query && req.query.token);
   if (!video || !SS_PREVIEW_ENABLED) return fail(403, 'invalid_or_expired_token');
-  const isCached = !!ssVideoCached(ssVideoKey(video));
-  let entry;
-  try { entry = await ssVideoGetOrDownload(video); }
-  catch (error) {return fail(error.status || 502, error.code || 'video_download_failed',error.upstreamStatus || 0);}
-  if (res.destroyed) return;
-  const range = ssVideoRange(req.get('range'), entry.size);
-  if (!range) {
-    res.setHeader('Content-Range',`bytes */${entry.size}`);
-    return fail(416, 'unsupported_range');
+  const range = ssVideoValidRange(req.get('range'));
+  if (range === null) return fail(416,'unsupported_range');
+  ssVideoPrune();
+  const key = ssVideoKey(video);
+  const failure = ssVideoFailures.get(key);
+  if (failure && failure.until > Date.now()) return fail(failure.error.status || 502,
+    failure.error.code || 'upstream_unavailable',failure.error.upstreamStatus || 0);
+  // A short wait is preferable to a 429 burst when switching hover cards.
+  if(ssVideoActive>=3) {
+    let closed=false;
+    const onClose=()=>{closed=true;};
+    res.once('close',onClose);
+    const until=Date.now()+3500;
+    while(!closed && !res.destroyed && ssVideoActive>=3 && Date.now()<until)
+      await new Promise(resolve=>setTimeout(resolve,100));
+    res.off('close',onClose);
+    if(closed||res.destroyed)return;
+    if(ssVideoActive>=3)return fail(503,'video_stream_busy');
   }
-  const length = range.end - range.start + 1;
-  ssVideoRollWindows();
-  const ip = String(req.ip || req.socket.remoteAddress || 'unknown');
-  let client = ssVideoClients.get(ip);
-  if (!client || Date.now() - client.start >= 600000) {
-    client = {start:Date.now(),bytes:0}; ssVideoClients.set(ip,client);
-  }
-  // Account conservatively before streaming, so repeated Range requests stay bounded.
-  if (req.method !== 'HEAD' && (ssVideoDailyEgress + length > SS_PREVIEW_VIDEO_EGRESS_DAILY_MAX_BYTES ||
-      client.bytes + length > SS_PREVIEW_VIDEO_IP_WINDOW_BYTES)) {
-    return fail(429, 'video_bandwidth_limit');
-  }
-  if (req.method !== 'HEAD') {
-    ssVideoDailyEgress += length;
-    client.bytes += length;
-  }
-  res.setHeader('Content-Type','video/mp4');
-  res.setHeader('Accept-Ranges','bytes');
-  res.setHeader('Content-Length',String(length));
-  res.setHeader('X-PSN-Video-Cache',isCached ? 'HIT' : 'MISS');
-  if (range.partial) {
-    res.status(206);
-    res.setHeader('Content-Range',`bytes ${range.start}-${range.end}/${entry.size}`);
-  } else res.status(200);
-  if (req.method === 'HEAD') return res.end();
-  entry.readers++;
-  const media = ssVideoFs.createReadStream(entry.file,{start:range.start,end:range.end});
-  let finished = false;
-  const close = () => {
-    if (finished) return;
-    finished = true;
-    entry.readers--;
-    if (entry.removeAfterRead && entry.readers === 0) ssVideoFs.promises.unlink(entry.file).catch(() => {});
+  ssVideoActive++;
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(),120000);
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    clearTimeout(deadline);
+    ssVideoActive--;
   };
-  media.on('error', () => {close(); if (!res.headersSent) fail(502, 'video_cache_read_error'); else res.destroy();});
-  media.on('close',close);
-  res.on('close', () => {media.destroy();close();});
-  media.pipe(res);
+  res.once('close',()=>{controller.abort();release();});
+  try {
+    await ssPreviewMaybeRefreshQuota();
+    if (res.destroyed) return;
+    const mediaUrl = ssVideoUpstreamUrl(video);
+    let upstream;
+    let releaseProvider=await ssProviderAcquire('video',controller.signal);
+    try {
+      ssPreviewQuotaReserve();
+      upstream = await ssVideoRequest(mediaUrl,controller.signal,range);
+    } catch (error) {
+      releaseProvider();
+      // Some ScreenScraper nodes reject Range; try one full stream without buffering.
+      if (!range || ![403,416].includes(Number(error && error.upstreamStatus))) throw error;
+      releaseProvider=await ssProviderAcquire('video',controller.signal);
+      try {
+        ssPreviewQuotaReserve();
+        upstream=await ssVideoRequest(mediaUrl,controller.signal,'');
+      } catch (second) {releaseProvider();throw second;}
+    }
+    upstream.once('close',releaseProvider);
+    res.once('close',releaseProvider);
+    if (res.destroyed) {upstream.destroy();return;}
+    const length = Number(upstream.headers['content-length'] || 0);
+    const upstreamPartial = upstream.statusCode === 206;
+    // A server that ignores Range is allowed to return HTTP 200. Never invent
+    // a partial Content-Range if the actual bytes are the entire file.
+    res.status(upstreamPartial ? 206 : 200);
+    res.setHeader('Content-Type','video/mp4');
+    if (length) res.setHeader('Content-Length',String(length));
+    if (upstreamPartial) {
+      res.setHeader('Accept-Ranges','bytes');
+      res.setHeader('Content-Range',String(upstream.headers['content-range']));
+    }
+    res.setHeader('Cache-Control','private, max-age=86400');
+    // Same token identifies the same day's media for browser partial caching.
+    res.setHeader('ETag','"psn-'+crypto.createHash('sha256').update(String(req.query.token)).digest('hex').slice(0,24)+'"');
+    res.setHeader('X-PSN-Video-Cache','STREAM');
+    let size = 0;
+    let prefix = Buffer.alloc(0);
+    const partialStart = upstreamPartial ? /^bytes (\d+)-(\d+)\//.exec(String(upstream.headers['content-range'])) : null;
+    const checkSignature = !upstreamPartial || (partialStart && Number(partialStart[1]) === 0 && Number(partialStart[2]) >= 11);
+    let validated = !checkSignature;
+    const filter = new SsVideoTransform({transform(chunk,encoding,callback) {
+      let data = chunk;
+      if (!validated) {
+        if (prefix.length + chunk.length < 12) {
+          prefix = Buffer.concat([prefix,chunk]);
+          callback();return;
+        }
+        data = prefix.length ? Buffer.concat([prefix,chunk]) : chunk;
+        prefix = Buffer.alloc(0);
+        if (data.toString('ascii',4,8) !== 'ftyp') {
+          callback(ssVideoHttpError(502,'upstream_invalid_mp4',upstream.statusCode));return;
+        }
+        validated = true;
+      }
+      size += data.length;
+      if (size > SS_PREVIEW_VIDEO_MAX_BYTES) {
+        callback(ssVideoHttpError(413,'video_too_large',upstream.statusCode));return;
+      }
+      callback(null,data);
+    },flush(callback) {
+      if (!validated) callback(ssVideoHttpError(502,'upstream_invalid_mp4',upstream.statusCode));
+      else callback();
+    }});
+    const onError = error => {
+      upstream.destroy();
+      filter.destroy();
+      release();
+      if (!res.headersSent) fail(error?.status || 502,error?.code || 'video_stream_failed',error?.upstreamStatus || 0);
+      else res.destroy();
+    };
+    filter.once('error',onError);
+    upstream.once('error',onError);
+    res.once('close',()=>{upstream.destroy();filter.destroy();});
+    upstream.pipe(filter).pipe(res);
+  } catch (error) {
+    release();
+    if (res.destroyed) return;
+    if (error && (error.name === 'AbortError' || error.message === 'video_upstream_timeout'))
+      return fail(504,'video_upstream_timeout');
+    if ([404,410].includes(Number(error && error.upstreamStatus))) {
+      // Genuine missing media revalidates saved IDs; transient errors do not.
+      for (const [cacheKey,entry] of ssPreviewCache) {
+        if (entry?.payload?.video?.gameId === video.g && entry.payload.video.system === video.s)
+          ssPreviewCache.delete(cacheKey);
+      }
+      pool.query('DELETE FROM screenscraper_game_cache WHERE game_id=$1 AND (system_id=$2 OR system_id=0)',
+        [video.g,video.s]).catch(()=>{});
+    }
+    if (error && error.code !== 'provider_cooldown' &&
+        ![429,430].includes(Number(error.upstreamStatus)) && error.name !== 'AbortError')
+      ssVideoFailures.set(key,{error,until:Date.now()+(error?.upstreamStatus === 429 ? 120000 :
+        [401,403].includes(error?.upstreamStatus) ? 300000 : 30000)});
+    fail(error?.status || 502,error?.code || 'video_stream_failed',error?.upstreamStatus || 0);
+  }
 });
 
 app.options('/api/gameplay-preview', (req, res) => { setMetadataCors(res); res.status(204).end(); });
@@ -2807,8 +3018,9 @@ app.get('/api/gameplay-preview', async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   if (!SS_PREVIEW_ENABLED) return res.status(503).json({ ok:false, configured:false });
   const name = String(req.query && req.query.name || '').trim().slice(0, 140);
-  const systemId = Number(req.query && req.query.system);
-  if (name.length < 3 || !SS_PREVIEW_SYSTEM_IDS.has(systemId) || !normalizeSsPreviewTitle(name)) {
+  const isPort = String(req.query && req.query.port || '') === '1';
+  const systemId = isPort ? 0 : Number(req.query && req.query.system);
+  if (name.length < 3 || (!isPort && !SS_PREVIEW_SYSTEM_IDS.has(systemId)) || !normalizeSsPreviewTitle(name)) {
     return res.status(400).json({ ok:false, error:'Invalid game or system.' });
   }
   try {
@@ -2818,8 +3030,10 @@ app.get('/api/gameplay-preview', async (req, res) => {
       fallbackUrl:`/api/gameplay-video?token=${ssPreviewVideoToken(result.video)}`,provider:'screenscraper'});
   } catch (error) {
     // Keep provider secrets and raw API URLs out of logs and client responses.
-    const reason = ['api_auth','api_rate_limit','api_unavailable','api_rejected','local_rate_limit','local_queue_full'].includes(error && error.code) ? error.code : 'api_unavailable';
-    return res.status(error && error.status === 429 ? 429 : 502).json({ ok:false, configured:true, retry:true, reason, upstreamStatus:Number(error && error.upstreamStatus) || 0 });
+    const reason = ['api_auth','api_rate_limit','api_unavailable','api_rejected','provider_cooldown','provider_queue_full'].includes(error && error.code) ? error.code : 'api_unavailable';
+    if(error?.status===429||error?.status===503)
+      res.setHeader('Retry-After',String(Math.min(3600,Math.max(2,Number(error.retryAfter)||60))));
+    return res.status([429,503].includes(Number(error?.status)) ? error.status : 502).json({ ok:false, configured:true, retry:true, reason, upstreamStatus:Number(error && error.upstreamStatus) || 0 });
   }
 });
 
@@ -2829,26 +3043,29 @@ app.get('/api/screenscraper-extras', async (req,res) => {
   res.setHeader('Cache-Control','private,max-age=120');
   if (!SS_PREVIEW_ENABLED) return res.status(503).json({ok:false,reason:'not_configured'});
   const name = String(req.query && req.query.name || '').trim().slice(0,140);
-  const system = Number(req.query && req.query.system);
-  if (!SS_PREVIEW_SYSTEM_IDS.has(system) || name.length < 3 || !normalizeSsPreviewTitle(name)) return res.status(400).json({ok:false});
+  const isPort = String(req.query && req.query.port || '') === '1';
+  const system = isPort ? 0 : Number(req.query && req.query.system);
+  if ((!isPort && !SS_PREVIEW_SYSTEM_IDS.has(system)) || name.length < 3 || !normalizeSsPreviewTitle(name)) return res.status(400).json({ok:false});
   try {
-    const result = await ssPreviewLookup(name,system);
+    const result = await ssPreviewLookup(name,system,{englishSummary:true,artwork:true});
     return res.json({ok:true,found:!!result.extras,extras:ssExtraPublic(result.extras)});
-  } catch (e) {return res.status(e.status === 429 ? 429 : 502).json({ok:false,reason:e.code || 'unavailable'});}
+  } catch (e) {if([429,503].includes(Number(e?.status)))res.setHeader('Retry-After',String(Math.min(3600,Math.max(2,Number(e.retryAfter)||60))));return res.status([429,503].includes(Number(e?.status)) ? e.status : 502).json({ok:false,reason:e.code || 'unavailable'});}
 });
 
 // Small bounded RAM cache for supplemental artwork, never database, never untrusted upstream hosts.
 async function ssExtraFetchLimited(data) {
-  if (ssExtraImageActive >= 2) {
+  // Reserve the released slot for the next waiter so concurrent arrivals
+  // never exceed the two-download limit on ScreenScraper.
+  if (ssExtraImageActive < 2) ssExtraImageActive++;
+  else {
     if (ssExtraImageWaiters.length >= 10) throw new Error('image_queue_full');
     await new Promise(resolve => ssExtraImageWaiters.push(resolve));
   }
-  ssExtraImageActive++;
   try {return await ssExtraFetchImage(data);}
   finally {
-    ssExtraImageActive--;
     const next=ssExtraImageWaiters.shift();
     if (next) next();
+    else ssExtraImageActive--;
   }
 }
 async function ssExtraFetchImage(data) {
@@ -2867,14 +3084,20 @@ async function ssExtraFetchImage(data) {
   const controller=new AbortController();
   const timer=setTimeout(()=>controller.abort(),18000);
   try {
-    const response=await ssVideoRequestImage(url.href,controller.signal);
-    const chunks=[]; let size=0;
-    for await (const chunk of response) {
-      size += chunk.length;
-      if (size > 4 * 1024 * 1024) {response.destroy();throw new Error('image_too_large');}
-      chunks.push(chunk);
-    }
-    const body=Buffer.concat(chunks);
+    await ssPreviewMaybeRefreshQuota();
+    const release=await ssProviderAcquire('image',controller.signal);
+    let body;
+    try {
+      ssPreviewQuotaReserve('image');
+      const response=await ssVideoRequestImage(url.href,controller.signal);
+      const chunks=[]; let size=0;
+      for await (const chunk of response) {
+        size += chunk.length;
+        if (size > 4 * 1024 * 1024) {response.destroy();throw new Error('image_too_large');}
+        chunks.push(chunk);
+      }
+      body=Buffer.concat(chunks);
+    } finally {release();}
     const isJpeg=body[0]===0xff&&body[1]===0xd8;
     const isPng=body.subarray(1,4).toString('ascii')==='PNG';
     const isWebp=body.subarray(8,12).toString('ascii')==='WEBP';
@@ -2882,7 +3105,7 @@ async function ssExtraFetchImage(data) {
     return {body,type:isJpeg?'image/jpeg':isPng?'image/png':'image/webp'};
   } finally {clearTimeout(timer);}
 }
-async function ssVideoRequestImage(raw,signal,redirects=0) {
+async function ssVideoRequestImage(raw,signal,redirects=0,maxBytes=4*1024*1024) {
   const url=ssVideoValidateUrl(raw);
   const response=await new Promise((resolve,reject)=>{
     const r=https.get(url,{signal,headers:{'User-Agent':'PSN-Content/1.0'}},resolve);
@@ -2892,13 +3115,15 @@ async function ssVideoRequestImage(raw,signal,redirects=0) {
   if ([301,302,303,307,308].includes(status)) {
     if (redirects>=4||!response.headers.location) {response.destroy();throw new Error('image_redirect');}
     const next=new URL(response.headers.location,url).href;
-    ssVideoValidateUrl(next);response.resume();return ssVideoRequestImage(next,signal,redirects+1);
+    ssVideoValidateUrl(next);response.resume();return ssVideoRequestImage(next,signal,redirects+1,maxBytes);
   }
-  if (status!==200) {response.destroy();throw new Error('image_upstream_'+status);}
-  if (Number(response.headers['content-length']||0)>4*1024*1024) {response.destroy();throw new Error('image_too_large');}
+  if (status!==200) {ssPreviewQuotaNoteRate(status);response.destroy();throw new Error('image_upstream_'+status);}
+  if (Number(response.headers['content-length']||0)>maxBytes) {response.destroy();throw new Error('image_too_large');}
   return response;
 }
+app.options('/api/screenscraper-manual',(req,res)=>{setMetadataCors(res);res.status(204).end();});
 app.get('/api/screenscraper-manual',async(req,res)=>{
+  setMetadataCors(res);
   const data=ssExtraVerifyToken(req.query&&req.query.token);
   if(!data||!['manual','manuel'].includes(data.t)||!SS_PREVIEW_ENABLED)return res.status(403).end();
   const url=new URL('https://api.screenscraper.fr/api2/mediaManuelJeu.php');
@@ -2911,10 +3136,16 @@ app.get('/api/screenscraper-manual',async(req,res)=>{
   if(SS_PREVIEW_USER && SS_PREVIEW_PASSWORD){url.searchParams.set('ssid',SS_PREVIEW_USER);url.searchParams.set('sspassword',SS_PREVIEW_PASSWORD);}
   const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),18000);
   try {
-    const upstream=await ssVideoRequestImage(url.href,controller.signal);
-    let size=0;const parts=[];
-    for await(const chunk of upstream){size+=chunk.length;if(size>9*1024*1024){upstream.destroy();throw Error('pdf_too_large');}parts.push(chunk);}
-    const pdf=Buffer.concat(parts);
+    await ssPreviewMaybeRefreshQuota();
+    const release=await ssProviderAcquire('image',controller.signal);
+    let pdf;
+    try {
+      ssPreviewQuotaReserve('image');
+      const upstream=await ssVideoRequestImage(url.href,controller.signal,0,9*1024*1024);
+      let size=0;const parts=[];
+      for await(const chunk of upstream){size+=chunk.length;if(size>9*1024*1024){upstream.destroy();throw Error('pdf_too_large');}parts.push(chunk);}
+      pdf=Buffer.concat(parts);
+    } finally {release();}
     if(pdf.subarray(0,5).toString('ascii')!=='%PDF-')throw Error('not_pdf');
     res.setHeader('Content-Type','application/pdf');
     res.setHeader('Content-Disposition','inline; filename="screenscraper-manual.pdf"');
@@ -2924,12 +3155,21 @@ app.get('/api/screenscraper-manual',async(req,res)=>{
   }catch(_){return res.status(404).end();}
   finally{clearTimeout(timer);}
 });
+app.options('/api/screenscraper-image',(req,res)=>{setMetadataCors(res);res.status(204).end();});
 app.get('/api/screenscraper-image',async(req,res)=>{
+  setMetadataCors(res);
+  res.setHeader('Access-Control-Expose-Headers','Retry-After');
   const data=ssExtraVerifyToken(req.query&&req.query.token);
   if (!data||!SS_PREVIEW_ENABLED) return res.status(403).end();
   const key=`${data.s}:${data.g}:${data.t}:${data.r}`;
   let cached=ssExtraImageCache.get(key);
   if(cached&&cached.until<Date.now()) {ssExtraImageCache.delete(key);ssExtraImageBytes-=cached.body.length;cached=null;}
+  if (cached) {
+    // Sliding one-hour TTL: popular artwork stays warm without increasing the RAM limit.
+    cached.until = Date.now() + SS_EXTRA_IMAGE_TTL_MS;
+    ssExtraImageCache.delete(key);
+    ssExtraImageCache.set(key,cached);
+  }
   if (!cached) {
     try {
       let pending=ssExtraImagePending.get(key);
@@ -2943,12 +3183,17 @@ app.get('/api/screenscraper-image',async(req,res)=>{
           const oldest=ssExtraImageCache.keys().next().value;
           ssExtraImageBytes-=ssExtraImageCache.get(oldest).body.length;ssExtraImageCache.delete(oldest);
         }
-        ssExtraImageCache.set(key,{...cached,until:Date.now()+15*60*1000});
+        ssExtraImageCache.set(key,{...cached,until:Date.now()+SS_EXTRA_IMAGE_TTL_MS});
         ssExtraImageBytes+=cached.body.length;
       }
-    } catch (_) {return res.status(404).end();}
+    } catch (error) {
+      const limited=error?.code==='provider_cooldown'||error?.message==='image_upstream_429'||error?.message==='image_upstream_430';
+      const busy=error?.message==='image_queue_full'||error?.code==='provider_queue_full';
+      if(limited||busy)res.setHeader('Retry-After',String(busy?5:Math.min(3600,Math.max(2,Number(error.retryAfter)||60))));
+      return res.status(limited?429:busy?503:404).end();
+    }
   }
-  res.setHeader('Cache-Control','private,max-age=900');
+  res.setHeader('Cache-Control','private,max-age=3600');
   res.setHeader('Content-Type',cached.type);
   res.setHeader('X-Content-Type-Options','nosniff');
   return res.send(cached.body);
@@ -3888,6 +4133,10 @@ async function initDb() {
       refreshed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       expires_at TIMESTAMPTZ NOT NULL
     );
+    -- Preserve previously cached, confirmed video matches on upgrade, too.
+    UPDATE screenscraper_game_cache SET expires_at='infinity'::timestamptz
+      WHERE media_type IN ('video','video-normalized')
+        AND expires_at <> 'infinity'::timestamptz;
     CREATE TABLE IF NOT EXISTS content_metadata_suggestions (
       id BIGSERIAL PRIMARY KEY,
       metadata_key TEXT NOT NULL,
