@@ -120365,7 +120365,11 @@ function getVisibleChatStackEl(id) {
     if(Date.now()<lookupBlockedUntil)return Promise.resolve({ok:false,reason:'rate_limited'});
     const promise=fetch(base()+'/api/gameplay-preview?name='+encodeURIComponent(info.name)+'&system='+info.system+(info.isPort?'&port=1':'')+(info.isMinis?'&minis=1':''),{cache:'no-store'})
       .then(async response=>{
-        if(response.status===429){lookupBlockedUntil=Date.now()+Math.min(120000,Math.max(10000,(Number(response.headers.get('Retry-After'))||60)*1000));return {ok:false,data:{ok:false,reason:'rate_limited'}};}
+        if(response.status===429||response.status===503){
+          const retrySeconds=Number(response.headers.get('Retry-After'))||(response.status===429?60:5);
+          lookupBlockedUntil=Math.max(lookupBlockedUntil,Date.now()+Math.min(120000,Math.max(response.status===429?10000:5000,retrySeconds*1000)));
+          return {ok:false,data:{ok:false,reason:response.status===429?'rate_limited':'api_unavailable'}};
+        }
         const data=await response.json().catch(()=>null);
         return {ok:response.ok,data:response.ok?data:{ok:false,reason:data?.reason||'api_unavailable'}};
       })
@@ -120377,7 +120381,10 @@ function getVisibleChatStackEl(id) {
           return data;
         }
         return data||{ok:false,reason:'api_unavailable'};
-      }).catch(()=>({ok:false,reason:'network_error'})).finally(()=>pending.delete(info.key));
+      }).catch(()=>{
+        lookupBlockedUntil=Math.max(lookupBlockedUntil,Date.now()+5000);
+        return {ok:false,reason:'network_error'};
+      }).finally(()=>pending.delete(info.key));
     pending.set(info.key,promise);return promise;
   }
   function validProxy(raw) {
