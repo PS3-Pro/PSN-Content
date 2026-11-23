@@ -15,7 +15,7 @@ const { monitorEventLoopDelay, performance } = require('node:perf_hooks');
 
 const app = express();
 app.use((req, res, next) => {
-  if (req.method !== 'GET' || !req.path.startsWith('/api/metadata/')) return next();
+  if (req.method !== 'GET' || (!req.path.startsWith('/api/metadata/') && req.path !== '/api/game-trophies/cache')) return next();
   const gzipPreference = String(req.headers['accept-encoding'] || '').split(',')
     .map(item => item.trim().split(';').map(part => part.trim()))
     .find(parts => parts[0].toLowerCase() === 'gzip');
@@ -3010,6 +3010,127 @@ app.get('/api/gameplay-video', async (req,res) => {
   }
 });
 
+const gameTrophyCacheMemory = new Map();
+const gameTrophyCacheReads = new Map();
+let gameTrophyCacheMemoryBytes = 0;
+const gameTrophyCacheWriteRates = new Map();
+let gameTrophyCacheLastPruneAt = 0;
+function normalizeGameTrophyCacheTitle(value) {
+  return String(value || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[™®©]/g, '').replace(/\b(full game|demo|trial|psn|pkg|digital|version|edition)\b/g, ' ')
+    .replace(/\[[^\]]*\]/g, ' ').replace(/\([^)]*(?:usa|europe|japan|asia|region|psn|pkg|demo)[^)]*\)/g, ' ')
+    .replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 150);
+}
+function deleteGameTrophyCacheMemory(key) {
+  const old = gameTrophyCacheMemory.get(key);
+  if (old) gameTrophyCacheMemoryBytes = Math.max(0, gameTrophyCacheMemoryBytes - old.bytes);
+  gameTrophyCacheMemory.delete(key);
+}
+function setGameTrophyCacheMemory(key, value) {
+  deleteGameTrophyCacheMemory(key);
+  const bytes = Buffer.byteLength(JSON.stringify(value));
+  if (bytes > 240000) return;
+  gameTrophyCacheMemory.set(key, {value, at:Date.now(), bytes});
+  gameTrophyCacheMemoryBytes += bytes;
+  while (gameTrophyCacheMemory.size > 200 || gameTrophyCacheMemoryBytes > 5*1024*1024)
+    deleteGameTrophyCacheMemory(gameTrophyCacheMemory.keys().next().value);
+}
+function gameTrophyCacheCors(req, res) {
+  const origin = String(req.headers.origin || '');
+  if (origin === 'https://ps3-pro.github.io' || /^http:\/\/(?:localhost|127\.0\.0\.1)(?::\d{1,5})?$/.test(origin))
+    res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Cache-Control', 'no-store');
+}
+app.options('/api/game-trophies/cache', (req,res) => { gameTrophyCacheCors(req,res); res.status(204).end(); });
+app.get('/api/game-trophies/cache', async (req,res) => {
+  gameTrophyCacheCors(req,res);
+  const title = normalizeGameTrophyCacheTitle(req.query && req.query.title);
+  if (req.query.platform !== 'ps3' || title.length < 3) return res.status(400).json({ok:false});
+  const key = 'ps3|' + title;
+  const memory = gameTrophyCacheMemory.get(key);
+  if (memory && Date.now()-memory.at < (memory.value.known ? 5*60*1000 : 30*1000)) return res.json({ok:true,...memory.value});
+  let pending = gameTrophyCacheReads.get(key);
+  if (!pending) {
+    pending = pool.query({
+      text:'SELECT has_trophies,game_data FROM game_trophy_cache WHERE platform=$1 AND title_norm=$2 AND expires_at>NOW() LIMIT 1',
+      values:['ps3',title],query_timeout:1500
+    }).then(result => {
+      const row=result.rows[0];
+      const value=row ? {known:true,hasTrophies:row.has_trophies===true,game:row.has_trophies===true?row.game_data:null} : {known:false};
+      const newer=gameTrophyCacheMemory.get(key);
+      if (newer && newer.value.known && !value.known) return newer.value;
+      setGameTrophyCacheMemory(key,value);
+      return value;
+    }).finally(()=>gameTrophyCacheReads.delete(key));
+    gameTrophyCacheReads.set(key,pending);
+  }
+  try { const value=await pending; return res.json({ok:true,...value}); }
+  catch(err) { return res.status(503).json({ok:false,known:false}); }
+});
+function isGameTrophyMatchTitle(localTitle, remoteTitle) {
+  return !!localTitle && localTitle === remoteTitle;
+}
+function sanitizedGameTrophyRecord(data, localTitle) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+  const id = String(data.npCommunicationId || '');
+  const title = String(data.title || '').slice(0,180);
+  const platform = String(data.platform || '').slice(0,60);
+  const trophies = data.trophies;
+  if (!/^NPWR\d{4,8}(?:_00)?$/.test(id) || !/ps3|playstation 3/i.test(platform)
+    || !isGameTrophyMatchTitle(localTitle,normalizeGameTrophyCacheTitle(title))
+    || !Array.isArray(trophies) || !trophies.length || trophies.length>500) return null;
+  const tidy = (value,max) => String(value ?? '').slice(0,max);
+  const parsed = trophies.map(trophy => {
+    if (!trophy || typeof trophy !== 'object' || Array.isArray(trophy)) return null;
+    return {t:tidy(trophy.t || trophy.trophyType,16),n:tidy(trophy.n || trophy.trophyName,220),
+      d:tidy(trophy.d || trophy.trophyDetail || trophy.description,700),
+      i:tidy(trophy.i || trophy.trophyIconUrl || trophy.trophyIconPath || trophy.icon,550),
+      h:Number(trophy.h || trophy.hidden || 0) === 1 ? 1 : 0};
+  });
+  if (parsed.some(t => !t || !t.n)) return null;
+  const result = {npCommunicationId:id,title,platform,trophySetVersion:tidy(data.trophySetVersion,24),
+    totalItemCount:parsed.length,iconKey:tidy(data.iconKey,130),isPS5:false,isSample:id === 'NPWR20790',trophies:parsed};
+  return Buffer.byteLength(JSON.stringify(result)) <= 225000 ? result : null;
+}
+app.post('/api/game-trophies/cache',express.json({limit:'240kb'}),async (req,res) => {
+  gameTrophyCacheCors(req,res);
+  const origin = String(req.headers.origin || '');
+  if (origin !== 'https://ps3-pro.github.io' && !/^http:\/\/(?:localhost|127\.0\.0\.1)(?::\d{1,5})?$/.test(origin))
+    return res.status(403).json({ok:false});
+  const now=Date.now(), ip=String(req.ip||'unknown');
+  for (const [key,value] of gameTrophyCacheWriteRates) if (now-value.at>60000) gameTrophyCacheWriteRates.delete(key);
+  const rate=gameTrophyCacheWriteRates.get(ip)||{at:now,count:0};
+  if (rate.count>=150) return res.status(429).json({ok:false});
+  rate.count++;gameTrophyCacheWriteRates.set(ip,rate);
+  const title=normalizeGameTrophyCacheTitle(req.body && req.body.title);
+  if (req.body?.platform!=='ps3' || title.length<3 || typeof req.body?.hasTrophies!=='boolean') return res.status(400).json({ok:false});
+  const positive=req.body.hasTrophies;
+  const game=positive?sanitizedGameTrophyRecord(req.body.game,title):null;
+  if (positive&&!game) return res.status(400).json({ok:false});
+  try {
+    const result=await queryDbWithRetry(`INSERT INTO game_trophy_cache(platform,title_norm,has_trophies,game_data,expires_at)
+      VALUES('ps3',$1,$2,$3::jsonb,CASE WHEN $2 THEN 'infinity'::timestamptz ELSE NOW()+INTERVAL '7 days' END)
+      ON CONFLICT(platform,title_norm) DO UPDATE SET has_trophies=EXCLUDED.has_trophies,
+        game_data=EXCLUDED.game_data,expires_at=EXCLUDED.expires_at,checked_at=NOW()
+      WHERE NOT game_trophy_cache.has_trophies OR (EXCLUDED.has_trophies AND game_trophy_cache.game_data->>'npCommunicationId'=EXCLUDED.game_data->>'npCommunicationId')
+      RETURNING has_trophies,game_data`,[title,positive,positive?JSON.stringify(game):null],
+      {attempts:2,label:'GAME TROPHY CACHE WRITE'});
+    const row=result.rows[0];
+    if(row) setGameTrophyCacheMemory('ps3|'+title,{known:true,hasTrophies:row.has_trophies,game:row.game_data});
+    else deleteGameTrophyCacheMemory('ps3|'+title);
+    if (now-gameTrophyCacheLastPruneAt>24*60*60*1000 && pool.waitingCount===0) {
+      gameTrophyCacheLastPruneAt=now;
+      setTimeout(()=>pool.query({text:`DELETE FROM game_trophy_cache WHERE ctid IN (
+        SELECT ctid FROM game_trophy_cache WHERE has_trophies=FALSE AND expires_at<=NOW() LIMIT 250
+      )`,query_timeout:2500}).catch(()=>{}),8000);
+    }
+    return res.json({ok:true,saved:!!row});
+  }catch(err){ return res.status(503).json({ok:false}); }
+});
+
 app.options('/api/gameplay-preview', (req, res) => { setMetadataCors(res); res.status(204).end(); });
 app.get('/api/gameplay-preview', async (req, res) => {
   setMetadataCors(res);
@@ -4100,6 +4221,16 @@ async function initDb() {
     );
     CREATE INDEX IF NOT EXISTS idx_content_metadata_overrides_title_id ON content_metadata_overrides(title_id);
     CREATE INDEX IF NOT EXISTS idx_content_metadata_overrides_updated_at ON content_metadata_overrides(updated_at DESC);
+    CREATE TABLE IF NOT EXISTS game_trophy_cache (
+      platform TEXT NOT NULL,
+      title_norm TEXT NOT NULL,
+      has_trophies BOOLEAN NOT NULL,
+      game_data JSONB,
+      checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      expires_at TIMESTAMPTZ NOT NULL,
+      PRIMARY KEY (platform,title_norm)
+    );
+    CREATE INDEX IF NOT EXISTS idx_game_trophy_cache_expiring ON game_trophy_cache(expires_at) WHERE has_trophies=FALSE;
     CREATE TABLE IF NOT EXISTS metadata_provider_cache (
       cache_key TEXT PRIMARY KEY,
       payload JSONB NOT NULL,
