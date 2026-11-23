@@ -197,7 +197,7 @@
 	<link rel="icon" type="image/png" sizes="32x32" href="https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/favicon/favicon-32x32.png">
 	<link rel="icon" type="image/png" sizes="16x16" href="https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/favicon/favicon-16x16.png">
 	<link rel="apple-touch-icon" sizes="180x180" href="https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/favicon/apple-touch-icon.png">	
-	<link rel="manifest" href="https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/favicon/site.webmanifest">
+	<link rel="manifest" href="../../resources/interface/modern/images/favicon/site.webmanifest">
 	<link rel="preconnect" href="https://raw.githubusercontent.com" crossorigin>
 	<link rel="dns-prefetch" href="//raw.githubusercontent.com">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
@@ -20471,16 +20471,25 @@ P
 		container.__exploreVirtualResetFrame = requestAnimationFrame(finishReset);
 	}
 
+	let exploreRenderFrameStamp = -1;
+	let exploreRenderFrameCount = 0;
+	let exploreRenderFrameOverBudget = false;
 	function scheduleExploreVirtualRender(container, force = false) {
 		if (!container || !container.__exploreVirtualData) return;
 		if (force) container.__exploreVirtualForcePending = true;
 		if (container.__exploreVirtualFrame) return;
-		container.__exploreVirtualFrame = requestAnimationFrame(() => {
+		const run = stamp => {
+			if (exploreRenderFrameStamp !== stamp) { exploreRenderFrameStamp = stamp; exploreRenderFrameCount = 0; exploreRenderFrameOverBudget = false; }
+			if (exploreRenderFrameCount >= 2 || (exploreRenderFrameOverBudget && exploreRenderFrameCount)) { container.__exploreVirtualFrame = requestAnimationFrame(run); return; }
 			container.__exploreVirtualFrame = 0;
+			if (!container.isConnected || !container.__exploreVirtualData) return;
+			exploreRenderFrameCount++;
 			const forceNow = container.__exploreVirtualForcePending === true;
 			container.__exploreVirtualForcePending = false;
 			renderExploreVirtualWindow(container, forceNow);
-		});
+			if (performance.now() - stamp > 10) exploreRenderFrameOverBudget = true;
+		};
+		container.__exploreVirtualFrame = requestAnimationFrame(run);
 	}
 
 	function forEachExploreVirtualContainer(callback) {
@@ -20887,6 +20896,7 @@ P
 	}
 	function hideSiteDisclaimerModalSilently() {
 		const modal = document.getElementById('site-disclaimer-modal');
+		if (modal && modal.contains(document.activeElement)) document.activeElement.blur();
 		clearTimeout(window.__siteDisclaimerOpenTimer);
 		window.__siteDisclaimerOpening = false;
 		unlockSiteDisclaimerInput();
@@ -20947,10 +20957,8 @@ P
 		lockSiteDisclaimerInput();
 		const skipTodayCheckbox = document.getElementById('site-disclaimer-skip-today');
 		if (skipTodayCheckbox) skipTodayCheckbox.checked = false;
-		void modal.offsetWidth;
 		window.__siteDisclaimerOpenTimer = setTimeout(() => {
 			modal.classList.remove('show', 'closing');
-			void modal.offsetWidth;
 			requestAnimationFrame(() => {
 				requestAnimationFrame(() => {
 					modal.setAttribute('aria-hidden', 'false');
@@ -20977,6 +20985,7 @@ P
 		clearTimeout(window.__siteDisclaimerOpenTimer);
 		window.__siteDisclaimerOpening = false;
 		if (typeof playUiClick === 'function') playUiClick();
+		if (modal.contains(document.activeElement)) document.activeElement.blur();
 		modal.classList.remove('show');
 		modal.classList.add('closing');
 		modal.setAttribute('aria-hidden', 'true');
@@ -21111,6 +21120,7 @@ P
 			}
 			const disclaimer = document.getElementById('site-disclaimer-modal');
 			if (disclaimer && !disclaimer.classList.contains('show') && !disclaimer.classList.contains('closing') && !window.__siteDisclaimerOpening) {
+				if (disclaimer.contains(document.activeElement)) document.activeElement.blur();
 				disclaimer.classList.remove('is-visible');
 				disclaimer.setAttribute('aria-hidden', 'true');
 			}
@@ -82527,7 +82537,7 @@ function getVisibleChatStackEl(id) {
 		searchMetric.hoverGlyph = searchMetric.hover.querySelector('.chat-emoji-hover-glyph');
 		if (resultCanvas) resultCanvas.__emojiRasterMetric = searchMetric;
 		const rasterizeEmojiCategory = function(metric) {
-			if (!metric || metric.ready || !metric.canvas) return false;
+			if (!metric || metric.ready || metric.drawing || !metric.canvas) return false;
 			const canvas = metric.canvas;
 			const dpr = Math.max(1, Math.min(Number(window.devicePixelRatio) || 1, CHAT_EMOJI_RASTER_DPR_MAX));
 			canvas.width = Math.max(1, Math.round(CHAT_EMOJI_CANVAS_WIDTH_PX * dpr));
@@ -82541,16 +82551,26 @@ function getVisibleChatStackEl(id) {
 			ctx.font = '22px "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", sans-serif';
 			ctx.textAlign = 'center';
 			ctx.textBaseline = 'middle';
-			metric.cat.emojis.forEach(function(emoji, index) {
-				if (!emoji) return;
-				const row = Math.floor(index / CHAT_EMOJI_COLUMNS);
-				const col = index % CHAT_EMOJI_COLUMNS;
-				const x = (col * CHAT_EMOJI_COLUMN_STEP_PX) + (CHAT_EMOJI_CELL_WIDTH_PX / 2);
-				const y = (row * CHAT_EMOJI_ROW_STEP_PX) + (CHAT_EMOJI_CELL_HEIGHT_PX / 2);
-				ctx.fillText(emoji, x, y);
-			});
-			metric.ready = true;
-			canvas.dataset.emojiRasterReady = '1';
+			metric.drawing = true;
+			let index = 0;
+			const drawBatch = () => {
+				const started = performance.now();
+				let drawn = 0;
+				while (index < metric.cat.emojis.length && drawn < 24 && performance.now() - started < 6) {
+					const emoji = metric.cat.emojis[index];
+					const row = Math.floor(index / CHAT_EMOJI_COLUMNS);
+					const col = index % CHAT_EMOJI_COLUMNS;
+					if (emoji) ctx.fillText(emoji, (col * CHAT_EMOJI_COLUMN_STEP_PX) + (CHAT_EMOJI_CELL_WIDTH_PX / 2), (row * CHAT_EMOJI_ROW_STEP_PX) + (CHAT_EMOJI_CELL_HEIGHT_PX / 2));
+					index++;
+					drawn++;
+				}
+				if (index < metric.cat.emojis.length) { requestAnimationFrame(drawBatch); return; }
+				metric.drawing = false;
+				metric.ready = true;
+				canvas.dataset.emojiRasterReady = '1';
+				if (picker.classList.contains('is-open')) scheduleEmojiRasterWarm();
+			};
+			requestAnimationFrame(drawBatch);
 			return true;
 		};
 
@@ -82710,24 +82730,20 @@ function getVisibleChatStackEl(id) {
 		let warmHandle = 0;
 		const warmEmojiRaster = function(deadline) {
 			warmHandle = 0;
-			let processed = 0;
-			while (warmMetricIndex < rasterMetrics.length && processed < 2) {
-				if (deadline && typeof deadline.timeRemaining === 'function' && !deadline.didTimeout && deadline.timeRemaining() < 4) break;
-				rasterizeEmojiCategory(rasterMetrics[warmMetricIndex]);
-				warmMetricIndex++;
-				processed++;
-			}
+			if (!picker.classList.contains('is-open')) return;
+			while (warmMetricIndex < rasterMetrics.length && rasterMetrics[warmMetricIndex].ready) warmMetricIndex++;
 			if (warmMetricIndex >= rasterMetrics.length) {
 				picker.dataset.emojiRasterWarm = '1';
 				picker.__emojiRasterWarmComplete = true;
 				return;
 			}
-			scheduleEmojiRasterWarm();
+			const metric = rasterMetrics[warmMetricIndex];
+			if (!metric.drawing) rasterizeEmojiCategory(metric);
 		};
 
 		const scheduleEmojiRasterWarm = function() {
-			if (warmMetricIndex >= rasterMetrics.length || warmHandle) return;
-			if (typeof requestIdleCallback === 'function') warmHandle = requestIdleCallback(warmEmojiRaster, { timeout:700 });
+			if (!picker.classList.contains('is-open') || warmMetricIndex >= rasterMetrics.length || warmHandle) return;
+			if (typeof requestIdleCallback === 'function') warmHandle = requestIdleCallback(warmEmojiRaster);
 			else warmHandle = setTimeout(function() { warmEmojiRaster(null); }, 24);
 		};
 
@@ -82794,7 +82810,16 @@ function getVisibleChatStackEl(id) {
 				if (metric.hover.style.top !== nextTop) metric.hover.style.top = nextTop;
 				if (!metric.hover.classList.contains('is-visible')) metric.hover.classList.add('is-visible');
 			};
-			contentArea.addEventListener('scroll', function() { invalidateEmojiPointerRects(); hideEmojiHover(); scheduleEmojiNavSync(); }, { passive:true });
+			contentArea.addEventListener('scroll', function() {
+				invalidateEmojiPointerRects(); hideEmojiHover(); scheduleEmojiNavSync();
+				if (!contentArea.classList.contains('is-searching')) {
+					const top = contentArea.scrollTop, bottom = top + contentArea.clientHeight + 120;
+					for (const metric of rasterMetrics) {
+						if (metric.categoryTop > bottom) break;
+						if (!metric.ready && !metric.drawing && metric.categoryTop + metric.gridHeight >= top) rasterizeEmojiCategory(metric);
+					}
+				}
+			}, { passive:true });
 			contentArea.addEventListener('pointermove', function(event) {
 				if (event.pointerType && event.pointerType !== 'mouse' && event.pointerType !== 'pen') return;
 				const canvas = event.target && event.target.closest ? event.target.closest('.chat-emoji-canvas') : null;
@@ -82847,9 +82872,14 @@ function getVisibleChatStackEl(id) {
 			});
 		}
 
-		rasterizeEmojiCategory(rasterMetrics[0]);
-		warmMetricIndex = rasterMetrics[0] && rasterMetrics[0].ready ? 1 : 0;
-		scheduleEmojiRasterWarm();
+		warmMetricIndex = 0;
+		const emojiOpenObserver = new MutationObserver(() => {
+			if (picker.classList.contains('is-open')) {
+				if (rasterMetrics[0] && !rasterMetrics[0].ready) rasterizeEmojiCategory(rasterMetrics[0]);
+				scheduleEmojiRasterWarm();
+			}
+		});
+		emojiOpenObserver.observe(picker, { attributes:true, attributeFilter:['class'] });
 		picker.__emojiRasterMetrics = rasterMetrics;
 		picker.__syncEmojiCategoryNav = syncEmojiNavToScroll;
 		syncEmojiNavToScroll();
@@ -116428,6 +116458,8 @@ function getVisibleChatStackEl(id) {
         const edgeBoundAttribute = 'data-psn-edge-bound';
         const activityBound = new WeakSet();
         const pendingEdges = new Set();
+        const edgesNeedingMeasure = new WeakSet();
+        const edgeSizes = new WeakMap();
         let pendingEdgeFrame = 0;
         const observedEdges = new Set();
         let pageFadeTop = null;
@@ -116480,22 +116512,21 @@ function getVisibleChatStackEl(id) {
             pageFadeBottom.classList.toggle('is-visible', showBottom && g.height > 40);
         }
 
-        function measureEdge(el) {
+        function measureEdge(el, full) {
             if (!el || !el.isConnected) return null;
             const directions = edgeDirections.get(el);
-            const vertical = directions ? directions.vertical : el.matches(edgeSelector);
-            const horizontal = directions ? directions.horizontal : el.matches(horizontalSelector);
-            const visible = el.clientWidth > 0 && el.clientHeight > 0;
-            const maxY = vertical && visible ? Math.max(0, el.scrollHeight - el.clientHeight) : 0;
-            const maxX = horizontal && visible ? Math.max(0, el.scrollWidth - el.clientWidth) : 0;
-            const state = {
-                hasY: maxY > 4,
-                hasX: maxX > 4,
-                scrollTop: el.scrollTop,
-                scrollLeft: el.scrollLeft,
-                maxY,
-                maxX
-            };
+            let sizes = edgeSizes.get(el);
+            const now = performance.now();
+            if (full || !sizes || now - sizes.at > 1500) {
+                const vertical = directions ? directions.vertical : el.matches(edgeSelector);
+                const horizontal = directions ? directions.horizontal : el.matches(horizontalSelector);
+                const visible = el.clientWidth > 0 && el.clientHeight > 0;
+                const maxY = vertical && visible ? Math.max(0, el.scrollHeight - el.clientHeight) : 0;
+                const maxX = horizontal && visible ? Math.max(0, el.scrollWidth - el.clientWidth) : 0;
+                sizes = { hasY:maxY > 4, hasX:maxX > 4, maxY, maxX, at:now };
+                edgeSizes.set(el, sizes);
+            }
+            const state = { ...sizes, scrollTop:el.scrollTop, scrollLeft:el.scrollLeft };
             if (directions ? directions.main : el.classList.contains('main-content')) state.pageFade = measurePageFade(el, state.hasY && state.scrollTop > 3);
             return state;
         }
@@ -116521,7 +116552,9 @@ function getVisibleChatStackEl(id) {
             let processed = 0;
             for (const el of pendingEdges) {
                 pendingEdges.delete(el);
-                const state = measureEdge(el);
+                const full = edgesNeedingMeasure.has(el);
+                edgesNeedingMeasure.delete(el);
+                const state = measureEdge(el, full);
                 if (state) measurements.push([el, state]);
                 if (++processed >= 12) break;
             }
@@ -116529,8 +116562,10 @@ function getVisibleChatStackEl(id) {
             if (pendingEdges.size) pendingEdgeFrame = requestAnimationFrame(flushScheduledEdges);
         }
 
-        function scheduleEdge(el) {
-            if (!el || pendingEdges.has(el)) return;
+        function scheduleEdge(el, full = true) {
+            if (!el) return;
+            if (full) edgesNeedingMeasure.add(el);
+            if (pendingEdges.has(el)) return;
             pendingEdges.add(el);
             if (!pendingEdgeFrame) pendingEdgeFrame = requestAnimationFrame(flushScheduledEdges);
         }
@@ -116563,7 +116598,7 @@ function getVisibleChatStackEl(id) {
             if (!horizontal) el.classList.add('psn-scrollbar-polished');
             el.addEventListener('scroll', () => {
                 if (!horizontal) markScrolling(el);
-                if (edgeBound.has(el)) scheduleEdge(el);
+                if (edgeBound.has(el)) scheduleEdge(el, false);
             }, { passive:true });
         }
 
@@ -116591,6 +116626,8 @@ function getVisibleChatStackEl(id) {
             if (!edgeBound.has(el)) return;
             edgeBound.delete(el);
             edgeDirections.delete(el);
+            edgesNeedingMeasure.delete(el);
+            edgeSizes.delete(el);
             el.removeAttribute(edgeBoundAttribute);
             observedEdges.delete(el);
             pendingEdges.delete(el);
@@ -116879,14 +116916,19 @@ function getVisibleChatStackEl(id) {
             '.admin-metadata-list'
         ].join(',');
         const softRefreshSignatures = new WeakMap();
+        const softRefreshKeyNodes = new WeakMap();
         const softRefreshAnimations = new WeakMap();
 
         function getSoftRefreshSignature(container) {
             const parts = [String(container.childElementCount)];
             for (const child of container.children) {
-                const keyed = child.matches?.('[data-content-id],[data-copy-title-id],[data-download-key],[data-game-title]')
-                    ? child
-                    : child.querySelector?.('[data-content-id],[data-copy-title-id],[data-download-key],[data-game-title]');
+                let keyed = softRefreshKeyNodes.get(child);
+                if (!keyed || (keyed !== child && !child.contains(keyed))) {
+                    keyed = child.matches?.('[data-content-id],[data-copy-title-id],[data-download-key],[data-game-title]')
+                        ? child
+                        : child.querySelector?.('[data-content-id],[data-copy-title-id],[data-download-key],[data-game-title]');
+                    if (keyed) softRefreshKeyNodes.set(child, keyed);
+                }
                 parts.push(
                     keyed?.dataset?.contentId ||
                     keyed?.dataset?.copyTitleId ||
