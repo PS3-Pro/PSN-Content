@@ -1507,7 +1507,6 @@ const METADATA_CACHE_MAX_ITEMS = Math.max(50, Math.min(1000, parseInt(
   10
 ) || 300));
 const METADATA_PROXY_CACHE_MAX = METADATA_CACHE_MAX_ITEMS;
-const METADATA_SHARED_CACHE_MS = 14 * 24 * 60 * 60 * 1000;
 let metadataSharedCachePrunedAt = 0;
 const METADATA_LIVE_SCHEMA_VERSION = 1;
 const METADATA_LIVE_PENDING_MAX = Math.max(2, Math.min(24, parseInt(process.env.METADATA_LIVE_PENDING_MAX || '8', 10) || 8));
@@ -1548,38 +1547,110 @@ function setMetadataProxyCache(key, value) {
   }
 }
 
+function isPersistentMetadataResult(cacheKey, payload) {
+  if (!payload || typeof payload !== 'object') return false;
+  if (cacheKey.startsWith('live-v') && cacheKey.includes(':psn:'))
+    return !!(payload.description || payload.provider_name || payload.release_date);
+  if (cacheKey.startsWith('live-v') && cacheKey.includes(':rawg:'))
+    return !!(payload.details && payload.details.id && payload.details.name);
+  if (cacheKey.startsWith('proxy:igdb:') || cacheKey.startsWith('proxy:steam-search:'))
+    return payload.ok === true && Array.isArray(payload.results) && payload.results.length > 0;
+  if (cacheKey.startsWith('proxy:steam-details:'))
+    return payload.ok === true && !!payload.details;
+  return false;
+}
+
 async function readSharedMetadataProviderCache(cacheKey) {
   if (!cacheKey) return null;
   try {
     const result = await pool.query({
-      text: 'SELECT payload FROM metadata_provider_cache WHERE cache_key=$1 AND expires_at>NOW() LIMIT 1',
+      text: "SELECT payload, expires_at>NOW() AS valid, expires_at='infinity'::timestamptz AS permanent FROM metadata_provider_cache WHERE cache_key=$1 LIMIT 1",
       values: [cacheKey],
       query_timeout: 1200
     });
-    return result.rows[0]?.payload || null;
+    const entry = result.rows[0];
+    if (!entry) return null;
+    const persistent = isPersistentMetadataResult(cacheKey, entry.payload);
+    if (!entry.valid && !persistent) return null;
+    if (!entry.permanent && persistent) {
+      pool.query({
+        text: "UPDATE metadata_provider_cache SET expires_at='infinity'::timestamptz WHERE cache_key=$1 AND expires_at<>'infinity'::timestamptz",
+        values: [cacheKey],
+        query_timeout: 1800
+      }).catch(() => {});
+    }
+    return entry.payload;
   } catch (err) { return null; }
 }
 
-function saveSharedMetadataProviderCache(cacheKey, payload) {
-  if (!cacheKey || !payload) return;
-  if (pool.waitingCount > 0 && pool.idleCount === 0) return;
-  const serialized = JSON.stringify(payload);
-  if (Buffer.byteLength(serialized) > 150000) return;
+const metadataCacheWrites = new Map();
+let metadataCacheWriteTimer = null;
+let metadataCacheWriteRunning = false;
+function flushSharedMetadataWrites() {
+  metadataCacheWriteTimer = null;
+  if (metadataCacheWriteRunning || !metadataCacheWrites.size) return;
+  if (pool.waitingCount > 0 && pool.idleCount === 0) {
+    metadataCacheWriteTimer = setTimeout(flushSharedMetadataWrites, 700);
+    return;
+  }
+  const [cacheKey, entry] = metadataCacheWrites.entries().next().value;
+  metadataCacheWrites.delete(cacheKey);
+  metadataCacheWriteRunning = true;
   pool.query({
     text: `INSERT INTO metadata_provider_cache(cache_key,payload,expires_at)
-      VALUES($1,$2::jsonb,NOW()+INTERVAL '14 days')
-      ON CONFLICT(cache_key) DO UPDATE SET payload=EXCLUDED.payload,expires_at=EXCLUDED.expires_at`,
-    values: [cacheKey, serialized],
-    query_timeout: 1800
-  }).catch(() => {});
+      VALUES($1,$2::jsonb,CASE WHEN $3::boolean THEN 'infinity'::timestamptz ELSE NOW()+INTERVAL '1 day' END)
+      ON CONFLICT(cache_key) DO UPDATE SET payload=EXCLUDED.payload,expires_at=EXCLUDED.expires_at
+      WHERE metadata_provider_cache.expires_at<>'infinity'::timestamptz
+        OR EXCLUDED.expires_at='infinity'::timestamptz`,
+    values: [cacheKey, entry.serialized, entry.persistent],
+    query_timeout: 2500
+  }).catch(() => {
+    if (entry.retries < 2 && !metadataCacheWrites.has(cacheKey))
+      metadataCacheWrites.set(cacheKey, {...entry,retries:entry.retries+1});
+  }).finally(() => {
+    metadataCacheWriteRunning = false;
+    if (metadataCacheWrites.size && !metadataCacheWriteTimer)
+      metadataCacheWriteTimer = setTimeout(flushSharedMetadataWrites, 100);
+  });
+}
+function saveSharedMetadataProviderCache(cacheKey, payload) {
+  if (!cacheKey || !payload) return;
+  const serialized = JSON.stringify(payload);
+  if (Buffer.byteLength(serialized) > 150000) return;
+  const persistent = isPersistentMetadataResult(cacheKey, payload);
+  metadataCacheWrites.delete(cacheKey);
+  metadataCacheWrites.set(cacheKey, {serialized,persistent,retries:0});
+  while (metadataCacheWrites.size > 96) {
+    let expiredKey;
+    for (const [key, entry] of metadataCacheWrites) {
+      if (!entry.persistent) { expiredKey = key; break; }
+    }
+    metadataCacheWrites.delete(expiredKey === undefined ? metadataCacheWrites.keys().next().value : expiredKey);
+  }
+  if (!metadataCacheWriteTimer && !metadataCacheWriteRunning)
+    metadataCacheWriteTimer = setTimeout(flushSharedMetadataWrites, 150);
   if (Date.now() - metadataSharedCachePrunedAt > 6 * 60 * 60 * 1000) {
     metadataSharedCachePrunedAt = Date.now();
-    pool.query({
-      text: `DELETE FROM metadata_provider_cache WHERE ctid IN
-        (SELECT ctid FROM metadata_provider_cache WHERE expires_at<=NOW() LIMIT 300)`,
-      query_timeout: 1800
-    }).catch(() => {});
+    pruneSharedMetadataProviderCache().catch(() => {});
   }
+}
+async function pruneSharedMetadataProviderCache() {
+  const result = await pool.query({
+    text: 'SELECT cache_key,payload FROM metadata_provider_cache WHERE expires_at<=NOW() ORDER BY expires_at LIMIT 300',
+    query_timeout: 2500
+  });
+  const promote = [], remove = [];
+  for (const row of result.rows || []) {
+    (isPersistentMetadataResult(row.cache_key, row.payload) ? promote : remove).push(row.cache_key);
+  }
+  if (promote.length) await pool.query({
+    text: "UPDATE metadata_provider_cache SET expires_at='infinity'::timestamptz WHERE cache_key=ANY($1::text[]) AND expires_at<=NOW()",
+    values: [promote], query_timeout: 3000
+  });
+  if (remove.length) await pool.query({
+    text: 'DELETE FROM metadata_provider_cache WHERE cache_key=ANY($1::text[]) AND expires_at<=NOW()',
+    values: [remove], query_timeout: 3000
+  });
 }
 
 function requestMetadataJson(rawUrl, options = {}) {
@@ -1823,6 +1894,11 @@ async function getOrLoadLiveMetadataProvider(cacheKey, loader) {
   if (cached) return { value: cached, cached: true };
   if (metadataLiveProviderPending.has(cacheKey)) return { value: await metadataLiveProviderPending.get(cacheKey), cached: false, shared: true };
   if (metadataLiveProviderPending.size >= METADATA_LIVE_PENDING_MAX) {
+    const persisted = await readSharedMetadataProviderCache(cacheKey);
+    if (persisted) {
+      setMetadataProxyCache(cacheKey, persisted);
+      return { value: persisted, cached: true };
+    }
     const err = new Error('Metadata live provider queue is busy.');
     err.code = 'METADATA_LIVE_BUSY';
     throw err;
@@ -2493,7 +2569,6 @@ function ssPreviewSetCached(key, payload) {
 }
 
 const SS_PREVIEW_DB_NO_VIDEO_DAYS = 1;
-const SS_PREVIEW_DB_MAX_ROWS = 12000;
 let ssPreviewDbPruneAfter = 0;
 async function ssPreviewLoadDatabase(key, systemId) {
   try {
@@ -2540,7 +2615,8 @@ function ssPreviewPersistDatabase(key, systemId, result) {
   const host = video && ssPreviewAllowedMediaHost(video.apiHost)
     ? video.apiHost : 'api.screenscraper.fr';
   const metadata = isNegative ? {negative:true,reason:result.reason || 'no_match'} : result.extras;
-  pool.query(`
+  const persistent = !!video || !!(result.extras && gameId > 0);
+  queryDbWithRetry(`
     INSERT INTO screenscraper_game_cache
       (cache_key, system_id, game_id, media_type, api_host, extras, refreshed_at, expires_at)
     VALUES ($1, $2, $3, $4, $5, $6::jsonb, NOW(),
@@ -2548,18 +2624,18 @@ function ssPreviewPersistDatabase(key, systemId, result) {
     ON CONFLICT (cache_key) DO UPDATE SET
       system_id=EXCLUDED.system_id, game_id=EXCLUDED.game_id,
       media_type=EXCLUDED.media_type, api_host=EXCLUDED.api_host,
-      extras=EXCLUDED.extras, refreshed_at=NOW(), expires_at=EXCLUDED.expires_at`,
-    [key, systemId, gameId, type, host, JSON.stringify(metadata || null), !!video, SS_PREVIEW_DB_NO_VIDEO_DAYS]
+      extras=EXCLUDED.extras, refreshed_at=NOW(), expires_at=EXCLUDED.expires_at
+    WHERE (screenscraper_game_cache.expires_at<>'infinity'::timestamptz
+      OR EXCLUDED.expires_at='infinity'::timestamptz)
+      AND (screenscraper_game_cache.media_type NOT IN ('video','video-normalized')
+        OR EXCLUDED.media_type IN ('video','video-normalized'))`,
+    [key, systemId, gameId, type, host, JSON.stringify(metadata || null), persistent, SS_PREVIEW_DB_NO_VIDEO_DAYS],
+    { attempts:3, label:'SCREENSCRAPER CACHE WRITE', queryTimeoutMs:2500 }
   ).then(() => {
     const now = Date.now();
     if (now < ssPreviewDbPruneAfter) return;
     ssPreviewDbPruneAfter = now + 6 * 60 * 60 * 1000;
-    pool.query(`DELETE FROM screenscraper_game_cache WHERE expires_at <= NOW()`).then(() =>
-      pool.query(`DELETE FROM screenscraper_game_cache WHERE cache_key IN
-        (SELECT cache_key FROM screenscraper_game_cache
-         ORDER BY CASE WHEN media_type <> '' THEN 0 ELSE 1 END, refreshed_at DESC
-         OFFSET $1)`, [SS_PREVIEW_DB_MAX_ROWS])
-    ).catch(() => {});
+    pool.query('DELETE FROM screenscraper_game_cache WHERE expires_at <= NOW()').catch(() => {});
   }).catch(() => {});
 }
 function ssPreviewFetchUpstream(name, systemId, key) {
@@ -2919,8 +2995,12 @@ app.get('/api/gameplay-video', async (req,res) => {
         if (entry?.payload?.video?.gameId === video.g && entry.payload.video.system === video.s)
           ssPreviewCache.delete(cacheKey);
       }
-      pool.query('DELETE FROM screenscraper_game_cache WHERE game_id=$1 AND (system_id=$2 OR system_id=0)',
-        [video.g,video.s]).catch(()=>{});
+      pool.query({
+        text: `UPDATE screenscraper_game_cache SET media_type='', refreshed_at=NOW()
+          WHERE game_id=$1 AND media_type IN ('video','video-normalized')
+            AND (system_id=$2 OR (system_id=0 AND extras->>'system'=$2::text))`,
+        values: [video.g,video.s], query_timeout: 2500
+      }).catch(()=>{});
     }
     if (error && error.code !== 'provider_cooldown' &&
         ![429,430].includes(Number(error.upstreamStatus)) && error.name !== 'AbortError')
@@ -4037,10 +4117,13 @@ async function initDb() {
       refreshed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       expires_at TIMESTAMPTZ NOT NULL
     );
-    -- Preserve previously cached, confirmed video matches on upgrade, too.
     UPDATE screenscraper_game_cache SET expires_at='infinity'::timestamptz
-      WHERE media_type IN ('video','video-normalized')
+      WHERE (media_type IN ('video','video-normalized')
+        OR (game_id > 0 AND jsonb_typeof(extras)='object' AND extras ? 'gameId'))
         AND expires_at <> 'infinity'::timestamptz;
+    CREATE INDEX IF NOT EXISTS idx_screenscraper_cache_expiring
+      ON screenscraper_game_cache (expires_at)
+      WHERE expires_at <> 'infinity'::timestamptz;
     CREATE TABLE IF NOT EXISTS content_metadata_suggestions (
       id BIGSERIAL PRIMARY KEY,
       metadata_key TEXT NOT NULL,

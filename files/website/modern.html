@@ -24705,6 +24705,8 @@ P
 
         if(typeof window.__psnPrefetchRegionsFanart==='function')
             window.__psnPrefetchRegionsFanart(groupItems[0]?.game,document.getElementById('cat-select')?.value||'games');
+        window.__psnPrefetchRegionsGameplay?.(groupItems[0]?.game,document.getElementById('cat-select')?.value||'games');
+        window.__psnPrefetchRegionsModal?.(groupItems[0]?.game,document.getElementById('cat-select')?.value||'games');
         if (typeof playUiClick === 'function') playUiClick();
         if (typeof window.setAlphabeticalSortButtonEnabled === 'function') window.setAlphabeticalSortButtonEnabled('browse', false, 'regions');
 
@@ -33744,6 +33746,7 @@ P
 	}
 
 	window.__psnLiveMetadataPending = window.__psnLiveMetadataPending instanceof Map ? window.__psnLiveMetadataPending : new Map();
+	const liveMetadataSuccessCache = new Map();
 	window.fetchPsnLiveMetadata = async function(options = {}) {
 		const include = ['all', 'psn', 'rawg'].includes(String(options.include || 'all')) ? String(options.include || 'all') : 'all';
 		const titleId = String(options.titleId || '').trim();
@@ -33765,7 +33768,17 @@ P
 		const base = getMetadataServerBaseCompat();
 		if (!base) return null;
 		const url = `${base}/api/metadata/live?${params.toString()}`;
-		if (window.__psnLiveMetadataPending.has(url)) return window.__psnLiveMetadataPending.get(url);
+		const lookupKey = include === 'rawg' && name
+			? `${base}|rawg|${name.normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()}|${releaseYear}|${platformHints.join(',').toLowerCase()}`
+			: url;
+		const cached = liveMetadataSuccessCache.get(lookupKey);
+		if (cached && cached.until > Date.now()) {
+			liveMetadataSuccessCache.delete(lookupKey);
+			liveMetadataSuccessCache.set(lookupKey, cached);
+			return cached.value;
+		}
+		if (cached) liveMetadataSuccessCache.delete(lookupKey);
+		if (window.__psnLiveMetadataPending.has(lookupKey)) return window.__psnLiveMetadataPending.get(lookupKey);
 
 		const pending = (async () => {
 			const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
@@ -33788,9 +33801,18 @@ P
 				if (timer) clearTimeout(timer);
 			}
 		})();
-		window.__psnLiveMetadataPending.set(url, pending);
-		try { return await pending; }
-		finally { if (window.__psnLiveMetadataPending.get(url) === pending) window.__psnLiveMetadataPending.delete(url); }
+		window.__psnLiveMetadataPending.set(lookupKey, pending);
+		try {
+			const payload = await pending;
+			if (payload && (include === 'rawg' ? payload.rawg : include === 'psn' ? payload.psnStore : payload.rawg || payload.psnStore)) {
+				liveMetadataSuccessCache.delete(lookupKey);
+				liveMetadataSuccessCache.set(lookupKey, { value:payload, until:Date.now()+20*60*1000 });
+				while (liveMetadataSuccessCache.size > 60) liveMetadataSuccessCache.delete(liveMetadataSuccessCache.keys().next().value);
+			}
+			return payload;
+		} finally {
+			if (window.__psnLiveMetadataPending.get(lookupKey) === pending) window.__psnLiveMetadataPending.delete(lookupKey);
+		}
 	};
 
 	window.fetchPsnStoreMetadata = async function(titleId, contentId, region, options = {}) {
@@ -36913,8 +36935,11 @@ P
 				? getBrowseRenderItems()
 				: (Array.isArray(filteredData) ? filteredData.map((game, index) => ({ game, sourceIndex: index })) : []);
 		}
-        if(!isAppending && browseExpandedGroupTitle && renderItems.length && typeof window.__psnPrefetchRegionsFanart==='function')
-            window.__psnPrefetchRegionsFanart(renderItems[0]?.game,currentCat);
+        if(!isAppending && browseExpandedGroupTitle && renderItems.length) {
+            window.__psnPrefetchRegionsFanart?.(renderItems[0]?.game,currentCat);
+            window.__psnPrefetchRegionsGameplay?.(renderItems[0]?.game,currentCat);
+            window.__psnPrefetchRegionsModal?.(renderItems[0]?.game,currentCat);
+        }
 		window.__browseRenderDataLength = renderItems.length;
 		if (!isAppending && typeof window.syncBrowseSurpriseButtonState === 'function') window.syncBrowseSurpriseButtonState(renderItems.length);
 		if (!isAppending && typeof syncBrowseSortButtonState === 'function') syncBrowseSortButtonState(renderItems.length);
@@ -120157,6 +120182,70 @@ function getVisibleChatStackEl(id) {
     const name=String(game.cleanName||game.name||game.title||'').trim();
     if(system&&name.length>=3)warmFanart(name,system,isPort,consoleTag==='minis');
   };
+
+  const regionModalPrefetch = new Map();
+  let regionScreenshotWarm = null;
+  function warmRegionScreenshots(key, urls) {
+    const connection=navigator.connection||navigator.mozConnection||navigator.webkitConnection;
+    if(document.hidden||connection?.saveData||/^(slow-2g|2g)$/.test(connection?.effectiveType||''))return;
+    const unique=[...new Set(urls.filter(Boolean))].slice(0,3);
+    if(!unique.length)return;
+    if(regionScreenshotWarm?.key===key && unique.every(url=>regionScreenshotWarm.urls.includes(url)))return;
+    if(regionScreenshotWarm)for(const image of regionScreenshotWarm.images) {
+      image.onload=null;image.onerror=null;
+      if(!image.complete)image.src='';
+    }
+    const entry={key,urls:unique,images:[]};
+    regionScreenshotWarm=entry;
+    for(const url of unique) {
+      const image=new Image();
+      image.decoding='async';
+      image.fetchPriority='low';
+      image.src=url;
+      entry.images.push(image);
+    }
+  }
+  window.__psnPrefetchRegionsModal = function(game,category='games') {
+    if(document.hidden)return;
+    const cat=String(category||'').toLowerCase();
+    if(!game||!['games','prototypes','ports'].includes(cat))return;
+    const isPort=cat==='ports';
+    const consoleTag=String(game.cTag||game.console||'').toLowerCase().replace(/[^a-z0-9]/g,'');
+    const system=platformIds[consoleTag]||(isPort?59:0);
+    const name=String(game.cleanName||game.name||game.title||'').trim();
+    if(!system||normalize(name).length<3)return;
+    const key=imageKey(name,system,isPort,consoleTag==='minis');
+    const existing=regionModalPrefetch.get(key);
+    if(existing && existing.until>Date.now())return existing.promise;
+    const entry={until:Date.now()+15*60*1000,promise:null};
+    const titleId=String(game.id||game.titleId||game.titleID||'').trim();
+    const contentId=String(game.contentId||game.contentID||'').trim();
+    const region=String(game.region||'').trim();
+    const lookupName=name.replace(/\s*\((?:trial(?: to full)?|demo|psx|ps1|ps2(?: classics?| classic)?|ps3|psp|mini(?:s)?|version[^)]*)[^)]*\)\s*$/i,'').trim();
+    const platformHints=/\(psp\)|playstation portable/i.test(name)?['playstation portable','psp']:/\(ps2\)|playstation\s*2/i.test(name)?['playstation 2','ps2']:/\(psx\)|\(ps1\)|playstation\s*1/i.test(name)?['playstation','playstation 1','ps1']:['playstation 3','ps3'];
+    entry.promise=new Promise(resolve=>{
+      setTimeout(async()=>{
+        if(document.hidden){entry.until=Date.now()+15000;resolve();return;}
+        const assets=getAssets(name,system,isPort,false,consoleTag==='minis');
+        const metadata=typeof window.fetchPsnLiveMetadata==='function'
+          ? window.fetchPsnLiveMetadata({include:'rawg',name:lookupName,platformHints}).catch(()=>null)
+          : Promise.resolve(null);
+        if(titleId&&typeof window.fetchPsnLiveMetadata==='function')
+          window.fetchPsnLiveMetadata({include:'psn',titleId,contentId,region,name:lookupName,platformHints}).catch(()=>null);
+        const [extras,rawg]=await Promise.all([assets.catch(()=>null),metadata]);
+        const rawgUrls=Array.isArray(rawg?.rawg?.screenshots)?rawg.rawg.screenshots.filter(url=>/^https:\/\//i.test(url)):[];
+        const extrasUrls=(extras?.extras?.images||[]).filter(item=>item.kind==='screenshot').map(item=>validImg(item.url)).filter(Boolean);
+        warmRegionScreenshots(key,rawgUrls.length?rawgUrls:extrasUrls);
+        entry.until=Date.now()+(extras?.ok||rawg?.rawg?15*60*1000:30000);
+        resolve();
+      },240);
+    });
+    regionModalPrefetch.delete(key);
+    regionModalPrefetch.set(key,entry);
+    while(regionModalPrefetch.size>8)regionModalPrefetch.delete(regionModalPrefetch.keys().next().value);
+    return entry.promise;
+  };
+
   function stopFanartFade(root) {
     const state=root?.__psnSsFadeState;
     if(!state)return;
@@ -120312,7 +120401,7 @@ function getVisibleChatStackEl(id) {
 
 <script>
 (() => {
-  if (!window.matchMedia || !matchMedia('(hover: hover) and (pointer: fine)').matches || matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  const hoverSupported=!!(window.matchMedia && matchMedia('(hover: hover) and (pointer: fine)').matches && !matchMedia('(prefers-reduced-motion: reduce)').matches);
   const systems = {ps3:59,ps2:58,ps1:57,psx:57,psp:61,minis:59,psv:62,psvita:62,vita:62,ps4:60};
   const cache = new Map(), pending = new Map(), failures = new Map();
   let lookupBlockedUntil=0, videoBlockedUntil=0, recentVideoErrors=[];
@@ -120399,6 +120488,7 @@ function getVisibleChatStackEl(id) {
   }
   function rememberCard(parent,video) {
     for(const [node,old] of cardVideos) {
+      if(old===video && node!==parent){cardVideos.delete(node);continue;}
       if(node.isConnected&&old.isConnected)continue;
       cardVideos.delete(node);
       if(old!==active?.video)dispose(old);
@@ -120426,6 +120516,100 @@ function getVisibleChatStackEl(id) {
     if(name.length<3||name.length>140)return null;
     return {name,system,isPort,isMinis:platform==='minis',key:(isPort?'port':platform==='minis'?'minis':system)+':'+normalized(name)};
   }
+  let regionWarm=null;
+  function bindPreviewEvents(video,info) {
+    if(video.__psnPreviewBound)return;
+    video.__psnPreviewBound=true;
+    video.addEventListener('playing',()=>{
+      if(active?.video===video){revealVideo(active,video);recentVideoErrors=[];videoBlockedUntil=0;}
+    });
+    const refresh=()=>{if(active?.video===video)updateProgress(active,video);};
+    for(const name of ['progress','loadedmetadata','loadeddata','canplay','durationchange'])video.addEventListener(name,refresh);
+    video.addEventListener('error',()=>{
+      const now=Date.now();
+      recentVideoErrors=recentVideoErrors.filter(t=>now-t<30000);recentVideoErrors.push(now);
+      if(recentVideoErrors.length>=3)videoBlockedUntil=Math.max(videoBlockedUntil,now+Math.min(60000,5000*2**Math.min(4,recentVideoErrors.length-3)));
+      failures.set(info.key,now+15000);cache.delete(info.key);sessionResult(info,true);
+      if(regionWarm?.video===video){regionWarm.video=null;regionWarm.state='error';regionWarm.retryAfter=now+30000;}
+      for(const [node,old] of cardVideos)if(old===video)cardVideos.delete(node);
+      if(active?.modal&&modalVideos.get(active.card)===video)modalVideos.delete(active.card);
+      if(active?.video===video){if(!active.progress)armProgress(active,active.modal?active.card:active.card.querySelector('.game-img-container'));showProgressStatus(active,'error');stop(true);}
+      dispose(video);
+    });
+  }
+  function adoptRegionVideo(info,parent,isModal) {
+    const warm=regionWarm;
+    const video=warm?.key===info.key?warm.video:null;
+    if(!video)return null;
+    if(!video.isConnected||video.error||Date.now()-Number(video.dataset.preparedAt||0)>VIDEO_RECHECK_MS){
+      warm.video=null;
+      dispose(video);
+      return null;
+    }
+    for(const [node,old] of cardVideos)if(old===video)cardVideos.delete(node);
+    parent.appendChild(video);
+    warm.host?.remove();warm.host=null;
+    if(isModal)modalVideos.set(parent,video);else rememberCard(parent,video);
+    bindPreviewEvents(video,info);
+    return video;
+  }
+  function regionGameInfo(game,category) {
+    const cat=String(category||'').toLowerCase();
+    if(!game||!['games','prototypes','ports'].includes(cat))return null;
+    const isPort=cat==='ports';
+    const platform=String(game.cTag||game.console||'').toLowerCase().replace(/[^a-z0-9]/g,'');
+    const system=systems[platform]||(isPort?59:0);
+    const name=cleanName(game.cleanName||game.name||game.title||'');
+    if(!system||name.length<3||name.length>140)return null;
+    return {name,system,isPort,isMinis:platform==='minis',key:(isPort?'port':platform==='minis'?'minis':system)+':'+normalized(name)};
+  }
+  window.__psnPrefetchRegionsGameplay=function(game,category='games') {
+    if(document.hidden)return;
+    const info=regionGameInfo(game,category);
+    if(!info)return;
+    if(regionWarm?.key===info.key){
+      if(regionWarm.state==='pending'||regionWarm.state==='missing')return;
+      if(regionWarm.state==='found'&&(!regionWarm.video||regionWarm.video.isConnected))return;
+      if(regionWarm.state==='error'&&Date.now()<regionWarm.retryAfter)return;
+    }
+    const prior=regionWarm;
+    regionWarm=null;
+    if(prior){
+      if(prior.video && prior.video!==active?.video){
+        for(const [node,old] of cardVideos)if(old===prior.video)cardVideos.delete(node);
+        dispose(prior.video);
+      }
+      prior.host?.remove();
+    }
+    const warm={key:info.key,video:null,host:null,state:'pending',retryAfter:0};
+    regionWarm=warm;
+    getResult(info).then(data=>{
+      if(regionWarm!==warm)return;
+      if(!data?.found||!validProxy(data.fallbackUrl)){
+        warm.state=data?.found===false&&data?.ok!==false?'missing':'error';
+        warm.retryAfter=Date.now()+(warm.state==='missing'?120000:30000);
+        return;
+      }
+      warm.state='found';
+      const connection=navigator.connection||navigator.mozConnection||navigator.webkitConnection;
+      if(!hoverSupported||document.hidden||connection?.saveData||/^(slow-2g|2g)$/.test(connection?.effectiveType||''))return;
+      const url=validProxy(data.fallbackUrl);
+      if(!url)return;
+      const host=document.createElement('div');
+      host.setAttribute('aria-hidden','true');
+      host.style.cssText='position:fixed;left:-10000px;top:0;width:1px;height:1px;overflow:hidden;visibility:hidden;pointer-events:none;';
+      const video=document.createElement('video');
+      video.className='psn-gameplay-preview-video';
+      video.muted=true;video.defaultMuted=true;video.playsInline=true;
+      video.loop=true;video.preload='auto';
+      video.setAttribute('aria-hidden','true');video.setAttribute('disablepictureinpicture','');
+      video.dataset.previewUrl=url;video.dataset.previewKey=info.key;video.dataset.preparedAt=String(Date.now());
+      warm.video=video;warm.host=host;
+      bindPreviewEvents(video,info);
+      host.appendChild(video);document.body.appendChild(host);
+      video.src=url;
+    }).catch(()=>{if(regionWarm===warm){warm.state='error';warm.retryAfter=Date.now()+30000;}});
+  };
   function progressBar(parent) {
     let bar=parent.querySelector(':scope > .psn-gameplay-preview-progress');
     if(!bar){
@@ -120493,7 +120677,8 @@ function getVisibleChatStackEl(id) {
     } else if(video.readyState>=2&&!video.paused){video.classList.add('is-ready');hideProgress(current);}
   }
   function cachedVideo(current,info,parent) {
-    const video=current.modal?modalVideos.get(parent):cardVideos.get(parent);
+    const video=(current.modal?modalVideos.get(parent):cardVideos.get(parent)) ||
+      (regionWarm?.key===info.key && regionWarm.video?.readyState>=2 ? adoptRegionVideo(info,parent,current.modal) : null);
     if(!video||!video.isConnected||video.dataset.previewKey!==info.key)return false;
     if(Date.now()-Number(video.dataset.preparedAt||0)>VIDEO_RECHECK_MS||video.readyState<2)return false;
     current.video=video;
@@ -120517,7 +120702,7 @@ function getVisibleChatStackEl(id) {
     }
     const url=validProxy(data.fallbackUrl);
     if(!url){showProgressStatus(current,'error');return;}
-    let video=current.modal?modalVideos.get(parent):cardVideos.get(parent);
+    let video=(current.modal?modalVideos.get(parent):cardVideos.get(parent)) || adoptRegionVideo(info,parent,current.modal);
     if(video&&(video.dataset.previewKey!==info.key||video.dataset.previewUrl!==url||Date.now()-Number(video.dataset.preparedAt||0)>VIDEO_RECHECK_MS)) {
       if(current.modal)modalVideos.delete(parent);else cardVideos.delete(parent);
       dispose(video);video=null;
@@ -120527,25 +120712,7 @@ function getVisibleChatStackEl(id) {
       video.className='psn-gameplay-preview-video';video.muted=true;video.defaultMuted=true;video.playsInline=true;
       video.loop=true;video.preload='auto';video.setAttribute('aria-hidden','true');video.setAttribute('disablepictureinpicture','');
       video.dataset.previewUrl=url;video.dataset.previewKey=info.key;video.dataset.preparedAt=String(Date.now());
-      video.addEventListener('playing',()=>{
-        if(active?.video===video){revealVideo(active,video);recentVideoErrors=[];videoBlockedUntil=0;}
-      });
-      const refresh=()=>{if(active?.video===video)updateProgress(active,video);};
-      video.addEventListener('progress',refresh);
-      video.addEventListener('loadedmetadata',refresh);
-      video.addEventListener('loadeddata',refresh);
-      video.addEventListener('canplay',refresh);
-      video.addEventListener('durationchange',refresh);
-      video.addEventListener('error',()=>{
-        const now=Date.now();
-        recentVideoErrors=recentVideoErrors.filter(t=>now-t<30000);recentVideoErrors.push(now);
-        if(recentVideoErrors.length>=3)videoBlockedUntil=Math.max(videoBlockedUntil,now+Math.min(60000,5000*2**Math.min(4,recentVideoErrors.length-3)));
-        failures.set(info.key,now+15000);cache.delete(info.key);sessionResult(info,true);
-        if(current.modal){if(modalVideos.get(parent)===video)modalVideos.delete(parent);}
-        else if(cardVideos.get(parent)===video)cardVideos.delete(parent);
-        if(active?.video===video){if(!active.progress)armProgress(active,parent);showProgressStatus(active,'error');stop(true);}
-        dispose(video);
-      });
+      bindPreviewEvents(video,info);
       parent.appendChild(video);video.src=url;
       if(current.modal)modalVideos.set(parent,video);else rememberCard(parent,video);
     }
@@ -120581,6 +120748,7 @@ function getVisibleChatStackEl(id) {
     },HOVER_LOOKUP_DELAY_MS);
     return true;
   }
+  if(!hoverSupported)return;
   document.addEventListener('pointerover',event=>{startPreview(event.target);},{passive:true});
   window.addEventListener('psn-game-modal-closed',()=>{
     if(active?.modal)stop();
