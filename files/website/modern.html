@@ -1059,6 +1059,7 @@ html.ios-webkit #object-particles { contain:strict; }
 #game-modal .modal-title-game-theme-btn:active:not(:disabled) { transform:scale(.94); }
 #game-modal .modal-title-game-theme-btn.is-playing { color:#fff; }
 #game-modal .modal-title-game-theme-btn:disabled { opacity:.55; cursor:default; }
+#game-modal .modal-title-game-theme-btn[hidden] { display:none !important; }
 #game-modal .modal-title-game-theme-btn i { font-size:12px; }
 #game-modal .modal-title-share-btn { color: rgba(255,255,255,.42) !important; transition: color .18s ease,filter .18s ease,transform .18s ease !important; }
 #game-modal .modal-title-share-btn i { font-size: 12px; transition: transform .18s ease,color .18s ease; }
@@ -24721,6 +24722,7 @@ P
 
         if(typeof window.__psnPrefetchRegionsFanart==='function')
             window.__psnPrefetchRegionsFanart(groupItems[0]?.game,document.getElementById('cat-select')?.value||'games');
+        window.psnGameTheme?.prefetch(groupItems[0]?.game,document.getElementById('cat-select')?.value||'games');
         window.__psnPrefetchRegionsGameplay?.(groupItems[0]?.game,document.getElementById('cat-select')?.value||'games');
         window.__psnPrefetchGameTrophies?.(groupItems[0]?.game,document.getElementById('cat-select')?.value||'games');
         for(const item of groupItems.slice(0,4))
@@ -36948,6 +36950,7 @@ P
 		}
         if(!isAppending && browseExpandedGroupTitle && renderItems.length) {
             window.__psnPrefetchRegionsFanart?.(renderItems[0]?.game,currentCat);
+            window.psnGameTheme?.prefetch(renderItems[0]?.game,currentCat);
             window.__psnPrefetchRegionsGameplay?.(renderItems[0]?.game,currentCat);
             window.__psnPrefetchGameTrophies?.(renderItems[0]?.game,currentCat);
             window.__psnPrefetchRegionsModal?.(renderItems[0]?.game,currentCat);
@@ -36956,6 +36959,7 @@ P
             const singleGame=renderItems.length===1 && document.getElementById('search-input')?.value.trim() ? renderItems[0]?.game : null;
             window.__psnScheduleBrowseSingleGameplay?.(singleGame,currentCat);
             if(singleGame)window.__psnPrefetchGameTrophies?.(singleGame,currentCat);
+            if(singleGame)window.psnGameTheme?.prefetch(singleGame,currentCat);
         }
 		window.__browseRenderDataLength = renderItems.length;
 		if (!isAppending && typeof window.syncBrowseSurpriseButtonState === 'function') window.syncBrowseSurpriseButtonState(renderItems.length);
@@ -42471,7 +42475,7 @@ P
 			const modalMetadataLabel = modalMetadataIsAdmin ? 'Correct metadata' : 'Suggest metadata correction';
 			const modalMetadataButtonHtml = modalInfoOnly ? '' : `<button type="button" id="modal-title-metadata-btn" class="modal-title-metadata-btn" title="${modalMetadataLabel}" aria-label="${modalMetadataLabel}" onmouseenter="playUiHover()" onclick="openMetadataCorrectionFromModal(event)"><i class="fas fa-pen"></i></button>`;
 			const modalThemeButtonHtml = !modalInfoOnly && ['games','ports','homebrew_games','prototypes'].includes(currentCat)
-				? `<button type="button" id="modal-title-game-theme-btn" class="modal-title-game-theme-btn" title="Searching game theme..." aria-label="Searching game theme..." onmouseenter="playUiHover()" onclick="window.psnGameTheme?.toggle()"><i class="fas fa-music"></i></button>` : '';
+				? `<button type="button" id="modal-title-game-theme-btn" class="modal-title-game-theme-btn" title="Game theme" aria-label="Game theme" hidden onmouseenter="playUiHover()" onclick="window.psnGameTheme?.toggle()"><i class="fas fa-music"></i></button>` : '';
 			modalHeader.innerHTML = `<span class="modal-title-main"><i class="${iconClass}"></i><span>${headerText}</span></span>${modalInfoOnly ? '' : `<span class="modal-title-action-group">${modalWishButtonHtml}${modalShareButtonHtml}${modalReportButtonHtml}${modalMetadataButtonHtml}${modalThemeButtonHtml}</span>`}`;
 		}
 		if (!modalInfoOnly && typeof window.syncGameModalReportButtonState === 'function') window.syncGameModalReportButtonState();
@@ -121046,6 +121050,21 @@ function getVisibleChatStackEl(id) {
   document.body.appendChild(audio);
   const lookupCache = new Map();
   const maxCache = 180;
+  const inflight = new Map();
+  const warmQueue = [];
+  const queued = new Set();
+  let warmRunning = 0;
+  const maxConcurrentWarm = 2;
+  const themeCategories = new Set(['games','ports','homebrew_games','prototypes']);
+  const nameOf = item => String(typeof item === 'string' ? item :
+    (item?.cleanName || item?.name || item?.title || '')).trim().slice(0,120);
+  const keyOf = name => String(name || '').normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '').toLowerCase()
+    .replace(/[^a-z0-9]+/g,' ').trim();
+  const shouldWarm = () => {
+    const network = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+    return !document.hidden && !network?.saveData && !/^(?:slow-2g|2g)$/.test(network?.effectiveType || '');
+  };
   let generation = 0, active = null, suspended = false, manuallyPaused = false, fadeToken = 0;
   const background = () => document.getElementById('background_music');
   const enabled = () => document.getElementById('audio-toggle')?.checked === true &&
@@ -121062,7 +121081,7 @@ function getVisibleChatStackEl(id) {
       const host = url.hostname.toLowerCase();
       return url.protocol === 'https:' &&
         ((host === 'api.audius.co' && /^\/v1\/tracks\/[a-z0-9_-]{3,64}\/stream$/i.test(url.pathname)) ||
-        ((host === 'archive.org' || host.endsWith('.archive.org') || host === 'vgmsite.com' || host.endsWith('.vgmsite.com') || host === 'vgmtreasurechest.com' || host.endsWith('.vgmtreasurechest.com')) &&
+        ((host === 'archive.org' || host.endsWith('.archive.org')) &&
         /\.(?:mp3|m4a|ogg|opus|aac)$/i.test(url.pathname)));
     } catch (_) { return false; }
   };
@@ -121087,6 +121106,8 @@ function getVisibleChatStackEl(id) {
   function updateButton(state, track) {
     const btn = button();
     if (!btn) return;
+    // Availability is warmed before opening; no music icon for an unknown or absent theme.
+    btn.hidden = !(active?.result?.found === true && validUrl(active.result.url));
     const icon = btn.querySelector('i');
     btn.classList.toggle('is-playing', state === 'playing');
     btn.classList.toggle('is-loading', state === 'loading');
@@ -121139,51 +121160,115 @@ function getVisibleChatStackEl(id) {
       else { updateButton('blocked', active?.result); resumeBackground(); }
     }
   }
-  async function load(name, key, token, skip = '') {
+  function load(name, key, skip = '') {
     const cacheKey = key + '|skip:' + skip;
+    const now = Date.now();
     const saved = lookupCache.get(cacheKey);
-    if (saved && saved.expires > Date.now()) return saved.result;
+    if (saved && saved.expires > now) {
+      lookupCache.delete(cacheKey);
+      lookupCache.set(cacheKey,saved);
+      return Promise.resolve(saved.result);
+    }
+    if (saved) lookupCache.delete(cacheKey);
+    if (inflight.has(cacheKey)) return inflight.get(cacheKey);
     const base = String(typeof getMetadataServerBaseCompat === 'function'
       ? getMetadataServerBaseCompat() : 'https://psn-content-fd6j.onrender.com').replace(/\/+$/, '');
-    const response = await fetch(base + '/api/game-theme?v=gts9&name=' + encodeURIComponent(name) + (skip ? '&skip=' + encodeURIComponent(skip) : ''), { cache:'default' });
-    if (!response.ok) throw new Error('Game theme lookup unavailable');
-    const result = await response.json();
-    if (token !== generation) return null;
-    if (result?.ok && typeof result.found === 'boolean') {
-      lookupCache.set(cacheKey, { result, expires:Date.now() + (result.found ? 60*60*1000 : 90*1000) });
-      while (lookupCache.size > maxCache) lookupCache.delete(lookupCache.keys().next().value);
+    const pending = fetch(base + '/api/game-theme?v=gts11&name=' + encodeURIComponent(name) +
+      (skip ? '&skip=' + encodeURIComponent(skip) : ''), { cache:'default' })
+      .then(response => { if (!response.ok) throw new Error('Game theme lookup unavailable'); return response.json(); })
+      .then(result => {
+        if (result && typeof result.found === 'boolean') {
+          // Unknown provider outages are not a negative availability verdict.
+          const ttl = result.retry || !result.ok ? (result.reason === 'db_pool_busy' ? 2500 : 10000)
+            : result.found ? 60*60*1000 : 12*60*1000;
+          lookupCache.delete(cacheKey);
+          lookupCache.set(cacheKey, { result, expires:Date.now()+ttl });
+          while (lookupCache.size > maxCache) lookupCache.delete(lookupCache.keys().next().value);
+        }
+        return result;
+      }).finally(() => inflight.delete(cacheKey));
+    inflight.set(cacheKey, pending);
+    return pending;
+  }
+  function drainWarmQueue() {
+    if (!shouldWarm()) return;
+    while (warmRunning < maxConcurrentWarm && warmQueue.length) {
+      const entry = warmQueue.shift();
+      queued.delete(entry.key);
+      // A user may have switched categories while external providers were slow.
+      // Don't spend network/Render resources preloading old off-screen cards.
+      if (Date.now() - entry.queuedAt > 12000) continue;
+      const saved = lookupCache.get(entry.key + '|skip:');
+      if (saved?.expires > Date.now() || inflight.has(entry.key + '|skip:')) continue;
+      warmRunning++;
+      load(entry.name, entry.key).catch(() => null).finally(() => {
+        warmRunning--;
+        drainWarmQueue();
+      });
     }
-    return result;
+  }
+  function prefetch(item, category = 'games', priority = false) {
+    if (!themeCategories.has(String(category || '').toLowerCase()) || !shouldWarm()) return;
+    const name = nameOf(item).replace(/\s+/g,' ').trim();
+    const key = keyOf(name);
+    if (key.length < 3 || lookupCache.get(key+'|skip:')?.expires > Date.now() ||
+      inflight.has(key+'|skip:')) return;
+    // Promote a hovered game rather than leaving it behind old background jobs.
+    if (queued.has(key)) {
+      if (priority) {
+        const index = warmQueue.findIndex(entry => entry.key === key);
+        if (index > 0) warmQueue.unshift(warmQueue.splice(index,1)[0]);
+      }
+      return;
+    }
+    if (warmQueue.length >= 12) {
+      if (!priority) return;
+      const stale = warmQueue.pop();
+      if (stale) queued.delete(stale.key);
+    }
+    queued.add(key);
+    const entry = { name, key, queuedAt:Date.now() };
+    if (priority) warmQueue.unshift(entry);
+    else warmQueue.push(entry);
+    drainWarmQueue();
+  }
+  function getCachedStatus(item) {
+    const name = nameOf(item).replace(/\s+/g,' ').trim();
+    const cache = lookupCache.get(keyOf(name)+'|skip:');
+    return cache?.expires > Date.now() ? (cache.result?.found === true ? 'available' :
+      cache.result?.retry || cache.result?.ok === false ? 'unknown' : 'unavailable') : 'unknown';
   }
   function open(name, category) {
-    const currentName = String(name || '').replace(/[:：﹕꞉]/g, ' ').replace(/\s+/g, ' ').trim().slice(0,120);
-    const key = currentName.normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
-    if (!['games','ports','homebrew_games','prototypes'].includes(String(category || '')) || key.length < 3) {
+    const currentName = nameOf(name).replace(/\s+/g, ' ').trim();
+    const key = keyOf(currentName);
+    if (!themeCategories.has(String(category || '').toLowerCase()) || key.length < 3) {
       stop();
       return;
     }
-    if (active?.key === key && active?.result && !audio.paused) { updateButton('playing', active.result); return; }
+    // Hydration can re-render the header while the same modal is already playing.
+    if (active?.key === key) {
+      if (active.result?.found && validUrl(active.result.url))
+        updateButton(!enabled() ? 'off' : !audio.paused ? 'playing' : 'paused', active.result);
+      else updateButton('loading');
+      return;
+    }
     stop(false);
     const token = generation;
     active = { key, name:currentName, result:null, failedProviders:new Set(), attemptedUrls:new Set(), recovering:false };
-    if (!enabled()) { updateButton('off'); resumeBackground(); return; }
-    updateButton('loading');
-    load(currentName,key,token).then(result => {
+    updateButton('loading'); // Button remains hidden while availability is unknown.
+    load(currentName,key).then(result => {
       if (token !== generation || !active || active.key !== key) return;
       if (!result?.found || !validUrl(result.url)) {
         updateButton(result?.ok ? 'missing' : 'blocked');
-        const btn = button();
-        if (btn && result?.sources) {
-          const details = Object.entries(result.sources).map(([name,status]) => name + ': ' + status.replace(/_/g,' ')).join(' | ');
-          btn.title += ' | ' + details;
-        }
-        if (btn && result?.searchedAs) btn.title += ' | Search: ' + result.searchedAs;
         resumeBackground();
         return;
       }
       active.result = result;
       active.alternatives = Array.isArray(result.alternatives) ? result.alternatives.slice(0,3) : [];
-      if (suspended || trailerOpen()) { updateButton('paused', result); return; }
+      if (!enabled()) { updateButton('off',result); resumeBackground(); return; }
+      if (suspended || trailerOpen()) { updateButton('paused',result); return; }
+      // Availability was prefetched: no new search, playback starts immediately.
+      updateButton('paused',result);
       play();
     }).catch(() => {
       if (token !== generation) return;
@@ -121214,19 +121299,21 @@ function getVisibleChatStackEl(id) {
     const previous = String(active.result.provider || '').toLowerCase().replace(/[^a-z]/g,'');
     if (previous) active.failedProviders.add(previous);
     const skip = [...active.failedProviders].sort().join(',');
-    if (active.failedProviders.size >= 3) {
+    if (active.failedProviders.size >= 2) {
       active.recovering=false;
-      updateButton('blocked',active.result);
+      active.result = null;
+      updateButton('blocked');
       resumeBackground();
       return;
     }
     updateButton('loading',active.result);
     const token = generation, session = active;
-    load(session.name,session.key,token,skip).then(result=>{
+    load(session.name,session.key,skip).then(result=>{
       if (token !== generation || active !== session) return;
       session.recovering = false;
       if (!result?.found || !validUrl(result.url) || session.attemptedUrls.has(result.url)) {
-        updateButton(result?.ok ? 'missing' : 'blocked',session.result);
+        session.result = null;
+        updateButton(result?.ok ? 'missing' : 'blocked');
         resumeBackground();
         return;
       }
@@ -121236,7 +121323,8 @@ function getVisibleChatStackEl(id) {
     }).catch(()=>{
       if (token !== generation || active !== session) return;
       session.recovering=false;
-      updateButton('blocked',session.result);
+      session.result = null;
+      updateButton('blocked');
       resumeBackground();
     });
   }
@@ -121264,11 +121352,9 @@ function getVisibleChatStackEl(id) {
   function settingsChanged() {
     if (!enabled()) {
       audio.pause();
-      if (active) updateButton('off',active.result);
-    } else if (active) {
-      if (active.result?.found) play();
-      else open(active.name,'games');
-    }
+      if (active) updateButton(active.result?.found ? 'off' : 'missing',active.result);
+      resumeBackground();
+    } else if (active?.result?.found) play();
   }
   audio.addEventListener('error', () => {
     if (!active || !audio.getAttribute('src')) return;
@@ -121278,7 +121364,39 @@ function getVisibleChatStackEl(id) {
     if (document.hidden) audio.pause();
     else if (active?.result?.found && !manuallyPaused) play();
   });
-  window.psnGameTheme = { open, stop, toggle, suspend, resume, settingsChanged,
+  let hoverWarmTimer = 0;
+  function warmFromCard(target, delay = 180) {
+    const card = target?.closest?.('.game-card, .recently-visited-discover-card, .promo-card');
+    if (!card || card.closest('#game-modal') || !shouldWarm()) return;
+    const img = card.querySelector('[data-name][data-cover-category]');
+    if (!img) return;
+    clearTimeout(hoverWarmTimer);
+    hoverWarmTimer = setTimeout(() => {
+      if (!card.isConnected || document.hidden) return;
+      prefetch(img.dataset.name, img.dataset.coverCategory, true);
+    },delay);
+  }
+  document.addEventListener('pointerover', event => {
+    if (event.pointerType === 'mouse' || event.pointerType === 'pen') warmFromCard(event.target);
+  },{passive:true});
+  document.addEventListener('focusin', event => warmFromCard(event.target,80),{passive:true});
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) drainWarmQueue(); });
+  // A small first-screen warm-up, mirroring fanart's bounded prefetch, not a catalog-wide scan.
+  const initialWarm = () => {
+    if (!shouldWarm()) return;
+    const cards = document.querySelectorAll('.game-card [data-name][data-cover-category]');
+    let seen = 0;
+    for (const img of cards) {
+      const rect = img.getBoundingClientRect();
+      if (rect.width < 1 || rect.height < 1 || rect.bottom < 0 || rect.top > innerHeight + 350) continue;
+      prefetch(img.dataset.name,img.dataset.coverCategory);
+      if (++seen >= 4) break;
+    }
+  };
+  if (typeof window.runPsnAfterHomeInteractive === 'function')
+    window.runPsnAfterHomeInteractive(initialWarm);
+  else document.addEventListener('DOMContentLoaded',initialWarm,{once:true});
+  window.psnGameTheme = { open, stop, toggle, suspend, resume, settingsChanged, prefetch, getCachedStatus,
     isActive:() => !!active && !audio.paused };
 })();
 </script>

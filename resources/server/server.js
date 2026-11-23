@@ -3278,18 +3278,18 @@ app.post('/api/game-trophies/cache',express.json({limit:'240kb'}),async (req,res
   }catch(err){ return res.status(503).json({ok:false}); }
 });
 
-// Game modal music: search an album first, then select a theme track. Never proxy audio through Render.
-// Adapted workflow inspired by BambooFury/Game-Theme-Song (MIT); media remains on its original provider.
+// Game modal music: Audius-first, then permission-checked Internet Archive. Never proxy audio through Render.
 const gameThemeMemory = new Map();
 const gameThemePending = new Map();
 const GAME_THEME_MEMORY_MAX = 350;
 const GAME_THEME_FOUND_TTL = 48 * 60 * 60 * 1000;
 const GAME_THEME_MISS_TTL = 2 * 60 * 60 * 1000;
-const GAME_THEME_VERSION = 'gts9:'; // Audius game-title track matching; fallback providers and play-failure skip cache.
+const GAME_THEME_VERSION = 'gts11:'; // Preserve valid cache entries across performance-only releases.
 const gameThemeSourceCooldown = new Map();
 let gameThemeActiveLookups = 0;
-// Normalize platform/edition suffixes WITHOUT losing sequel numbers. Preserve a display-oriented
-// lookup title separately: KHInsider album names often use Roman numerals (II, III, IV).
+let gameThemeLastExpiredPrune = 0;
+// Normalize platform/edition suffixes WITHOUT losing sequel numbers. Keep the original
+// Roman numeral form for lookup, with numeric equivalents used as secondary variants.
 function gameThemeSearchTitle(value) {
   return String(value || '').replace(/[™®©℠]/g, ' ').normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[‘’]/g, "'").replace(/[–—]/g, '-').replace(/[:：﹕꞉]/g, ' ')
     .replace(/\b(?:digital version|digital edition|trial to full|full game|game of the year edition|game of the year|goty|complete edition|deluxe edition|ultimate edition|special edition|standard edition|collector'?s edition|definitive edition|director'?s cut|remastered edition|remastered|remaster|hd remaster|hd collection|hd edition|high definition|playstation network|psn|ps3|ps4|ps5|ps2|psp|ps vita|vita version|us version|eu version|north american version|european version|digital download|dlc|demo|bundle)\b/gi, ' ')
@@ -3298,6 +3298,20 @@ function gameThemeSearchTitle(value) {
     .replace(/\s*\((?:usa|europe|japan|asia|english|spanish|french|german|portuguese|en|eu|us|jp|pal|ntsc)(?:[\s,/-]+(?:en|eu|us|jp|pal|ntsc))*\)\s*/gi, ' ')
     .replace(/\s*\[[^\]]{0,30}(?:edition|region|language|version)[^\]]*\]\s*/gi, ' ')
     .replace(/\s+/g, ' ').replace(/^[\s:,.\-\[(]+|[\s:,.\-)\]]+$/g, '').trim();
+}
+// Use a numbered game's base title for soundtrack discovery. Keep the full display name
+// untouched; score remote album/track titles WITHOUT stripping their own song subtitles.
+function gameThemeCanonicalGameTitle(value) {
+  const raw = String(value || '').replace(/[™®©℠]/g, ' ').replace(/[–—]/g, '-').trim();
+  const split = /^(.{3,100}?)\s*(?:-\s+|:\s*)(.+)$/.exec(raw);
+  if (split) {
+    const base = gameThemeSearchTitle(split[1]);
+    const sequel = /\b(?:[2-9]|1[0-9]|20|II|III|IV|V|VI|VII|VIII|IX|X|XI|XII|XIII|XIV|XV)\b$/i.test(base);
+    const editionOnly = /^(?:special|definitive|deluxe|ultimate|complete|standard|collector'?s|anniversary|remastered|remaster|hd|game of the year|goty)(?:\s+edition|\s+version)?\b/i.test(split[2].trim());
+    // Do not shorten essential subtitles such as Batman: Arkham City.
+    if ((sequel && base.split(/\s+/).length >= 3) || editionOnly) return base;
+  }
+  return gameThemeSearchTitle(raw);
 }
 function gameThemeNormalize(value) {
   let name = gameThemeSearchTitle(value).toLowerCase()
@@ -3310,8 +3324,8 @@ function gameThemeNormalize(value) {
   return name.split(' ').map((word,index) => (index && romans[word]) || word).join(' ');
 }
 function gameThemeSearchVariants(value) {
-  const clean = gameThemeSearchTitle(value);
-  const normalized = gameThemeNormalize(value);
+  const clean = gameThemeCanonicalGameTitle(value);
+  const normalized = gameThemeNormalize(clean);
   const roman = { 2:'II',3:'III',4:'IV',5:'V',6:'VI',7:'VII',8:'VIII',9:'IX',10:'X',11:'XI',12:'XII',13:'XIII',14:'XIV',15:'XV' };
   const romanVariant = normalized.replace(/\b(?:2|3|4|5|6|7|8|9|10|11|12|13|14|15)\b/g, number => roman[number] || number);
   const values = [clean,romanVariant,normalized];
@@ -3329,7 +3343,7 @@ function gameThemeTokens(value) {
 }
 function gameThemeComparable(value) { return ' ' + gameThemeNormalize(value) + ' '; }
 function gameThemeAlbumScore(gameName, albumName) {
-  const expected = gameThemeTokens(gameName);
+  const expected = gameThemeTokens(gameThemeCanonicalGameTitle(gameName));
   const album = gameThemeTokens(albumName);
   if (!expected.length || !album.length) return -999;
   const set = new Set(album);
@@ -3367,123 +3381,12 @@ function gameThemeSongScore(songName, index, durationSeconds = 0) {
   if (/^(?:track|audio|sound)\s*\d+\s*$/.test(title) && durationSeconds < 65) score -= 85;
   return score;
 }
-function gameThemeTrackDuration(row) {
-  // KHInsider shows song duration inside the same <tr> as the track's .mp3 page link.
-  const text = gameThemeStripTags(row);
-  const match = /\b(?:(\d{1,2}):)?(\d{1,2}):(\d{2})\b/.exec(text);
-  return match ? (Number(match[1] || 0) * 3600 + Number(match[2]) * 60 + Number(match[3])) : 0;
-}
-function gameThemeAlbumTracks(html, albumSlug) {
-  const table = /<table\b[^>]*\bid\s*=\s*["']songlist["'][^>]*>[\s\S]*?<\/table>/i.exec(html);
-  if (!table) return [];
-  const songs = [], unique = new Set();
-  const rows = table[0].match(/<tr\b[^>]*>[\s\S]*?<\/tr>/gi) || [];
-  for (const row of rows) {
-    const duration = gameThemeTrackDuration(row);
-    const links = gameThemeHtmlLinks(row);
-    for (const link of links) {
-      if (!link.href || !link.title) continue;
-      let url;
-      try { url = new URL(link.href, 'https://downloads.khinsider.com'); } catch (_) { continue; }
-      if (url.hostname !== 'downloads.khinsider.com' || !/^\/game-soundtracks\/album\/[^/]+\/[^/]+(?:\.mp3)?$/i.test(url.pathname)) continue;
-      const parts = url.pathname.split('/');
-      if (parts[3] !== albumSlug) continue;
-      // Song links ending in .mp3 on KHInsider are HTML detail pages, NOT direct audio URLs.
-      if (unique.has(url.href)) continue;
-      unique.add(url.href);
-      songs.push({pageUrl:url.href,title:link.title,index:songs.length,duration});
-      break;
-    }
-  }
-  return songs.sort((a,b) => gameThemeSongScore(b.title,b.index,b.duration) - gameThemeSongScore(a.title,a.index,a.duration));
-}
-function gameThemeEntities(text) {
-  const named = { amp:'&',quot:'"',apos:"'",nbsp:' ',lt:'<',gt:'>',rsquo:"'",lsquo:"'",ndash:'-',mdash:'-',hellip:'...',eacute:'é',ouml:'ö' };
-  return String(text || '').replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (_, entity) => {
-    if (entity[0] === '#') { const x = entity[1]?.toLowerCase() === 'x'; const n = parseInt(entity.slice(x ? 2 : 1), x ? 16 : 10); return n > 0 && n <= 0x10ffff ? String.fromCodePoint(n) : ''; }
-    return named[entity.toLowerCase()] || _;
-  });
-}
-function gameThemeStripTags(html) { return gameThemeEntities(String(html || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ')).trim(); }
-function gameThemeHtmlLinks(html) {
-  const list = [];
-  const re = /<a\b([^>]*)>([\s\S]*?)<\/a\s*>/gi;
-  let m;
-  while ((m = re.exec(html)) && list.length < 900) {
-    const href = /\bhref\s*=\s*["']([^"']+)["']/i.exec(m[1]);
-    if (href) list.push({ href:gameThemeEntities(href[1]), title:gameThemeStripTags(m[2]) });
-  }
-  return list;
-}
-
-// KHInsider embeds a complete track list inside a Dean Edwards packer script.
-// Decode only its string dictionary; NEVER evaluate provider JavaScript.
-function gameThemePackedAlbumTracks(html, albumSlug) {
-  const script = /eval\(function\(p,a,c,k,e,d\)\{[\s\S]*?return p\}\('((?:\\.|[^'\\])*)',\s*(\d+),\s*(\d+),\s*'((?:\\.|[^'\\])*)'\.split\('\|'\),\s*0,\s*\{\}\)\)/.exec(String(html || ''));
-  if (!script || script[1].length > 500000 || script[4].length > 75000) return [];
-  const radix = Number(script[2]), count = Number(script[3]);
-  if (radix !== 62 || count < 1 || count > 2000) return [];
-  const unescapeJs = value => value.replace(/\\(['"\\])/g, '$1').replace(/\\n/g, '\n').replace(/\\r/g, '\r');
-  const dictionary = unescapeJs(script[4]).split('|');
-  if (dictionary.length < count) return [];
-  let source = unescapeJs(script[1]);
-  const encode62 = number => {
-    let result = '';
-    do {
-      const digit = number % 62;
-      result = (digit < 10 ? String(digit) : String.fromCharCode(digit <= 35 ? digit + 87 : digit + 29)) + result;
-      number = Math.floor(number / 62);
-    } while (number > 0);
-    return result;
-  };
-  for (let i = count - 1; i >= 0; i--) {
-    if (!dictionary[i]) continue;
-    source = source.replace(new RegExp('\\b' + encode62(i) + '\\b', 'g'), () => dictionary[i]);
-    if (source.length > 750000) return [];
-  }
-  const list = /\btracks\s*=\s*(\[[\s\S]{1,200000}?\])\s*,\s*trackCount\s*=/.exec(source);
-  if (!list) return [];
-  let entries;
-  try { entries = JSON.parse(list[1].replace(/,\s*\]$/, ']')); } catch (_) { return []; }
-  if (!Array.isArray(entries)) return [];
-  const tracks = [];
-  for (const [index, entry] of entries.slice(0,300).entries()) {
-    if (!entry || typeof entry.name !== 'string' || typeof entry.file !== 'string') continue;
-    const rawPath = entry.file.replace(/^https?:\/\//i, '');
-    const url = 'https://' + rawPath;
-    if (!gameThemeAllowedAudio(url)) continue;
-    let parsed;
-    try { parsed = new URL(url); } catch (_) { continue; }
-    // The encoded playlist must belong to the requested album, not an unrelated widget.
-    if (!parsed.pathname.startsWith('/soundtracks/' + albumSlug + '/')) continue;
-    const duration = /^\d{1,2}:\d{2}$/.test(entry.length || '')
-      ? Number(entry.length.split(':')[0]) * 60 + Number(entry.length.split(':')[1]) : 0;
-    tracks.push({title:entry.name.trim().slice(0,180),url,index,duration});
-  }
-  return tracks.sort((a,b) => gameThemeSongScore(b.title,b.index,b.duration) - gameThemeSongScore(a.title,a.index,a.duration));
-}
-function gameThemeAlbumHeading(html) {
-  const heading = /<h2\b[^>]*>([\s\S]*?)<\/h2>/i.exec(html);
-  const alternative = /<p\b[^>]*class=["'][^"']*albuminfoAlternativeTitles[^"']*["'][^>]*>([\s\S]*?)<\/p>/i.exec(html);
-  return [heading ? gameThemeStripTags(heading[1]) : '', alternative ? gameThemeStripTags(alternative[1]) : ''].filter(Boolean);
-}
-function gameThemeGuessedSlugs(name) {
-  const variants = gameThemeSearchVariants(name);
-  const list = [], seen = new Set();
-  for (const name of variants) {
-    const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
-    if (slug && !seen.has(slug)) { list.push(slug); seen.add(slug); }
-    if (list.length >= 2) break;
-  }
-  return list;
-}
-
 function gameThemeRequest(url, options = {}) {
   const maxBytes = options.maxBytes || 750000;
   return new Promise((resolve, reject) => {
     let parsed;
     try { parsed = new URL(url); } catch (_) { return reject(new Error('Invalid provider URL')); }
-    if (parsed.protocol !== 'https:' || !['api.audius.co','downloads.khinsider.com','archive.org','www.archive.org'].includes(parsed.hostname)) return reject(new Error('Unexpected provider host'));
+    if (parsed.protocol !== 'https:' || !['api.audius.co','archive.org','www.archive.org'].includes(parsed.hostname)) return reject(new Error('Unexpected provider host'));
     const req = https.get(parsed, { headers:{ 'User-Agent':'PSN-Content/1.0 (+https://github.com/PS3-Pro/PSN-Content)', 'Accept':options.json ? 'application/json' : 'text/html,application/xhtml+xml', 'Accept-Encoding':'identity' } }, response => {
       if ([301,302,303,307,308].includes(response.statusCode) && response.headers.location && (options.redirects || 0) < 2) {
         response.resume();
@@ -3502,13 +3405,6 @@ function gameThemeRequest(url, options = {}) {
     req.on('error', reject);
   });
 }
-function gameThemeAllowedAudio(value) {
-  try {
-    const u = new URL(value);
-    return u.protocol === 'https:' && (u.hostname === 'archive.org' || u.hostname.endsWith('.archive.org') || u.hostname === 'vgmsite.com' || u.hostname.endsWith('.vgmsite.com') || u.hostname === 'vgmtreasurechest.com' || u.hostname.endsWith('.vgmtreasurechest.com'))
-      && /\.(?:mp3|m4a|ogg|opus|aac)(?:$|[?#])/i.test(u.pathname + u.search);
-  } catch (_) { return false; }
-}
 const gameThemeProviderReady = name => (gameThemeSourceCooldown.get(name) || 0) <= Date.now();
 function gameThemeProviderError(name) { gameThemeSourceCooldown.set(name, Date.now() + 20000); }
 function gameThemeCooldownError(name) {
@@ -3524,76 +3420,6 @@ function gameThemeSourceStatus(error) {
   if (/\b(?:502|503|504)\b|ENOTFOUND|ECONNRESET|EAI_AGAIN|ETIMEDOUT/i.test(message)) return 'provider_unavailable';
   return 'provider_error';
 }
-async function gameThemeFromKhinsider(gameName) {
-  if (!gameThemeProviderReady('khinsider')) throw gameThemeCooldownError('KHInsider');
-  const deadline = Date.now() + 16000;
-  const albums = new Map();
-  const cleanName = gameThemeSearchTitle(gameName);
-  const sourceErrors = [];
-  const tryAlbum = async (album) => {
-    let html = album.html;
-    if (!html) html = await gameThemeRequest('https://downloads.khinsider.com/game-soundtracks/album/' + encodeURIComponent(album.slug), {maxBytes:1700000,timeout:5500});
-    const titles = gameThemeAlbumHeading(html);
-    const score = Math.max(-999,...titles.map(title => gameThemeAlbumScore(gameName,title)));
-    if (score < 80) return null;
-    const playlist = gameThemePackedAlbumTracks(html, album.slug);
-    const playable = playlist.filter(song => gameThemeSongScore(song.title,song.index,song.duration) >= 0).slice(0,4);
-    if (playable.length) return {ok:true,found:true,provider:'KHInsider',title:playable[0].title,album:titles[0] || album.title,
-      sourceUrl:'https://downloads.khinsider.com/game-soundtracks/album/' + album.slug,url:playable[0].url,
-      alternatives:playable.slice(1).map(({title,url}) => ({title,url}))};
-    // Older KHInsider album layouts do not embed a playlist. Keep the detail-page fallback.
-    const songs = gameThemeAlbumTracks(html,album.slug);
-    const fallback = [];
-    for (const song of songs.filter(song => gameThemeSongScore(song.title,song.index,song.duration) >= 0).slice(0,3)) {
-      if (Date.now() >= deadline) break;
-      let trackPage;
-      try { trackPage = await gameThemeRequest(song.pageUrl, {maxBytes:550000,timeout:4300}); }
-      catch (error) { sourceErrors.push('track: ' + String(error?.message || error)); continue; }
-      const candidates = gameThemeHtmlLinks(trackPage).map(link => link.href).filter(gameThemeAllowedAudio);
-      const url = candidates.find(url => /\.mp3(?:[?#]|$)/i.test(url)) || candidates[0];
-      if (url) fallback.push({title:song.title,url});
-    }
-    return fallback.length ? {ok:true,found:true,provider:'KHInsider',title:fallback[0].title,album:titles[0] || album.title,
-      sourceUrl:'https://downloads.khinsider.com/game-soundtracks/album/' + album.slug,url:fallback[0].url,
-      alternatives:fallback.slice(1)} : null;
-  };
-  // Direct album URL guesses avoid the search endpoint for common clean slugs.
-  for (const slug of gameThemeGuessedSlugs(cleanName)) {
-    if (Date.now() >= deadline) break;
-    try {
-      const result = await tryAlbum({slug});
-      if (result) return result;
-    } catch (error) {
-      const message = String(error?.message || error);
-      if (/\b(?:403|429)\b|challenge|captcha/i.test(message)) { gameThemeProviderError('khinsider'); throw error; }
-      if (!/\b404\b/.test(message)) sourceErrors.push('album: ' + message);
-    }
-  }
-  for (const phrase of gameThemeSearchVariants(cleanName)) {
-    let html;
-    try {
-      html = await gameThemeRequest('https://downloads.khinsider.com/search?search=' + encodeURIComponent(phrase), {maxBytes:1200000,timeout:5500});
-      if (/cf-chl|just a moment|enable javascript and cookies|captcha/i.test(html.slice(0,7000))) throw new Error('Provider challenge');
-    } catch (error) { gameThemeProviderError('khinsider'); throw error; }
-    for (const link of gameThemeHtmlLinks(html)) {
-      const match = /^\/?game-soundtracks\/album\/([^/?#]+)/i.exec(link.href.replace(/^https?:\/\/downloads\.khinsider\.com\//i, ''));
-      if (!match || !link.title) continue;
-      const score = gameThemeAlbumScore(gameName,link.title);
-      if (score >= 80 && (!albums.has(match[1]) || albums.get(match[1]).score < score))
-        albums.set(match[1], {slug:match[1],title:link.title,score});
-    }
-    if (albums.size) break;
-  }
-  for (const album of [...albums.values()].sort((a,b) => b.score - a.score).slice(0,3)) {
-    if (Date.now() >= deadline) break;
-    try {
-      const result = await tryAlbum(album);
-      if (result) return result;
-    } catch (error) {sourceErrors.push('album: ' + String(error?.message || error));}
-  }
-  if (sourceErrors.length) throw new Error('KHInsider album unavailable: ' + sourceErrors[0]);
-  return null;
-}
 // Audius is queried with the original Roman-numeral display name first.
 // A candidate must CONTAIN the complete game name as a contiguous, word-boundary phrase
 // (not merely share some keywords); longer track titles are valid, e.g. DMC3 - Devils Never Cry.
@@ -3602,12 +3428,12 @@ function gameThemeAudiusScore(gameName, track) {
   if (!/^[a-z0-9_-]{3,64}$/i.test(String(track.id || '')) || track.is_streamable === false ||
       track.isStreamable === false || track.isStreamable === 'false' || track.is_delete === true ||
       track.is_unlisted === true || track.isUnlisted === true) return -999;
-  const expected = gameThemeNormalize(gameName);
+  const expected = gameThemeNormalize(gameThemeCanonicalGameTitle(gameName));
   const title = gameThemeNormalize(track.title);
   if (!title || !expected || !(' ' + title + ' ').includes(' ' + expected + ' ')) return -999;
   if (/\b(?:cough|sneeze|voiceover|voice over|dialogue|dialog|speech|conversation|interview|podcast|commentary|walkthrough|gameplay|lets play|reaction|trailer|cutscene|sound effects|sfx|sound effect|footsteps|gunshots|tutorial|review|meme|parody)\b/.test(title)) return -999;
   // Even when the required phrase appears, reject tracks combining different sequels.
-  const requestedNumbers = new Set(gameThemeTokens(gameName).filter(x => /^\d+$/.test(x)));
+  const requestedNumbers = new Set(gameThemeTokens(gameThemeCanonicalGameTitle(gameName)).filter(x => /^\d+$/.test(x)));
   const titleNumbers = gameThemeTokens(track.title).filter(x => /^\d+$/.test(x) && !(Number(x)>=1970 && Number(x)<=2100));
   if (titleNumbers.some(number => !requestedNumbers.has(number))) return -999;
   const duration = Number(track.duration) || 0;
@@ -3638,10 +3464,10 @@ function gameThemeAudiusResult(track) {
 }
 async function gameThemeFromAudius(gameName) {
   if (!gameThemeProviderReady('audius')) throw gameThemeCooldownError('Audius');
-  const clean = gameThemeSearchTitle(gameName);
+  const clean = gameThemeCanonicalGameTitle(gameName);
   const shortened = clean.replace(/\s+(?:II|III|IV|V|VI|VII|VIII|IX|X|XI|XII|XIII|XIV|XV|[2-9]|1[0-5])$/i, '').trim();
   // Audius may surface DMC3 only for a broad 'Devil May Cry' query. Discovery may be broad; acceptance stays strict.
-  const phrases = [...gameThemeSearchVariants(gameName)];
+  const phrases = [...gameThemeSearchVariants(clean)];
   if (shortened !== clean && shortened.split(' ').length >= 2) phrases.push(shortened);
   phrases.push(clean + ' soundtrack');
   const unique = [], seen = new Set();
@@ -3674,7 +3500,8 @@ async function gameThemeFromAudius(gameName) {
       artist:String(picks[0].track.user?.name || picks[0].track.user?.handle || '').slice(0,120),
       alternatives:selected.slice(1).map(({title,url})=>({title,url}))};
   }
-  if (errors && !searched) { gameThemeProviderError('audius'); throw lastError || new Error('Audius unavailable'); }
+  // Partial upstream failures are not evidence that music does not exist.
+  if (errors) { gameThemeProviderError('audius'); throw lastError || new Error('Audius search incomplete'); }
   return null;
 }
 function gameThemeArchiveLicense(meta) {
@@ -3753,7 +3580,8 @@ async function gameThemeFromArchive(gameName) {
         if (result?.unlicensed && !unlicensedAlbum) unlicensedAlbum=result.unlicensed;
       }
     }
-    if (metadataFailures && metadataFailures === matches.length) throw new Error('Internet Archive metadata unavailable');
+    // Do not save a negative result when some candidate albums could not be inspected.
+    if (metadataFailures) throw new Error('Internet Archive metadata incomplete');
     if (unlicensedAlbum) return {ok:true,found:false,reason:'reuse_permission_not_verified',...unlicensedAlbum};
     if (licensedAlbumMissingPlayable) return {ok:true,found:false,reason:'no_browser_compatible_audio'};
   } catch (error) { gameThemeProviderError('archive'); throw error; }
@@ -3767,26 +3595,44 @@ function gameThemeRemember(key, result, ttl = result.found ? GAME_THEME_FOUND_TT
 }
 async function gameThemeResolve(name, key, skip = new Set()) {
   const cache = gameThemeMemory.get(key);
-  if (cache && cache.expires > Date.now()) return cache.result;
+  if (cache && cache.expires > Date.now()) {
+    // Refresh the access order so frequently opened games stay in the small RAM cache.
+    gameThemeMemory.delete(key);
+    gameThemeMemory.set(key, cache);
+    return cache.result;
+  }
+  if (cache) gameThemeMemory.delete(key);
   if (gameThemePending.has(key)) return gameThemePending.get(key);
   if (gameThemeActiveLookups >= 4) return {ok:false,found:false,retry:true,reason:'busy'};
   ++gameThemeActiveLookups;
   const pending = (async () => {
     try {
-      const fastRead = pool.waitingCount ? null : queryDbWithRetry('SELECT payload,expires_at FROM game_theme_cache WHERE name_key=$1 AND expires_at>NOW() LIMIT 1',[key],{label:'GAME THEME CACHE READ',attempts:1});
-      const saved = fastRead ? await Promise.race([fastRead.catch(() => null),new Promise(resolve => setTimeout(() => resolve(null),750))]) : null;
+      // Avoid abandoning a still-running SQL read while starting expensive provider lookups.
+      // Under pool pressure, skip this optional read instead of occupying a busy connection.
+      let canReadCache = pool.waitingCount === 0 && (pool.idleCount > 0 || pool.totalCount < PG_POOL_MAX);
+      if (!canReadCache) {
+        // Do not bypass an existing SQL cache entry and launch two remote searches
+        // just because the shared DB pool was momentarily saturated.
+        await new Promise(resolve => setTimeout(resolve, 180));
+        canReadCache = pool.waitingCount === 0 && (pool.idleCount > 0 || pool.totalCount < PG_POOL_MAX);
+        if (!canReadCache) return {ok:false,found:false,retry:true,reason:'db_pool_busy'};
+      }
+      const saved = await queryDbWithRetry(
+        'SELECT payload,expires_at FROM game_theme_cache WHERE name_key=$1 AND expires_at>NOW() LIMIT 1',
+        [key], {label:'GAME THEME CACHE READ',attempts:1,queryTimeoutMs:1200}
+      ).catch(() => null);
       const row = saved?.rows?.[0];
       if (row && row.payload && row.payload.ok === true && typeof row.payload.found === 'boolean')
         return gameThemeRemember(key,row.payload,Math.max(20000,new Date(row.expires_at).getTime()-Date.now()));
     } catch (_) {}
     let result = null, failed = 0;
     const diagnostics = {};
-    for (const [providerName,provider] of [['Audius',gameThemeFromAudius],['KHInsider',gameThemeFromKhinsider],['Internet Archive',gameThemeFromArchive]]) {
+    for (const [providerName,provider] of [['Audius',gameThemeFromAudius],['Internet Archive',gameThemeFromArchive]]) {
       if (skip.has(providerName.toLowerCase().replace(/[^a-z]/g,''))) { diagnostics[providerName] = 'skipped'; continue; }
       result = null;
       try {
-        result = await provider(name);
-        diagnostics[providerName] = result?.found ? 'found' : (result?.reason || (gameThemeProviderReady(providerName === 'Audius' ? 'audius' : providerName === 'KHInsider' ? 'khinsider' : 'archive') ? 'no_playable_match' : 'temporarily_unavailable'));
+        result = await provider(gameThemeCanonicalGameTitle(name));
+        diagnostics[providerName] = result?.found ? 'found' : (result?.reason || (gameThemeProviderReady(providerName === 'Audius' ? 'audius' : 'archive') ? 'no_playable_match' : 'temporarily_unavailable'));
       } catch (error) {
         failed++;
         const message = String(error?.message || 'unavailable');
@@ -3801,13 +3647,29 @@ async function gameThemeResolve(name, key, skip = new Set()) {
         ...(result?.sourceUrl ? {archiveExample:result.sourceUrl} : {})};
     } else if (!result) result = {ok:true,found:false,reason:'no_playable_theme',sources:diagnostics};
     else if (!result.found) result = {...result,sources:diagnostics};
-    if (!result.retry) {
+    if (result.retry) {
+      // Short-lived RAM-only retry memo: avoid provider storms during outages.
+      // Never store a transient outage as a confirmed music absence in PostgreSQL.
+      gameThemeRemember(key,result,10000);
+    } else {
       gameThemeRemember(key,result);
       queryDbWithRetry(`INSERT INTO game_theme_cache(name_key,payload,expires_at)
         VALUES($1,$2::jsonb,NOW()+($3::bigint * INTERVAL '1 millisecond'))
         ON CONFLICT(name_key) DO UPDATE SET payload=EXCLUDED.payload,expires_at=EXCLUDED.expires_at`,
         [key,JSON.stringify(result),result.found ? GAME_THEME_FOUND_TTL : GAME_THEME_MISS_TTL],
         {label:'GAME THEME CACHE WRITE',attempts:1}).catch(() => {});
+      // Expired entries from old versions are removed in small, low-priority batches.
+      const now = Date.now();
+      if (now - gameThemeLastExpiredPrune > 6 * 60 * 60 * 1000 && pool.waitingCount === 0) {
+        gameThemeLastExpiredPrune = now;
+        const timer = setTimeout(() => {
+          if (pool.waitingCount || (pool.totalCount >= PG_POOL_MAX && !pool.idleCount)) return;
+          pool.query({text:`DELETE FROM game_theme_cache WHERE ctid IN (
+            SELECT ctid FROM game_theme_cache WHERE expires_at<=NOW() ORDER BY expires_at LIMIT 500
+          )`,query_timeout:2500}).catch(() => {});
+        },8000);
+        timer.unref?.();
+      }
     }
     return result;
   })().finally(() => { gameThemePending.delete(key); --gameThemeActiveLookups; });
@@ -3818,14 +3680,15 @@ app.options('/api/game-theme',(req,res) => {setMetadataCors(res);res.status(204)
 app.get('/api/game-theme', async (req,res) => {
   setMetadataCors(res);
   const name = String(req.query?.name || '').replace(/[\u0000-\u001f\u007f]/g,'').trim().slice(0,120);
-  const normalized = gameThemeNormalize(name);
+  const searchedAs = gameThemeCanonicalGameTitle(name);
+  const normalized = gameThemeNormalize(searchedAs);
   if (name.length < 2 || !normalized) return res.status(400).json({ok:false,found:false,reason:'invalid_title'});
   try {
-    const skip = new Set(String(req.query?.skip || '').toLowerCase().split(',').filter(x => ['audius','khinsider','internetarchive'].includes(x)));
+    const skip = new Set(String(req.query?.skip || '').toLowerCase().split(',').filter(x => ['audius','internetarchive'].includes(x)));
     const skippedKey = [...skip].sort().join(',');
-    const result = await gameThemeResolve(name,GAME_THEME_VERSION + normalized + (skippedKey ? ':skip:' + skippedKey : ''),skip);
+    const result = await gameThemeResolve(searchedAs,GAME_THEME_VERSION + normalized + (skippedKey ? ':skip:' + skippedKey : ''),skip);
     res.setHeader('Cache-Control',result.retry ? 'no-store' : 'public,max-age=60');
-    return res.json({ ...result, searchedAs:gameThemeSearchTitle(name), normalizedTitle:normalized });
+    return res.json({ ...result, searchedAs, normalizedTitle:normalized });
   } catch (_) { return res.status(503).json({ok:false,found:false,retry:true}); }
 });
 
@@ -4941,6 +4804,7 @@ async function initDb() {
       payload JSONB NOT NULL,
       expires_at TIMESTAMPTZ NOT NULL
     );
+    CREATE INDEX IF NOT EXISTS idx_game_theme_cache_expires ON game_theme_cache(expires_at);
     CREATE TABLE IF NOT EXISTS metadata_provider_cache (
       cache_key TEXT PRIMARY KEY,
       payload JSONB NOT NULL,
