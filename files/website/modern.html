@@ -36941,6 +36941,10 @@ P
             window.__psnPrefetchRegionsGameplay?.(renderItems[0]?.game,currentCat);
             window.__psnPrefetchRegionsModal?.(renderItems[0]?.game,currentCat);
         }
+        if(!isAppending && !browseExpandedGroupTitle) {
+            const singleGame=renderItems.length===1 && document.getElementById('search-input')?.value.trim() ? renderItems[0]?.game : null;
+            window.__psnScheduleBrowseSingleGameplay?.(singleGame,currentCat);
+        }
 		window.__browseRenderDataLength = renderItems.length;
 		if (!isAppending && typeof window.syncBrowseSurpriseButtonState === 'function') window.syncBrowseSurpriseButtonState(renderItems.length);
 		if (!isAppending && typeof syncBrowseSortButtonState === 'function') syncBrowseSortButtonState(renderItems.length);
@@ -120554,7 +120558,59 @@ function getVisibleChatStackEl(id) {
     if(name.length<3||name.length>140)return null;
     return {name,system,isPort,isMinis:platform==='minis',key:(isPort?'port':platform==='minis'?'minis':system)+':'+normalized(name)};
   }
-  let regionWarm=null;
+  let regionWarm=null, parkedHost=null;
+  const parkedVideos=new Map();
+  function getParkedHost() {
+    if(!parkedHost||!parkedHost.isConnected){
+      parkedHost=document.createElement('div');
+      parkedHost.setAttribute('aria-hidden','true');
+      parkedHost.style.cssText='position:fixed;left:-10000px;top:0;width:1px;height:1px;overflow:hidden;visibility:hidden;pointer-events:none;';
+      document.body.appendChild(parkedHost);
+    }
+    return parkedHost;
+  }
+  function parkVideo(video) {
+    if(!video||video.error||!video.dataset.previewKey)return;
+    const key=video.dataset.previewKey;
+    const previous=parkedVideos.get(key);
+    if(previous&&previous!==video)dispose(previous);
+    for(const [node,old] of cardVideos)if(old===video)cardVideos.delete(node);
+    parkedVideos.delete(key);parkedVideos.set(key,video);
+    getParkedHost().appendChild(video);
+    while(parkedVideos.size>2){
+      const [oldKey,oldVideo]=parkedVideos.entries().next().value;
+      parkedVideos.delete(oldKey);dispose(oldVideo);
+    }
+  }
+  function adoptParkedVideo(info,parent,isModal) {
+    const video=parkedVideos.get(info.key);
+    if(!video)return null;
+    parkedVideos.delete(info.key);
+    if(video.error||!video.isConnected||Date.now()-Number(video.dataset.preparedAt||0)>VIDEO_RECHECK_MS){
+      dispose(video);return null;
+    }
+    parent.appendChild(video);
+    if(isModal)modalVideos.set(parent,video);else rememberCard(parent,video);
+    return video;
+  }
+  function hasPreparedVideo(key) {
+    if(active&&!active.card.isConnected)stop();
+    const now=Date.now();
+    for(const [id,video] of parkedVideos){
+      if(video.isConnected&&!video.error&&now-Number(video.dataset.preparedAt||0)<=VIDEO_RECHECK_MS)continue;
+      parkedVideos.delete(id);
+      if(video!==active?.video)dispose(video);
+    }
+    for(const [node,video] of cardVideos){
+      if(node.isConnected&&video.isConnected&&!video.error&&now-Number(video.dataset.preparedAt||0)<=VIDEO_RECHECK_MS)continue;
+      cardVideos.delete(node);
+      if(video!==active?.video)dispose(video);
+    }
+    if(parkedVideos.has(key))return true;
+    if(regionWarm?.key===key&&regionWarm.video?.isConnected&&!regionWarm.video.error&&now-Number(regionWarm.video.dataset.preparedAt||0)<=VIDEO_RECHECK_MS)return true;
+    for(const video of cardVideos.values())if(video.dataset.previewKey===key)return true;
+    return false;
+  }
   function bindPreviewEvents(video,info) {
     if(video.__psnPreviewBound)return;
     video.__psnPreviewBound=true;
@@ -120569,6 +120625,7 @@ function getVisibleChatStackEl(id) {
       if(recentVideoErrors.length>=3)videoBlockedUntil=Math.max(videoBlockedUntil,now+Math.min(60000,5000*2**Math.min(4,recentVideoErrors.length-3)));
       failures.set(info.key,now+15000);cache.delete(info.key);sessionResult(info,true);
       if(regionWarm?.video===video){regionWarm.video=null;regionWarm.state='error';regionWarm.retryAfter=now+30000;}
+      if(parkedVideos.get(info.key)===video)parkedVideos.delete(info.key);
       for(const [node,old] of cardVideos)if(old===video)cardVideos.delete(node);
       if(active?.modal&&modalVideos.get(active.card)===video)modalVideos.delete(active.card);
       if(active?.video===video){if(!active.progress)armProgress(active,active.modal?active.card:active.card.querySelector('.game-img-container'));showProgressStatus(active,'error');stop(true);}
@@ -120586,7 +120643,7 @@ function getVisibleChatStackEl(id) {
     }
     for(const [node,old] of cardVideos)if(old===video)cardVideos.delete(node);
     parent.appendChild(video);
-    warm.host?.remove();warm.host=null;
+    warm.host?.remove();warm.host=null;warm.video=null;
     if(isModal)modalVideos.set(parent,video);else rememberCard(parent,video);
     bindPreviewEvents(video,info);
     return video;
@@ -120601,14 +120658,14 @@ function getVisibleChatStackEl(id) {
     if(!system||name.length<3||name.length>140)return null;
     return {name,system,isPort,isMinis:platform==='minis',key:(isPort?'port':platform==='minis'?'minis':system)+':'+normalized(name)};
   }
-  window.__psnPrefetchRegionsGameplay=function(game,category='games') {
+  window.__psnPrefetchRegionsGameplay=function(game,category='games',options={}) {
     if(document.hidden)return;
     const info=regionGameInfo(game,category);
     if(!info)return;
     if(regionWarm?.key===info.key){
-      if(regionWarm.state==='pending'||regionWarm.state==='missing')return;
-      if(regionWarm.state==='found'&&(!regionWarm.video||regionWarm.video.isConnected))return;
-      if(regionWarm.state==='error'&&Date.now()<regionWarm.retryAfter)return;
+      if(regionWarm.state==='pending')return;
+      if((regionWarm.state==='missing'||regionWarm.state==='error')&&Date.now()<regionWarm.retryAfter)return;
+      if(regionWarm.state==='found'&&hasPreparedVideo(info.key))return;
     }
     const prior=regionWarm;
     regionWarm=null;
@@ -120633,8 +120690,8 @@ function getVisibleChatStackEl(id) {
       if(!hoverSupported||document.hidden||connection?.saveData||/^(slow-2g|2g)$/.test(connection?.effectiveType||''))return;
       const url=validProxy(data.fallbackUrl);
       if(!url)return;
-      await window.__psnWaitRegionsFanart?.(game,category);
-      if(regionWarm!==warm||document.hidden)return;
+      if(!options.skipFanart)await window.__psnWaitRegionsFanart?.(game,category);
+      if(regionWarm!==warm||document.hidden||hasPreparedVideo(info.key))return;
       const host=document.createElement('div');
       host.setAttribute('aria-hidden','true');
       host.style.cssText='position:fixed;left:-10000px;top:0;width:1px;height:1px;overflow:hidden;visibility:hidden;pointer-events:none;';
@@ -120649,6 +120706,32 @@ function getVisibleChatStackEl(id) {
       host.appendChild(video);document.body.appendChild(host);
       video.src=url;
     }).catch(()=>{if(regionWarm===warm){warm.state='error';warm.retryAfter=Date.now()+30000;}});
+  };
+  window.__psnPrefetchBrowseGameplay=function(game,category='games') {
+    const info=regionGameInfo(game,category);
+    if(!info||hasPreparedVideo(info.key))return;
+    window.__psnPrefetchRegionsGameplay(game,category,{skipFanart:true});
+  };
+  let browseSinglePreviewTimer=0,browseSinglePreviewRequest=0;
+  window.__psnScheduleBrowseSingleGameplay=function(game,category='games') {
+    clearTimeout(browseSinglePreviewTimer);
+    const request=++browseSinglePreviewRequest;
+    if(!game||document.hidden)return;
+    const info=regionGameInfo(game,category);
+    if(!info)return;
+    const check=remaining=>{
+      if(request!==browseSinglePreviewRequest||document.hidden)return;
+      const browse=document.getElementById('view-browse');
+      const grid=document.getElementById('database-grid');
+      if(!browse||getComputedStyle(browse).display==='none'||!document.getElementById('search-input')?.value.trim())return;
+      const cards=grid?.querySelectorAll(':scope > .game-card:not(.skeleton-card)');
+      if(cards?.length===1&&identity(cards[0])?.key===info.key){
+        window.__psnPrefetchBrowseGameplay(game,category);
+      } else if(remaining>0) {
+        browseSinglePreviewTimer=setTimeout(()=>check(remaining-1),220);
+      }
+    };
+    browseSinglePreviewTimer=setTimeout(()=>check(3),260);
   };
   function progressBar(parent) {
     let bar=parent.querySelector(':scope > .psn-gameplay-preview-progress');
@@ -120706,7 +120789,11 @@ function getVisibleChatStackEl(id) {
     const old=active;active=null;
     clearTimeout(old.timer);clearTimeout(old.lookupTimer);
     if(!keepProgress)hideProgress(old);
-    if(old.video){old.video.pause();old.video.classList.remove('is-ready');}
+    if(old.video){
+      old.video.pause();old.video.classList.remove('is-ready');
+      if(old.modal&&modalVideos.get(old.card)===old.video)modalVideos.delete(old.card);
+      parkVideo(old.video);
+    }
   }
   function revealVideo(current,video) {
     if(active!==current||current.video!==video||!current.card.isConnected||!current.card.matches(':hover')||document.hidden)return;
@@ -120718,6 +120805,7 @@ function getVisibleChatStackEl(id) {
   }
   function cachedVideo(current,info,parent) {
     const video=(current.modal?modalVideos.get(parent):cardVideos.get(parent)) ||
+      adoptParkedVideo(info,parent,current.modal) ||
       (regionWarm?.key===info.key && regionWarm.video?.readyState>=2 ? adoptRegionVideo(info,parent,current.modal) : null);
     if(!video||!video.isConnected||video.dataset.previewKey!==info.key)return false;
     if(Date.now()-Number(video.dataset.preparedAt||0)>VIDEO_RECHECK_MS||video.readyState<2)return false;
@@ -120742,7 +120830,8 @@ function getVisibleChatStackEl(id) {
     }
     const url=validProxy(data.fallbackUrl);
     if(!url){showProgressStatus(current,'error');return;}
-    let video=(current.modal?modalVideos.get(parent):cardVideos.get(parent)) || adoptRegionVideo(info,parent,current.modal);
+    let video=(current.modal?modalVideos.get(parent):cardVideos.get(parent)) ||
+      adoptParkedVideo(info,parent,current.modal) || adoptRegionVideo(info,parent,current.modal);
     if(video&&(video.dataset.previewKey!==info.key||video.dataset.previewUrl!==url||Date.now()-Number(video.dataset.preparedAt||0)>VIDEO_RECHECK_MS)) {
       if(current.modal)modalVideos.delete(parent);else cardVideos.delete(parent);
       dispose(video);video=null;
