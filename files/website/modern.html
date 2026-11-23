@@ -121057,8 +121057,13 @@ function getVisibleChatStackEl(id) {
   const trailerOpen = () => document.getElementById('trailer-modal')?.classList.contains('show') === true;
   const button = () => document.getElementById('modal-title-game-theme-btn');
   const validUrl = value => {
-    try { const url = new URL(value); return url.protocol === 'https:' && url.hostname === 'api.audius.co' && /^\/v1\/tracks\/[a-zA-Z0-9_-]+\/stream$/.test(url.pathname); }
-    catch (_) { return false; }
+    try {
+      const url = new URL(value);
+      const host = url.hostname.toLowerCase();
+      return url.protocol === 'https:' &&
+        (host === 'archive.org' || host.endsWith('.archive.org') || host === 'vgmsite.com' || host.endsWith('.vgmsite.com') || host === 'downloads.khinsider.com' || host.endsWith('.khinsider.com')) &&
+        /\.(?:mp3|m4a|ogg|opus|aac)$/i.test(url.pathname);
+    } catch (_) { return false; }
   };
   function fade(element, target, duration, done) {
     if (!element) return;
@@ -121085,7 +121090,7 @@ function getVisibleChatStackEl(id) {
     btn.classList.toggle('is-playing', state === 'playing');
     btn.classList.toggle('is-loading', state === 'loading');
     btn.setAttribute('aria-pressed', state === 'playing' ? 'true' : 'false');
-    const label = state === 'playing' ? `Pause theme: ${track?.title || 'Game theme'}`
+    const label = state === 'playing' ? `Pause theme: ${track?.title || 'Game theme'} (${track?.provider || 'source'})`
       : state === 'paused' ? 'Play game theme'
       : state === 'loading' ? 'Searching game theme...'
       : state === 'blocked' ? 'Click to play game theme'
@@ -121168,6 +121173,7 @@ function getVisibleChatStackEl(id) {
         return;
       }
       active.result = result;
+      active.alternatives = Array.isArray(result.alternatives) ? result.alternatives.slice(0,3) : [];
       if (suspended || trailerOpen()) { updateButton('paused', result); return; }
       play();
     }).catch(() => {
@@ -121208,6 +121214,16 @@ function getVisibleChatStackEl(id) {
   }
   audio.addEventListener('error', () => {
     if (!active || !audio.getAttribute('src')) return;
+    const remaining = active.alternatives || [];
+    const next = remaining.shift();
+    if (next && validUrl(next.url) && enabled() && visible()) {
+      active.result = { ...active.result, title:next.title || active.result.title, url:next.url };
+      audio.pause();
+      audio.removeAttribute('src');
+      audio.load();
+      play();
+      return;
+    }
     updateButton('blocked', active.result);
     audio.pause();
     resumeBackground();
