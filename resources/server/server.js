@@ -3278,6 +3278,130 @@ app.post('/api/game-trophies/cache',express.json({limit:'240kb'}),async (req,res
   }catch(err){ return res.status(503).json({ok:false}); }
 });
 
+// Game modal soundtrack lookup: metadata through Render, audio directly from Audius.
+const gameThemeMemory = new Map();
+const gameThemePending = new Map();
+const GAME_THEME_MEMORY_MAX = 350;
+const GAME_THEME_FOUND_TTL = 7 * 24 * 60 * 60 * 1000;
+const GAME_THEME_MISS_TTL = 8 * 60 * 60 * 1000;
+let gameThemeProviderCooldownUntil = 0;
+function gameThemeNormalize(value) {
+  return String(value || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase().replace(/&/g, ' and ').replace(/[™®©]/g, ' ')
+    .replace(/\b(?:ps3|ps2|psp|ps1|ps4|ps5|playstation|digital version|game of the year|goty|complete edition)\b/g, ' ')
+    .replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ');
+}
+function gameThemeWords(value) {
+  return gameThemeNormalize(value).split(' ').filter(word => (word.length > 1 || /^[0-9ivx]$/.test(word)) && !['the','and','for','of','to','in','a','an'].includes(word));
+}
+function gameThemeScore(gameName, track) {
+  const name = gameThemeNormalize(gameName);
+  const title = gameThemeNormalize(track && track.title);
+  const album = gameThemeNormalize(track && (track.album_name || track.album?.album_name || track.album?.name));
+  const full = `${title} ${album}`.trim();
+  const words = gameThemeWords(gameName);
+  if (!words.length || !title || !words.every(word => new RegExp(`(?:^| )${word}(?: |$)`).test(full))) return -100;
+  const isTitleMatch = words.every(word => new RegExp(`(?:^| )${word}(?: |$)`).test(title));
+  const hasTheme = /\b(theme|soundtrack|ost|score|menu|title screen|opening|intro|main title|game music|original game)\b/.test(full);
+  if (!hasTheme || !(isTitleMatch || album.includes(name))) return -100;
+  let score = 45 + (isTitleMatch ? 38 : 16);
+  if (title.includes(name)) score += 28;
+  if (/\b(main theme|main title|title theme|menu theme|original soundtrack|official soundtrack)\b/.test(full)) score += 28;
+  if (/\b(ost|soundtrack|theme|video game music)\b/.test(title)) score += 18;
+  if (/\b(remix|nightcore|slowed|sped up|reverb|trap|lofi|lo fi|beat|extended|8d|ai cover|mashup)\b/.test(full)) score -= 40;
+  if (/\b(cover|reimagined|arrangement|piano version)\b/.test(full)) score -= 12;
+  if (track && (track.is_streamable === false || track.is_unlisted === true || track.is_delete === true)) score = -100;
+  return score;
+}
+function gameThemeHttpsJson(url, timeoutMs = 7500) {
+  return new Promise((resolve, reject) => {
+    const request = https.get(url, { headers: { 'Accept':'application/json', 'User-Agent':'PSN-Content/1.0' } }, response => {
+      if (response.statusCode !== 200) { response.resume(); return reject(new Error(`Audius ${response.statusCode}`)); }
+      let size = 0, body = '';
+      response.setEncoding('utf8');
+      response.on('data', chunk => {
+        size += Buffer.byteLength(chunk);
+        if (size > 512 * 1024) { request.destroy(new Error('Game theme response too large')); return; }
+        body += chunk;
+      });
+      response.on('end', () => {
+        try { resolve(JSON.parse(body)); } catch (error) { reject(error); }
+      });
+      response.on('error', reject);
+    });
+    request.setTimeout(timeoutMs, () => request.destroy(new Error('Audius timeout')));
+    request.on('error', reject);
+  });
+}
+function gameThemeRemember(key, result, ttl = result.found ? GAME_THEME_FOUND_TTL : GAME_THEME_MISS_TTL) {
+  gameThemeMemory.delete(key);
+  gameThemeMemory.set(key, { result, expires: Date.now() + ttl });
+  while (gameThemeMemory.size > GAME_THEME_MEMORY_MAX) gameThemeMemory.delete(gameThemeMemory.keys().next().value);
+  return result;
+}
+async function gameThemeResolve(name, key) {
+  const cache = gameThemeMemory.get(key);
+  if (cache && cache.expires > Date.now()) return cache.result;
+  if (gameThemePending.has(key)) return gameThemePending.get(key);
+  const pending = (async () => {
+    // Persist references, never audio, across server redeployments.
+    try {
+      const fastRead = pool.waitingCount > 0 ? null : queryDbWithRetry('SELECT payload, expires_at FROM game_theme_cache WHERE name_key=$1 AND expires_at>NOW() LIMIT 1', [key], { label:'GAME THEME CACHE READ', attempts:1 });
+      const saved = fastRead ? await Promise.race([fastRead.catch(() => null), new Promise(resolve => setTimeout(() => resolve(null), 800))]) : null;
+      const row = saved?.rows && saved.rows[0];
+      if (row && row.payload && typeof row.payload.found === 'boolean') {
+        const ttl = Math.max(30000, Math.min(GAME_THEME_FOUND_TTL, new Date(row.expires_at).getTime() - Date.now()));
+        return gameThemeRemember(key, row.payload, ttl);
+      }
+    } catch (_) { /* DB may be warming up; still allow Audius lookup. */ }
+    if (Date.now() < gameThemeProviderCooldownUntil) return { ok:false, found:false, retry:true };
+    let best = null, bestScore = 76;
+    try {
+      for (const phrase of [`${name} soundtrack`, `${name} main theme`]) {
+        const url = 'https://api.audius.co/v1/tracks/search?' + new URLSearchParams({ query:phrase, limit:'20' }).toString();
+        const data = await gameThemeHttpsJson(url);
+        for (const item of Array.isArray(data?.data) ? data.data : []) {
+          if (!item || !/^[a-zA-Z0-9_-]{3,40}$/.test(String(item.id || ''))) continue;
+          const score = gameThemeScore(name, item);
+          if (score > bestScore) { best = item; bestScore = score; }
+        }
+        if (bestScore >= 125) break;
+      }
+    } catch (error) {
+      if (!best) {
+        gameThemeProviderCooldownUntil = Date.now() + 20000;
+        return { ok:false, found:false, retry:true };
+      }
+    }
+    const result = best ? {
+      ok:true, found:true, provider:'Audius', id:best.id,
+      title:String(best.title || '').slice(0,180),
+      artist:String(best.user?.name || best.user?.handle || '').slice(0,120),
+      url:`https://api.audius.co/v1/tracks/${encodeURIComponent(best.id)}/stream`
+    } : { ok:true, found:false, provider:'Audius' };
+    gameThemeRemember(key, result);
+    queryDbWithRetry(`INSERT INTO game_theme_cache(name_key,payload,expires_at) VALUES($1,$2::jsonb,NOW()+($3::bigint * INTERVAL '1 millisecond'))
+      ON CONFLICT(name_key) DO UPDATE SET payload=EXCLUDED.payload,expires_at=EXCLUDED.expires_at`,
+      [key,JSON.stringify(result),result.found ? GAME_THEME_FOUND_TTL : GAME_THEME_MISS_TTL],
+      { label:'GAME THEME CACHE WRITE', attempts:1 }).catch(() => {});
+    return result;
+  })().finally(() => gameThemePending.delete(key));
+  gameThemePending.set(key, pending);
+  return pending;
+}
+app.options('/api/game-theme', (req, res) => { setMetadataCors(res); res.status(204).end(); });
+app.get('/api/game-theme', async (req, res) => {
+  setMetadataCors(res);
+  const name = String(req.query?.name || '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0,120);
+  const key = gameThemeNormalize(name);
+  if (name.length < 3 || name.length > 120 || key.length < 3) return res.status(400).json({ok:false,found:false});
+  try {
+    const result = await gameThemeResolve(name,key);
+    res.setHeader('Cache-Control', result.retry ? 'no-store' : 'public,max-age=60');
+    return res.json(result);
+  } catch (_) { return res.status(503).json({ok:false,found:false,retry:true}); }
+});
+
 app.options('/api/gameplay-preview', (req, res) => { setMetadataCors(res); res.status(204).end(); });
 app.get('/api/gameplay-preview', async (req, res) => {
   setMetadataCors(res);
@@ -4384,6 +4508,11 @@ async function initDb() {
       index_version SMALLINT PRIMARY KEY,
       payload BYTEA NOT NULL,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS game_theme_cache (
+      name_key TEXT PRIMARY KEY,
+      payload JSONB NOT NULL,
+      expires_at TIMESTAMPTZ NOT NULL
     );
     CREATE TABLE IF NOT EXISTS metadata_provider_cache (
       cache_key TEXT PRIMARY KEY,

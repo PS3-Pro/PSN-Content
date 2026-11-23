@@ -1054,6 +1054,12 @@ html.ios-webkit #object-particles { contain:strict; }
 #game-modal .modal-title-wish-btn, #game-modal .modal-title-share-btn, #game-modal .modal-title-report-btn, #game-modal .modal-title-metadata-btn { position: relative !important; bottom: auto !important; right: auto !important; width: 28px; height: 28px; min-width: 28px; flex: 0 0 28px; display: inline-grid !important; place-items: center !important; margin-left: 0 !important; vertical-align: middle; background: transparent !important; border: 0 !important; box-shadow: none !important; backdrop-filter: none !important; -webkit-backdrop-filter: none !important; border-radius: 50% !important; transform-origin: center center !important; padding: 0 !important; }
 #game-modal .modal-title-wish-btn:hover, #game-modal .modal-title-share-btn:hover, #game-modal .modal-title-report-btn:hover, #game-modal .modal-title-metadata-btn:hover { background: transparent !important; border-color: transparent !important; box-shadow: none !important; }
 #game-modal .modal-title-wish-btn i, #game-modal .modal-title-share-btn i, #game-modal .modal-title-report-btn i, #game-modal .modal-title-metadata-btn i { pointer-events: none; display: block; transform-origin: center center !important; }
+#game-modal .modal-title-game-theme-btn { display:inline-flex; align-items:center; justify-content:center; width:24px; height:25px; border:0; padding:0; background:transparent; color:rgba(255,255,255,.42); cursor:pointer; transition:color .18s ease,transform .18s ease; }
+#game-modal .modal-title-game-theme-btn:hover:not(:disabled) { color:#fff; transform:scale(1.08); }
+#game-modal .modal-title-game-theme-btn:active:not(:disabled) { transform:scale(.94); }
+#game-modal .modal-title-game-theme-btn.is-playing { color:#fff; }
+#game-modal .modal-title-game-theme-btn:disabled { opacity:.55; cursor:default; }
+#game-modal .modal-title-game-theme-btn i { font-size:12px; }
 #game-modal .modal-title-share-btn { color: rgba(255,255,255,.42) !important; transition: color .18s ease,filter .18s ease,transform .18s ease !important; }
 #game-modal .modal-title-share-btn i { font-size: 12px; transition: transform .18s ease,color .18s ease; }
 #game-modal .modal-title-share-btn:hover { color:#0070cc !important; filter:drop-shadow(0 0 7px rgba(0,112,204,.32)); }
@@ -13106,13 +13112,16 @@ P
 		
 		let audioEl = document.getElementById('background_music');
 		if (audioEl) {
-			if (isChecked) {
+			if (isChecked && window.psnGameTheme?.isActive()) {
+				audioEl.pause();
+			} else if (isChecked) {
 				audioEl.volume = 0.35;
 				audioEl.play().catch(e => console.log("Waiting user interaction..."));
 			} else {
 				audioEl.pause();
 			}
 		}
+		window.psnGameTheme?.settingsChanged();
 		if (typeof broadcastProfileUpdate === 'function') broadcastProfileUpdate();
 	}
 	
@@ -14658,7 +14667,7 @@ P
 				!bootVisible &&
 				localStorage.getItem('psn_username')
 			);
-			if (audioToggle.checked && audioEl && canAutoPlayMusic) {
+			if (audioToggle.checked && audioEl && canAutoPlayMusic && !window.psnGameTheme?.isActive()) {
 				audioEl.volume = 0.35;
 				audioEl.play().catch(e => {});
 			} else if (audioEl && !canAutoPlayMusic) {
@@ -17251,7 +17260,9 @@ P
 			!bootVisible &&
 			!window.__loginRevealBusy
 		);
-		if (canPlayMusic) {
+		if (canPlayMusic && window.psnGameTheme?.isActive()) {
+			audioEl.pause();
+		} else if (canPlayMusic) {
 			audioEl.volume = 0.35;
 			audioEl.play().catch(e => console.log("Play blocked by the browser until user interaction."));
 		} else {
@@ -17534,6 +17545,7 @@ P
 		if (name === (localStorage.getItem('psn_username') || '') && typeof window.updatePs3ConsoleHeaderUi === 'function') window.updatePs3ConsoleHeaderUi();
 
 		applySyncedBackgroundMusic(next.audio !== "0");
+		window.psnGameTheme?.settingsChanged();
 		if (typeof updateChatAutoTranslateUi === 'function') updateChatAutoTranslateUi();
 		if (typeof updateInterfaceAutoTranslateUi === 'function' && window.isProfileLoaded === true && name === (localStorage.getItem('psn_username') || '')) updateInterfaceAutoTranslateUi({ silent: true });
 		if (typeof updateHapticFeedbackUi === 'function') updateHapticFeedbackUi();
@@ -42458,7 +42470,9 @@ P
 			const modalMetadataIsAdmin = document.body.classList.contains('is-admin');
 			const modalMetadataLabel = modalMetadataIsAdmin ? 'Correct metadata' : 'Suggest metadata correction';
 			const modalMetadataButtonHtml = modalInfoOnly ? '' : `<button type="button" id="modal-title-metadata-btn" class="modal-title-metadata-btn" title="${modalMetadataLabel}" aria-label="${modalMetadataLabel}" onmouseenter="playUiHover()" onclick="openMetadataCorrectionFromModal(event)"><i class="fas fa-pen"></i></button>`;
-			modalHeader.innerHTML = `<span class="modal-title-main"><i class="${iconClass}"></i><span>${headerText}</span></span>${modalInfoOnly ? '' : `<span class="modal-title-action-group">${modalWishButtonHtml}${modalShareButtonHtml}${modalReportButtonHtml}${modalMetadataButtonHtml}</span>`}`;
+			const modalThemeButtonHtml = !modalInfoOnly && ['games','ports','homebrew_games','prototypes'].includes(currentCat)
+				? `<button type="button" id="modal-title-game-theme-btn" class="modal-title-game-theme-btn" title="Searching game theme..." aria-label="Searching game theme..." onmouseenter="playUiHover()" onclick="window.psnGameTheme?.toggle()"><i class="fas fa-music"></i></button>` : '';
+			modalHeader.innerHTML = `<span class="modal-title-main"><i class="${iconClass}"></i><span>${headerText}</span></span>${modalInfoOnly ? '' : `<span class="modal-title-action-group">${modalWishButtonHtml}${modalShareButtonHtml}${modalReportButtonHtml}${modalMetadataButtonHtml}${modalThemeButtonHtml}</span>`}`;
 		}
 		if (!modalInfoOnly && typeof window.syncGameModalReportButtonState === 'function') window.syncGameModalReportButtonState();
 		
@@ -42704,6 +42718,7 @@ P
 		if (typeof window.loadGamePlayers === 'function') window.loadGamePlayers(game.id || game.titleId || '', modalDisplayName || game.cleanName || '', currentCat, modal);
 		const shouldRecordRecentlyVisited = !modalInfoOnly && game && typeof window.recordRecentlyVisitedGame === 'function';
 		modal.style.display = 'flex';
+		window.psnGameTheme?.open(modalDisplayName || game.cleanName || game.title || '',currentCat);
 		window.__psnPrepareGameModalFanart?.(modal,game,currentCat,hydrationToken);
 		if (cardMorphMotionSource && typeof window.prepareGameModalCardMorphOpening === 'function') {
 			if (!window.prepareGameModalCardMorphOpening(modal, cardMorphMotionSource)) {
@@ -42747,6 +42762,7 @@ P
 	
 		const clickedClose = e && e.target && (e.target.classList.contains('sys-modal-close') || (e.target.closest && e.target.closest('.sys-modal-close')));
 		if (!e || clickedClose) {
+			window.psnGameTheme?.stop();
 			if (modal.classList.contains('psn-card-morph-closing') && options.skipCardMorph !== true) return;
 			if (options.skipCardMorph !== true && typeof window.canRunGameModalCardMorphClose === 'function' && window.canRunGameModalCardMorphClose(modal) && typeof window.runGameModalCardMorphClose === 'function') {
 				if (options.silent !== true && typeof playUiBack === 'function') playUiBack();
@@ -45023,6 +45039,7 @@ P
 	};
 
 	function trailerOpenShell(title) {
+		window.psnGameTheme?.suspend();
 		window.__trailerCloseGeneration = (Number(window.__trailerCloseGeneration) || 0) + 1;
 		const audioEl = document.getElementById('background_music');
 
@@ -45268,6 +45285,7 @@ P
 			}
 
 			musicWasPlaying = false;
+			setTimeout(() => window.psnGameTheme?.resume(), 340);
 		}
 	}
 
@@ -97289,7 +97307,7 @@ function getVisibleChatStackEl(id) {
 		}
 		window.isBooting = false;
 		if (typeof isLoggingIn !== 'undefined') isLoggingIn = false;
-		if (options.disableBackgroundMusicPlayback === true) window.__allowBackgroundMusicPlayback = false;
+		if (options.disableBackgroundMusicPlayback === true) { window.__allowBackgroundMusicPlayback = false; window.psnGameTheme?.stop(false); }
 		try {
 			const audioEl = document.getElementById('background_music');
 			if (audioEl) { audioEl.pause(); audioEl.currentTime = 0; }
@@ -121014,6 +121032,192 @@ function getVisibleChatStackEl(id) {
   window.addEventListener('blur',stop);
   document.addEventListener('pointerdown',stop,{passive:true});
   document.addEventListener('scroll',()=>{if(active&&(!active.card.isConnected||!active.card.matches(':hover')))stop();},{passive:true,capture:true});
+})();
+</script>
+
+<script>
+(() => {
+  const audio = document.createElement('audio');
+  audio.preload = 'none';
+  audio.loop = true;
+  audio.volume = 0.28;
+  audio.setAttribute('aria-hidden', 'true');
+  audio.id = 'psn-game-theme-audio';
+  document.body.appendChild(audio);
+  const lookupCache = new Map();
+  const maxCache = 180;
+  let generation = 0, active = null, suspended = false, manuallyPaused = false, fadeToken = 0;
+  const background = () => document.getElementById('background_music');
+  const enabled = () => document.getElementById('audio-toggle')?.checked === true &&
+    window.__allowBackgroundMusicPlayback === true && window.isProfileLoaded === true;
+  const visible = () => {
+    const modal = document.getElementById('game-modal');
+    return !!(modal && modal.style.display === 'flex' && !modal.classList.contains('psn-card-morph-closing'));
+  };
+  const trailerOpen = () => document.getElementById('trailer-modal')?.classList.contains('show') === true;
+  const button = () => document.getElementById('modal-title-game-theme-btn');
+  const validUrl = value => {
+    try { const url = new URL(value); return url.protocol === 'https:' && url.hostname === 'api.audius.co' && /^\/v1\/tracks\/[a-zA-Z0-9_-]+\/stream$/.test(url.pathname); }
+    catch (_) { return false; }
+  };
+  function fade(element, target, duration, done) {
+    if (!element) return;
+    const token = ++fadeToken, start = performance.now(), initial = element.volume;
+    function frame(now) {
+      if (token !== fadeToken) return;
+      const progress = Math.min(1, (now - start) / duration);
+      element.volume = Math.max(0, Math.min(1, initial + (target - initial) * progress));
+      if (progress < 1) requestAnimationFrame(frame);
+      else if (typeof done === 'function') done();
+    }
+    requestAnimationFrame(frame);
+  }
+  function resumeBackground() {
+    const bg = background();
+    if (!bg || !enabled() || trailerOpen() || !audio.paused) return;
+    if (bg.paused) { bg.volume = 0; bg.play().catch(() => {}); }
+    fade(bg, 0.35, 320);
+  }
+  function updateButton(state, track) {
+    const btn = button();
+    if (!btn) return;
+    const icon = btn.querySelector('i');
+    btn.classList.toggle('is-playing', state === 'playing');
+    btn.classList.toggle('is-loading', state === 'loading');
+    btn.setAttribute('aria-pressed', state === 'playing' ? 'true' : 'false');
+    const label = state === 'playing' ? `Pause theme: ${track?.title || 'Game theme'}`
+      : state === 'paused' ? 'Play game theme'
+      : state === 'loading' ? 'Searching game theme...'
+      : state === 'blocked' ? 'Click to play game theme'
+      : state === 'off' ? 'Enable Background Music to hear game themes'
+      : state === 'missing' ? 'No matching game theme found' : 'Game theme';
+    btn.title = label;
+    btn.setAttribute('aria-label', label);
+    btn.disabled = ['missing','loading','off'].includes(state);
+    if (icon) icon.className = state === 'loading' ? 'fas fa-circle-notch fa-spin'
+      : state === 'playing' ? 'fas fa-volume-up'
+      : state === 'missing' || state === 'off' ? 'fas fa-music' : 'fas fa-play';
+  }
+  function stop(restore = true) {
+    ++generation;
+    ++fadeToken;
+    audio.pause();
+    audio.removeAttribute('src');
+    audio.load();
+    active = null;
+    manuallyPaused = false;
+    suspended = false;
+    if (restore) resumeBackground();
+  }
+  async function play(shouldResume = false) {
+    if (!active?.result?.found || !visible() || !enabled() || suspended || trailerOpen() || !validUrl(active.result.url)) return;
+    if (shouldResume) manuallyPaused = false;
+    if (manuallyPaused) return;
+    if (audio.getAttribute('src') !== active.result.url) {
+      audio.src = active.result.url;
+      audio.volume = 0;
+    }
+    const token = generation, result = active.result;
+    try {
+      await audio.play();
+      if (token !== generation || active?.result !== result) return;
+      if (!active || audio.paused || suspended || !visible()) { audio.pause(); return; }
+      const bg = background();
+      if (bg) { bg.pause(); bg.volume = 0.35; }
+      fade(audio, 0.28, 360);
+      updateButton('playing', active.result);
+    } catch (_) {
+      if (token !== generation) return;
+      updateButton('blocked', active?.result);
+      resumeBackground();
+    }
+  }
+  async function load(name, key, token) {
+    const saved = lookupCache.get(key);
+    if (saved && saved.expires > Date.now()) return saved.result;
+    const base = String(typeof getMetadataServerBaseCompat === 'function'
+      ? getMetadataServerBaseCompat() : 'https://psn-content-fd6j.onrender.com').replace(/\/+$/, '');
+    const response = await fetch(base + '/api/game-theme?name=' + encodeURIComponent(name), { cache:'default' });
+    if (!response.ok) throw new Error('Game theme lookup unavailable');
+    const result = await response.json();
+    if (token !== generation) return null;
+    if (result?.ok && typeof result.found === 'boolean') {
+      lookupCache.set(key, { result, expires:Date.now() + (result.found ? 60*60*1000 : 15*60*1000) });
+      while (lookupCache.size > maxCache) lookupCache.delete(lookupCache.keys().next().value);
+    }
+    return result;
+  }
+  function open(name, category) {
+    const currentName = String(name || '').trim().slice(0,120);
+    const key = currentName.normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+    if (!['games','ports','homebrew_games','prototypes'].includes(String(category || '')) || key.length < 3) {
+      stop();
+      return;
+    }
+    if (active?.key === key && active?.result && !audio.paused) { updateButton('playing', active.result); return; }
+    stop(false);
+    const token = generation;
+    active = { key, name:currentName, result:null };
+    if (!enabled()) { updateButton('off'); resumeBackground(); return; }
+    updateButton('loading');
+    load(currentName,key,token).then(result => {
+      if (token !== generation || !active || active.key !== key) return;
+      if (!result?.found || !validUrl(result.url)) {
+        updateButton(result?.ok ? 'missing' : 'blocked');
+        resumeBackground();
+        return;
+      }
+      active.result = result;
+      if (suspended || trailerOpen()) { updateButton('paused', result); return; }
+      play();
+    }).catch(() => {
+      if (token !== generation) return;
+      updateButton('blocked');
+      resumeBackground();
+    });
+  }
+  function toggle() {
+    if (!active || !enabled()) return;
+    if (!active.result?.found) { open(active.name,'games'); return; }
+    if (!audio.paused) {
+      manuallyPaused = true;
+      audio.pause();
+      updateButton('paused', active.result);
+      resumeBackground();
+    } else play(true);
+  }
+  function suspend() {
+    if (!active) return;
+    suspended = true;
+    audio.pause();
+    if (active.result?.found) updateButton('paused', active.result);
+  }
+  function resume() {
+    suspended = false;
+    if (active?.result?.found && !manuallyPaused) play();
+    else if (!active?.result?.found) resumeBackground();
+  }
+  function settingsChanged() {
+    if (!enabled()) {
+      audio.pause();
+      if (active) updateButton('off',active.result);
+    } else if (active) {
+      if (active.result?.found) play();
+      else open(active.name,'games');
+    }
+  }
+  audio.addEventListener('error', () => {
+    if (!active || !audio.getAttribute('src')) return;
+    updateButton('blocked', active.result);
+    audio.pause();
+    resumeBackground();
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) audio.pause();
+    else if (active?.result?.found && !manuallyPaused) play();
+  });
+  window.psnGameTheme = { open, stop, toggle, suspend, resume, settingsChanged,
+    isActive:() => !!active && !audio.paused };
 })();
 </script>
 
