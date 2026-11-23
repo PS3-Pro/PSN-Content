@@ -3285,13 +3285,13 @@ const gameThemePending = new Map();
 const GAME_THEME_MEMORY_MAX = 350;
 const GAME_THEME_FOUND_TTL = 48 * 60 * 60 * 1000;
 const GAME_THEME_MISS_TTL = 2 * 60 * 60 * 1000;
-const GAME_THEME_VERSION = 'gts5:'; // Versioned cache: normalized editions and failed-provider state must not reuse old misses.
+const GAME_THEME_VERSION = 'gts7:'; // Versioned cache: KHInsider packed playlist decoder and album-first lookups.
 const gameThemeSourceCooldown = new Map();
 let gameThemeActiveLookups = 0;
 // Normalize platform/edition suffixes WITHOUT losing sequel numbers. Preserve a display-oriented
 // lookup title separately: KHInsider album names often use Roman numerals (II, III, IV).
 function gameThemeSearchTitle(value) {
-  return String(value || '').replace(/[™®©℠]/g, ' ').normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[‘’]/g, "'").replace(/[–—]/g, '-')
+  return String(value || '').replace(/[™®©℠]/g, ' ').normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[‘’]/g, "'").replace(/[–—]/g, '-').replace(/[:：﹕꞉]/g, ' ')
     .replace(/\b(?:digital version|digital edition|trial to full|full game|game of the year edition|game of the year|goty|complete edition|deluxe edition|ultimate edition|special edition|standard edition|collector'?s edition|definitive edition|director'?s cut|remastered edition|remastered|remaster|hd remaster|hd collection|hd edition|high definition|playstation network|psn|ps3|ps4|ps5|ps2|psp|ps vita|vita version|us version|eu version|north american version|european version|digital download|dlc|demo|bundle)\b/gi, ' ')
     // Standalone HD/4K after a title is a product format, not a sequel.
     .replace(/(?:[\s:()\[\]-]+(?:HD|4K|UHD))(?=\s*(?:$|[()\[\]]))/gi, ' ')
@@ -3415,6 +3415,69 @@ function gameThemeHtmlLinks(html) {
   }
   return list;
 }
+
+// KHInsider embeds a complete track list inside a Dean Edwards packer script.
+// Decode only its string dictionary; NEVER evaluate provider JavaScript.
+function gameThemePackedAlbumTracks(html, albumSlug) {
+  const script = /eval\(function\(p,a,c,k,e,d\)\{[\s\S]*?return p\}\('((?:\\.|[^'\\])*)',\s*(\d+),\s*(\d+),\s*'((?:\\.|[^'\\])*)'\.split\('\|'\),\s*0,\s*\{\}\)\)/.exec(String(html || ''));
+  if (!script || script[1].length > 500000 || script[4].length > 75000) return [];
+  const radix = Number(script[2]), count = Number(script[3]);
+  if (radix !== 62 || count < 1 || count > 2000) return [];
+  const unescapeJs = value => value.replace(/\\(['"\\])/g, '$1').replace(/\\n/g, '\n').replace(/\\r/g, '\r');
+  const dictionary = unescapeJs(script[4]).split('|');
+  if (dictionary.length < count) return [];
+  let source = unescapeJs(script[1]);
+  const encode62 = number => {
+    let result = '';
+    do {
+      const digit = number % 62;
+      result = (digit < 10 ? String(digit) : String.fromCharCode(digit <= 35 ? digit + 87 : digit + 29)) + result;
+      number = Math.floor(number / 62);
+    } while (number > 0);
+    return result;
+  };
+  for (let i = count - 1; i >= 0; i--) {
+    if (!dictionary[i]) continue;
+    source = source.replace(new RegExp('\\b' + encode62(i) + '\\b', 'g'), () => dictionary[i]);
+    if (source.length > 750000) return [];
+  }
+  const list = /\btracks\s*=\s*(\[[\s\S]{1,200000}?\])\s*,\s*trackCount\s*=/.exec(source);
+  if (!list) return [];
+  let entries;
+  try { entries = JSON.parse(list[1].replace(/,\s*\]$/, ']')); } catch (_) { return []; }
+  if (!Array.isArray(entries)) return [];
+  const tracks = [];
+  for (const [index, entry] of entries.slice(0,300).entries()) {
+    if (!entry || typeof entry.name !== 'string' || typeof entry.file !== 'string') continue;
+    const rawPath = entry.file.replace(/^https?:\/\//i, '');
+    const url = 'https://' + rawPath;
+    if (!gameThemeAllowedAudio(url)) continue;
+    let parsed;
+    try { parsed = new URL(url); } catch (_) { continue; }
+    // The encoded playlist must belong to the requested album, not an unrelated widget.
+    if (!parsed.pathname.startsWith('/soundtracks/' + albumSlug + '/')) continue;
+    const duration = /^\d{1,2}:\d{2}$/.test(entry.length || '')
+      ? Number(entry.length.split(':')[0]) * 60 + Number(entry.length.split(':')[1]) : 0;
+    tracks.push({title:entry.name.trim().slice(0,180),url,index,duration});
+  }
+  return tracks.sort((a,b) => gameThemeSongScore(b.title,b.index,b.duration) - gameThemeSongScore(a.title,a.index,a.duration));
+}
+function gameThemeAlbumHeading(html) {
+  const heading = /<h2\b[^>]*>([\s\S]*?)<\/h2>/i.exec(html);
+  const alternative = /<p\b[^>]*class=["'][^"']*albuminfoAlternativeTitles[^"']*["'][^>]*>([\s\S]*?)<\/p>/i.exec(html);
+  return [heading ? gameThemeStripTags(heading[1]) : '', alternative ? gameThemeStripTags(alternative[1]) : ''].filter(Boolean);
+}
+function gameThemeGuessedSlugs(name) {
+  const variants = gameThemeSearchVariants(name);
+  const list = [], seen = new Set();
+  for (const name of variants) {
+    const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+    if (slug && !seen.has(slug)) { list.push(slug); seen.add(slug); }
+    if (list.length >= 2) break;
+  }
+  return list;
+}
+
 function gameThemeRequest(url, options = {}) {
   const maxBytes = options.maxBytes || 750000;
   return new Promise((resolve, reject) => {
@@ -3466,52 +3529,69 @@ async function gameThemeFromKhinsider(gameName) {
   const deadline = Date.now() + 16000;
   const albums = new Map();
   const cleanName = gameThemeSearchTitle(gameName);
-  const prefix = cleanName.split(/\s*[:–—]\s*/)[0].trim();
-  const usePrefix = prefix !== cleanName && gameThemeTokens(prefix).length >= 2 && gameThemeTokens(prefix).some(word => /^\d+$/.test(word));
-  const searches = gameThemeSearchVariants(cleanName);
-  if (usePrefix && searches.length < 3) searches.push(prefix);
-  for (const phrase of searches) {
+  const sourceErrors = [];
+  const tryAlbum = async (album) => {
+    let html = album.html;
+    if (!html) html = await gameThemeRequest('https://downloads.khinsider.com/game-soundtracks/album/' + encodeURIComponent(album.slug), {maxBytes:1700000,timeout:5500});
+    const titles = gameThemeAlbumHeading(html);
+    const score = Math.max(-999,...titles.map(title => gameThemeAlbumScore(gameName,title)));
+    if (score < 80) return null;
+    const playlist = gameThemePackedAlbumTracks(html, album.slug);
+    const playable = playlist.filter(song => gameThemeSongScore(song.title,song.index,song.duration) >= 0).slice(0,4);
+    if (playable.length) return {ok:true,found:true,provider:'KHInsider',title:playable[0].title,album:titles[0] || album.title,
+      sourceUrl:'https://downloads.khinsider.com/game-soundtracks/album/' + album.slug,url:playable[0].url,
+      alternatives:playable.slice(1).map(({title,url}) => ({title,url}))};
+    // Older KHInsider album layouts do not embed a playlist. Keep the detail-page fallback.
+    const songs = gameThemeAlbumTracks(html,album.slug);
+    const fallback = [];
+    for (const song of songs.filter(song => gameThemeSongScore(song.title,song.index,song.duration) >= 0).slice(0,3)) {
+      if (Date.now() >= deadline) break;
+      let trackPage;
+      try { trackPage = await gameThemeRequest(song.pageUrl, {maxBytes:550000,timeout:4300}); }
+      catch (error) { sourceErrors.push('track: ' + String(error?.message || error)); continue; }
+      const candidates = gameThemeHtmlLinks(trackPage).map(link => link.href).filter(gameThemeAllowedAudio);
+      const url = candidates.find(url => /\.mp3(?:[?#]|$)/i.test(url)) || candidates[0];
+      if (url) fallback.push({title:song.title,url});
+    }
+    return fallback.length ? {ok:true,found:true,provider:'KHInsider',title:fallback[0].title,album:titles[0] || album.title,
+      sourceUrl:'https://downloads.khinsider.com/game-soundtracks/album/' + album.slug,url:fallback[0].url,
+      alternatives:fallback.slice(1)} : null;
+  };
+  // Direct album URL guesses avoid the search endpoint for common clean slugs.
+  for (const slug of gameThemeGuessedSlugs(cleanName)) {
+    if (Date.now() >= deadline) break;
+    try {
+      const result = await tryAlbum({slug});
+      if (result) return result;
+    } catch (error) {
+      const message = String(error?.message || error);
+      if (/\b(?:403|429)\b|challenge|captcha/i.test(message)) { gameThemeProviderError('khinsider'); throw error; }
+      if (!/\b404\b/.test(message)) sourceErrors.push('album: ' + message);
+    }
+  }
+  for (const phrase of gameThemeSearchVariants(cleanName)) {
     let html;
     try {
-      html = await gameThemeRequest('https://downloads.khinsider.com/search?search=' + encodeURIComponent(phrase), { maxBytes:950000,timeout:5500 });
+      html = await gameThemeRequest('https://downloads.khinsider.com/search?search=' + encodeURIComponent(phrase), {maxBytes:1200000,timeout:5500});
       if (/cf-chl|just a moment|enable javascript and cookies|captcha/i.test(html.slice(0,7000))) throw new Error('Provider challenge');
     } catch (error) { gameThemeProviderError('khinsider'); throw error; }
     for (const link of gameThemeHtmlLinks(html)) {
       const match = /^\/?game-soundtracks\/album\/([^/?#]+)/i.exec(link.href.replace(/^https?:\/\/downloads\.khinsider\.com\//i, ''));
       if (!match || !link.title) continue;
-      const exactScore = gameThemeAlbumScore(gameName,link.title);
-      const prefixScore = usePrefix ? gameThemeAlbumScore(prefix,link.title) - 40 : -999;
-      const score = Math.max(exactScore,prefixScore);
-      if (score >= 80 && (!albums.has(match[1]) || albums.get(match[1]).score < score)) albums.set(match[1], { slug:match[1], title:link.title, score });
+      const score = gameThemeAlbumScore(gameName,link.title);
+      if (score >= 80 && (!albums.has(match[1]) || albums.get(match[1]).score < score))
+        albums.set(match[1], {slug:match[1],title:link.title,score});
     }
     if (albums.size) break;
   }
-  const bestAlbums = [...albums.values()].sort((a,b) => b.score - a.score).slice(0,3);
-  const sourceErrors = [];
-  for (const album of bestAlbums) {
+  for (const album of [...albums.values()].sort((a,b) => b.score - a.score).slice(0,3)) {
     if (Date.now() >= deadline) break;
-    let page;
-    try { page = await gameThemeRequest('https://downloads.khinsider.com/game-soundtracks/album/' + encodeURIComponent(album.slug), {timeout:5000}); }
-    catch (error) { sourceErrors.push(String(error?.message || error)); continue; }
-
-    const songs = gameThemeAlbumTracks(page, album.slug);
-    const playable = [];
-    // Try meaningful track names, favor full-length music. Avoid tiny sound effects.
-    for (const song of songs.filter(s => gameThemeSongScore(s.title,s.index,s.duration) >= 0).slice(0,5)) {
-      if (Date.now() >= deadline) break;
-      let trackPage;
-      try { trackPage = await gameThemeRequest(song.pageUrl, { maxBytes:550000, timeout:4300 }); }
-      catch (error) { sourceErrors.push(String(error?.message || error)); continue; }
-      const candidates = gameThemeHtmlLinks(trackPage).map(x => x.href).filter(gameThemeAllowedAudio);
-      const preferred = candidates.find(u => /\.mp3(?:[?#]|$)/i.test(u)) || candidates[0];
-      if (preferred) playable.push({title:song.title,url:preferred});
-      if (playable.length >= 3) break;
-    }
-    if (playable.length) return {ok:true,found:true,provider:'KHInsider',title:playable[0].title,album:album.title,
-      sourceUrl:'https://downloads.khinsider.com/game-soundtracks/album/' + album.slug,url:playable[0].url,
-      alternatives:playable.slice(1)};
+    try {
+      const result = await tryAlbum(album);
+      if (result) return result;
+    } catch (error) {sourceErrors.push('album: ' + String(error?.message || error));}
   }
-  if (sourceErrors.length) throw new Error('KHInsider track/album unavailable: ' + sourceErrors[0]);
+  if (sourceErrors.length) throw new Error('KHInsider album unavailable: ' + sourceErrors[0]);
   return null;
 }
 function gameThemeArchiveLicense(meta) {
