@@ -1,3 +1,6 @@
+// ============================================================================
+// Dependencies & HTTP bootstrap
+// ============================================================================
 const express = require('express');
 const http = require('http');
 const https = require('https');
@@ -42,10 +45,16 @@ app.use((req, res, next) => {
 });
 const server = http.createServer(app);
 
+// ============================================================================
+// Core identity & defaults
+// ============================================================================
 const ADMIN_USERS = ["Luan Teles", "Goku Cheats", "JumpSuit"];
 
 const DEFAULT_AVATAR = "https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/avatars/default.png";
 
+// ============================================================================
+// Chat limits & payload guards
+// ============================================================================
 const MAX_CHAT_HISTORY = 1000;
 const CHAT_SYNC_CHANGE_LOG_MAX = Math.max(1000, Math.min(20000, parseInt(process.env.CHAT_SYNC_CHANGE_LOG_MAX || "5000", 10) || 5000));
 const CHAT_SYNC_MAX_DELTA = Math.max(100, Math.min(5000, parseInt(process.env.CHAT_SYNC_MAX_DELTA || "1500", 10) || 1500));
@@ -447,6 +456,9 @@ async function clearChatSpamProtectionForUser(name, options = {}) {
   return { success:true, targetName:userName, resetAt, wasActive };
 }
 
+// ============================================================================
+// Runtime, presence & application limits
+// ============================================================================
 const SERVER_STARTED_AT = Date.now();
 const INSTANCE_ID = process.env.RENDER_INSTANCE_ID || process.env.RAILWAY_REPLICA_ID || process.env.HOSTNAME || `instance-${Math.random().toString(36).slice(2, 10)}`;
 const PRESENCE_TTL_SECONDS = 90;
@@ -504,6 +516,9 @@ const ADMIN_STATE_KEYS = {
   metadataSuggestions: "content_metadata_suggestions"
 };
 
+// ============================================================================
+// PostgreSQL pool & shared server limits
+// ============================================================================
 const PG_POOL_MAX = Math.max(1, Math.min(10, parseInt(process.env.PG_POOL_MAX || process.env.DB_POOL_MAX || "5", 10) || 5));
 const PG_CONNECTION_TIMEOUT_MS = Math.max(3000, parseInt(process.env.PG_CONNECTION_TIMEOUT_MS || "10000", 10) || 10000);
 const PG_IDLE_TIMEOUT_MS = Math.max(30000, parseInt(process.env.PG_IDLE_TIMEOUT_MS || "120000", 10) || 120000);
@@ -586,6 +601,9 @@ const lastPublicProfileSignatureByUser = new Map();
 let lastBroadcastTrendingSignature = "";
 let lastBroadcastGlobalTrophyStatsSignature = "";
 
+// ============================================================================
+// Core cache, database reliability & runtime helpers
+// ============================================================================
 function invalidateOnlineListCache(reason = "") {
   onlineListCache = null;
   onlineListCacheAt = 0;
@@ -1223,6 +1241,9 @@ function runNonOverlappingTask(taskName, taskFn) {
   };
 }
 
+// ============================================================================
+// Keep-alive & lightweight HTTP endpoints
+// ============================================================================
 let keepAliveInterval = null;
 
 function getKeepAlivePingUrl(rawUrl) {
@@ -1473,6 +1494,9 @@ app.post('/api/site-visits', async (req, res) => {
   }
 });
 
+// ============================================================================
+// Metadata proxy: PS Store / RAWG / IGDB / Steam
+// ============================================================================
 const DEFAULT_IGDB_CLIENT_ID = String(process.env.IGDB_CLIENT_ID || process.env.TWITCH_CLIENT_ID || '').trim();
 const DEFAULT_IGDB_CLIENT_SECRET = String(process.env.IGDB_CLIENT_SECRET || process.env.TWITCH_CLIENT_SECRET || '').trim();
 const METADATA_PROXY_TIMEOUT_MS = Math.max(2500, parseInt(process.env.METADATA_PROXY_TIMEOUT_MS || '8000', 10) || 8000);
@@ -3177,6 +3201,9 @@ app.get('/api/metadata/steam/details', async (req, res) => {
   }
 });
 
+// ============================================================================
+// User cache, profile data, database schema & statistics
+// ============================================================================
 let userDatabase = {};
 let userNameIndexDirty = true;
 let userNameIndexAlpha = [];
@@ -10343,6 +10370,9 @@ async function saveAdminState(key, data) {
   );
 }
 
+// ============================================================================
+// Chat history, seen state, sync & deletion
+// ============================================================================
 function cleanChatMessage(message = {}) {
   const clean = { ...(message || {}) };
   delete clean._dbId;
@@ -11124,6 +11154,9 @@ async function syncChatAcrossInstances() {
   }
 }
 
+// ============================================================================
+// Admin state, logs, socket indexes & profile realtime sync
+// ============================================================================
 async function emitAdminState(socket) {
   if (socket.isAdmin === true) await Promise.all([refreshBlockedStoreContentFromDb(), refreshContentMetadataOverridesFromDb({ maxAgeMs: profileSyncListenReady ? CONTENT_METADATA_OVERRIDES_DB_FRESH_MS : 0 })]);
   socket.emit('maintenance_mode', adminState.maintenance);
@@ -11270,6 +11303,9 @@ function getSocketsByUserName(name) {
   return sockets;
 }
 
+// ============================================================================
+// Direct messages (private user-to-user chat)
+// ============================================================================
 function normalizeDirectMessageUser(value) {
   return normalizeText(value, '').slice(0, 120);
 }
@@ -13326,6 +13362,9 @@ async function initProfileSyncNotifications() {
   }
 }
 
+// ============================================================================
+// Friend activity
+// ============================================================================
 const FRIEND_ACTIVITY_TYPES = new Set(['online', 'offline', 'playing', 'played', 'xmb', 'trophy', 'download', 'library', 'wishlist', 'favorite', 'cheat', 'post']);
 const FRIEND_ACTIVITY_REPLACED_IDS_LIMIT = 60;
 const FRIEND_ACTIVITY_ROOM_PREFIX = 'friend-activity:';
@@ -13984,6 +14023,9 @@ async function getFriendActivityHistoryForUser(userName, afterId = 0, resolvedFr
   };
 }
 
+// ============================================================================
+// User notifications & chat notification routing
+// ============================================================================
 const USER_NOTIFICATION_TYPES = new Set(['mention', 'reply', 'reaction', 'trophy', 'catalog', 'game_match', 'play_together', 'private_message', 'social']);
 
 function normalizeUserNotificationData(type, rawData = {}) {
@@ -14828,6 +14870,9 @@ async function recordChatUserNotifications(message = {}) {
   })));
 }
 
+// ============================================================================
+// Presence, PS3 activity, moderation & reports
+// ============================================================================
 function ps3PlayTimeToSeconds(value) {
   const playTime = normalizePs3PlayTimeServer(value);
   if (!playTime) return 0;
@@ -15695,6 +15740,9 @@ async function createReport(data = {}, reporterName = "Unknown") {
   return report;
 }
 
+// ============================================================================
+// Socket.IO server, cross-instance sync & background tasks
+// ============================================================================
 const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] },
   maxHttpBufferSize: 1e7
@@ -15848,6 +15896,9 @@ function startBackgroundTasks() {
   }
 }
 
+// ============================================================================
+// Content share tokens
+// ============================================================================
 const CONTENT_SHARE_TOKEN_BYTES = 12;
 const CONTENT_SHARE_MAX_PER_USER = 250;
 const CONTENT_SHARE_CREATE_WINDOW_MS = 60 * 1000;
@@ -15976,6 +16027,9 @@ async function readContentShareTokenForUser(safeToken) {
   return { success:true, descriptor, sharer };
 }
 
+// ============================================================================
+// Social — public community feed
+// ============================================================================
 const SOCIAL_POST_LIMIT = 15;
 const SOCIAL_RICH_PREFIX = '[PSN_SOCIAL_RICH_V1]';
 function normalizeSocialPostBody(value) {
@@ -16604,6 +16658,9 @@ function readSocialUnseenStateShared(actor) {
   return pending;
 }
 
+// ============================================================================
+// Client connection & event handlers
+// ============================================================================
 io.on('connection', (socket) => {
   console.log('[NETWORK] Socket connected. ID: ' + socket.id);
   socket.emit('content_limits', getClientContentLimits());
@@ -21889,6 +21946,9 @@ io.on('connection', (socket) => {
   });
 });
 
+// ============================================================================
+// Server startup
+// ============================================================================
 const PORT = process.env.PORT || 3000;
 let startupInFlight = false;
 let startupRetryTimer = null;
