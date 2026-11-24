@@ -2337,12 +2337,50 @@ const ssPreviewCache = new Map();
 const ssPreviewInflight = new Map();
 let ssPreviewQueued = 0;
 
+function ssPreviewStripGotySuffix(value) {
+  // GOTY is a catalog bundle label. For media matching, use the original game.
+  return String(value || '').replace(/\s*(?:[-–—:]\s*|[([{]\s*|\s+)\b(?:GOTY(?:\s+Edition)?|Game\s+of\s+the\s+Year(?:\s+Edition)?)\s*[)\]}]?\s*$/i, '').trim();
+}
 function ssPreviewSearchName(value) {
-  return stripGameTechnicalAnnotations(value).replace(/[™®©]/g, ' ').replace(/\b(?:tm|registered)\b/gi, ' ')
+  return ssPreviewStripGotySuffix(stripGameTechnicalAnnotations(value)).replace(/[™®©]/g, ' ').replace(/\b(?:tm|registered)\b/gi, ' ')
     .replace(/\s*[[(](?:usa|eur|europe|japan|jpn|us|eu|ps3|ps2|psp|ps1|ps4|digital version)[)\]]/gi, '')
     .replace(/\b(?:digital version|version digitale)\b/gi, '')
     .replace(/\s*[:：;；‐‑‒–—−]\s*/g, ' - ').replace(/\s+-\s+/g, ' - ')
     .replace(/\s+/g, ' ').trim();
+}
+function ssPreviewPossessiveVariant(value) {
+  const title = String(value || '').trim();
+  // The API may index "Dante's Inferno" but not "Dantes Inferno".
+  // This is only a fallback search spelling; strict title/edition validation stays in place.
+  if (/[’']/.test(title)) return title.replace(/[’']/g, '');
+  return title.replace(/^([a-z]{4,})s(\s+\S.*)$/i, (all, stem, tail) => `${stem}'s${tail}`);
+}
+function ssPreviewConjunctionVariant(value) {
+  const title = String(value || '').trim();
+  // ScreenScraper often spells "&" as "And" (or vice versa).
+  // This is a search-only fallback: never rewrite the catalog title.
+  if (/(?:^|\s)&(?:\s|$)/.test(title)) return title.replace(/\s+&\s+/g, ' And ');
+  if (/\band\b/i.test(title)) return title.replace(/\band\b/gi, '&');
+  return title;
+}
+// Only well-established regional titles belong here. Generic fuzzy matching still
+// handles punctuation and minor spellings; major title changes need known aliases.
+const SS_PREVIEW_REGIONAL_TITLES = Object.freeze([
+  Object.freeze(['Persona 4 Arena Ultimax', 'Persona 4 The Ultimax Ultra Suplex Hold']),
+  // 2016 game: Europe uses "Wings of Freedom"; the ScreenScraper base title omits it.
+  Object.freeze(['Attack on Titan', 'Attack on Titan Wings of Freedom'])
+]);
+function ssPreviewRegionalAlias(value) {
+  const normalized = String(value || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ');
+  for (const names of SS_PREVIEW_REGIONAL_TITLES) {
+    const [western, japanese] = names;
+    const a = western.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+    const b = japanese.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+    if (normalized === a) return japanese;
+    if (normalized === b) return western;
+  }
+  return '';
 }
 // Search both catalog spellings of numeric sequels, without confusing game editions.
 // Avoid Roman I and X: a standalone I/X is often a letter (e.g. Mega Man X).
@@ -2364,7 +2402,19 @@ function ssPreviewSearchVariants(value) {
   const unwrapped = title.replace(/[\[\]{}]/g, ' ').replace(/\(([^()]*)\)/g, ' $1 ')
     .replace(/\s+-\s+/g, ' - ').replace(/\s+/g, ' ').trim();
   const plain = unwrapped.replace(/\s+-\s+/g, ' ').replace(/\s+/g, ' ').trim();
-  const variants = [unwrapped, plain];
+  const variants = [unwrapped];
+  const conjunction = ssPreviewConjunctionVariant(unwrapped);
+  const possessive = ssPreviewPossessiveVariant(unwrapped);
+  // Try common spelling combinations early, not only each substitution alone.
+  // "Akiba's Trip - Undead & Undressed" -> "Akibas Trip - Undead And Undressed".
+  if (conjunction !== unwrapped) variants.push(conjunction);
+  const combined = ssPreviewConjunctionVariant(possessive);
+  if (combined !== unwrapped && combined !== conjunction) variants.push(combined);
+  // Known regional names are more useful than a punctuation-only retry.
+  const regionalAlias = ssPreviewRegionalAlias(unwrapped);
+  if (regionalAlias) variants.push(regionalAlias);
+  variants.push(plain);
+  if (possessive !== unwrapped) variants.push(possessive);
   // Try numerals only as fallbacks; ordinary titles still need only one request.
   const alternate = ssPreviewNumberVariant(unwrapped);
   if (alternate !== unwrapped) {
@@ -2387,10 +2437,18 @@ function normalizeSsPreviewTitle(value) {
   // Only strip a leading article or its catalog-style trailing form.
   // Keep articles inside titles and recognize roman-numbered sequels.
   const roman = {ii:'2',iii:'3',iv:'4',v:'5',vi:'6',vii:'7',viii:'8',ix:'9'};
-  return text.replace(/^(?:the|an|a)\s+/i, '').replace(/,\s*(?:the|an|a)$/i, '')
+  const normalized = text.replace(/^(?:the|an|a)\s+/i, '').replace(/,\s*(?:the|an|a)$/i, '')
     .replace(/\b(part|episode|chapter)\s+i\b/g, '$1 1')
     .replace(/\b(?:ii|iii|iv|v|vi|vii|viii|ix)\b/g, part => roman[part] || part)
     .replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
+  // Canonicalize only verified regional aliases. Never strip subtitles globally:
+  // "Attack on Titan: Wings of Freedom" is the 2016 game, but "Attack on Titan 2" is not.
+  for (const aliases of SS_PREVIEW_REGIONAL_TITLES) {
+    const canonical = aliases[0].toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+    if (aliases.some(title => title.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim() === normalized))
+      return canonical;
+  }
+  return normalized;
 }
 
 function ssPreviewNames(game) {
@@ -2761,7 +2819,10 @@ function ssPreviewFetchUpstream(name, systemId, key) {
     let bestScore = 0;
     let candidates = 0;
     const searchTitle = ssPreviewSearchName(name);
-    const tryAlternateMedia = /^(?:the|an|a)\s+\S|,\s*(?:the|an|a)$/i.test(searchTitle) || ssPreviewNumberVariant(searchTitle) !== searchTitle;
+    const tryAlternateMedia = /^(?:the|an|a)\s+\S|,\s*(?:the|an|a)$/i.test(searchTitle) ||
+      ssPreviewNumberVariant(searchTitle) !== searchTitle || ssPreviewPossessiveVariant(searchTitle) !== searchTitle ||
+      ssPreviewStripGotySuffix(stripGameTechnicalAnnotations(name)) !== stripGameTechnicalAnnotations(name).trim() ||
+      !!ssPreviewRegionalAlias(searchTitle) || ssPreviewConjunctionVariant(searchTitle) !== searchTitle;
     const mediaRank = game => {
       if (!game) return 0;
       const hasVideo = !!ssPreviewFindVideo(game, systemId);
@@ -2853,7 +2914,13 @@ function ssPreviewLookup(name, systemId, options = null) {
   const articleKey = /^(?:the|an|a)\s+\S|,\s*(?:the|an|a)$/i.test(searchName) ? 'art4:' : '';
   const editionKey = /\b(?:special|limited|collectors?|deluxe|ultimate|complete|definitive|anniversary) edition\b/.test(normalized) ? 'ed2:' : '';
   const numeralKey = ssPreviewNumberVariant(searchName) !== searchName ? 'num1:' : '';
-  const key = `${systemId}:${articleKey}${editionKey}${numeralKey}${normalized}`;
+  // Refresh old negative records only for the title patterns whose search just changed.
+  const gotyKey = ssPreviewStripGotySuffix(stripGameTechnicalAnnotations(name)) !== stripGameTechnicalAnnotations(name).trim() ? 'goty1:' : '';
+  const apostropheKey = ssPreviewPossessiveVariant(searchName) !== searchName ? 'apos1:' : '';
+  const regionalKey = ssPreviewRegionalAlias(searchName) ? 'reg1:' : '';
+  // Refresh only searches with &/And: previous misses may predate combined spellings.
+  const conjunctionKey = ssPreviewConjunctionVariant(searchName) !== searchName ? 'amp1:' : '';
+  const key = `${systemId}:${articleKey}${editionKey}${numeralKey}${gotyKey}${apostropheKey}${regionalKey}${conjunctionKey}${normalized}`;
   const requireEnglish = options?.englishSummary === true;
   const requireArtwork = options?.artwork === true;
   const ready = result => !!result &&
