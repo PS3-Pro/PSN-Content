@@ -22344,6 +22344,17 @@ P
             .trim();
     }
 
+    window.psnUpdateMediaGame = function(game, category) {
+        if (category !== 'updates' || !game) return game;
+        const id = String(game.titleId || game.titleID || game.id || '').trim().toUpperCase();
+        const base = id ? window.findPsnStoreItemById?.(id) : null;
+        const source = (base?.category === 'games' ? base.item : (id ? window.findPsnStoreExactMatchInCategory?.('games', [id]) : null)) || game;
+        const name = stripCatalogVersionMetadata(String(source.cleanName || source.name || source.title || game.cleanName || game.name || game.title || ''))
+            .replace(/\s*(?:[-–—:]\s*)?(?:\[|\()?\s*(?:update|patch)\s*(?:v(?:er(?:sion)?)?\.?\s*)?\d+(?:\.\d+)*\s*(?:\]|\))?\s*$/i, '')
+            .replace(/\s*[-–—:]\s*(?:update|patch)\s*$/i, '').trim();
+        return { ...game, cleanName:name, cTag:source.cTag || source.console || game.cTag || game.console };
+    };
+
     function stripDemoTitleMarkers(value) {
         let title = stripCatalogVersionMetadata(value);
         if (/^LEGOBATMAN3DEMO0$/i.test(title.trim())) title = 'LEGO Batman 3: Beyond Gotham Demo';
@@ -36653,6 +36664,12 @@ P
 
 	function refreshUnchangedBrowseFilterDisplay(items, category) {
 		prefetchBrowseSingleModal(items, category);
+		if (category === 'updates' && !browseExpandedGroupTitle && items.length === 1 && !items[0]?.isGroup && document.getElementById('search-input')?.value.trim()) {
+			const game=items[0]?.game;
+			window.__psnScheduleBrowseSingleGameplay?.(game,category);
+			window.__psnPrefetchGameTrophies?.(game,category);
+			window.psnGameTheme?.prefetch(game,category);
+		}
 		const cards = document.getElementById('database-grid')?.querySelectorAll(':scope > .game-card') || [];
 		for (let i = 0; i < cards.length; i++) {
 			const item = items[i];
@@ -39062,6 +39079,7 @@ P
 		});
 	}
 	function prepareGameTrophyMatch(game, category) {
+		game=window.psnUpdateMediaGame(game,category);
 		if (!isPs3TrophyGame(game, category)) return Promise.resolve(null);
 		const title=normalizeGameTrophyTitle(game.cleanName || game.name || game.title || '');
 		if (!title) return Promise.resolve(null);
@@ -39082,6 +39100,7 @@ P
 
 	const trophyPreloadPending = new Set();
 	window.__psnPrefetchGameTrophies = function(game, category='games') {
+		game=window.psnUpdateMediaGame(game,category);
 		if (document.hidden || !isPs3TrophyGame(game, category)) return;
 		const key=gameTrophyCacheKey(game);
 		if (key === 'ps3|' || trophyPreloadPending.has(key) || getKnownTrophyDbEntry(key)) return;
@@ -39162,13 +39181,15 @@ P
 	}
 
 	function isPs3TrophyGame(localGame = {}, currentCat = '') {
+		if (!localGame) return false;
 		const consoleTag = String(localGame.cTag || localGame.console || localGame.platform || '').trim().toLowerCase();
-		return currentCat === 'games' && consoleTag.startsWith('ps3');
+		return (currentCat === 'games' || currentCat === 'updates') && consoleTag.startsWith('ps3');
 	}
 
 	function updateModalTrophyStatus(localGame, currentCat) {
 		const statusEl = document.getElementById('modal-trophies-status');
-		if (!statusEl || currentCat !== 'games') return;
+		if (!statusEl || (currentCat !== 'games' && currentCat !== 'updates')) return;
+		localGame=window.psnUpdateMediaGame(localGame,currentCat);
 		const token = ++modalTrophyLookupToken;
 		activeModalTrophyGame = null;
 
@@ -42420,8 +42441,8 @@ P
 		if (!badges) return;
 		badges.querySelectorAll('.game-modal-languages').forEach(row => row.remove());
 		badges.querySelectorAll('.has-game-modal-languages').forEach(panel => panel.classList.remove('has-game-modal-languages'));
-		if (category !== 'games') return;
-		const identity = getGameDbIdentity(game);
+		if (category !== 'games' && category !== 'updates') return;
+		const identity = getGameDbIdentity(window.psnUpdateMediaGame(game,category));
 		const isCurrent = () => modal.isConnected &&
 			String(modal.dataset.openHydrationToken || '') === String(hydrationToken) &&
 			String(modal.dataset.storeCategory || '') === category &&
@@ -42642,7 +42663,7 @@ P
 			const modalMetadataIsAdmin = document.body.classList.contains('is-admin');
 			const modalMetadataLabel = modalMetadataIsAdmin ? 'Correct metadata' : 'Suggest metadata correction';
 			const modalMetadataButtonHtml = modalInfoOnly ? '' : `<button type="button" id="modal-title-metadata-btn" class="modal-title-metadata-btn" title="${modalMetadataLabel}" aria-label="${modalMetadataLabel}" onmouseenter="playUiHover()" onclick="openMetadataCorrectionFromModal(event)"><i class="fas fa-pen"></i></button>`;
-			const modalThemeButtonHtml = !modalInfoOnly && ['games','ports','homebrew_games','prototypes'].includes(currentCat)
+			const modalThemeButtonHtml = !modalInfoOnly && ['games','ports','homebrew_games','prototypes','updates'].includes(currentCat)
 				? `<button type="button" id="modal-title-game-theme-btn" class="modal-title-game-theme-btn" title="Game theme" aria-label="Game theme" hidden onmouseenter="playUiHover()" onclick="window.psnGameTheme?.toggle()"><i class="fas fa-music"></i></button>` : '';
 			modalHeader.innerHTML = `<span class="modal-title-main"><i class="${iconClass}"></i><span>${headerText}</span></span>${modalInfoOnly ? '' : `<span class="modal-title-action-group">${modalWishButtonHtml}${modalThemeButtonHtml}${modalShareButtonHtml}${modalReportButtonHtml}${modalMetadataButtonHtml}</span>`}`;
 		}
@@ -42669,7 +42690,7 @@ P
 		const titleHtml = modalDisplayName + (displayVersion ? ` <span style="color:#FF1493; font-size:14px;">[v${displayVersion}]</span>` : "");
 		const selectedCategoryOption = Array.from(catSelect?.options || []).find(option => option.value === currentCat);
 		const typeText = (currentCat === 'games') ? String(game.cTag || 'PS3').toUpperCase() + " Game" : (selectedCategoryOption?.text || String(currentCat || '').replace(/_/g, ' ').replace(/\b\w/g, char => char.toUpperCase()));
-		const showModalTrophies = currentCat === 'games';
+		const showModalTrophies = currentCat === 'games' || currentCat === 'updates';
 	
 		let actionsHtml = '';
 		const safeName = modalDisplayName.replace(/'/g, "\\'");
@@ -42890,7 +42911,7 @@ P
 		if (typeof window.loadGamePlayers === 'function') window.loadGamePlayers(game.id || game.titleId || '', modalDisplayName || game.cleanName || '', currentCat, modal);
 		const shouldRecordRecentlyVisited = !modalInfoOnly && game && typeof window.recordRecentlyVisitedGame === 'function';
 		modal.style.display = 'flex';
-		window.psnGameTheme?.open(modalDisplayName || game.cleanName || game.title || '',currentCat);
+		window.psnGameTheme?.open(currentCat==='updates' ? window.psnUpdateMediaGame(game,currentCat) : (modalDisplayName || game.cleanName || game.title || ''),currentCat);
 		window.__psnPrepareGameModalFanart?.(modal,game,currentCat,hydrationToken);
 		if (cardMorphMotionSource && typeof window.prepareGameModalCardMorphOpening === 'function') {
 			if (!window.prepareGameModalCardMorphOpening(modal, cardMorphMotionSource)) {
@@ -44428,6 +44449,7 @@ P
 
 		const extraMetaContainer = modalRoot?.querySelector('#modal-extra-meta') || document.getElementById('modal-extra-meta');
 		const metadataCategory = String(modalRoot?.dataset.storeCategory || 'games');
+		if (metadataCategory === 'updates') gameName = window.psnUpdateMediaGame({cleanName:gameName,id:gameId},metadataCategory).cleanName;
 		const contentMetadataOverride = typeof window.getContentMetadataOverride === 'function' ? window.getContentMetadataOverride({ titleId: gameId, contentId }, metadataCategory) : null;
 		const metadataSourceTracking = options && options.trackSources === true && !!modalRoot;
 		const collectSummaryCandidates = metadataSourceTracking && options && options.collectSummaryCandidates === true;
@@ -120435,11 +120457,13 @@ function getVisibleChatStackEl(id) {
   window.tryScreenScraperCoverFallback = function(img, category) {
     if (!img || !img.isConnected) return false;
     const cat=String(category||img.dataset.coverCategory||'').toLowerCase();
-    if (!['games','prototypes','ports'].includes(cat)) return false;
-    const platform=String(img.dataset.console||'').toLowerCase().replace(/[^a-z0-9]/g,'');
+    if (!['games','prototypes','ports','updates'].includes(cat)) return false;
+    const originalName=String(img.dataset.name||'').trim();
+    const mediaGame=window.psnUpdateMediaGame({cleanName:originalName,id:img.dataset.titleId,cTag:img.dataset.console},cat);
+    const platform=String(mediaGame.cTag||'').toLowerCase().replace(/[^a-z0-9]/g,'');
     const isPort=cat==='ports';
     const system=platformIds[platform] || (isPort ? 59 : 0);
-    const name=String(img.dataset.name||'').trim();
+    const name=mediaGame.cleanName;
     if (!system || normalize(name).length<3) return false;
     const attempted=img.dataset.psnSsCoverTried==='1';
     const renewal=attempted && img.dataset.psnSsCoverActive==='1' && img.dataset.psnSsCoverRenewed!=='1';
@@ -120450,7 +120474,7 @@ function getVisibleChatStackEl(id) {
     const identity=cat+':'+platform+':'+normalize(name)+':'+String(img.dataset.titleId||'');
     img.__psnSsCoverIdentity=identity;
     const stillCurrent=()=>img.isConnected && img.__psnSsCoverIdentity===identity &&
-      String(img.dataset.name||'').trim()===name;
+      String(img.dataset.name||'').trim()===originalName;
     getAssets(name,system,isPort,renewal,platform==='minis',img.dataset.titleId).then(data=>{
       if(!stillCurrent())return;
       const artwork=data?.extras?.images||[];
@@ -120508,8 +120532,9 @@ function getVisibleChatStackEl(id) {
     return entry.promise;
   }
   window.__psnPrefetchRegionsFanart = function(game,category='games') {
+    game=window.psnUpdateMediaGame(game,category);
     const cat=String(category||'').toLowerCase();
-    if(!game||!['games','prototypes','ports'].includes(cat))return;
+    if(!game||!['games','prototypes','ports','updates'].includes(cat))return;
     const isPort=cat==='ports';
     const consoleTag=String(game.cTag||game.console||'').toLowerCase().replace(/[^a-z0-9]/g,'');
     const system=platformIds[consoleTag]||(isPort?59:0);
@@ -120517,6 +120542,7 @@ function getVisibleChatStackEl(id) {
     if(system&&name.length>=3)warmFanart(name,system,isPort,consoleTag==='minis',gameSerial(game,isPort));
   };
   window.__psnWaitRegionsFanart = function(game,category='games') {
+    game=window.psnUpdateMediaGame(game,category);
     const cat=String(category||'').toLowerCase();
     const consoleTag=String(game?.cTag||game?.console||'').toLowerCase().replace(/[^a-z0-9]/g,'');
     const system=platformIds[consoleTag]||(cat==='ports'?59:0);
@@ -120554,9 +120580,10 @@ function getVisibleChatStackEl(id) {
     }
   }
   window.__psnPrefetchRegionsModal = function(game,category='games') {
+    game=window.psnUpdateMediaGame(game,category);
     if(document.hidden)return;
     const cat=String(category||'').toLowerCase();
-    if(!game||!['games','prototypes','ports'].includes(cat))return;
+    if(!game||!['games','prototypes','ports','updates'].includes(cat))return;
     const isPort=cat==='ports';
     const consoleTag=String(game.cTag||game.console||'').toLowerCase().replace(/[^a-z0-9]/g,'');
     const system=platformIds[consoleTag]||(isPort?59:0);
@@ -120629,8 +120656,9 @@ function getVisibleChatStackEl(id) {
     content.style.setProperty('--psn-ss-fade-end','88%');
   }
   window.__psnPrepareGameModalFanart = function(root,game,category,requestToken) {
+    game=window.psnUpdateMediaGame(game,category);
     const cat=String(category||'').toLowerCase();
-    if(!root||!game||!['games','prototypes','ports'].includes(cat))return;
+    if(!root||!game||!['games','prototypes','ports','updates'].includes(cat))return;
     const isPort=cat==='ports';
     const consoleTag=String(game.cTag||game.console||'').toLowerCase().replace(/[^a-z0-9]/g,'');
     const system=platformIds[consoleTag]||(isPort?59:0);
@@ -120695,11 +120723,13 @@ function getVisibleChatStackEl(id) {
       return;
     }
     const category=String(root.dataset.storeCategory||'').toLowerCase();
-    if(!['games','prototypes','ports'].includes(category)) return;
+    if(!['games','prototypes','ports','updates'].includes(category)) return;
     const img=root.querySelector('img.modal-img');
-    const consoleTag=String(img?.dataset.console||root.__psnLastOpenedGame?.cTag||'').toLowerCase().replace(/[^a-z0-9]/g,'');
+    const mediaGame=window.psnUpdateMediaGame({cleanName:name,id:titleId,cTag:img?.dataset.console||root.__psnLastOpenedGame?.cTag},category);
+    const consoleTag=String(mediaGame.cTag||'').toLowerCase().replace(/[^a-z0-9]/g,'');
     const isPort=category==='ports';
     const system=platformIds[consoleTag] || (isPort?59:0);
+    name=mediaGame.cleanName;
     if(!system||!name||name.length<3) return;
     const match=()=>root.isConnected&&root.classList.contains('show')&&String(root.dataset.titleId||'')===String(titleId||'')&&(!requestToken||String(root.dataset.openHydrationToken||'')===String(requestToken));
     const isMinis=consoleTag==='minis';
@@ -120796,12 +120826,13 @@ function getVisibleChatStackEl(id) {
   }
   function identity(card) {
     const img=card.querySelector('.game-img-container > img.game-img');
-    const platform=String(img.dataset.console||card.dataset.console||'').toLowerCase().replace(/[^a-z0-9]/g,'');
     const category=String(img.dataset.coverCategory||card.dataset.storeCategory||'').toLowerCase();
-    if(!['games','prototypes','ports'].includes(category))return null;
+    if(!['games','prototypes','ports','updates'].includes(category))return null;
+    const mediaGame=window.psnUpdateMediaGame({cleanName:img.dataset.name||img.getAttribute('alt')||'',id:img.dataset.titleId||card.dataset.titleId,cTag:img.dataset.console||card.dataset.console},category);
+    const platform=String(mediaGame.cTag||'').toLowerCase().replace(/[^a-z0-9]/g,'');
     const isPort=category==='ports';
     const system=systems[platform] || (isPort?59:0);if(!system)return null;
-    const name=cleanName(img.dataset.name||img.getAttribute('alt')||'');
+    const name=cleanName(mediaGame.cleanName);
     if(name.length<3||name.length>140)return null;
     const serial=String(img.dataset.titleId||card.dataset.titleId||'').trim().toUpperCase().replace(/[-_ .]/g,'');
     const titleId=!isPort&&/^[A-Z]{4}\d{5}$/.test(serial)?serial:'';
@@ -120867,11 +120898,12 @@ function getVisibleChatStackEl(id) {
     const img=cover.querySelector('img.modal-img');
     if(!img)return null;
     const category=String(img.dataset.coverCategory||'').toLowerCase();
-    if(!['games','prototypes','ports'].includes(category))return null;
+    if(!['games','prototypes','ports','updates'].includes(category))return null;
     const isPort=category==='ports';
-    const platform=String(img.dataset.console||'').toLowerCase().replace(/[^a-z0-9]/g,'');
+    const mediaGame=window.psnUpdateMediaGame({cleanName:img.dataset.name||'',id:img.dataset.titleId||cover.closest('#game-modal')?.dataset.titleId,cTag:img.dataset.console},category);
+    const platform=String(mediaGame.cTag||'').toLowerCase().replace(/[^a-z0-9]/g,'');
     const system=systems[platform]||(isPort?59:0);if(!system)return null;
-    const name=cleanName(img.dataset.name||'');
+    const name=cleanName(mediaGame.cleanName);
     if(name.length<3||name.length>140)return null;
     const serial=String(img.dataset.titleId||cover.closest('#game-modal')?.dataset.titleId||'').trim().toUpperCase().replace(/[-_ .]/g,'');
     const titleId=!isPort&&/^[A-Z]{4}\d{5}$/.test(serial)?serial:'';
@@ -120978,8 +121010,9 @@ function getVisibleChatStackEl(id) {
     return video;
   }
   function regionGameInfo(game,category) {
+    game=window.psnUpdateMediaGame(game,category);
     const cat=String(category||'').toLowerCase();
-    if(!game||!['games','prototypes','ports'].includes(cat))return null;
+    if(!game||!['games','prototypes','ports','updates'].includes(cat))return null;
     const isPort=cat==='ports';
     const platform=String(game.cTag||game.console||'').toLowerCase().replace(/[^a-z0-9]/g,'');
     const system=systems[platform]||(isPort?59:0);
@@ -121268,7 +121301,7 @@ function getVisibleChatStackEl(id) {
   const queued = new Set();
   let warmRunning = 0;
   const maxConcurrentWarm = 2;
-  const themeCategories = new Set(['games','ports','homebrew_games','prototypes']);
+  const themeCategories = new Set(['games','ports','homebrew_games','prototypes','updates']);
   const nameOf = item => String(typeof item === 'string' ? item :
     (item?.cleanName || item?.name || item?.title || '')).trim().slice(0,120);
   const keyOf = name => String(name || '').normalize('NFKD')
@@ -121436,7 +121469,7 @@ function getVisibleChatStackEl(id) {
   }
   function prefetch(item, category = 'games', priority = false) {
     if (!themeCategories.has(String(category || '').toLowerCase()) || !shouldWarm()) return;
-    const name = nameOf(item).replace(/\s+/g,' ').trim();
+    const name = nameOf(window.psnUpdateMediaGame(typeof item==='string'?{cleanName:item}:item,category)).replace(/\s+/g,' ').trim();
     const key = keyOf(name);
     if (key.length < 3 || lookupCache.get(key+'|skip:')?.expires > Date.now() ||
       inflight.has(key+'|skip:')) return;
@@ -121609,7 +121642,7 @@ function getVisibleChatStackEl(id) {
       // Don't query a game the pointer/focus already left during the debounce.
       if (!card.isConnected || document.hidden ||
           (!card.matches(':hover') && !card.matches(':focus-within'))) return;
-      prefetch(img.dataset.name, img.dataset.coverCategory, true);
+      prefetch({cleanName:img.dataset.name,id:img.dataset.titleId,cTag:img.dataset.console}, img.dataset.coverCategory, true);
     },delay);
   }
   document.addEventListener('pointerover', event => {
@@ -121631,7 +121664,7 @@ function getVisibleChatStackEl(id) {
     for (const img of cards) {
       const rect = img.getBoundingClientRect();
       if (rect.width < 1 || rect.height < 1 || rect.bottom < 0 || rect.top > innerHeight + 350) continue;
-      prefetch(img.dataset.name,img.dataset.coverCategory);
+      prefetch({cleanName:img.dataset.name,id:img.dataset.titleId,cTag:img.dataset.console},img.dataset.coverCategory);
       if (++seen >= 4) break;
     }
   };
