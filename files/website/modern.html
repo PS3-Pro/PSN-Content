@@ -121175,7 +121175,6 @@ function getVisibleChatStackEl(id) {
       const host = url.hostname.toLowerCase();
       return url.protocol === 'https:' &&
         ((host === 'api.audius.co' && /^\/v1\/tracks\/[a-z0-9_-]{3,64}\/stream$/i.test(url.pathname)) ||
-        (host === 'youtube.ps3-pro.workers.dev' && /^\/audio\/[a-z0-9_-]{11}\.m4a$/i.test(url.pathname)) ||
         ((host === 'archive.org' || host.endsWith('.archive.org')) &&
         /\.(?:mp3|m4a|ogg|opus|aac)$/i.test(url.pathname)));
     } catch (_) { return false; }
@@ -121223,6 +121222,7 @@ function getVisibleChatStackEl(id) {
   function stop(restore = true) {
     ++generation;
     ++fadeToken;
+    if (active?.mediaTimeout) clearTimeout(active.mediaTimeout);
     audio.pause();
     audio.removeAttribute('src');
     audio.load();
@@ -121241,8 +121241,17 @@ function getVisibleChatStackEl(id) {
     }
     const token = generation, result = active.result;
     active.attemptedUrls.add(result.url);
+    const session = active;
+    const attempt = session.mediaAttempt = (session.mediaAttempt || 0) + 1;
+    const mediaTimeout = setTimeout(() => {
+      if (token === generation && active === session && session.mediaAttempt === attempt && audio.readyState < 3)
+        recoverPlayback();
+    }, 9000);
+    session.mediaTimeout = mediaTimeout;
     try {
       await audio.play();
+      clearTimeout(mediaTimeout);
+      if (session.mediaTimeout === mediaTimeout) session.mediaTimeout = null;
       if (token !== generation || active?.result !== result) return;
       if (!active || audio.paused || suspended || !visible()) { audio.pause(); return; }
       const bg = background();
@@ -121250,6 +121259,8 @@ function getVisibleChatStackEl(id) {
       fade(audio, 0.28, 360);
       updateButton('playing', active.result);
     } catch (error) {
+      clearTimeout(mediaTimeout);
+      if (session.mediaTimeout === mediaTimeout) session.mediaTimeout = null;
       if (token !== generation || active?.result !== result) return;
       if (error?.name !== 'NotAllowedError' && error?.name !== 'AbortError') recoverPlayback();
       else { updateButton('blocked', active?.result); resumeBackground(); }
@@ -121267,7 +121278,7 @@ function getVisibleChatStackEl(id) {
     if (saved) lookupCache.delete(cacheKey);
     if (inflight.has(cacheKey)) return inflight.get(cacheKey);
     const base = getMetadataServerBaseCompat();
-    const pending = fetch(base + '/api/game-theme?v=gts13&name=' + encodeURIComponent(name) +
+    const pending = fetch(base + '/api/game-theme?v=gts14a&name=' + encodeURIComponent(name) +
       (skip ? '&skip=' + encodeURIComponent(skip) : ''), { cache:'default' })
       .then(response => { if (!response.ok) throw new Error('Game theme lookup unavailable'); return response.json(); })
       .then(result => {
@@ -121348,7 +121359,7 @@ function getVisibleChatStackEl(id) {
     }
     stop(false);
     const token = generation;
-    active = { key, name:currentName, result:null, failedProviders:new Set(), attemptedUrls:new Set(), recovering:false };
+    active = { key, name:currentName, result:null, failedProviders:new Set(), attemptedUrls:new Set(), recovering:false, mediaAttempt:0, mediaTimeout:null };
     updateButton('loading'); // Button remains hidden while availability is unknown.
     load(currentName,key).then(result => {
       if (token !== generation || !active || active.key !== key) return;
@@ -121375,6 +121386,8 @@ function getVisibleChatStackEl(id) {
   function recoverPlayback() {
     if (!active?.result?.found || active.recovering || !enabled() || !visible() || suspended) return;
     active.recovering = true;
+    ++active.mediaAttempt;
+    if (active.mediaTimeout) { clearTimeout(active.mediaTimeout); active.mediaTimeout = null; }
     const remaining = active.alternatives || [];
     let next = null;
     while (remaining.length) {
@@ -121393,7 +121406,7 @@ function getVisibleChatStackEl(id) {
     const previous = String(active.result.provider || '').toLowerCase().replace(/[^a-z]/g,'');
     if (previous) active.failedProviders.add(previous);
     const skip = [...active.failedProviders].sort().join(',');
-    if (active.failedProviders.size >= 3) {
+    if (active.failedProviders.size >= 2) {
       active.recovering=false;
       active.result = null;
       updateButton('blocked');
@@ -121427,6 +121440,7 @@ function getVisibleChatStackEl(id) {
     if (!active.result?.found) { open(active.name,'games'); return; }
     if (!audio.paused) {
       manuallyPaused = true;
+      if (active.mediaTimeout) { clearTimeout(active.mediaTimeout); active.mediaTimeout = null; }
       audio.pause();
       updateButton('paused', active.result);
       resumeBackground();
@@ -121435,6 +121449,7 @@ function getVisibleChatStackEl(id) {
   function suspend() {
     if (!active) return;
     suspended = true;
+    if (active.mediaTimeout) { clearTimeout(active.mediaTimeout); active.mediaTimeout = null; }
     audio.pause();
     if (active.result?.found) updateButton('paused', active.result);
   }
@@ -121445,6 +121460,7 @@ function getVisibleChatStackEl(id) {
   }
   function settingsChanged() {
     if (!enabled()) {
+      if (active?.mediaTimeout) { clearTimeout(active.mediaTimeout); active.mediaTimeout = null; }
       audio.pause();
       if (active) updateButton(active.result?.found ? 'off' : 'missing',active.result);
       resumeBackground();
@@ -121455,8 +121471,10 @@ function getVisibleChatStackEl(id) {
     recoverPlayback();
   });
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden) audio.pause();
-    else if (active?.result?.found && !manuallyPaused) play();
+    if (document.hidden) {
+      if (active?.mediaTimeout) { clearTimeout(active.mediaTimeout); active.mediaTimeout = null; }
+      audio.pause();
+    } else if (active?.result?.found && !manuallyPaused) play();
   });
   let hoverWarmTimer = 0;
   function warmFromCard(target, delay = 180) {
@@ -121466,14 +121484,22 @@ function getVisibleChatStackEl(id) {
     if (!img) return;
     clearTimeout(hoverWarmTimer);
     hoverWarmTimer = setTimeout(() => {
-      if (!card.isConnected || document.hidden) return;
+      // Don't query a game the pointer/focus already left during the debounce.
+      if (!card.isConnected || document.hidden ||
+          (!card.matches(':hover') && !card.matches(':focus-within'))) return;
       prefetch(img.dataset.name, img.dataset.coverCategory, true);
     },delay);
   }
   document.addEventListener('pointerover', event => {
-    if (event.pointerType === 'mouse' || event.pointerType === 'pen') warmFromCard(event.target);
+    if (event.pointerType !== 'mouse' && event.pointerType !== 'pen') return;
+    const card = event.target?.closest?.('.game-card, .recently-visited-discover-card, .promo-card');
+    // Moving between buttons/images inside the same card isn't a new hover.
+    if (card && !card.contains(event.relatedTarget)) warmFromCard(card);
   },{passive:true});
-  document.addEventListener('focusin', event => warmFromCard(event.target,80),{passive:true});
+  document.addEventListener('focusin', event => {
+    const card = event.target?.closest?.('.game-card, .recently-visited-discover-card, .promo-card');
+    if (card && !card.contains(event.relatedTarget)) warmFromCard(card,80);
+  },{passive:true});
   document.addEventListener('visibilitychange', () => { if (!document.hidden) drainWarmQueue(); });
   // A small first-screen warm-up, mirroring fanart's bounded prefetch, not a catalog-wide scan.
   const initialWarm = () => {

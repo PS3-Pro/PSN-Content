@@ -3402,13 +3402,13 @@ app.post('/api/game-trophies/cache',express.json({limit:'240kb'}),async (req,res
   }catch(err){ return res.status(503).json({ok:false}); }
 });
 
-// Game modal music: YouTube-first (Cloudflare Worker), then Audius and permission-checked Archive. Never proxy audio through Render.
+// Game modal music: Audius and license-checked Internet Archive; no YouTube player or video fallback.
 const gameThemeMemory = new Map();
 const gameThemePending = new Map();
 const GAME_THEME_MEMORY_MAX = 350;
 const GAME_THEME_FOUND_TTL = 48 * 60 * 60 * 1000;
 const GAME_THEME_MISS_TTL = 2 * 60 * 60 * 1000;
-const GAME_THEME_VERSION = 'gts13:'; // YouTube-first; refresh prior source preferences.
+const GAME_THEME_VERSION = 'gts14a:'; // Two providers and improved theme ranking: invalidate old soundtrack picks.
 const gameThemeSourceCooldown = new Map();
 let gameThemeActiveLookups = 0;
 let gameThemeLastExpiredPrune = 0;
@@ -3465,7 +3465,6 @@ const GAME_THEME_STOP_WORDS = new Set(['the','and','for','of','to','in','a','an'
 function gameThemeTokens(value) {
   return gameThemeNormalize(value).split(' ').filter(x => x && !GAME_THEME_STOP_WORDS.has(x));
 }
-function gameThemeComparable(value) { return ' ' + gameThemeNormalize(value) + ' '; }
 function gameThemeAlbumScore(gameName, albumName) {
   const expected = gameThemeTokens(gameThemeCanonicalGameTitle(gameName));
   const album = gameThemeTokens(albumName);
@@ -3490,8 +3489,28 @@ function gameThemeAlbumScore(gameName, albumName) {
   return score;
 }
 
-function gameThemeSongScore(songName, index, durationSeconds = 0) {
+// Known main themes: only improve matching and ranking; do not hardcode audio URLs.
+const GAME_THEME_PREFERRED_TRACKS = Object.freeze({
+  'grand theft auto 5':['welcome to los santos'],
+  'grand theft auto 4':['soviet connection'],
+  'grand theft auto san andreas':['theme from san andreas'],
+  'grand theft auto vice city':['theme from vice city'],
+  'devil may cry 3':['devils never cry']
+});
+function gameThemePreferredTracks(gameName) {
+  return GAME_THEME_PREFERRED_TRACKS[gameThemeNormalize(gameThemeCanonicalGameTitle(gameName))] || [];
+}
+function gameThemePreferredMatch(gameName, songName) {
+  const title = ' ' + gameThemeNormalize(songName) + ' ';
+  return gameThemePreferredTracks(gameName).some(song => title.includes(' ' + song + ' '));
+}
+function gameThemeUnwantedSong(value) {
+  const text = gameThemeNormalize(value);
+  return /\b(?:pause menu|pause screen|pause theme|paused music|ambient loop|background ambience|low quality|low volume|bad quality|muffled|distorted|earrape|recorded from|recording from|gameplay audio|gameplay rip|radio static|soundfont|midi recreation|sound effects|sfx|podcast|interview|commentary|walkthrough|trailer|cutscene)\b/.test(text);
+}
+function gameThemeSongScore(songName, index, durationSeconds = 0, gameName = '') {
   const title = gameThemeNormalize(songName).replace(/^\d{1,3}(?:\s+|$)/, '');
+  if (gameThemeUnwantedSong(title)) return -999;
   if (/\b(?:cough|sneeze|voice|voiceover|voice over|dialogue|dialog|speech|talking|conversation|sfx|sound effect|sound effects|ambience|ambient noise|footstep|gunshot|cinematic dialogue|radio chatter|interview|podcast|commentary|cutscene|sound test|announcer|intro skit|trailer|walkthrough|lets play)\b/.test(title)) return -999;
   if (/\b(?:remix|karaoke|fanmade|fan made|cover version|acapella|tribute|nightcore|lofi)\b/.test(title)) return -50;
   let score = 25 - Math.min(index, 35);
@@ -3499,6 +3518,9 @@ function gameThemeSongScore(songName, index, durationSeconds = 0) {
   else if (/\b(?:theme|opening|intro|title|menu|prologue|overture|prelude|credits)\b/.test(title)) score += 55;
   if (/\b(?:music|soundtrack|score|original)\b/.test(title)) score += 12;
   if (/\b(?:remaster|arranged|medley|bonus|demo)\b/.test(title)) score -= 35;
+  if (gameThemePreferredMatch(gameName,title)) score += 210;
+  if (/\b(?:extended|loop|one hour|1 hour|30 minutes|60 minutes|bass boosted|slowed|reverb)\b/.test(title)) score -= 75;
+  if (durationSeconds > 1200) score -= 60;
   if (durationSeconds > 0 && durationSeconds < 40) score -= 95;
   else if (durationSeconds >= 75) score += 35;
   else if (durationSeconds >= 45) score += 8;
@@ -3510,7 +3532,7 @@ function gameThemeRequest(url, options = {}) {
   return new Promise((resolve, reject) => {
     let parsed;
     try { parsed = new URL(url); } catch (_) { return reject(new Error('Invalid provider URL')); }
-    if (parsed.protocol !== 'https:' || !['api.audius.co','archive.org','www.archive.org','youtube.ps3-pro.workers.dev'].includes(parsed.hostname)) return reject(new Error('Unexpected provider host'));
+    if (parsed.protocol !== 'https:' || !['api.audius.co','archive.org','www.archive.org'].includes(parsed.hostname)) return reject(new Error('Unexpected provider host'));
     const req = https.get(parsed, { headers:{ 'User-Agent':'PSN-Content/1.0 (+https://github.com/PS3-Pro/PSN-Content)', 'Accept':options.json ? 'application/json' : 'text/html,application/xhtml+xml', 'Accept-Encoding':'identity' } }, response => {
       if ([301,302,303,307,308].includes(response.statusCode) && response.headers.location && (options.redirects || 0) < 2) {
         response.resume();
@@ -3528,29 +3550,6 @@ function gameThemeRequest(url, options = {}) {
     req.setTimeout(options.timeout || 8500, () => req.destroy(new Error('Provider timed out')));
     req.on('error', reject);
   });
-}
-// YouTube audio discovery is metadata-only: never proxy the stream through Render.
-// Actual media is resolved by the existing Cloudflare Worker when the modal plays it.
-async function gameThemeFromYouTubeAudio(gameName) {
-  if(!gameThemeProviderReady('youtubeaudio'))throw gameThemeCooldownError('YouTube Audio');
-  const name=gameThemeCanonicalGameTitle(gameName);
-  const workerBase='https://youtube.ps3-pro.workers.dev';
-  let data;
-  try {
-    data=await gameThemeRequest(workerBase+'/theme-search?name='+encodeURIComponent(name),
-      {json:true,maxBytes:50000,timeout:10500});
-    if(!data?.ok)throw new Error('YouTube audio metadata unavailable');
-  } catch(e){gameThemeProviderError('youtubeaudio');throw e;}
-  if(!data.found)return null;
-  const valid = id => /^[a-zA-Z0-9_-]{11}$/.test(String(id||''));
-  if(!valid(data.videoId))return null;
-  const toTrack=x=>({title:String(x.title||'').slice(0,180),
-    url:workerBase+'/audio/'+x.videoId+'.m4a'});
-  const first=toTrack(data);
-  const alternatives=(Array.isArray(data.alternatives)?data.alternatives:[])
-    .filter(x=>valid(x?.videoId)&&x.videoId!==data.videoId).slice(0,3).map(toTrack);
-  return {ok:true,found:true,provider:'YouTube Audio',...first,
-    sourceUrl:'https://www.youtube.com/watch?v='+data.videoId,alternatives};
 }
 const gameThemeProviderReady = name => (gameThemeSourceCooldown.get(name) || 0) <= Date.now();
 function gameThemeProviderError(name) { gameThemeSourceCooldown.set(name, Date.now() + 20000); }
@@ -3577,7 +3576,11 @@ function gameThemeAudiusScore(gameName, track) {
       track.is_unlisted === true || track.isUnlisted === true) return -999;
   const expected = gameThemeNormalize(gameThemeCanonicalGameTitle(gameName));
   const title = gameThemeNormalize(track.title);
-  if (!title || !expected || !(' ' + title + ' ').includes(' ' + expected + ' ')) return -999;
+  if (!title || !expected) return -999;
+  if (gameThemeUnwantedSong(title)) return -999;
+  // Allow the exact recognized main-theme title even when it omits the game name.
+  const preferred = gameThemePreferredMatch(gameName,title);
+  if (!preferred && !(' ' + title + ' ').includes(' ' + expected + ' ')) return -999;
   if (/\b(?:cough|sneeze|voiceover|voice over|dialogue|dialog|speech|conversation|interview|podcast|commentary|walkthrough|gameplay|lets play|reaction|trailer|cutscene|sound effects|sfx|sound effect|footsteps|gunshots|tutorial|review|meme|parody)\b/.test(title)) return -999;
   // Even when the required phrase appears, reject tracks combining different sequels.
   const requestedNumbers = new Set(gameThemeTokens(gameThemeCanonicalGameTitle(gameName)).filter(x => /^\d+$/.test(x)));
@@ -3588,7 +3591,10 @@ function gameThemeAudiusScore(gameName, track) {
   let score = 110;
   if (title === expected) score += 18;
   if (title.startsWith(expected + ' ')) score += 20;
-  if (/\b(?:main theme|theme song|title theme|menu theme|opening theme|theme|soundtrack|original soundtrack|ost|official|opening|overture|main menu)\b/.test(title)) score += 24;
+  if (/\b(?:main theme|theme song|title theme|opening theme|theme|soundtrack|original soundtrack|ost|official|opening|overture|main menu)\b/.test(title)) score += 24;
+  if (preferred) score += 210;
+  if (/\b(?:menu loop|loading screen|radio|extended|loop|bass boosted|slowed|reverb|rip)\b/.test(title)) score -= 75;
+  if (duration > 1200) score -= 60;
   if (/\b(?:remix|nightcore|sped up|slowed|reverb|karaoke|mashup|lofi|8d|ai cover|fanmade|fan made)\b/.test(title)) score -= 38;
   if (/\b(?:cover|piano version|instrumental remake)\b/.test(title)) score -= 13;
   if (duration >= 75) score += 10;
@@ -3597,6 +3603,7 @@ function gameThemeAudiusScore(gameName, track) {
   const musicLabels = new Set(['ost','theme','song','music','original','soundtrack','official','intro','opening','menu','main','score','from','game','the','of']);
   score += Math.min(36,suffix.split(' ').filter(word=>word.length>=3 && !musicLabels.has(word)).length * 12);
   score -= Math.min(20, Math.max(0,title.split(' ').length - expected.split(' ').length - 5));
+  score += Math.min(24, Math.floor(Math.log10(Math.max(1,Number(track.play_count || 0) + 1)) * 5));
   return score;
 }
 function gameThemeAudiusResult(track) {
@@ -3614,22 +3621,28 @@ async function gameThemeFromAudius(gameName) {
   const clean = gameThemeCanonicalGameTitle(gameName);
   const shortened = clean.replace(/\s+(?:II|III|IV|V|VI|VII|VIII|IX|X|XI|XII|XIII|XIV|XV|[2-9]|1[0-5])$/i, '').trim();
   // Audius may surface DMC3 only for a broad 'Devil May Cry' query. Discovery may be broad; acceptance stays strict.
-  const phrases = [...gameThemeSearchVariants(clean)];
+  const preferredTracks = gameThemePreferredTracks(gameName);
+  const phrases = [clean];
+  if (preferredTracks.length) phrases.push(clean + ' ' + preferredTracks[0],preferredTracks[0]);
+  phrases.push(...gameThemeSearchVariants(clean));
   if (shortened !== clean && shortened.split(' ').length >= 2) phrases.push(shortened);
-  phrases.push(clean + ' soundtrack');
+  phrases.push(clean + ' main theme',clean + ' soundtrack');
   const unique = [], seen = new Set();
   for (const phrase of phrases) {
     const key = phrase.toLowerCase().trim();
     if (key && !seen.has(key)) { unique.push(phrase.trim()); seen.add(key); }
   }
   const results = new Map();
-  let searched = 0, errors = 0, lastError;
+  let errors = 0, lastError;
   const deadline = Date.now() + 13500;
-  for (const phrase of unique.slice(0,4)) {
+  for (const phrase of unique.slice(0,preferredTracks.length ? 5 : 4)) {
     if (Date.now() >= deadline) break;
     const url = 'https://api.audius.co/v1/tracks/search?' + new URLSearchParams({query:phrase,limit:'35',app_name:'PSNContent'});
     let data;
-    try { data = await gameThemeRequest(url,{json:true,maxBytes:950000,timeout:4500}); searched++; }
+    // Enforce the overall search deadline even on the final provider call.
+    const remaining = deadline - Date.now();
+    if (remaining < 300) break;
+    try { data = await gameThemeRequest(url,{json:true,maxBytes:950000,timeout:Math.min(4500,remaining)}); }
     catch (error) { errors++; lastError=error; break; }
     for (const item of Array.isArray(data?.data) ? data.data : []) {
       const score = gameThemeAudiusScore(gameName,item);
@@ -3638,7 +3651,7 @@ async function gameThemeFromAudius(gameName) {
       const old = results.get(id);
       if (!old || old.score < score) results.set(id,{track:item,score});
     }
-    if ([...results.values()].some(x=>x.score>=130)) break;
+    if ([...results.values()].some(x => x.score >= (preferredTracks.length ? 290 : 150))) break;
   }
   const picks = [...results.values()].sort((a,b)=>b.score-a.score || Number(b.track.play_count||0)-Number(a.track.play_count||0)).slice(0,4);
   if (picks.length) {
@@ -3663,7 +3676,7 @@ function gameThemeArchiveSearchQuery(name) {
   const unique = [...new Set(variants.map(phrase => phrase.replace(/[\\"():]/g,' ').replace(/\s+/g,' ').trim()).filter(Boolean))].slice(0,4);
   return 'mediatype:audio AND (' + unique.map(phrase => 'title:"' + phrase + '"').join(' OR ') + ')';
 }
-function gameThemeArchiveTrackFiles(metadata) {
+function gameThemeArchiveTrackFiles(metadata, gameName) {
   const files = Array.isArray(metadata?.files) ? metadata.files : [];
   return files.filter(file => file && file.source === 'original' &&
     /\.(?:mp3|m4a|ogg|opus)$/i.test(String(file.name || '')) &&
@@ -3673,7 +3686,10 @@ function gameThemeArchiveTrackFiles(metadata) {
         .replace(/\.(?:mp3|m4a|ogg|opus)$/i,'')
         .replace(/^\s*(?:disc|cd)\s*\d+[\s/\\-]*/i,'')
         .replace(/^[\d\s._-]{1,10}(?=\D)/,'').trim();
-      const score = gameThemeSongScore(title,index);
+      const rawDuration = String(file.length || '').trim();
+      const duration = /^\d+(?:\.\d+)?$/.test(rawDuration) ? Number(rawDuration)
+        : /^\d+:\d{2}(?::\d{2})?$/.test(rawDuration) ? rawDuration.split(':').reduce((value,part) => value*60+Number(part),0) : 0;
+      const score = gameThemeSongScore(title,index,duration,gameName);
       return {file,title,index,score};
     })
     .filter(track => track.title.length >= 4 && track.score >= 0 &&
@@ -3711,7 +3727,7 @@ async function gameThemeFromArchive(gameName) {
         if (gameThemeAlbumScore(gameName,album) < 75) return null;
         if (!gameThemeArchiveLicense(metadata?.metadata))
           return {unlicensed:{album,sourceUrl:'https://archive.org/details/' + encodeURIComponent(item.id)}};
-        const tracks = gameThemeArchiveTrackFiles(metadata);
+        const tracks = gameThemeArchiveTrackFiles(metadata,gameName);
         if (!tracks.length) return {noPlayable:true};
         const toTrack = track => ({title:track.title,url:'https://archive.org/download/' +
           encodeURIComponent(item.id) + '/' + String(track.file.name).split('/').map(encodeURIComponent).join('/')});
@@ -3774,17 +3790,16 @@ async function gameThemeResolve(name, key, skip = new Set()) {
     } catch (_) {}
     let result = null, failed = 0;
     const diagnostics = {};
-    for (const [providerName,provider] of [['YouTube Audio',gameThemeFromYouTubeAudio],['Audius',gameThemeFromAudius],['Internet Archive',gameThemeFromArchive]]) {
+    for (const [providerName,provider] of [['Audius',gameThemeFromAudius],['Internet Archive',gameThemeFromArchive]]) {
       if (skip.has(providerName.toLowerCase().replace(/[^a-z]/g,''))) { diagnostics[providerName] = 'skipped'; continue; }
       result = null;
       try {
         result = await provider(gameThemeCanonicalGameTitle(name));
-        diagnostics[providerName] = result?.found ? 'found' : (result?.reason || (gameThemeProviderReady(providerName === 'Audius' ? 'audius' : providerName === 'YouTube Audio' ? 'youtubeaudio' : 'archive') ? 'no_playable_match' : 'temporarily_unavailable'));
+        diagnostics[providerName] = result?.found ? 'found' : (result?.reason || (gameThemeProviderReady(providerName === 'Audius' ? 'audius' : 'archive') ? 'no_playable_match' : 'temporarily_unavailable'));
       } catch (error) {
         failed++;
         const message = String(error?.message || 'unavailable');
         diagnostics[providerName] = gameThemeSourceStatus(error);
-        if (process.env.DEBUG_GAME_THEME === '1') console.warn('[GAME THEME]',providerName,name.slice(0,80),diagnostics[providerName],message.slice(0,160));
       }
       if (result?.found) { result.sources = diagnostics; break; }
     }
@@ -3831,7 +3846,7 @@ app.get('/api/game-theme', async (req,res) => {
   const normalized = gameThemeNormalize(searchedAs);
   if (name.length < 2 || !normalized) return res.status(400).json({ok:false,found:false,reason:'invalid_title'});
   try {
-    const skip = new Set(String(req.query?.skip || '').toLowerCase().split(',').filter(x => ['audius','youtubeaudio','internetarchive'].includes(x)));
+    const skip = new Set(String(req.query?.skip || '').toLowerCase().split(',').filter(x => ['audius','internetarchive'].includes(x)));
     const skippedKey = [...skip].sort().join(',');
     const result = await gameThemeResolve(searchedAs,GAME_THEME_VERSION + normalized + (skippedKey ? ':skip:' + skippedKey : ''),skip);
     res.setHeader('Cache-Control',result.retry ? 'no-store' : 'public,max-age=60');
