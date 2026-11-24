@@ -53140,7 +53140,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 				    const consoleTag = typeof window.getSafeConsoleTagForItem === 'function'
 				        ? window.getSafeConsoleTagForItem(item, category)
 				        : String(item?.cTag || item?.console || 'ps3');
-				    const scraperText = await window.__psnGetScraperSummary(gameName, consoleTag).catch(() => '');
+				    const scraperText = await window.__psnGetScraperSummary(gameName, consoleTag, titleId).catch(() => '');
 				    if (scraperText) candidates.push({ source:'ScreenScraper', text:scraperText });
 				}
 				state.candidates = adminNormalizeSummaryCandidateList(candidates);
@@ -120385,14 +120385,20 @@ function getVisibleChatStackEl(id) {
   const cleanName = value => String(value || '').replace(/[™®©]/g,' ').replace(/\b(?:tm|registered)\b/gi,' ').replace(/\s*[[(](?:usa|eur|europe|japan|ps3|ps2|psp|ps1|ps4)[)\]]/gi,'').replace(/\b(?:digital version)\b/gi,'').trim();
   const normalize = value => cleanName(value).normalize('NFKD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
   const escapeText = value => String(value || '').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-  function getAssets(name,system,isPort=false,renew=false,isMinis=false) {
-    const key=(isPort?'port':isMinis?'minis':system)+':'+normalize(name), now=Date.now();
+  const serialFor = (value,isPort=false) => {
+    const serial=String(value||'').trim().toUpperCase().replace(/[-_ .]/g,'');
+    return !isPort && /^[A-Z]{4}\d{5}$/.test(serial)?serial:'';
+  };
+  const gameSerial = (game,isPort=false) => serialFor(game?.titleId||game?.titleID||game?.id,isPort);
+  function getAssets(name,system,isPort=false,renew=false,isMinis=false,titleId='') {
+    titleId=serialFor(titleId,isPort);
+    const key=imageKey(name,system,isPort,isMinis,titleId), now=Date.now();
     if(renew) memory.delete(key);
     const cached=memory.get(key);
     if(cached && now-cached.at<15*60*1000) return Promise.resolve(cached.data);
     if(pending.has(key)) return pending.get(key);
     if(now<extrasBlockedUntil)return Promise.resolve(null);
-    const url=baseServer()+'/api/screenscraper-extras?name='+encodeURIComponent(cleanName(name))+'&system='+system+(isPort?'&port=1':'')+(isMinis?'&minis=1':'');
+    const url=baseServer()+'/api/screenscraper-extras?name='+encodeURIComponent(cleanName(name))+'&system='+system+(isPort?'&port=1':'')+(isMinis?'&minis=1':'')+(titleId?'&titleId='+encodeURIComponent(titleId):'');
     const promise=fetch(url,{cache:'no-store'}).then(r=>{
       if(r.status===429){extrasBlockedUntil=Date.now()+Math.min(120000,Math.max(10000,(Number(r.headers.get('Retry-After'))||60)*1000));return null;}
       return r.ok?r.json():null;
@@ -120425,7 +120431,7 @@ function getVisibleChatStackEl(id) {
     img.__psnSsCoverIdentity=identity;
     const stillCurrent=()=>img.isConnected && img.__psnSsCoverIdentity===identity &&
       String(img.dataset.name||'').trim()===name;
-    getAssets(name,system,isPort,renewal,platform==='minis').then(data=>{
+    getAssets(name,system,isPort,renewal,platform==='minis',img.dataset.titleId).then(data=>{
       if(!stillCurrent())return;
       const artwork=data?.extras?.images||[];
       const candidates=['box-2D-front','box-2D'];
@@ -120442,10 +120448,10 @@ function getVisibleChatStackEl(id) {
     return true;
   };
   const warmImages = new Map();
-  const imageKey = (name,system,isPort,isMinis=false) => (isPort?'port':isMinis?'minis':system)+':'+normalize(name);
-  function warmFanart(name,system,isPort=false,isMinis=false) {
+  const imageKey = (name,system,isPort,isMinis=false,titleId='') => (isPort?'port':isMinis?'minis':system)+':'+(serialFor(titleId,isPort)||normalize(name));
+  function warmFanart(name,system,isPort=false,isMinis=false,titleId='') {
     if(document.hidden)return Promise.resolve(null);
-    const key=imageKey(name,system,isPort,isMinis), now=Date.now();
+    const key=imageKey(name,system,isPort,isMinis,titleId), now=Date.now();
     const previous=warmImages.get(key);
     if(previous && previous.until>now)return previous.promise;
     if(previous)warmImages.delete(key);
@@ -120462,7 +120468,7 @@ function getVisibleChatStackEl(id) {
       };
       image.onerror=async()=>{
         if(allowRenew) {
-          const fresh=await getAssets(name,system,isPort,true,isMinis);
+          const fresh=await getAssets(name,system,isPort,true,isMinis,titleId);
           const art=(fresh?.extras?.images||[]).find(item=>item.kind==='background'&&validImg(item.url));
           const next=validImg(art?.url);
           if(next && next!==url) {resolve(load(next,false));return;}
@@ -120471,7 +120477,7 @@ function getVisibleChatStackEl(id) {
       };
       image.src=url;
     });
-    entry.promise=getAssets(name,system,isPort,false,isMinis).then(data=>{
+    entry.promise=getAssets(name,system,isPort,false,isMinis,titleId).then(data=>{
       const art=(data?.extras?.images||[]).find(item=>item.kind==='background'&&validImg(item.url));
       const url=validImg(art?.url);
       if(!url){entry.status=data?.ok?'absent':'failed';entry.until=Date.now()+(data?.ok?60000:15000);return null;}
@@ -120488,14 +120494,14 @@ function getVisibleChatStackEl(id) {
     const consoleTag=String(game.cTag||game.console||'').toLowerCase().replace(/[^a-z0-9]/g,'');
     const system=platformIds[consoleTag]||(isPort?59:0);
     const name=String(game.cleanName||game.name||game.title||'').trim();
-    if(system&&name.length>=3)warmFanart(name,system,isPort,consoleTag==='minis');
+    if(system&&name.length>=3)warmFanart(name,system,isPort,consoleTag==='minis',gameSerial(game,isPort));
   };
   window.__psnWaitRegionsFanart = function(game,category='games') {
     const cat=String(category||'').toLowerCase();
     const consoleTag=String(game?.cTag||game?.console||'').toLowerCase().replace(/[^a-z0-9]/g,'');
     const system=platformIds[consoleTag]||(cat==='ports'?59:0);
     const name=String(game?.cleanName||game?.name||game?.title||'').trim();
-    const entry=system?warmImages.get(imageKey(name,system,cat==='ports',consoleTag==='minis')):null;
+    const entry=system?warmImages.get(imageKey(name,system,cat==='ports',consoleTag==='minis',gameSerial(game,cat==='ports'))):null;
     if(!entry||entry.status==='ready'||entry.status==='absent'||entry.status==='failed')return Promise.resolve();
     return new Promise(resolve=>{
       const timeout=setTimeout(resolve,800);
@@ -120536,7 +120542,7 @@ function getVisibleChatStackEl(id) {
     const system=platformIds[consoleTag]||(isPort?59:0);
     const name=String(game.cleanName||game.name||game.title||'').trim();
     if(!system||normalize(name).length<3)return;
-    const key=imageKey(name,system,isPort,consoleTag==='minis');
+    const key=imageKey(name,system,isPort,consoleTag==='minis',gameSerial(game,isPort));
     latestRegionScreenshotKey=key;
     const titleId=String(game.id||game.titleId||game.titleID||'').trim();
     const contentId=String(game.contentId||game.contentID||'').trim();
@@ -120563,7 +120569,7 @@ function getVisibleChatStackEl(id) {
     entry.promise=new Promise(resolve=>{
       setTimeout(async()=>{
         if(document.hidden){entry.until=Date.now()+15000;resolve();return;}
-        const assets=getAssets(name,system,isPort,false,consoleTag==='minis');
+        const assets=getAssets(name,system,isPort,false,consoleTag==='minis',titleId);
         const metadata=typeof window.fetchPsnLiveMetadata==='function'
           ? window.fetchPsnLiveMetadata({include:'rawg',name:lookupName,platformHints}).catch(()=>null)
           : Promise.resolve(null);
@@ -120614,7 +120620,8 @@ function getVisibleChatStackEl(id) {
     if(!content)return;
     const token=String(requestToken||'');
     const generation=Number(root.__psnFanartGeneration||0);
-    const identity=imageKey(name,system,isPort,consoleTag==='minis');
+    const lookupTitleId=gameSerial(game,isPort)||serialFor(root.dataset.titleId,isPort);
+    const identity=imageKey(name,system,isPort,consoleTag==='minis',lookupTitleId);
     if(root.__psnSsPreparingFanart===token+'|'+identity+'|'+generation)return;
     root.__psnSsPreparingFanart=token+'|'+identity+'|'+generation;
     const titleId=String(root.dataset.titleId||'');
@@ -120635,14 +120642,14 @@ function getVisibleChatStackEl(id) {
     if(warmed?.status==='ready'&&warmed.image?.naturalWidth&&warmed.until>Date.now()){
       apply(warmed.url);
     }else{
-      warmFanart(name,system,isPort,consoleTag==='minis').then(apply);
+      warmFanart(name,system,isPort,consoleTag==='minis',lookupTitleId).then(apply);
     }
   };
-  window.__psnGetScraperSummary = async function(name, consoleTag) {
+  window.__psnGetScraperSummary = async function(name, consoleTag, titleId='') {
     const platform = String(consoleTag || '').toLowerCase().replace(/[^a-z0-9]/g,'');
     const system = platformIds[platform];
     if (!system || !name || String(name).length < 3) return '';
-    const result = await getAssets(name,system,false,false,platform==='minis');
+    const result = await getAssets(name,system,false,false,platform==='minis',titleId);
     return result?.found && result.extras?.summaryEnglishChecked === true ? String(result.extras.summary || '').trim() : '';
   };
   window.__psnApplyScraperSupplement = async function(root,name,titleId,requestToken) {
@@ -120677,7 +120684,7 @@ function getVisibleChatStackEl(id) {
     const match=()=>root.isConnected&&root.classList.contains('show')&&String(root.dataset.titleId||'')===String(titleId||'')&&(!requestToken||String(root.dataset.openHydrationToken||'')===String(requestToken));
     const isMinis=consoleTag==='minis';
     window.__psnPrepareGameModalFanart?.(root,root.__psnLastOpenedGame||{cleanName:name,cTag:consoleTag},category,requestToken);
-    const data=await getAssets(name,system,isPort,false,isMinis);
+    const data=await getAssets(name,system,isPort,false,isMinis,titleId);
     if(!match()||!data?.found||!data.extras) return;
     const ext=data.extras;
     const wrapper=root.querySelector('#modal-screenshots-wrapper');
@@ -120707,7 +120714,7 @@ function getVisibleChatStackEl(id) {
             image.onerror=async()=>{
               if(!match()||image.dataset.psnSsRenewed)return;
               image.dataset.psnSsRenewed='1';
-              const fresh=await getAssets(name,system,isPort,true,isMinis);
+              const fresh=await getAssets(name,system,isPort,true,isMinis,titleId);
               if(!match())return;
               const replacements=(fresh?.extras?.images||[]).filter(item=>item.kind==='screenshot').map(item=>validImg(item.url)).filter(Boolean);
               if(replacements[index] && replacements[index]!==image.src)image.src=replacements[index];
@@ -120776,7 +120783,9 @@ function getVisibleChatStackEl(id) {
     const system=systems[platform] || (isPort?59:0);if(!system)return null;
     const name=cleanName(img.dataset.name||img.getAttribute('alt')||'');
     if(name.length<3||name.length>140)return null;
-    return {name,system,isPort,isMinis:platform==='minis',key:(isPort?'port':platform==='minis'?'minis':system)+':'+normalized(name)};
+    const serial=String(img.dataset.titleId||card.dataset.titleId||'').trim().toUpperCase().replace(/[-_ .]/g,'');
+    const titleId=!isPort&&/^[A-Z]{4}\d{5}$/.test(serial)?serial:'';
+    return {name,system,isPort,titleId,isMinis:platform==='minis',key:(isPort?'port':platform==='minis'?'minis':system)+':'+(titleId||normalized(name))};
   }
   function getResult(info,renew=false) {
     if(renew){cache.delete(info.key);sessionResult(info,true);}
@@ -120784,7 +120793,7 @@ function getVisibleChatStackEl(id) {
     if(!renew){const saved=sessionResult(info);if(saved)return Promise.resolve(saved);}
     if(pending.has(info.key))return pending.get(info.key);
     if(Date.now()<lookupBlockedUntil)return Promise.resolve({ok:false,reason:'rate_limited'});
-    const promise=fetch(base()+'/api/gameplay-preview?name='+encodeURIComponent(info.name)+'&system='+info.system+(info.isPort?'&port=1':'')+(info.isMinis?'&minis=1':''),{cache:'no-store'})
+    const promise=fetch(base()+'/api/gameplay-preview?name='+encodeURIComponent(info.name)+'&system='+info.system+(info.isPort?'&port=1':'')+(info.isMinis?'&minis=1':'')+(info.titleId?'&titleId='+encodeURIComponent(info.titleId):''),{cache:'no-store'})
       .then(async response=>{
         if(response.status===429||response.status===503){
           const retrySeconds=Number(response.headers.get('Retry-After'))||(response.status===429?60:5);
@@ -120844,7 +120853,9 @@ function getVisibleChatStackEl(id) {
     const system=systems[platform]||(isPort?59:0);if(!system)return null;
     const name=cleanName(img.dataset.name||'');
     if(name.length<3||name.length>140)return null;
-    return {name,system,isPort,isMinis:platform==='minis',key:(isPort?'port':platform==='minis'?'minis':system)+':'+normalized(name)};
+    const serial=String(img.dataset.titleId||cover.closest('#game-modal')?.dataset.titleId||'').trim().toUpperCase().replace(/[-_ .]/g,'');
+    const titleId=!isPort&&/^[A-Z]{4}\d{5}$/.test(serial)?serial:'';
+    return {name,system,isPort,titleId,isMinis:platform==='minis',key:(isPort?'port':platform==='minis'?'minis':system)+':'+(titleId||normalized(name))};
   }
   let regionWarm=null, parkedHost=null;
   const parkedVideos=new Map();
@@ -120954,7 +120965,9 @@ function getVisibleChatStackEl(id) {
     const system=systems[platform]||(isPort?59:0);
     const name=cleanName(game.cleanName||game.name||game.title||'');
     if(!system||name.length<3||name.length>140)return null;
-    return {name,system,isPort,isMinis:platform==='minis',key:(isPort?'port':platform==='minis'?'minis':system)+':'+normalized(name)};
+    const serial=String(game.titleId||game.titleID||game.id||'').trim().toUpperCase().replace(/[-_ .]/g,'');
+    const titleId=!isPort&&/^[A-Z]{4}\d{5}$/.test(serial)?serial:'';
+    return {name,system,isPort,titleId,isMinis:platform==='minis',key:(isPort?'port':platform==='minis'?'minis':system)+':'+(titleId||normalized(name))};
   }
   window.__psnPrefetchRegionsGameplay=function(game,category='games') {
     if(document.hidden)return;
