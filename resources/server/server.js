@@ -1761,6 +1761,19 @@ function compactPsnStoreMetadataServer(data) {
   return compact;
 }
 
+// Catalog entries can contain installer notes that are not part of the game name.
+// Keep genuine edition/version labels (e.g. Special Edition, Remastered, HD).
+function stripGameTechnicalAnnotations(value) {
+  return String(value || '').replace(/\s*\(([^()]{1,180})\)/g, (whole, rawNote) => {
+    const parts = rawNote.split(/\s*[,;|]\s*/).map(part => part.trim()).filter(Boolean);
+    const technical = part => /^(?:(?:game\s+)?downloader(?:\s+(?:only|version|ver\.?))?|download(?:\s+(?:only|version|ver\.?|and\s+install|required))?|installer(?:\s+(?:only|version))?|install(?:ation)?(?:\s+(?:required|files|data|only|version))?|(?:needs?|requires?)\b[\s\S]*|(?:minimum|at\s+least)\s+\d+(?:\.\d+)?\s*(?:gb|mb|tb)\b[\s\S]*|\d+(?:\.\d+)?\s*(?:gb|mb|tb)\s+(?:of\s+)?(?:free\s+)?(?:disk\s+)?space[\s\S]*|(?:free\s+space|disk\s+space|storage\s+required)\b[\s\S]*)$/i.test(part) ||
+      /\b(?:needs?|requires?|minimum|at\s+least)\s+\d+(?:\.\d+)?\s*(?:gb|mb|tb)\b/i.test(part) ||
+      /\b\d+(?:\.\d+)?\s*(?:gb|mb|tb)\b[\s\S]*\b(?:free\s+space|disk\s+space|storage|install(?:ation)?)\b/i.test(part);
+    const kept = parts.filter(part => !technical(part));
+    return kept.length === parts.length ? whole : kept.length ? ' (' + kept.join(', ') + ')' : '';
+  }).replace(/\s+/g, ' ').trim();
+}
+
 function normalizeLiveMetadataTitle(value) {
   let text = String(value || '');
   try { text = text.normalize('NFKD').replace(/[\u0300-\u036f]/g, ''); } catch (error) {}
@@ -1769,7 +1782,7 @@ function normalizeLiveMetadataTitle(value) {
 }
 
 function cleanLiveMetadataCatalogTitle(value) {
-  let text = String(value || '').trim();
+  let text = stripGameTechnicalAnnotations(value);
   const trailingTags = /\s*\((?:trial(?: to full)?|demo|psx|ps1|ps2(?: classics?| classic)?|ps3|psp|mini(?:s)?|version[^)]*|download ver\.?|full game|russian[^)]*|uk english|english|french|german|italian|spanish|polish|japanese|korean|chinese|taiwanese)[^)]*\)\s*$/i;
   for (let pass = 0; pass < 4; pass++) {
     const next = text.replace(trailingTags, '').trim();
@@ -2325,7 +2338,7 @@ const ssPreviewInflight = new Map();
 let ssPreviewQueued = 0;
 
 function ssPreviewSearchName(value) {
-  return String(value || '').replace(/[™®©]/g, ' ').replace(/\b(?:tm|registered)\b/gi, ' ')
+  return stripGameTechnicalAnnotations(value).replace(/[™®©]/g, ' ').replace(/\b(?:tm|registered)\b/gi, ' ')
     .replace(/\s*[[(](?:usa|eur|europe|japan|jpn|us|eu|ps3|ps2|psp|ps1|ps4|digital version)[)\]]/gi, '')
     .replace(/\b(?:digital version|version digitale)\b/gi, '')
     .replace(/\s*[:：;；‐‑‒–—−]\s*/g, ' - ').replace(/\s+-\s+/g, ' - ')
@@ -3028,7 +3041,7 @@ let gameTrophyCacheMemoryBytes = 0;
 const gameTrophyCacheWriteRates = new Map();
 let gameTrophyCacheLastPruneAt = 0;
 function normalizeGameTrophyCacheTitle(value) {
-  return String(value || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+  return stripGameTechnicalAnnotations(value).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
     .replace(/[™®©]/g, '').replace(/\b(full game|demo|trial|psn|pkg|digital|version|edition)\b/g, ' ')
     .replace(/\[[^\]]*\]/g, ' ').replace(/\([^)]*(?:usa|europe|japan|asia|region|psn|pkg|demo)[^)]*\)/g, ' ')
     .replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 150);
@@ -3195,6 +3208,7 @@ function buildGameTrophySourceIndex() {
   const source = [
     "const {parentPort}=require('node:worker_threads');",
     "const https=require('https');const zlib=require('zlib');const crypto=require('crypto');",
+    stripGameTechnicalAnnotations.toString(),
     normalizeGameTrophyCacheTitle.toString(),
     gameTrophyComparableTitle.toString(),
     gameTrophyTitleMatchScore.toString(),
@@ -3415,7 +3429,7 @@ let gameThemeLastExpiredPrune = 0;
 // Normalize platform/edition suffixes WITHOUT losing sequel numbers. Keep the original
 // Roman numeral form for lookup, with numeric equivalents used as secondary variants.
 function gameThemeSearchTitle(value) {
-  return String(value || '').replace(/[™®©℠]/g, ' ').normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[‘’]/g, "'").replace(/[–—]/g, '-').replace(/[:：﹕꞉]/g, ' ')
+  return stripGameTechnicalAnnotations(value).replace(/[™®©℠]/g, ' ').normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[‘’]/g, "'").replace(/[–—]/g, '-').replace(/[:：﹕꞉]/g, ' ')
     .replace(/\b(?:digital version|digital edition|trial to full|full game|game of the year edition|game of the year|goty|complete edition|deluxe edition|ultimate edition|special edition|standard edition|collector'?s edition|definitive edition|director'?s cut|remastered edition|remastered|remaster|hd remaster|hd collection|hd edition|high definition|playstation network|psn|ps3|ps4|ps5|ps2|psp|ps vita|vita version|us version|eu version|north american version|european version|digital download|dlc|demo|bundle)\b/gi, ' ')
     // Standalone HD/4K after a title is a product format, not a sequel.
     .replace(/(?:[\s:()\[\]-]+(?:HD|4K|UHD))(?=\s*(?:$|[()\[\]]))/gi, ' ')
@@ -3426,7 +3440,7 @@ function gameThemeSearchTitle(value) {
 // Use a numbered game's base title for soundtrack discovery. Keep the full display name
 // untouched; score remote album/track titles WITHOUT stripping their own song subtitles.
 function gameThemeCanonicalGameTitle(value) {
-  const raw = String(value || '').replace(/[™®©℠]/g, ' ').replace(/[–—]/g, '-').trim();
+  const raw = stripGameTechnicalAnnotations(value).replace(/[™®©℠]/g, ' ').replace(/[–—]/g, '-').trim();
   const split = /^(.{3,100}?)\s*(?:-\s+|:\s*)(.+)$/.exec(raw);
   if (split) {
     const base = gameThemeSearchTitle(split[1]);
@@ -3722,7 +3736,7 @@ function gameThemeArchiveVideoFiles(metadata, gameName) {
 // Bounded header-only media check during provider lookup / cache fill. A redirect
 // is not proof of playable bytes; check the terminal HTTP response. Never stream
 // the full media through Render or follow a redirect to an arbitrary host.
-function gameThemeProbeMedia(url, provider, timeoutMs=2600) {
+function gameThemeProbeMedia(url, provider, mediaType='audio', timeoutMs=2600) {
   return new Promise(resolve => {
     let finished=false, request=null;
     // One deadline across redirects: an upstream CDN cannot keep a hover preload busy.
@@ -3748,7 +3762,11 @@ function gameThemeProbeMedia(url, provider, timeoutMs=2600) {
         }
         const mime=String(response.headers['content-type']||'').toLowerCase().split(';')[0].trim();
         const accepted = status===200 || status===206;
-        const supported=/^(?:audio\/|video\/|application\/(?:octet-stream|mp4|ogg|x-ogg|vnd\.apple\.mpegurl))/.test(mime);
+        // Audio is not interchangeable with video; generic binary or playlist headers
+        // are not enough to claim this file will play in an HTML5 media element.
+        const playableAudio=/^(?:audio\/(?:mpeg|mp3|mp4|x-m4a|aac|aacp|ogg|opus|webm|wav|x-wav|flac|x-flac)|application\/(?:ogg|x-ogg))$/.test(mime);
+        const playableVideo=/^(?:video\/(?:mp4|webm|ogg|x-m4v)|application\/(?:ogg|x-ogg))$/.test(mime);
+        const supported=mediaType==='video' ? playableVideo : playableAudio;
         // Finalize before closing: a socket-abort error must not overwrite a valid response.
         const state = (status===404 || status===410) ? 'missing' :
           (accepted && supported) ? 'verified' :
@@ -3768,12 +3786,17 @@ async function gameThemeChooseReachable(result) {
   if (!result?.found || !result.url) return result;
   const candidates=[{title:result.title,url:result.url,mediaType:result.mediaType},
     ...(Array.isArray(result.alternatives)?result.alternatives:[])].slice(0,3);
-  // At most two probes, in parallel: hover prefetch must not fan out into a scan.
-  const checked=await Promise.all(candidates.slice(0,2).map(async candidate=>({candidate,
-    status:await gameThemeProbeMedia(candidate.url,result.provider)})));
+  // Usually two cheap, parallel header checks. Probe a third only if both failed:
+  // no extra request for the common case where the first two offer a valid stream.
+  const inspect = async candidate => ({candidate,
+    status:await gameThemeProbeMedia(candidate.url,result.provider,candidate.mediaType||'audio')});
+  const checked=await Promise.all(candidates.slice(0,2).map(inspect));
+  if (!checked.some(x=>x.status==='verified') && candidates.length>2)
+    checked.push(await inspect(candidates[2]));
   const first=checked.find(x=>x.status==='verified');
   if (!first) {
-    if (checked.some(x=>x.status==='uncertain')) return {...result,availability:'unverified'};
+    const uncertain=checked.find(x=>x.status==='uncertain');
+    if (uncertain) return {...result,...uncertain.candidate,availability:'unverified'};
     return {...result,found:false,retry:true,reason:'media_not_reachable'};
   }
   const rest=candidates.filter(x=>x.url!==first.candidate.url).map(x=>({title:x.title,url:x.url,

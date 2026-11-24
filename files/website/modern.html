@@ -23696,7 +23696,7 @@ P
 
     function getBrowseDisplayTitleCandidate(game) {
         const knownAlias = getBrowseKnownProductAlias(game);
-        if (knownAlias && knownAlias.title) return knownAlias.title;
+        if (knownAlias && knownAlias.title) return stripDisplayGameTechnicalNotes(knownAlias.title);
 
         let name = stripCatalogVersionMetadata(stripTitleLanguageQualifiers(String(
             game && (game.cleanName || game.name || game.title || game.rawName)
@@ -23720,7 +23720,7 @@ P
             name = cleaned;
         }
 
-        return name
+        return stripDisplayGameTechnicalNotes(name)
             .replace(/\s{2,}/g, ' ')
             .replace(/^[\s\-–—:,]+|[\s\-–—:,]+$/g, '')
             .trim();
@@ -32136,7 +32136,7 @@ P
     }
 
     function cleanGameName(name, cat) {
-        let t = String(name || '').normalize('NFKC')
+        let t = (cat === 'games' || cat === 'demos' || cat === 'apps' ? stripDisplayGameTechnicalNotes(name) : String(name || '')).normalize('NFKC')
             .replace(/\u0393\u00E4\u00F3/g, '™')
             .replace(/\u0393[\u00C7\u00E7]\u00F4/g, '–')
             .replace(/[『』「」【】〈〉《》　]/g, " ");
@@ -32354,7 +32354,7 @@ P
         var cleanName = cleanGameName(sourceName, cat);
         if ((cat === 'games' || cat === 'demos') && typeof getBrowseKnownProductAlias === 'function') {
             var knownProductAlias = getBrowseKnownProductAlias({ contentId: contentID, titleId: titleID });
-            if (knownProductAlias && knownProductAlias.title) cleanName = knownProductAlias.title;
+            if (knownProductAlias && knownProductAlias.title) cleanName = stripDisplayGameTechnicalNotes(knownProductAlias.title);
         }
         return { cleanName: cleanName, cTag: cTag, aTag: aTag };
     }
@@ -32654,9 +32654,24 @@ P
 		return getContentMetadataOverrideTitleIndex().get(`${category}|${titleId}`) || null;
 	};
 
+    // Display only: preserve the original catalog name, content ID and download identity.
+    // Edition labels such as (Remastered), (HD) and [Special Edition] remain intact.
+    function stripDisplayGameTechnicalNotes(value) {
+        const title = String(value || '');
+        if (title.indexOf('(') === -1) return title;
+        return title.replace(/\s*\(([^()]{1,180})\)/g, (whole, rawNote) => {
+            const parts = rawNote.split(/\s*[,;|]\s*/).map(part => part.trim()).filter(Boolean);
+            const technical = part => /^(?:(?:game\s+)?downloader(?:\s+(?:only|version|ver\.?))?|download(?:\s+(?:only|version|ver\.?|and\s+install|required))?|installer(?:\s+(?:only|version))?|install(?:ation)?(?:\s+(?:required|files|data|only|version))?|(?:needs?|requires?)\b[\s\S]*|(?:minimum|at\s+least)\s+\d+(?:\.\d+)?\s*(?:gb|mb|tb)\b[\s\S]*|\d+(?:\.\d+)?\s*(?:gb|mb|tb)\s+(?:of\s+)?(?:free\s+)?(?:disk\s+)?space[\s\S]*|(?:free\s+space|disk\s+space|storage\s+required)\b[\s\S]*)$/i.test(part) ||
+                /\b(?:needs?|requires?|minimum|at\s+least)\s+\d+(?:\.\d+)?\s*(?:gb|mb|tb)\b/i.test(part) ||
+                /\b\d+(?:\.\d+)?\s*(?:gb|mb|tb)\b[\s\S]*\b(?:free\s+space|disk\s+space|storage|install(?:ation)?)\b/i.test(part);
+            const kept = parts.filter(part => !technical(part));
+            return kept.length === parts.length ? whole : kept.length ? ' (' + kept.join(', ') + ')' : '';
+        }).replace(/\s+/g, ' ').trim();
+    }
+
 	window.getEffectiveContentTitle = function(data = {}, categoryOverride = '', fallback = '') {
 		const override = typeof window.getContentMetadataOverride === 'function' ? window.getContentMetadataOverride(data, categoryOverride) : null;
-		return String(override?.title || data?.cleanName || data?.title || data?.name || fallback || '').trim();
+		return stripDisplayGameTechnicalNotes(override?.title || data?.cleanName || data?.title || data?.name || fallback || '');
 	};
 
 	window.applyContentMetadataOverrideToItem = function(item, category = '') {
@@ -32683,11 +32698,11 @@ P
 			item.__metadataAppliedKeyRevision = keyRevision;
 			item.__metadataAppliedBulkRevision = bulkRevision;
 		}
-		item.cleanName = item.__metadataBaseCleanName;
+		item.cleanName = stripDisplayGameTechnicalNotes(item.__metadataBaseCleanName);
 		item.title = item.__metadataBaseTitle;
 		item.name = item.__metadataBaseName;
 		const override = metadataKey ? (window.__contentMetadataOverridesMap.get(metadataKey) || null) : null;
-		if (override && override.title) item.cleanName = item.title = item.name = override.title;
+		if (override && override.title) item.cleanName = item.title = item.name = stripDisplayGameTechnicalNotes(override.title);
 		return item;
 	};
 
@@ -32772,7 +32787,7 @@ P
 				const titleEl = card.querySelector('.game-title, .promo-card-title, [data-game-title]');
 				if (titleEl) {
 					if (!titleEl.dataset.metadataBaseTitle) titleEl.dataset.metadataBaseTitle = String(titleEl.textContent || '').trim();
-					const nextTitle = override?.title || loaded?.item?.cleanName || titleEl.dataset.metadataBaseTitle;
+					const nextTitle = stripDisplayGameTechnicalNotes(override?.title || loaded?.item?.cleanName || titleEl.dataset.metadataBaseTitle);
 					if (nextTitle && titleEl.textContent !== nextTitle) titleEl.textContent = nextTitle;
 				}
 			}
