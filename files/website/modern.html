@@ -120938,26 +120938,60 @@ function getVisibleChatStackEl(id) {
   const cache = new Map(), pending = new Map(), failures = new Map();
   let lookupBlockedUntil=0, videoBlockedUntil=0, recentVideoErrors=[];
   const cardVideos=new Map(), modalVideos=new WeakMap();
-  const MAX_CARD_VIDEOS=12, VIDEO_RECHECK_MS=12*60*60*1000, HOVER_REVEAL_DELAY_MS=320;
+  const memoryGB=Number(navigator.deviceMemory)||0;
+  const MAX_CARD_VIDEOS=memoryGB>0&&memoryGB<=2?6:memoryGB>=8?24:12;
+  const MAX_CROSS_VIEW_VIDEOS=memoryGB>0&&memoryGB<=2?3:memoryGB>=8?8:6;
+  const MAX_LOOKUP_RESULTS=1000, VIDEO_RECHECK_MS=12*60*60*1000, HOVER_REVEAL_DELAY_MS=320;
+  let previewScope='', sessionKeys=null;
   const sessionPrefix='psn-ss-gameplay-v2:';
+  function getSessionKeys() {
+    if(sessionKeys)return sessionKeys;
+    sessionKeys=new Map();
+    for(let i=0;i<sessionStorage.length;i++){
+      const key=sessionStorage.key(i);
+      if(key?.startsWith(sessionPrefix))sessionKeys.set(key,true);
+    }
+    return sessionKeys;
+  }
+  function touchSessionKey(key) {
+    const keys=getSessionKeys();keys.delete(key);keys.set(key,true);
+    while(keys.size>MAX_LOOKUP_RESULTS){
+      const oldest=keys.keys().next().value;sessionStorage.removeItem(oldest);keys.delete(oldest);
+    }
+  }
+  function lookupExpiry(data) {
+    if(!data?.found)return Date.now()+2*60*1000;
+    try{
+      const raw=new URL(validProxy(data.fallbackUrl)).searchParams.get('token').split('.')[0];
+      const expiry=Number(JSON.parse(atob(raw.replace(/-/g,'+').replace(/_/g,'/'))).e)*1000;
+      if(Number.isFinite(expiry)&&expiry>0)return Math.max(Date.now(),Math.min(Date.now()+86400000,expiry-60000));
+    }catch(_){}
+    return Date.now()+10*60*1000;
+  }
   function sessionResult(info,clear=false) {
     try {
       const key=sessionPrefix+info.key;
-      if(clear){sessionStorage.removeItem(key);return null;}
+      if(clear){sessionStorage.removeItem(key);sessionKeys?.delete(key);return null;}
       const saved=JSON.parse(sessionStorage.getItem(key)||'null');
       if(saved?.expires>Date.now() && saved?.base===base() && saved.data?.found &&
-          validProxy(saved.data.fallbackUrl))return saved.data;
-      if(saved)sessionStorage.removeItem(key);
+          validProxy(saved.data.fallbackUrl)){touchSessionKey(key);return saved;}
+      if(saved){sessionStorage.removeItem(key);sessionKeys?.delete(key);}
     }catch(_){}
     return null;
   }
-  function saveSessionResult(info,data) {
+  function saveSessionResult(info,data,expires) {
     if(!data?.found||!validProxy(data.fallbackUrl))return;
     try {
-      sessionStorage.setItem(sessionPrefix+info.key,JSON.stringify({
-        expires:Date.now()+30*60*1000,base:base(),data:{found:true,fallbackUrl:data.fallbackUrl}
+      const key=sessionPrefix+info.key;
+      touchSessionKey(key);
+      sessionStorage.setItem(key,JSON.stringify({
+        expires,base:base(),data:{found:true,fallbackUrl:data.fallbackUrl}
       }));
     }catch(_){}
+  }
+  function rememberResult(key,data,until) {
+    cache.delete(key);cache.set(key,{value:data,until});
+    while(cache.size>MAX_LOOKUP_RESULTS)cache.delete(cache.keys().next().value);
   }
   const base = () => getMetadataServerBaseCompat();
   const cleanName = value => String(value||'').replace(/[™®©]/g,' ').replace(/\b(?:tm|registered)\b/gi,' ').replace(/\s*[[(](?:usa|eur|europe|japan|jpn|ps3|ps2|psp|ps1|ps4)[)\]]/gi,'').replace(/\b(?:digital version)\b/gi,'').trim();
@@ -120985,8 +121019,12 @@ function getVisibleChatStackEl(id) {
   }
   function getResult(info,renew=false) {
     if(renew){cache.delete(info.key);sessionResult(info,true);}
-    const entry=cache.get(info.key);if(entry&&entry.until>Date.now())return Promise.resolve(entry.value);
-    if(!renew){const saved=sessionResult(info);if(saved)return Promise.resolve(saved);}
+    const entry=cache.get(info.key);
+    if(entry&&entry.until>Date.now()&&(!entry.value.found||validProxy(entry.value.fallbackUrl))){
+      rememberResult(info.key,entry.value,entry.until);return Promise.resolve(entry.value);
+    }
+    if(entry)cache.delete(info.key);
+    if(!renew){const saved=sessionResult(info);if(saved){rememberResult(info.key,saved.data,saved.expires);return Promise.resolve(saved.data);}}
     if(pending.has(info.key))return pending.get(info.key);
     if(Date.now()<lookupBlockedUntil)return Promise.resolve({ok:false,reason:'rate_limited'});
     const promise=fetch(base()+'/api/gameplay-preview?name='+encodeURIComponent(info.name)+'&system='+info.system+(info.isPort?'&port=1':'')+(info.isMinis?'&minis=1':'')+(info.titleId?'&titleId='+encodeURIComponent(info.titleId):''),{cache:'no-store'})
@@ -121001,9 +121039,9 @@ function getVisibleChatStackEl(id) {
       })
       .then(({ok,data})=>{
         if(ok&&data?.ok!==false&&typeof data?.found==='boolean'){
-          cache.delete(info.key);cache.set(info.key,{value:data,until:Date.now()+(data.found?10*60*1000:2*60*1000)});
-          while(cache.size>250)cache.delete(cache.keys().next().value);
-          saveSessionResult(info,data);
+          const expires=lookupExpiry(data);
+          rememberResult(info.key,data,expires);
+          saveSessionResult(info,data,expires);
           return data;
         }
         return data||{ok:false,reason:'api_unavailable'};
@@ -121018,7 +121056,8 @@ function getVisibleChatStackEl(id) {
     catch(_){return '';}
   }
   function dispose(video) {
-    if(!video)return;
+    if(!video||video.__psnPreviewDisposed)return;
+    video.__psnPreviewDisposed=true;
     video.pause();video.removeAttribute('src');video.load();video.remove();
   }
   function rememberCard(parent,video) {
@@ -121065,25 +121104,47 @@ function getVisibleChatStackEl(id) {
     }
     return parkedHost;
   }
+  function trimParkedVideos(reserve=0) {
+    const now=Date.now();
+    for(const [key,video] of parkedVideos){
+      if(video.isConnected&&!video.error&&now-Number(video.dataset.preparedAt||0)<=VIDEO_RECHECK_MS)continue;
+      parkedVideos.delete(key);dispose(video);
+    }
+    // Keep the idle videos off-card, so card clones and layout animations never copy them.
+    const live=new Set(cardVideos.values());
+    if(active?.video)live.add(active.video);
+    if(regionWarm?.video)live.add(regionWarm.video);
+    let foreign=0;
+    if(previewScope){
+      for(const video of parkedVideos.values())if(video.__psnPreviewScope!==previewScope)foreign++;
+      for(const [key,video] of parkedVideos){
+        if(foreign<=MAX_CROSS_VIEW_VIDEOS)break;
+        if(video.__psnPreviewScope===previewScope)continue;
+        parkedVideos.delete(key);dispose(video);foreign--;
+      }
+    }
+    while(parkedVideos.size&&parkedVideos.size+live.size+reserve>MAX_CARD_VIDEOS){
+      const [key,video]=parkedVideos.entries().next().value;
+      parkedVideos.delete(key);dispose(video);
+    }
+  }
   function parkVideo(video) {
-    if(!video||video.error||!video.dataset.previewKey)return;
+    if(!video)return;
+    for(const [node,old] of cardVideos)if(old===video)cardVideos.delete(node);
+    if(video.error||!video.dataset.previewKey||video.__psnPreviewDisposed){dispose(video);return;}
     // Do not let abandoned, still-buffering previews occupy provider slots.
     let complete=false;
     try{complete=Number.isFinite(video.duration)&&video.duration>0&&video.buffered.length===1&&video.buffered.start(0)<.1&&video.buffered.end(0)>=video.duration-.1;}catch(_){}
     if(!complete&&(video.readyState<2||video.networkState===2)){
-      for(const [node,old] of cardVideos)if(old===video)cardVideos.delete(node);
       dispose(video);return;
     }
     const key=video.dataset.previewKey;
     const previous=parkedVideos.get(key);
     if(previous&&previous!==video)dispose(previous);
-    for(const [node,old] of cardVideos)if(old===video)cardVideos.delete(node);
+    video.pause();video.classList.remove('is-ready');
     parkedVideos.delete(key);parkedVideos.set(key,video);
     getParkedHost().appendChild(video);
-    while(parkedVideos.size>2){
-      const [oldKey,oldVideo]=parkedVideos.entries().next().value;
-      parkedVideos.delete(oldKey);dispose(oldVideo);
-    }
+    trimParkedVideos();
   }
   function adoptParkedVideo(info,parent,isModal) {
     const video=parkedVideos.get(info.key);
@@ -121092,6 +121153,7 @@ function getVisibleChatStackEl(id) {
     if(video.error||!video.isConnected||Date.now()-Number(video.dataset.preparedAt||0)>VIDEO_RECHECK_MS){
       dispose(video);return null;
     }
+    video.__psnPreviewScope=previewScope||video.__psnPreviewScope;
     parent.appendChild(video);
     if(isModal)modalVideos.set(parent,video);else rememberCard(parent,video);
     return video;
@@ -121099,11 +121161,7 @@ function getVisibleChatStackEl(id) {
   function hasPreparedVideo(key) {
     if(active&&!active.card.isConnected)stop();
     const now=Date.now();
-    for(const [id,video] of parkedVideos){
-      if(video.isConnected&&!video.error&&now-Number(video.dataset.preparedAt||0)<=VIDEO_RECHECK_MS)continue;
-      parkedVideos.delete(id);
-      if(video!==active?.video)dispose(video);
-    }
+    trimParkedVideos();
     for(const [node,video] of cardVideos){
       if(node.isConnected&&video.isConnected&&!video.error&&now-Number(video.dataset.preparedAt||0)<=VIDEO_RECHECK_MS)continue;
       cardVideos.delete(node);
@@ -121123,6 +121181,7 @@ function getVisibleChatStackEl(id) {
     const refresh=()=>{if(active?.video===video)updateProgress(active,video);};
     for(const name of ['progress','loadedmetadata','loadeddata','canplay','durationchange'])video.addEventListener(name,refresh);
     video.addEventListener('error',()=>{
+      if(video.__psnPreviewDisposed)return;
       const now=Date.now();
       recentVideoErrors=recentVideoErrors.filter(t=>now-t<30000);recentVideoErrors.push(now);
       if(recentVideoErrors.length>=3)videoBlockedUntil=Math.max(videoBlockedUntil,now+Math.min(60000,5000*2**Math.min(4,recentVideoErrors.length-3)));
@@ -121148,6 +121207,7 @@ function getVisibleChatStackEl(id) {
       return null;
     }
     for(const [node,old] of cardVideos)if(old===video)cardVideos.delete(node);
+    video.__psnPreviewScope=previewScope||video.__psnPreviewScope;
     parent.appendChild(video);
     warm.host?.remove();warm.host=null;warm.video=null;
     if(isModal)modalVideos.set(parent,video);else rememberCard(parent,video);
@@ -121179,10 +121239,7 @@ function getVisibleChatStackEl(id) {
     const prior=regionWarm;
     regionWarm=null;
     if(prior){
-      if(prior.video && prior.video!==active?.video){
-        for(const [node,old] of cardVideos)if(old===prior.video)cardVideos.delete(node);
-        dispose(prior.video);
-      }
+      if(prior.video && prior.video!==active?.video)parkVideo(prior.video);
       prior.host?.remove();
     }
     const warm={key:info.key,video:null,host:null,state:'pending',retryAfter:0};
@@ -121200,6 +121257,7 @@ function getVisibleChatStackEl(id) {
       const url=validProxy(data.fallbackUrl);
       if(!url)return;
       if(regionWarm!==warm||document.hidden||(active&&active.key!==info.key)||hasPreparedVideo(info.key))return;
+      trimParkedVideos(1);
       const host=document.createElement('div');
       host.setAttribute('aria-hidden','true');
       host.style.cssText='position:fixed;left:-10000px;top:0;width:1px;height:1px;overflow:hidden;visibility:hidden;pointer-events:none;';
@@ -121209,6 +121267,7 @@ function getVisibleChatStackEl(id) {
       video.loop=true;video.preload='auto';
       video.setAttribute('aria-hidden','true');video.setAttribute('disablepictureinpicture','');
       video.dataset.previewUrl=url;video.dataset.previewKey=info.key;video.dataset.preparedAt=String(Date.now());
+      video.__psnPreviewScope=previewScope||'view-browse';
       warm.video=video;warm.host=host;
       bindPreviewEvents(video,info);
       host.appendChild(video);document.body.appendChild(host);
@@ -121352,10 +121411,12 @@ function getVisibleChatStackEl(id) {
       dispose(video);video=null;
     }
     if(!video) {
+      trimParkedVideos(1);
       video=document.createElement('video');
       video.className='psn-gameplay-preview-video';video.muted=true;video.defaultMuted=true;video.playsInline=true;
       video.loop=true;video.preload='auto';video.setAttribute('aria-hidden','true');video.setAttribute('disablepictureinpicture','');
       video.dataset.previewUrl=url;video.dataset.previewKey=info.key;video.dataset.preparedAt=String(Date.now());
+      video.__psnPreviewScope=previewScope;
       bindPreviewEvents(video,info);
       parent.appendChild(video);video.src=url;
       if(current.modal)modalVideos.set(parent,video);else rememberCard(parent,video);
@@ -121379,6 +121440,10 @@ function getVisibleChatStackEl(id) {
     stop();
     const info=modal?modalIdentity(modal):identity(card);
     if(!info)return false;
+    if(!modal){
+      const scope=card.closest('.view-section')?.id||card.closest('[id$="-grid"]')?.id||'';
+      if(scope&&scope!==previewScope){previewScope=scope;trimParkedVideos();}
+    }
     rearmAfterModal=false;
     if(regionWarm&&regionWarm.key!==info.key&&regionWarm.video?.networkState===2){
       const warm=regionWarm;regionWarm=null;
