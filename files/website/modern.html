@@ -18873,6 +18873,7 @@ P
 	function playLoginAnimation(username) {
 		setPsnLoginLayoutLocked(true);
 		if (typeof window.setPsnUserSelectSubtitle === 'function') window.setPsnUserSelectSubtitle('Preparing your session...', { animate: true });
+		window.__psnWarmTrophyCatalog?.();
 		const userSelect = document.getElementById('user-select-screen');
 		if (userSelect) {
 			['userIntroTimer', 'userIntroEndTimer'].forEach(key => {
@@ -21134,6 +21135,7 @@ P
 				document.body.style.touchAction = '';
 				document.body.classList.remove('site-disclaimer-input-lock');
 				document.body.classList.add('psn-home-interactive');
+				window.__psnWarmTrophyCatalog?.();
 				if (typeof window.__psnFlushHomeDeferredWork === 'function') window.__psnFlushHomeDeferredWork();
 			}
 			if (document.documentElement) document.documentElement.style.pointerEvents = 'auto';
@@ -38655,13 +38657,39 @@ P
 		return JSON.parse(new TextDecoder('utf-8').decode(buffer));
 	}
 
-	async function loadExternalTrophyDbOnMainThread() {
+	async function loadExternalTrophyDbOnMainThread({ background = false } = {}) {
+		// Start the transfer during Preparing even without Workers; defer heavy JSON work
+		// until Home is interactive so it cannot hold up the login animation.
 		const response = await fetch(EXTERNAL_TROPHY_DB_URL, { cache: 'default' });
-		const data = await readExternalTrophyCatalog(response);
-		externalTrophyDbGames = Object.keys(data || {}).map(id => normalizeExternalTrophyGame(id, data[id])).filter(game => game.title && game.trophies.length);
-		if (!externalTrophyDbGames.length) { externalTrophyDbGames = null; throw new Error('Empty trophy database'); }
+		if (!response.ok) throw new Error('Failed to load trophy database');
+		const compressed = await response.arrayBuffer();
+		if (background && !document.body?.classList.contains('psn-home-interactive')) {
+			await new Promise(resolve => {
+				if (typeof window.runPsnAfterHomeInteractive === 'function') window.runPsnAfterHomeInteractive(resolve);
+				else resolve();
+			});
+		}
+		const data = await readExternalTrophyCatalog(new Response(compressed));
+		const games = [], entries = [], exact = new Map();
+		const ids = Object.keys(data || {});
+		for (let i = 0; i < ids.length; i++) {
+			const game = normalizeExternalTrophyGame(ids[i], data[ids[i]]);
+			if (game.title && game.trophies.length) {
+				games.push(game);
+				const entry = {game,title:normalizeGameTrophyTitle(game.title),platform:String(game.platform || '').toLowerCase()};
+				entries.push(entry);
+				let group = exact.get(entry.title);
+				if (!group) exact.set(entry.title,group=[]);
+				group.push(entry);
+			}
+			// Yield occasionally: main-thread fallback must remain responsive.
+			if (i > 0 && i % 400 === 0) await new Promise(resolve => setTimeout(resolve, 0));
+		}
+		if (!games.length) throw new Error('Empty trophy database');
+		externalTrophyTitleIndex = {entries,exact};
+		externalTrophyDbGames = games;
 		window.psnTrophyPrefetchReady = true;
-		return externalTrophyDbGames;
+		return games;
 	}
 
 	let externalTrophyWorker = null;
@@ -38744,15 +38772,26 @@ P
 		});
 	}
 
-	async function loadExternalTrophyDb() {
+	async function loadExternalTrophyDb({ background = false } = {}) {
 		if (externalTrophyWorkerReady || externalTrophyDbGames) return true;
 		if (externalTrophyDbPromise) return externalTrophyDbPromise;
-		externalTrophyDbPromise = loadExternalTrophyDbInWorker().catch(err => {
-			console.warn('[System] Trophy worker unavailable. Falling back to main thread.', err);
-			return loadExternalTrophyDbOnMainThread();
-		}).catch(err => { externalTrophyDbPromise = null; throw err; });
+		const workerAvailable = !externalTrophyWorkerDisabled && window.Worker && window.Blob && window.URL;
+		const task = workerAvailable
+			? loadExternalTrophyDbInWorker().catch(err => {
+				console.warn('[System] Trophy worker unavailable. Falling back to main thread.', err);
+				return loadExternalTrophyDbOnMainThread({ background });
+			})
+			: loadExternalTrophyDbOnMainThread({ background });
+		externalTrophyDbPromise = task.catch(err => { externalTrophyDbPromise = null; throw err; });
 		return externalTrophyDbPromise;
 	}
+
+	window.__psnWarmTrophyCatalog = function() {
+		const connection = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+		if (document.hidden || navigator.onLine === false || connection?.saveData || /^(slow-2g|2g)$/.test(connection?.effectiveType || '')) return;
+		if (externalTrophyDbPromise || externalTrophyWorkerReady || externalTrophyDbGames) return;
+		loadExternalTrophyDb({background:true}).catch(()=>{});
+	};
 
 	async function matchExternalTrophyGame(game) {
 		await loadExternalTrophyDb();
