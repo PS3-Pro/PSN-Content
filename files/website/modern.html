@@ -55261,6 +55261,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 			return;
 		}
 		window.__lastSwitchViewWasNoop = null;
+		window.__psnStopTouchGameplay?.();
 		if (currentViewId === 'view-explore' && viewId !== 'view-explore' && typeof window.resetExploreUpdateHighlights === 'function') {
 			window.resetExploreUpdateHighlights();
 		}
@@ -120933,7 +120934,9 @@ function getVisibleChatStackEl(id) {
 
 <script>
 (() => {
-  const hoverSupported=!!(window.matchMedia && matchMedia('(hover: hover) and (pointer: fine)').matches && !matchMedia('(prefers-reduced-motion: reduce)').matches);
+  const mouseHover=window.matchMedia?.('(any-hover: hover) and (any-pointer: fine)');
+  const reducedMotion=window.matchMedia?.('(prefers-reduced-motion: reduce)');
+  const TOUCH_HOLD_MS=350, TOUCH_MOVE_LIMIT=12;
   const systems = {ps3:59,ps2:58,ps1:57,psx:57,psp:61,minis:59,psv:62,psvita:62,vita:62,ps4:60};
   const cache = new Map(), pending = new Map(), failures = new Map();
   let lookupBlockedUntil=0, videoBlockedUntil=0, recentVideoErrors=[];
@@ -120996,7 +120999,7 @@ function getVisibleChatStackEl(id) {
   const base = () => getMetadataServerBaseCompat();
   const cleanName = value => String(value||'').replace(/[™®©]/g,' ').replace(/\b(?:tm|registered)\b/gi,' ').replace(/\s*[[(](?:usa|eur|europe|japan|jpn|ps3|ps2|psp|ps1|ps4)[)\]]/gi,'').replace(/\b(?:digital version)\b/gi,'').trim();
   const normalized = value => cleanName(value).normalize('NFKD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/&/g,' and ').replace(/\b(?:the|a|an)\b/g,' ').replace(/[^a-z0-9]+/g,' ').trim();
-  let active = null;
+  let active = null, touchPress=null, heldClick=null, touchObserver=null;
   function cardFrom(target) {
     const card=target?.closest?.('.game-card');
     if(!card||!card.isConnected||card.matches('.recently-visited-placeholder,.store-item-unavailable,[data-missing="true"]'))return null;
@@ -121253,7 +121256,7 @@ function getVisibleChatStackEl(id) {
       }
       warm.state='found';
       const connection=navigator.connection||navigator.mozConnection||navigator.webkitConnection;
-      if(!hoverSupported||document.hidden||connection?.saveData||/^(slow-2g|2g)$/.test(connection?.effectiveType||''))return;
+      if(reducedMotion?.matches||(!mouseHover?.matches&&!navigator.maxTouchPoints)||document.hidden||connection?.saveData||/^(slow-2g|2g)$/.test(connection?.effectiveType||''))return;
       const url=validProxy(data.fallbackUrl);
       if(!url)return;
       if(regionWarm!==warm||document.hidden||(active&&active.key!==info.key)||hasPreparedVideo(info.key))return;
@@ -121354,6 +121357,7 @@ function getVisibleChatStackEl(id) {
   function stop(keepProgress=false) {
     if(!active)return;
     const old=active;active=null;
+    touchObserver?.disconnect();touchObserver=null;
     clearTimeout(old.timer);
     if(!keepProgress)hideProgress(old);
     if(old.video){
@@ -121362,8 +121366,13 @@ function getVisibleChatStackEl(id) {
       parkVideo(old.video);
     }
   }
+  function previewAllowed(current) {
+    // Pointer exit cancels mouse sessions; touch sessions stay active after release.
+    return active===current&&current.card.isConnected&&!document.hidden&&
+      (current.modal?modalVisible():!modalVisible());
+  }
   function revealVideo(current,video) {
-    if(active!==current||current.video!==video||!current.card.isConnected||!current.card.matches(':hover')||document.hidden)return;
+    if(current.video!==video||!previewAllowed(current))return;
     const delay=current.revealAt-Date.now();
     if(delay>0) {
       clearTimeout(current.timer);
@@ -121385,7 +121394,7 @@ function getVisibleChatStackEl(id) {
       return true;
     }
     current.timer=setTimeout(()=>{
-      if(active!==current||!current.card.isConnected||!current.card.matches(':hover')||document.hidden)return;
+      if(!previewAllowed(current))return;
       video.play().then(()=>revealVideo(current,video)).catch(()=>{if(active===current){if(!current.progress)armProgress(current,parent);showProgressStatus(current,'error');stop(true);}});
     },Math.max(0,current.revealAt-Date.now()));
     return true;
@@ -121395,7 +121404,7 @@ function getVisibleChatStackEl(id) {
     if(!parent||Date.now()<videoBlockedUntil){if(active===current)hideProgress(current);return;}
     if(cachedVideo(current,info,parent))return;
     const data=await (current.lookup||getResult(info));
-    if(active!==current||!current.card.isConnected||!current.card.matches(':hover')||document.hidden)return;
+    if(!previewAllowed(current))return;
     if(Date.now()<videoBlockedUntil){showProgressStatus(current,'error');return;}
     if(!data?.found){
       // Only a verified 'no_video' means the ScreenScraper found this game.
@@ -121431,9 +121440,9 @@ function getVisibleChatStackEl(id) {
     const modal=document.getElementById('game-modal');
     return !!(modal && (modal.classList.contains('show') || modal.style.display==='flex'));
   }
-  function startPreview(target) {
-    if(document.hidden)return false;
-    const modal=modalFrom(target);
+  function startPreview(target,touch=false) {
+    if(document.hidden||reducedMotion?.matches)return false;
+    const modal=touch?null:modalFrom(target);
     if(!modal&&modalVisible())return false;
     const card=modal||cardFrom(target);
     if(!card||(active&&active.card===card))return false;
@@ -121449,35 +121458,101 @@ function getVisibleChatStackEl(id) {
       const warm=regionWarm;regionWarm=null;
       parkVideo(warm.video);warm.host?.remove();
     }
-    const current={card,key:info.key,modal:!!modal,timer:null,lookup:null,video:null,progress:null,bufferRatio:0,revealAt:Date.now()+HOVER_REVEAL_DELAY_MS};active=current;
+    const current={card,key:info.key,modal:!!modal,touch,timer:null,lookup:null,video:null,progress:null,bufferRatio:0,revealAt:Date.now()+HOVER_REVEAL_DELAY_MS};active=current;
+    if(touch)watchTouchCard(current);
     const parent=modal?card:card.querySelector('.game-img-container');
     if(parent&&cachedVideo(current,info,parent))return true;
     armProgress(current,parent);
     if((failures.get(info.key)||0)>Date.now()||Date.now()<videoBlockedUntil){showProgressStatus(current,'error');return true;}
-    if(active!==current||document.hidden||!card.isConnected||!card.matches(':hover'))return false;
+    if(!previewAllowed(current)){stop();return false;}
     current.lookup=getResult(info);
     play(current,info);
     return true;
   }
-  if(!hoverSupported)return;
-  document.addEventListener('pointerover',event=>{startPreview(event.target);},{passive:true});
+  function watchTouchCard(current) {
+    // Only watch the active card's ancestor chain, not the whole catalog subtree.
+    touchObserver=new MutationObserver(()=>{
+      if(active===current&&(!previewAllowed(current)||current.view?.style.display==='none'))stop();
+    });
+    current.view=current.card.closest('.view-section');
+    for(let node=current.card.parentElement;node;node=node.parentElement){
+      touchObserver.observe(node,{childList:true,...(node===current.view?{attributes:true,attributeFilter:['style']}:{})});
+      if(node===document.body)break;
+    }
+    const modal=document.getElementById('game-modal');
+    if(modal)touchObserver.observe(modal,{attributes:true,attributeFilter:['class','style']});
+  }
+  function cancelTouchPress(stopPreview=false) {
+    const press=touchPress;touchPress=null;
+    if(press){clearTimeout(press.timer);if(stopPreview&&press.activated&&active?.touch&&active.card===press.card)stop();}
+  }
+  window.__psnStopTouchGameplay=function(){
+    cancelTouchPress(true);
+    if(active?.touch)stop();
+  };
+  function mouseInput(event){return event.pointerType==='mouse'&&!reducedMotion?.matches;}
+  document.addEventListener('pointerover',event=>{
+    if(mouseInput(event)&&!touchPress){lastPointerType='mouse';startPreview(event.target);}
+  },{passive:true});
   window.addEventListener('psn-game-modal-closed',()=>{
     if(active?.modal)stop();
-    rearmAfterModal=true;
-    const hovered=document.querySelector('.game-card:hover');
-    if(hovered)startPreview(hovered);
+    rearmAfterModal=!reducedMotion?.matches;
+    // Rearm only on a real mouse movement, never a sticky touch :hover.
+    if(lastPointerType==='mouse'&&rearmAfterModal){
+      const hovered=document.querySelector('.game-card:hover');
+      if(hovered)startPreview(hovered);
+    }
   });
+  let lastPointerType='';
+  window.addEventListener('pointerdown',event=>{
+    lastPointerType=event.pointerType;
+    heldClick=null;
+    cancelTouchPress(true);
+    stop();
+    if(reducedMotion?.matches||document.hidden||modalVisible()||(event.pointerType!=='touch'&&event.pointerType!=='pen')||event.isPrimary===false||event.button!==0)return;
+    if(event.target?.closest?.('button,a,input,select,textarea,label,[role="button"],.btn-mini,.btn-mini-round,.fav-btn,.wish-btn,.action-btn'))return;
+    const card=cardFrom(event.target);
+    if(!card)return;
+    const press={card,pointerId:event.pointerId,x:event.clientX,y:event.clientY,activated:false,timer:null};
+    touchPress=press;
+    press.timer=setTimeout(()=>{
+      if(touchPress!==press||!card.isConnected||document.hidden||modalVisible())return;
+      press.activated=startPreview(card,true);
+      if(press.activated)heldClick={card};
+    },TOUCH_HOLD_MS);
+  },{capture:true,passive:true});
   document.addEventListener('pointermove',event=>{
-    if(rearmAfterModal && !active && event.pointerType==='mouse')startPreview(event.target);
+    const press=touchPress;
+    if(press&&event.pointerId===press.pointerId&&Math.hypot(event.clientX-press.x,event.clientY-press.y)>TOUCH_MOVE_LIMIT){cancelTouchPress(true);return;}
+    if(event.pointerType==='mouse'){
+      lastPointerType='mouse';
+      if(rearmAfterModal&&!active&&mouseInput(event))startPreview(event.target);
+    }
   },{passive:true});
+  window.addEventListener('pointerup',event=>{
+    if(touchPress?.pointerId===event.pointerId)cancelTouchPress();
+  },{capture:true,passive:true});
+  window.addEventListener('pointercancel',event=>{
+    if(touchPress?.pointerId===event.pointerId)cancelTouchPress(true);
+  },{capture:true,passive:true});
+  // Consume only the synthetic click from this hold; the next real tap opens normally.
+  window.addEventListener('click',event=>{
+    if(heldClick&&event.detail!==0&&heldClick.card.contains(event.target)){
+      heldClick=null;event.preventDefault();event.stopImmediatePropagation();return;
+    }
+    if(active?.touch)stop();
+  },true);
   document.addEventListener('pointerout',event=>{
-    if(active&&active.card.contains(event.target)&&(!event.relatedTarget||!active.card.contains(event.relatedTarget)))stop();
+    if(event.pointerType==='mouse'&&active&&!active.touch&&active.card.contains(event.target)&&(!event.relatedTarget||!active.card.contains(event.relatedTarget)))stop();
   },{passive:true});
-  document.addEventListener('visibilitychange',()=>{if(document.hidden)stop();});
+  document.addEventListener('visibilitychange',()=>{if(document.hidden){cancelTouchPress(true);stop();}});
   document.addEventListener('click',event=>{if(active?.modal&&event.target.closest('.modal-cover-wrapper'))stop();},true);
-  window.addEventListener('blur',()=>stop());
-  document.addEventListener('pointerdown',()=>stop(),{passive:true});
-  document.addEventListener('scroll',()=>{if(active&&(!active.card.isConnected||!active.card.matches(':hover')))stop();},{passive:true,capture:true});
+  window.addEventListener('blur',()=>{cancelTouchPress(true);stop();});
+  document.addEventListener('scroll',event=>{
+    const card=touchPress?.card||(active?.touch?active.card:null);
+    if(card&&(!card.isConnected||event.target===document||event.target?.contains?.(card))){cancelTouchPress(true);if(active?.touch)stop();}
+    else if(active&&!active.touch&&(!active.card.isConnected||!active.card.matches(':hover')))stop();
+  },{passive:true,capture:true});
 })();
 </script>
 
