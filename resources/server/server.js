@@ -2333,8 +2333,12 @@ function ssPreviewSearchName(value) {
 }
 function ssPreviewSearchVariants(value) {
   const title = ssPreviewSearchName(value);
-  const plain = title.replace(/\s+-\s+/g, ' ').replace(/\s+/g, ' ').trim();
-  return [...new Set([title, plain])].filter(Boolean);
+  // ScreenScraper indexes some editions without the site's square/round brackets.
+  // Keep the edition words: [Special Edition] and Special Edition are the same game.
+  const unwrapped = title.replace(/[\[\]{}]/g, ' ').replace(/\(([^()]*)\)/g, ' $1 ')
+    .replace(/\s+-\s+/g, ' - ').replace(/\s+/g, ' ').trim();
+  const plain = unwrapped.replace(/\s+-\s+/g, ' ').replace(/\s+/g, ' ').trim();
+  return [...new Set([unwrapped, plain, title])].filter(Boolean);
 }
 function normalizeSsPreviewTitle(value) {
   return ssPreviewSearchName(value).normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
@@ -2356,6 +2360,9 @@ function ssPreviewNames(game) {
 function ssPreviewTitleSimilarity(a, b) {
   if (!a || !b) return 0;
   if (a === b || a.replace(/\s+/g, '') === b.replace(/\s+/g, '')) return 1;
+  // A base release must not replace an explicitly requested special/limited edition.
+  const edition = value => (value.match(/\b(?:special|limited|collectors?|deluxe|ultimate|complete|definitive|anniversary) edition\b/g) || []).join('|');
+  if (edition(a) !== edition(b)) return 0;
   const nums = value => (value.match(/\b\d+\b/g) || []).join('|');
   if (nums(a) !== nums(b)) return 0;
   const leftSet = new Set(a.split(' ')), rightSet = new Set(b.split(' '));
@@ -2724,7 +2731,11 @@ function ssPreviewFetchUpstream(name, systemId, key) {
   return work.finally(() => { ssPreviewQueued--; });
 }
 function ssPreviewLookup(name, systemId, options = null) {
-  const key = `${systemId}:${normalizeSsPreviewTitle(name)}`;
+  const normalized = normalizeSsPreviewTitle(name);
+  // Only edition titles get a new lookup namespace; bypass old saved false negatives
+  // without invalidating the ScreenScraper cache for the rest of the catalog.
+  const editionKey = /\b(?:special|limited|collectors?|deluxe|ultimate|complete|definitive|anniversary) edition\b/.test(normalized) ? 'ed2:' : '';
+  const key = `${systemId}:${editionKey}${normalized}`;
   const requireEnglish = options?.englishSummary === true;
   const requireArtwork = options?.artwork === true;
   const ready = result => !!result &&
