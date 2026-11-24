@@ -2162,8 +2162,8 @@ app.get('/api/metadata/live', async (req, res) => {
 
 const SS_PREVIEW_DEVID = String(process.env.SCREENSCRAPER_DEV_ID || 'LuanTeles').trim();
 const SS_PREVIEW_DEVPASSWORD = String(process.env.SCREENSCRAPER_DEV_PASSWORD || '69bjUwTdqXA').trim();
-const SS_PREVIEW_USER = String(process.env.SCREENSCRAPER_USER || '').trim();
-const SS_PREVIEW_PASSWORD = String(process.env.SCREENSCRAPER_PASSWORD || '').trim();
+const SS_PREVIEW_USER = String(process.env.SCREENSCRAPER_USER || 'LuanTeles').trim();
+const SS_PREVIEW_PASSWORD = String(process.env.SCREENSCRAPER_PASSWORD || 'LuanTeles12').trim();
 const SS_PREVIEW_ENABLED = process.env.SCREENSCRAPER_PREVIEWS_ENABLED !== '0' && !!SS_PREVIEW_DEVID && !!SS_PREVIEW_DEVPASSWORD;
 if (SS_PREVIEW_ENABLED && !(SS_PREVIEW_USER && SS_PREVIEW_PASSWORD))
   console.warn('[ScreenScraper] No member login configured; set SCREENSCRAPER_USER and SCREENSCRAPER_PASSWORD on Render to use member quota.');
