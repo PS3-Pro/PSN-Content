@@ -2938,17 +2938,9 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
     };
     let bestMediaRank = 0;
     let bestSerialMatch = false;
-    if (systemId && (knownGameId || serial)) {
-      let game = knownGameId ? await ssPreviewRequestInfo(systemId,'',knownGameId) : null;
-      let trusted = ssPreviewGameUsable(game,systemId) && Number(game.id)===knownGameId;
-      if (!trusted && serial) {
-        game=await ssPreviewRequestInfo(systemId,serial);
-        const romSerials=ssPreviewRomSerials(game);
-        const exactName=ssPreviewNames(game).some(title=>normalizeSsPreviewTitle(title)===wanted);
-        trusted=ssPreviewGameUsable(game,systemId) && (romSerials.length ? romSerials.includes(serial) : exactName);
-        if (game && !trusted) legacy=null; // Do not mask a contradictory serial response with an old name match.
-      }
-      if (trusted) {
+    if (systemId && knownGameId) {
+      const game = await ssPreviewRequestInfo(systemId,'',knownGameId);
+      if (ssPreviewGameUsable(game,systemId) && Number(game.id)===knownGameId) {
         bestGame=game;bestScore=1;bestMediaRank=mediaRank(game);bestSerialMatch=!!serial && ssPreviewRomSerials(game).includes(serial);candidates=1;
       }
     }
@@ -2957,7 +2949,7 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
       ssPreviewSetCached(key,legacy,30*60*1000);
       return legacy;
     }
-    for (const searchName of bestGame ? [] : searches) {
+    const searchByName = async searchName => {
       const release = await ssProviderAcquire('search');
       let response;
       try {
@@ -2977,7 +2969,7 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
         ssPreviewQuotaNoteRate(Number(response.status),'search');
         if (response.data) ssPreviewQuotaFromResponse(response.data);
       } finally {release();}
-      if (Number(response.status) === 404) continue; // Try alternate article ordering.
+      if (Number(response.status) === 404) return;
       if (!response.ok || !response.data || typeof response.data !== 'object') {
         const error = new Error('ScreenScraper search unavailable.');
         error.status = [429,430,431].includes(Number(response.status)) ? 429 : 502;
@@ -3016,9 +3008,23 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
         if ((!serial || bestSerialMatch) && bestScore === 1 && (systemId === 0 ? bestMediaRank >= 2 :
             (!tryAlternateMedia ? bestMediaRank > 0 : bestMediaRank === 3))) break;
       }
-      // A fuzzy hit is provisional: check the other spelling before accepting it.
-      if (bestScore === 1 && (systemId === 0 ? bestMediaRank >= 2 :
-          (!tryAlternateMedia ? bestMediaRank > 0 : bestMediaRank === 3))) break;
+    };
+    if (!bestGame) {
+      if (searches.length) await searchByName(searches[0]);
+      // Digital PSN serials are often absent. Only probe serials after a name miss
+      // or an uncertain match, not when the game is identified but lacks media.
+      if (systemId && serial && !bestSerialMatch && bestScore !== 1) {
+        const game = await ssPreviewRequestInfo(systemId,serial);
+        const romSerials = ssPreviewRomSerials(game);
+        const exactName = ssPreviewNames(game).some(title=>normalizeSsPreviewTitle(title)===wanted);
+        if (ssPreviewGameUsable(game,systemId) && (romSerials.length ? romSerials.includes(serial) : exactName)) {
+          bestGame=game;bestScore=1;bestMediaRank=mediaRank(game);bestSerialMatch=romSerials.includes(serial);candidates++;
+        }
+      }
+      const sufficient = () => bestSerialMatch || (bestScore === 1 &&
+        (systemId === 0 ? bestMediaRank >= 2 : (!tryAlternateMedia ? bestMediaRank > 0 : bestMediaRank === 3)));
+      // Keep the existing alternate-name/media fallback for unresolved results.
+      for (let i=1; i<searches.length && !sufficient(); i++) await searchByName(searches[i]);
     }
     const minScore = systemId === 0 ? 0.95 : 0.78;
     const mediaSystem = Number(bestGame && (bestGame.systemeid || (bestGame.systeme && bestGame.systeme.id)));
