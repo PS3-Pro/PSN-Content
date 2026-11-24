@@ -63,6 +63,25 @@
 			if(document.body)arm();else document.addEventListener('DOMContentLoaded',arm,{once:true});
 		};
 	})();</script>
+	<script>(function(){
+		if (/PS3|PlayStation 3|NetFront/i.test(navigator.userAgent || '') || navigator.platform === 'PlayStation 3' || typeof fetch !== 'function') return;
+		const url = 'https://raw.githubusercontent.com/FlexBy420/psn-trophy-scraper/main/all.json.gz';
+		let pending = null;
+		window.__psnGetTrophyCatalogBlob = function() {
+			if (pending) return pending;
+			const controller = typeof AbortController === 'function' ? new AbortController() : null;
+			const timeout = controller ? setTimeout(() => controller.abort(), 120000) : null;
+			const task = fetch(url, {cache:'force-cache', signal:controller ? controller.signal : undefined})
+				.then(response => { if (!response.ok) throw new Error('Failed to load trophy database'); return response.blob(); })
+				.finally(() => clearTimeout(timeout));
+			pending = task;
+			task.catch(() => { if (pending === task) pending = null; });
+			return task;
+		};
+		window.__psnReleaseTrophyCatalogBlob = function() { pending = null; };
+		const connection = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+		if (!document.hidden && navigator.onLine !== false && !connection?.saveData && !/^(slow-2g|2g)$/.test(connection?.effectiveType || '')) window.__psnGetTrophyCatalogBlob().catch(()=>{});
+	})();</script>
 	<script>
 	window.psnHeroFallbackImage = 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(
 		'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900">' +
@@ -24901,6 +24920,8 @@ P
     window.__bootStorePrefetchHighPriority = true;
 
     function startBootPreloads(reason = 'boot') {
+        // Warm trophies at Starting, independently of the boot readiness promise.
+        window.__psnWarmTrophyCatalog?.();
         const iosFrameFriendly = document.documentElement.classList.contains('ios-webkit');
         const preLogin = iosFrameFriendly &&
             window.__psnSessionEntryStarted !== true &&
@@ -38657,16 +38678,23 @@ P
 		return JSON.parse(new TextDecoder('utf-8').decode(buffer));
 	}
 
+	let externalTrophyForegroundRequested = false;
+	let externalTrophyForegroundWake = null;
+	function getExternalTrophyCatalogBlob() {
+		if (typeof window.__psnGetTrophyCatalogBlob === 'function') return window.__psnGetTrophyCatalogBlob();
+		return fetch(EXTERNAL_TROPHY_DB_URL, {cache:'force-cache'}).then(response => {
+			if (!response.ok) throw new Error('Failed to load trophy database');
+			return response.blob();
+		});
+	}
 	async function loadExternalTrophyDbOnMainThread({ background = false } = {}) {
-		// Start the transfer during Preparing even without Workers; defer heavy JSON work
-		// until Home is interactive so it cannot hold up the login animation.
-		const response = await fetch(EXTERNAL_TROPHY_DB_URL, { cache: 'default' });
-		if (!response.ok) throw new Error('Failed to load trophy database');
-		const compressed = await response.arrayBuffer();
-		if (background && !document.body?.classList.contains('psn-home-interactive')) {
+		const compressed = await getExternalTrophyCatalogBlob();
+		if (background && !externalTrophyForegroundRequested && !document.body?.classList.contains('psn-home-interactive')) {
 			await new Promise(resolve => {
-				if (typeof window.runPsnAfterHomeInteractive === 'function') window.runPsnAfterHomeInteractive(resolve);
-				else resolve();
+				const wake = () => { if (externalTrophyForegroundWake === wake) externalTrophyForegroundWake = null; resolve(); };
+				externalTrophyForegroundWake = wake;
+				if (typeof window.runPsnAfterHomeInteractive === 'function') window.runPsnAfterHomeInteractive(() => setTimeout(wake,0), {beforeReveal:true});
+				else wake();
 			});
 		}
 		const data = await readExternalTrophyCatalog(new Response(compressed));
@@ -38688,6 +38716,7 @@ P
 		if (!games.length) throw new Error('Empty trophy database');
 		externalTrophyTitleIndex = {entries,exact};
 		externalTrophyDbGames = games;
+		window.__psnReleaseTrophyCatalogBlob?.();
 		window.psnTrophyPrefetchReady = true;
 		return games;
 	}
@@ -38701,7 +38730,6 @@ P
 	function loadExternalTrophyDbInWorker() {
 		if (externalTrophyWorkerDisabled || !window.Worker || !window.Blob || !window.URL) return Promise.reject(new Error('Trophy worker unavailable'));
 		const workerSource = `
-			const EXTERNAL_TROPHY_DB_URL = ${JSON.stringify(EXTERNAL_TROPHY_DB_URL)};
 			${readExternalTrophyCatalog.toString()}
 			${normalizeExternalTrophyGame.toString()}
 			${normalizeGameTrophyTitle.toString()}
@@ -38713,8 +38741,7 @@ P
 				const msg = event.data || {};
 				try {
 					if (msg.type === 'load') {
-						const response = await fetch(EXTERNAL_TROPHY_DB_URL, {cache:'default'});
-						const data = await readExternalTrophyCatalog(response);
+						const data = await readExternalTrophyCatalog(new Response(msg.blob));
 						const games = Object.keys(data || {}).map(id => normalizeExternalTrophyGame(id, data[id])).filter(game => game.title && game.trophies.length);
 						if (!games.length) throw new Error('Empty trophy database');
 						index = buildExternalTrophyTitleIndex(games);
@@ -38728,8 +38755,10 @@ P
 			};
 		`;
 		return new Promise((resolve,reject) => {
-			let worker, url, timer;
+			let worker, url, timer, failed = false;
 			const fail = error => {
+				if (failed) return;
+				failed = true;
 				clearTimeout(timer);
 				if (url) { URL.revokeObjectURL(url); url = ''; }
 				if (worker) worker.terminate();
@@ -38756,6 +38785,7 @@ P
 						clearTimeout(timer);
 						if (url) { URL.revokeObjectURL(url); url = ''; }
 						externalTrophyWorkerReady = true;
+						window.__psnReleaseTrophyCatalogBlob?.();
 						window.psnTrophyPrefetchReady = true;
 						resolve(true);
 					} else if (msg.type === 'match') {
@@ -38766,13 +38796,21 @@ P
 						pending.resolve(msg.game || null);
 					} else if (msg.type === 'error') fail(new Error(msg.message || 'Trophy worker failed'));
 				};
-				timer = setTimeout(() => fail(new Error('Trophy worker timeout')), 45000);
-				worker.postMessage({type:'load'});
+				// Blob cloning shares immutable bytes; retain them until the worker is ready so fallback can reuse the download.
+				getExternalTrophyCatalogBlob().then(blob => {
+					if (failed) return;
+					timer = setTimeout(() => fail(new Error('Trophy worker timeout')), 45000);
+					worker.postMessage({type:'load',blob});
+				}).catch(fail);
 			} catch (error) { fail(error); }
 		});
 	}
 
 	async function loadExternalTrophyDb({ background = false } = {}) {
+		if (!background) {
+			externalTrophyForegroundRequested = true;
+			externalTrophyForegroundWake?.();
+		}
 		if (externalTrophyWorkerReady || externalTrophyDbGames) return true;
 		if (externalTrophyDbPromise) return externalTrophyDbPromise;
 		const workerAvailable = !externalTrophyWorkerDisabled && window.Worker && window.Blob && window.URL;
@@ -38792,6 +38830,8 @@ P
 		if (externalTrophyDbPromise || externalTrophyWorkerReady || externalTrophyDbGames) return;
 		loadExternalTrophyDb({background:true}).catch(()=>{});
 	};
+	window.addEventListener('online', window.__psnWarmTrophyCatalog);
+	document.addEventListener('visibilitychange', () => { if (!document.hidden) window.__psnWarmTrophyCatalog(); });
 
 	async function matchExternalTrophyGame(game) {
 		await loadExternalTrophyDb();
@@ -38863,6 +38903,7 @@ P
 		return bestScore >= 78 ? best : null;
 	}
 	let externalTrophyTitleIndex = null;
+	Promise.resolve().then(() => window.__psnWarmTrophyCatalog());
 	function findExternalTrophyGame(localGame = {}) {
 		if (!Array.isArray(externalTrophyDbGames) || !externalTrophyDbGames.length) return null;
 		if (!externalTrophyTitleIndex) externalTrophyTitleIndex = buildExternalTrophyTitleIndex(externalTrophyDbGames);
@@ -38893,16 +38934,16 @@ P
 	function gameTrophyCacheKey(game) {
 		return `ps3|${normalizeGameTrophyTitle(game.cleanName || game.name || game.title || '')}`;
 	}
-	function keepTrophyDbKnown(key, match) {
+	function keepTrophyDbKnown(key, match, fromCache = false) {
 		trophyDbKnown.delete(key);
-		trophyDbKnown.set(key, {match:match || null,until:match ? Infinity : Date.now()+5*60*1000});
+		trophyDbKnown.set(key, {match:match || null,fromCache,until:match ? Infinity : Date.now()+5*60*1000});
 		if (match && match.npCommunicationId) trophyDbGameById.set(match.npCommunicationId,match);
 		while (trophyDbKnown.size>320) trophyDbKnown.delete(trophyDbKnown.keys().next().value);
 		while (trophyDbGameById.size>80) trophyDbGameById.delete(trophyDbGameById.keys().next().value);
 	}
 	function getKnownTrophyDbEntry(key) {
 		const entry=trophyDbKnown.get(key);
-		if (!entry || entry.until<=Date.now()) { trophyDbKnown.delete(key); return null; }
+		if (!entry || entry.until<=Date.now() || (!entry.match && entry.fromCache && (externalTrophyWorkerReady || externalTrophyDbGames))) { trophyDbKnown.delete(key); return null; }
 		trophyDbKnown.delete(key); trophyDbKnown.set(key,entry);
 		return entry;
 	}
@@ -38956,10 +38997,10 @@ P
 		if (externalTrophyWorkerReady || externalTrophyDbGames || title.length<3 || title.length>150) return local();
 		return new Promise((resolve,reject) => {
 			const controller = new AbortController();
-			let settled = false, cacheDone = false, localStarted = false, localError = null, localResult = null, timer;
+			let settled = false, cacheDone = false, localStarted = false, localError = null, localResult = null;
 			function finish(result) {
 				if (settled) return;
-				settled = true; clearTimeout(timer); controller.abort(); resolve(result);
+				settled = true; controller.abort(); resolve(result);
 			}
 			function startLocal() {
 				if (settled || localStarted) return;
@@ -38969,19 +39010,17 @@ P
 					if (result.match || cacheDone) finish(result);
 				},error => {
 					localError = error;
-					if (cacheDone && !settled) { settled = true; clearTimeout(timer); reject(error); }
+					if (cacheDone && !settled) { settled = true; reject(error); }
 				});
 			}
-			// A quick cache hit avoids the catalog transfer; a slow DB must not block it.
-			if (externalTrophyDbPromise) startLocal();
-			else timer = setTimeout(startLocal, 250);
+			// Never put a game lookup behind a cache-network timer.
+			startLocal();
 			readCachedGameTrophyMatch(title,controller).then(cached => {
 				cacheDone = true;
 				if (settled) return;
 				if (cached && (cached.match || !localResult?.match)) { finish(cached); return; }
 				if (localResult) { finish(localResult); return; }
-				if (localError) { settled = true; clearTimeout(timer); reject(localError); return; }
-				clearTimeout(timer); startLocal();
+				if (localError) { settled = true; reject(localError); return; }
 			});
 		});
 	}
@@ -38995,7 +39034,7 @@ P
 		const pending=trophyMatchPending.get(key);
 		if (pending) return pending;
 		const task=resolveGameTrophyMatch(game,title).then(({match,fromCache}) => {
-			keepTrophyDbKnown(key,match);
+			keepTrophyDbKnown(key,match,fromCache);
 			if (!fromCache) saveGameTrophyDbMatch(game,match);
 			return match;
 		});
@@ -39102,25 +39141,33 @@ P
 			return;
 		}
 
+		const renderMatch = match => {
+			if (token !== modalTrophyLookupToken || !statusEl.isConnected || document.getElementById('modal-trophies-status') !== statusEl) return;
+			if (!match) {
+				statusEl.className = 'modal-trophies-no';
+				translateModalTrophyAvailability(statusEl, 'No');
+				return;
+			}
+			activeModalTrophyGame = match;
+			const safeId = escapeGameTrophyHtml(match.npCommunicationId);
+			const trophyCount = match.totalItemCount || match.trophies.length;
+			statusEl.className = '';
+			statusEl.innerHTML = `<button class="modal-trophies-link" title="Open trophy list (${trophyCount})" onclick="event.stopPropagation(); playUiClick(); openGameTrophyModal('${safeId}')"><span data-modal-trophy-source="Yes">Yes</span><i class="fas fa-chevron-right" aria-hidden="true"></i></button>`;
+			translateModalTrophyAvailability(statusEl, 'Yes');
+			translateModalTrophyButtonTitle(statusEl.querySelector('.modal-trophies-link'), `Open trophy list (${trophyCount})`);
+		};
+		const known = getKnownTrophyDbEntry(gameTrophyCacheKey(localGame));
+		if (known) { renderMatch(known.match); return; }
+		if (externalTrophyDbGames && !trophyMatchPending.has(gameTrophyCacheKey(localGame))) {
+			const match = findExternalTrophyGame(localGame);
+			keepTrophyDbKnown(gameTrophyCacheKey(localGame),match);
+			renderMatch(match);
+			saveGameTrophyDbMatch(localGame,match);
+			return;
+		}
 		statusEl.className = 'modal-trophies-loading';
 		statusEl.innerHTML = '<span class="modal-trophies-skeleton"></span>';
-
-		prepareGameTrophyMatch(localGame,currentCat)
-			.then(match => {
-				if (token !== modalTrophyLookupToken || !statusEl.isConnected || document.getElementById('modal-trophies-status') !== statusEl) return;
-				if (!match) {
-					statusEl.className = 'modal-trophies-no';
-					translateModalTrophyAvailability(statusEl, 'No');
-					return;
-				}
-				activeModalTrophyGame = match;
-				const safeId = escapeGameTrophyHtml(match.npCommunicationId);
-				const trophyCount = match.totalItemCount || match.trophies.length;
-				statusEl.className = '';
-				statusEl.innerHTML = `<button class="modal-trophies-link" title="Open trophy list (${trophyCount})" onclick="event.stopPropagation(); playUiClick(); openGameTrophyModal('${safeId}')"><span data-modal-trophy-source="Yes">Yes</span><i class="fas fa-chevron-right" aria-hidden="true"></i></button>`;
-				translateModalTrophyAvailability(statusEl, 'Yes');
-				translateModalTrophyButtonTitle(statusEl.querySelector('.modal-trophies-link'), `Open trophy list (${trophyCount})`);
-			})
+		prepareGameTrophyMatch(localGame,currentCat).then(renderMatch)
 			.catch(() => {
 				if (token !== modalTrophyLookupToken || !statusEl.isConnected || document.getElementById('modal-trophies-status') !== statusEl) return;
 				statusEl.className = 'modal-trophies-loading';
@@ -42670,6 +42717,7 @@ P
 				</div>
 				${modalInfoOnly ? '' : `<div class="modal-divider" style="margin: 15px 0;"></div><div class="btn-group" id="modal-links-actions" style="margin-top: 0;">${actionsHtml}</div>`}
 			`;
+			if (showModalTrophies) updateModalTrophyStatus(game, currentCat);
 			startGameDbLanguageLookup(game, currentCat, modal, hydrationToken);
 			if (isPsnStoreSummaryCat) {
 				const summaryEl = document.getElementById('modal-summary');
@@ -42745,7 +42793,6 @@ P
 				primeGameModalMetadataLoadingUi(modal, { screenshots: true });
 				fetchGameSummary(game.cleanName, game.id || game.titleId || '', game.contentId || '', game.region || '', { prepared: true, requestToken: hydrationToken });
 			}
-			if (showModalTrophies) updateModalTrophyStatus(game, currentCat);
 		} else {
 			modalContent.style.maxWidth = '650px';
 			modalBody.innerHTML = `
