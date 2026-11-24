@@ -2344,44 +2344,130 @@ function ssPreviewSearchName(value) {
     .replace(/\s*[:：;；‐‑‒–—−]\s*/g, ' - ').replace(/\s+-\s+/g, ' - ')
     .replace(/\s+/g, ' ').trim();
 }
+// Search both catalog spellings of numeric sequels, without confusing game editions.
+// Avoid Roman I and X: a standalone I/X is often a letter (e.g. Mega Man X).
+const SS_PREVIEW_ROMAN_NUMERALS = Object.freeze({
+  II:'2', III:'3', IV:'4', V:'5', VI:'6', VII:'7', VIII:'8', IX:'9'
+});
+const SS_PREVIEW_ARABIC_NUMERALS = Object.freeze(
+  Object.fromEntries(Object.entries(SS_PREVIEW_ROMAN_NUMERALS).map(([roman, number]) => [number, roman]))
+);
+function ssPreviewNumberVariant(value) {
+  return String(value || '').replace(/\b(?:VIII|VII|III|VI|IV|IX|II|V|[2-9])\b/gi, token => {
+    const roman = token.toUpperCase();
+    return SS_PREVIEW_ROMAN_NUMERALS[roman] || SS_PREVIEW_ARABIC_NUMERALS[token] || token;
+  });
+}
 function ssPreviewSearchVariants(value) {
   const title = ssPreviewSearchName(value);
-  // ScreenScraper indexes some editions without the site's square/round brackets.
-  // Keep the edition words: [Special Edition] and Special Edition are the same game.
+  // Keep edition terms but remove decorative brackets for ScreenScraper lookup.
   const unwrapped = title.replace(/[\[\]{}]/g, ' ').replace(/\(([^()]*)\)/g, ' $1 ')
     .replace(/\s+-\s+/g, ' - ').replace(/\s+/g, ' ').trim();
   const plain = unwrapped.replace(/\s+-\s+/g, ' ').replace(/\s+/g, ' ').trim();
-  return [...new Set([unwrapped, plain, title])].filter(Boolean);
+  const variants = [unwrapped, plain];
+  // Try numerals only as fallbacks; ordinary titles still need only one request.
+  const alternate = ssPreviewNumberVariant(unwrapped);
+  if (alternate !== unwrapped) {
+    variants.push(alternate);
+    const alternatePlain = ssPreviewNumberVariant(plain);
+    if (alternatePlain !== alternate) variants.push(alternatePlain);
+  }
+  // ScreenScraper may index "The Last of Us" as "Last of Us, The".
+  const first = /^(the|an|a)\s+(.+)$/i.exec(unwrapped);
+  const last = /^(.+?),\s*(the|an|a)$/i.exec(unwrapped);
+  if (first) variants.push(`${first[2]}, ${first[1]}`, first[2]);
+  if (last) variants.push(`${last[2]} ${last[1]}`, last[1]);
+  variants.push(title);
+  // The cap prevents quota explosions on very long/compound game names.
+  return [...new Set(variants.filter(Boolean))].slice(0, 6);
 }
 function normalizeSsPreviewTitle(value) {
-  return ssPreviewSearchName(value).normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
-    .replace(/\b(?:the|a|an)\b/gi, ' ').replace(/&/g, ' and ')
-    .replace(/[^a-z0-9]+/gi, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+  const text = ssPreviewSearchName(value).normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/&/g, ' and ').replace(/[‘’']/g, '').toLowerCase().trim();
+  // Only strip a leading article or its catalog-style trailing form.
+  // Keep articles inside titles and recognize roman-numbered sequels.
+  const roman = {ii:'2',iii:'3',iv:'4',v:'5',vi:'6',vii:'7',viii:'8',ix:'9'};
+  return text.replace(/^(?:the|an|a)\s+/i, '').replace(/,\s*(?:the|an|a)$/i, '')
+    .replace(/\b(part|episode|chapter)\s+i\b/g, '$1 1')
+    .replace(/\b(?:ii|iii|iv|v|vi|vii|viii|ix)\b/g, part => roman[part] || part)
+    .replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
 function ssPreviewNames(game) {
-  const names = game && game.noms;
-  let rows = Array.isArray(names) ? names : (names && Array.isArray(names.nom) ? names.nom : (names && names.nom ? [names.nom] : []));
-  if (!rows.length && names && typeof names === 'object') rows = Object.values(names);
-  const found = rows.map(item => String(typeof item === 'string' ? item : item && (item.text || item.nom || item.name) || '').trim()).filter(Boolean);
-  for (const fallback of [game && game.nom, game && game.name, game && game.title]) {
-    if (typeof fallback === 'string' && fallback.trim()) found.push(fallback.trim());
-  }
+  const found = [];
+  const add = value => {
+    if (typeof value === 'string' && value.trim()) found.push(value.trim());
+  };
+  // API JSON supports flat noms.nom_ss/nom_us/nom_eu, and some wrappers
+  // expose an array of {text, region} names instead.
+  const collect = (value, depth = 0) => {
+    if (depth > 3 || value == null) return;
+    if (typeof value === 'string') { add(value); return; }
+    if (Array.isArray(value)) { for (const entry of value) collect(entry, depth + 1); return; }
+    if (typeof value !== 'object') return;
+    for (const [key, entry] of Object.entries(value)) {
+      if (/^(?:region|lang|langue|id|code|country|type)$/i.test(key)) continue;
+      if (typeof entry === 'string' && !/^(?:nom(?:_|$)|name(?:_|$)|text$|texte$|title$|value$)/i.test(key)) continue;
+      collect(entry, depth + 1);
+    }
+  };
+  collect(game && game.noms);
+  for (const fallback of [game && game.nom, game && game.name, game && game.title]) add(fallback);
   return [...new Set(found)];
 }
 
 function ssPreviewTitleSimilarity(a, b) {
   if (!a || !b) return 0;
   if (a === b || a.replace(/\s+/g, '') === b.replace(/\s+/g, '')) return 1;
-  // A base release must not replace an explicitly requested special/limited edition.
-  const edition = value => (value.match(/\b(?:special|limited|collectors?|deluxe|ultimate|complete|definitive|anniversary) edition\b/g) || []).join('|');
-  if (edition(a) !== edition(b)) return 0;
-  const nums = value => (value.match(/\b\d+\b/g) || []).join('|');
-  if (nums(a) !== nums(b)) return 0;
-  const leftSet = new Set(a.split(' ')), rightSet = new Set(b.split(' '));
-  const common = [...leftSet].filter(value => rightSet.has(value)).length;
-  const coverage = 2 * common / (leftSet.size + rightSet.size);
-  return coverage >= 0.78 && Math.abs(a.length - b.length) <= 22 ? coverage : 0;
+  // Similar names are useful for punctuation and minor catalog differences, but
+  // must never silently substitute another sequel, edition, or DLC.
+  const variantMarkers = [
+    /\bremaster(?:ed)?\b/g, /\bremake\b/g, /\b(?:hd|4k|vr)\b/g,
+    /\b(?:special|limited|collectors?|deluxe|ultimate|complete|definitive|anniversary|legendary|gold|premium|standard) edition\b/g,
+    /\b(?:game of the year|goty|directors? cut)\b/g,
+    /\b(?:left behind|separate ways|dlc|expansion|demo|trial|beta|prologue)\b/g,
+    /\b(?:part|episode|chapter)\s+\d+\b/g
+  ];
+  const signature = title => variantMarkers.map(pattern => (title.match(pattern) || []).join(',')).join('|');
+  if (signature(a) !== signature(b)) return 0;
+  const numbers = title => (title.match(/\b\d+\b/g) || []).join(',');
+  if (numbers(a) !== numbers(b)) return 0;
+  const aa = a.split(' '), bb = b.split(' ');
+  const left = new Set(aa), right = new Set(bb);
+  const unmatched = [...right];
+  let shared = 0;
+  const nearToken = (x, y) => {
+    if (x.length < 5 || y.length < 5 || Math.abs(x.length-y.length) > 1) return false;
+    let i = 0, j = 0, changes = 0;
+    while (i < x.length && j < y.length) {
+      if (x[i] === y[j]) { i++; j++; continue; }
+      if (++changes > 1) return false;
+      if (x.length >= y.length) i++;
+      if (y.length >= x.length) j++;
+    }
+    return changes + (i < x.length || j < y.length ? 1 : 0) <= 1;
+  };
+  for (const token of left) {
+    let found = unmatched.indexOf(token);
+    if (found < 0) found = unmatched.findIndex(other => nearToken(token, other));
+    if (found >= 0) { shared++; unmatched.splice(found, 1); }
+  }
+  const words = (2 * shared) / (left.size + right.size);
+  if (words < 0.74 || Math.abs(a.length - b.length) > 18) return 0;
+  // Short titles need practically exact matches to avoid false positives.
+  if (Math.min(a.length, b.length) < 9) return 0;
+  // Lightweight Levenshtein check on the few candidate names, not on the catalog.
+  let prev = Array.from({length:b.length+1}, (_, i) => i);
+  for (let i=1; i<=a.length; i++) {
+    const curr = [i];
+    for (let j=1; j<=b.length; j++) {
+      curr[j] = Math.min(prev[j]+1, curr[j-1]+1, prev[j-1]+(a[i-1]===b[j-1]?0:1));
+    }
+    prev = curr;
+  }
+  const chars = 1 - prev[b.length] / Math.max(a.length, b.length);
+  const score = 0.55*words + 0.45*chars;
+  return words >= 0.78 && chars >= 0.78 && score >= 0.85 ? score : 0;
 }
 
 function ssPreviewMediaList(game) {
@@ -2674,6 +2760,15 @@ function ssPreviewFetchUpstream(name, systemId, key) {
     let bestGame = null;
     let bestScore = 0;
     let candidates = 0;
+    const searchTitle = ssPreviewSearchName(name);
+    const tryAlternateMedia = /^(?:the|an|a)\s+\S|,\s*(?:the|an|a)$/i.test(searchTitle) || ssPreviewNumberVariant(searchTitle) !== searchTitle;
+    const mediaRank = game => {
+      if (!game) return 0;
+      const hasVideo = !!ssPreviewFindVideo(game, systemId);
+      const hasFanart = ssPreviewMediaList(game).some(item => String(item?.type || '').toLowerCase().replace(/_/g,'-') === 'fanart');
+      return (hasVideo ? 2 : 0) + (hasFanart ? 1 : 0);
+    };
+    let bestMediaRank = 0;
     for (const searchName of searches) {
       await ssPreviewMaybeRefreshQuota();
       const release = await ssProviderAcquire('search');
@@ -2694,6 +2789,7 @@ function ssPreviewFetchUpstream(name, systemId, key) {
         response = await requestMetadataJson(url, { timeoutMs:9000, headers:{ 'User-Agent':'PSN-Content/1.0 ScreenScraper-Preview' } });
       } finally {release();}
       ssPreviewQuotaNoteRate(Number(response.status));
+      if (Number(response.status) === 404) continue; // Try alternate article ordering.
       if (response.ok) ssPreviewQuotaFromResponse(response.data);
       if (!response.ok || !response.data || typeof response.data !== 'object') {
         const error = new Error('ScreenScraper search unavailable.');
@@ -2719,15 +2815,21 @@ function ssPreviewFetchUpstream(name, systemId, key) {
         const mediaSystem = Number(game && (game.systemeid || (game.systeme && game.systeme.id)));
         if (!ssPreviewValidMediaSystem(mediaSystem) || (systemId !== 0 && mediaSystem !== systemId)) continue;
         const score = Math.max(0, ...ssPreviewNames(game).map(title => ssPreviewTitleSimilarity(wanted, normalizeSsPreviewTitle(title))));
-        const videoAvailable = systemId === 0 && score >= minScore && !!ssPreviewFindVideo(game, 0);
-        const previousHasVideo = systemId === 0 && bestGame && !!ssPreviewFindVideo(bestGame, 0);
-        if (score > bestScore || (videoAvailable && !previousHasVideo && score >= bestScore - 0.01)) {
+        if (score < minScore) continue;
+        const rank = mediaRank(game);
+        if (score > bestScore + 0.025 ||
+            (score >= bestScore - 0.025 && rank > bestMediaRank) ||
+            (score > bestScore && rank === bestMediaRank)) {
           bestGame = game;
           bestScore = score;
+          bestMediaRank = rank;
         }
-        if (bestScore === 1 && (systemId !== 0 || !!ssPreviewFindVideo(bestGame, 0))) break;
+        if (bestScore === 1 && (systemId === 0 ? bestMediaRank >= 2 :
+            (!tryAlternateMedia ? bestMediaRank > 0 : bestMediaRank === 3))) break;
       }
-      if (bestScore >= minScore && (systemId !== 0 || !!ssPreviewFindVideo(bestGame, 0))) break;
+      // A fuzzy hit is provisional: check the other spelling before accepting it.
+      if (bestScore === 1 && (systemId === 0 ? bestMediaRank >= 2 :
+          (!tryAlternateMedia ? bestMediaRank > 0 : bestMediaRank === 3))) break;
     }
     const minScore = systemId === 0 ? 0.95 : 0.78;
     const mediaSystem = Number(bestGame && (bestGame.systemeid || (bestGame.systeme && bestGame.systeme.id)));
@@ -2745,10 +2847,13 @@ function ssPreviewFetchUpstream(name, systemId, key) {
 }
 function ssPreviewLookup(name, systemId, options = null) {
   const normalized = normalizeSsPreviewTitle(name);
-  // Only edition titles get a new lookup namespace; bypass old saved false negatives
-  // without invalidating the ScreenScraper cache for the rest of the catalog.
+  const searchName = ssPreviewSearchName(name);
+  // Invalidate only article-indexed titles once: old cached misses may predate
+  // the "Last of Us, The" search fallback. Other games keep their DB cache.
+  const articleKey = /^(?:the|an|a)\s+\S|,\s*(?:the|an|a)$/i.test(searchName) ? 'art4:' : '';
   const editionKey = /\b(?:special|limited|collectors?|deluxe|ultimate|complete|definitive|anniversary) edition\b/.test(normalized) ? 'ed2:' : '';
-  const key = `${systemId}:${editionKey}${normalized}`;
+  const numeralKey = ssPreviewNumberVariant(searchName) !== searchName ? 'num1:' : '';
+  const key = `${systemId}:${articleKey}${editionKey}${numeralKey}${normalized}`;
   const requireEnglish = options?.englishSummary === true;
   const requireArtwork = options?.artwork === true;
   const ready = result => !!result &&
