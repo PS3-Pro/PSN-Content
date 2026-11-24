@@ -3408,7 +3408,7 @@ const gameThemePending = new Map();
 const GAME_THEME_MEMORY_MAX = 350;
 const GAME_THEME_FOUND_TTL = 48 * 60 * 60 * 1000;
 const GAME_THEME_MISS_TTL = 2 * 60 * 60 * 1000;
-const GAME_THEME_VERSION = 'gts14a:'; // Two providers and improved theme ranking: invalidate old soundtrack picks.
+const GAME_THEME_VERSION = 'gts14b:'; // Archive movie soundtrack matches and bounded media reachability probes.
 const gameThemeSourceCooldown = new Map();
 let gameThemeActiveLookups = 0;
 let gameThemeLastExpiredPrune = 0;
@@ -3670,11 +3670,11 @@ function gameThemeArchiveLicense(meta) {
   return /creativecommons\.org\/(?:licenses\/by(?:-sa|-nc|-nd|-nc-sa|-nc-nd)?\/|publicdomain\/)|public domain|cc0/i.test(value);
 }
 function gameThemeArchiveSearchQuery(name) {
-  // Search title variants, not just a normalized numeric title: Archive keeps OST and
-  // Soundtrack suffixes, and Roman numerals frequently differ from our catalog names.
+  // Archive items like G4TV's "007 Blood Stone Soundtrack" are catalogued as movies,
+  // despite containing OST music. Search both classes, but validate the full game title.
   const variants = gameThemeSearchVariants(name);
   const unique = [...new Set(variants.map(phrase => phrase.replace(/[\\"():]/g,' ').replace(/\s+/g,' ').trim()).filter(Boolean))].slice(0,4);
-  return 'mediatype:audio AND (' + unique.map(phrase => 'title:"' + phrase + '"').join(' OR ') + ')';
+  return '(mediatype:audio OR mediatype:movies) AND (' + unique.map(phrase => 'title:"' + phrase + '"').join(' OR ') + ')';
 }
 function gameThemeArchiveTrackFiles(metadata, gameName) {
   const files = Array.isArray(metadata?.files) ? metadata.files : [];
@@ -3696,6 +3696,90 @@ function gameThemeArchiveTrackFiles(metadata, gameName) {
       !/\b(?:track\s*\d+|audio\s*\d+|unknown|untitled|sample|test|preview|instrumental cover)\b/i.test(track.title))
     .sort((a,b) => b.score - a.score || a.index - b.index);
 }
+// Audio-only files win. Licensed Archive video with a soundtrack can be used as a
+// background media element, without pretending an .mp4 is an .mp3. These files are
+// never proxied through Render; the browser streams them from archive.org.
+function gameThemeArchiveVideoFiles(metadata, gameName) {
+  if (String(metadata?.metadata?.mediatype || '') !== 'movies') return [];
+  const title = String(metadata?.metadata?.title || '');
+  if (gameThemeAlbumScore(gameName,title) < 75 ||
+      !/\b(?:soundtrack|original score|ost|music from)\b/i.test(title) ||
+      /\b(?:interview|gameplay|walkthrough|review|podcast|commentary|trailer)\b/i.test(title)) return [];
+  const files = Array.isArray(metadata.files) ? metadata.files : [];
+  return files.filter(file => file && /\.(?:mp4|webm|ogv)$/i.test(String(file.name || '')) &&
+    Number(file.size || 0) >= 250000 && Number(file.size || 0) <= 150*1024*1024 &&
+    ['original','derivative'].includes(String(file.source || '')))
+    .map((file,index) => {
+      const ext = String(file.name).split('.').pop().toLowerCase();
+      const name = title.replace(/^\s*(?:g4tv\.com-video\d+\s*:\s*)/i,'').trim();
+      const score = gameThemeSongScore(name,index,0,gameName) +
+        (ext === 'mp4' ? 36 : ext === 'webm' ? 16 : -30) +
+        (file.source === 'derivative' ? 12 : 0) - Math.min(20,Number(file.size||0)/10000000);
+      return {file,title:name,index,score,mediaType:'video'};
+    }).filter(item=>item.score>=0)
+    .sort((a,b)=>b.score-a.score || Number(a.file.size||0)-Number(b.file.size||0));
+}
+// Bounded header-only media check during provider lookup / cache fill. A redirect
+// is not proof of playable bytes; check the terminal HTTP response. Never stream
+// the full media through Render or follow a redirect to an arbitrary host.
+function gameThemeProbeMedia(url, provider, timeoutMs=2600) {
+  return new Promise(resolve => {
+    let finished=false, request=null;
+    // One deadline across redirects: an upstream CDN cannot keep a hover preload busy.
+    const deadline=setTimeout(() => { request?.destroy(); finish('uncertain'); },timeoutMs+1300);
+    deadline.unref?.();
+    const finish = result => { if (finished) return; finished=true; clearTimeout(deadline); resolve(result); };
+    const allowedHost = host => provider === 'Audius'
+      ? (host === 'api.audius.co' || host === 'audius.co' || host.endsWith('.audius.co') ||
+        host.endsWith('.audiuscdn.com') || host.endsWith('.cloudfront.net'))
+      : (host === 'archive.org' || host.endsWith('.archive.org'));
+    const fetchHead = (target, left) => {
+      let u; try { u=new URL(target); } catch (_) { return finish('uncertain'); }
+      if (u.protocol !== 'https:' || !allowedHost(u.hostname.toLowerCase())) return finish('uncertain');
+      request=https.request(u,{method:'GET',headers:{'Range':'bytes=0-1','Accept':'audio/*,video/*,application/octet-stream',
+        'User-Agent':'PSN-Content/1.0 (+https://github.com/PS3-Pro/PSN-Content)','Accept-Encoding':'identity'}},response=>{
+        const status=Number(response.statusCode||0);
+        if (status>=300 && status<400 && response.headers.location) {
+          // A redirect is small; draining avoids an aborted socket error racing the next hop.
+          response.resume();
+          if (left<=0) return finish('uncertain');
+          let next; try { next=new URL(response.headers.location,u).href; } catch (_) { return finish('uncertain'); }
+          return fetchHead(next,left-1);
+        }
+        const mime=String(response.headers['content-type']||'').toLowerCase().split(';')[0].trim();
+        const accepted = status===200 || status===206;
+        const supported=/^(?:audio\/|video\/|application\/(?:octet-stream|mp4|ogg|x-ogg|vnd\.apple\.mpegurl))/.test(mime);
+        // Finalize before closing: a socket-abort error must not overwrite a valid response.
+        const state = (status===404 || status===410) ? 'missing' :
+          (accepted && supported) ? 'verified' :
+          (accepted && /^(?:text\/html|application\/json)/.test(mime)) ? 'missing' : 'uncertain';
+        finish(state);
+        // Headers are enough: don't consume a whole file when the origin ignores Range.
+        response.destroy();
+      });
+      request.setTimeout(timeoutMs,()=>request.destroy(new Error('Media probe timeout')));
+      request.on('error',()=>finish('uncertain'));
+      request.end();
+    };
+    fetchHead(url,3);
+  });
+}
+async function gameThemeChooseReachable(result) {
+  if (!result?.found || !result.url) return result;
+  const candidates=[{title:result.title,url:result.url,mediaType:result.mediaType},
+    ...(Array.isArray(result.alternatives)?result.alternatives:[])].slice(0,3);
+  // At most two probes, in parallel: hover prefetch must not fan out into a scan.
+  const checked=await Promise.all(candidates.slice(0,2).map(async candidate=>({candidate,
+    status:await gameThemeProbeMedia(candidate.url,result.provider)})));
+  const first=checked.find(x=>x.status==='verified');
+  if (!first) {
+    if (checked.some(x=>x.status==='uncertain')) return {...result,availability:'unverified'};
+    return {...result,found:false,retry:true,reason:'media_not_reachable'};
+  }
+  const rest=candidates.filter(x=>x.url!==first.candidate.url).map(x=>({title:x.title,url:x.url,
+    ...(x.mediaType?{mediaType:x.mediaType}:{})}));
+  return {...result,...first.candidate,availability:'verified',alternatives:rest};
+}
 async function gameThemeFromArchive(gameName) {
   if (!gameThemeProviderReady('archive')) throw gameThemeCooldownError('Internet Archive');
   try {
@@ -3706,8 +3790,8 @@ async function gameThemeFromArchive(gameName) {
       {json:true,maxBytes:380000,timeout:5000});
     const docs = Array.isArray(listing?.response?.docs) ? listing.response.docs : [];
     const matches = docs.map(item => ({
-        id:String(item?.identifier || ''), title:String(item?.title || ''),
-        score:gameThemeAlbumScore(gameName,String(item?.title || ''))
+        id:String(item?.identifier || ''), title:String(item?.title || ''), mediatype:String(item?.mediatype || ''),
+        score:gameThemeAlbumScore(gameName,String(item?.title || '')) + (item?.mediatype==='audio'?20:0)
       }))
       .filter(item => /^[a-z0-9_.-]{4,110}$/i.test(item.id) && item.score >= 75 &&
         /\b(?:original soundtrack|official soundtrack|soundtrack|original score|ost|game music|music from)\b/i.test(item.title) &&
@@ -3727,14 +3811,17 @@ async function gameThemeFromArchive(gameName) {
         if (gameThemeAlbumScore(gameName,album) < 75) return null;
         if (!gameThemeArchiveLicense(metadata?.metadata))
           return {unlicensed:{album,sourceUrl:'https://archive.org/details/' + encodeURIComponent(item.id)}};
-        const tracks = gameThemeArchiveTrackFiles(metadata,gameName);
+        const audioTracks = gameThemeArchiveTrackFiles(metadata,gameName);
+        const tracks = audioTracks.length ? audioTracks : gameThemeArchiveVideoFiles(metadata,gameName);
         if (!tracks.length) return {noPlayable:true};
         const toTrack = track => ({title:track.title,url:'https://archive.org/download/' +
-          encodeURIComponent(item.id) + '/' + String(track.file.name).split('/').map(encodeURIComponent).join('/')});
+          encodeURIComponent(item.id) + '/' + String(track.file.name).split('/').map(encodeURIComponent).join('/'),
+          ...(track.mediaType?{mediaType:track.mediaType}:{})});
         const selected = tracks.slice(0,4).map(toTrack);
         return {ok:true,found:true,provider:'Internet Archive',title:selected[0].title,
           album,sourceUrl:'https://archive.org/details/' + encodeURIComponent(item.id),
-          url:selected[0].url,alternatives:selected.slice(1)};
+          url:selected[0].url,...(selected[0].mediaType?{mediaType:selected[0].mediaType}:{}),
+          alternatives:selected.slice(1)};
       }));
       for (const result of batch) {
         if (result?.found) return result;
@@ -3801,7 +3888,13 @@ async function gameThemeResolve(name, key, skip = new Set()) {
         const message = String(error?.message || 'unavailable');
         diagnostics[providerName] = gameThemeSourceStatus(error);
       }
-      if (result?.found) { result.sources = diagnostics; break; }
+      if (result?.found) {
+        // Check media availability before promising the theme in preloaded metadata.
+        result=await gameThemeChooseReachable(result);
+        diagnostics[providerName] = result.found ? (result.availability==='verified'?'verified':'unverified') : result.reason;
+        if (result?.found) { result.sources = diagnostics; break; }
+        if (result?.retry) failed++;
+      }
     }
     if (failed && !result?.found) {
       // A blocked provider cannot prove the game has no theme. Never cache a negative result.
@@ -3814,11 +3907,11 @@ async function gameThemeResolve(name, key, skip = new Set()) {
       // Never store a transient outage as a confirmed music absence in PostgreSQL.
       gameThemeRemember(key,result,10000);
     } else {
-      gameThemeRemember(key,result);
+      gameThemeRemember(key,result,result.found && result.availability==='unverified' ? 60*1000 : undefined);
       queryDbWithRetry(`INSERT INTO game_theme_cache(name_key,payload,expires_at)
         VALUES($1,$2::jsonb,NOW()+($3::bigint * INTERVAL '1 millisecond'))
         ON CONFLICT(name_key) DO UPDATE SET payload=EXCLUDED.payload,expires_at=EXCLUDED.expires_at`,
-        [key,JSON.stringify(result),result.found ? GAME_THEME_FOUND_TTL : GAME_THEME_MISS_TTL],
+        [key,JSON.stringify(result),result.found && result.availability==='unverified' ? 60*1000 : result.found ? GAME_THEME_FOUND_TTL : GAME_THEME_MISS_TTL],
         {label:'GAME THEME CACHE WRITE',attempts:1}).catch(() => {});
       // Expired entries from old versions are removed in small, low-priority batches.
       const now = Date.now();

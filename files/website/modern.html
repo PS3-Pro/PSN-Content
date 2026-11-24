@@ -121142,6 +121142,20 @@ function getVisibleChatStackEl(id) {
   audio.setAttribute('aria-hidden', 'true');
   audio.id = 'psn-game-theme-audio';
   document.body.appendChild(audio);
+  // Archive can supply a licensed OST as an H.264/WebM movie rather than audio.
+  // Reuse one unobtrusive media element; never load a video during card prefetch.
+  const video = document.createElement('video');
+  video.preload = 'none';
+  video.loop = true;
+  video.playsInline = true;
+  video.volume = 0.28;
+  video.setAttribute('aria-hidden','true');
+  video.style.display = 'none';
+  video.id = 'psn-game-theme-archive-video';
+  document.body.appendChild(video);
+  const mediaFor = result => result?.mediaType === 'video' ? video : audio;
+  const currentMedia = () => mediaFor(active?.result);
+  const pauseAll = () => { audio.pause(); video.pause(); };
   const lookupCache = new Map();
   const maxCache = 180;
   const inflight = new Map();
@@ -121176,7 +121190,7 @@ function getVisibleChatStackEl(id) {
       return url.protocol === 'https:' &&
         ((host === 'api.audius.co' && /^\/v1\/tracks\/[a-z0-9_-]{3,64}\/stream$/i.test(url.pathname)) ||
         ((host === 'archive.org' || host.endsWith('.archive.org')) &&
-        /\.(?:mp3|m4a|ogg|opus|aac)$/i.test(url.pathname)));
+        /\.(?:mp3|m4a|ogg|opus|aac|mp4|webm|ogv)$/i.test(url.pathname)));
     } catch (_) { return false; }
   };
   function fade(element, target, duration, done) {
@@ -121193,7 +121207,7 @@ function getVisibleChatStackEl(id) {
   }
   function resumeBackground() {
     const bg = background();
-    if (!bg || !enabled() || trailerOpen() || !audio.paused) return;
+    if (!bg || !enabled() || trailerOpen() || !audio.paused || !video.paused) return;
     if (bg.paused) { bg.volume = 0; bg.play().catch(() => {}); }
     fade(bg, 0.35, 320);
   }
@@ -121223,9 +121237,8 @@ function getVisibleChatStackEl(id) {
     ++generation;
     ++fadeToken;
     if (active?.mediaTimeout) clearTimeout(active.mediaTimeout);
-    audio.pause();
-    audio.removeAttribute('src');
-    audio.load();
+    pauseAll();
+    for (const element of [audio,video]) { element.removeAttribute('src'); element.load(); }
     active = null;
     manuallyPaused = false;
     suspended = false;
@@ -121235,28 +121248,32 @@ function getVisibleChatStackEl(id) {
     if (!active?.result?.found || !visible() || !enabled() || suspended || trailerOpen() || !validUrl(active.result.url)) return;
     if (shouldResume) manuallyPaused = false;
     if (manuallyPaused) return;
-    if (audio.getAttribute('src') !== active.result.url) {
-      audio.src = active.result.url;
-      audio.volume = 0;
+    const media = currentMedia();
+    const inactive = media===audio ? video : audio;
+    inactive.pause();
+    if (inactive.hasAttribute('src')) { inactive.removeAttribute('src'); inactive.load(); }
+    if (media.getAttribute('src') !== active.result.url) {
+      media.src = active.result.url;
+      media.volume = 0;
     }
     const token = generation, result = active.result;
     active.attemptedUrls.add(result.url);
     const session = active;
     const attempt = session.mediaAttempt = (session.mediaAttempt || 0) + 1;
     const mediaTimeout = setTimeout(() => {
-      if (token === generation && active === session && session.mediaAttempt === attempt && audio.readyState < 3)
+      if (token === generation && active === session && session.mediaAttempt === attempt && media.readyState < 3)
         recoverPlayback();
     }, 9000);
     session.mediaTimeout = mediaTimeout;
     try {
-      await audio.play();
+      await media.play();
       clearTimeout(mediaTimeout);
       if (session.mediaTimeout === mediaTimeout) session.mediaTimeout = null;
       if (token !== generation || active?.result !== result) return;
-      if (!active || audio.paused || suspended || !visible()) { audio.pause(); return; }
+      if (!active || media.paused || suspended || !visible()) { media.pause(); return; }
       const bg = background();
       if (bg) { bg.pause(); bg.volume = 0.35; }
-      fade(audio, 0.28, 360);
+      fade(media, 0.28, 360);
       updateButton('playing', active.result);
     } catch (error) {
       clearTimeout(mediaTimeout);
@@ -121278,7 +121295,7 @@ function getVisibleChatStackEl(id) {
     if (saved) lookupCache.delete(cacheKey);
     if (inflight.has(cacheKey)) return inflight.get(cacheKey);
     const base = getMetadataServerBaseCompat();
-    const pending = fetch(base + '/api/game-theme?v=gts14a&name=' + encodeURIComponent(name) +
+    const pending = fetch(base + '/api/game-theme?v=gts14b&name=' + encodeURIComponent(name) +
       (skip ? '&skip=' + encodeURIComponent(skip) : ''), { cache:'default' })
       .then(response => { if (!response.ok) throw new Error('Game theme lookup unavailable'); return response.json(); })
       .then(result => {
@@ -121353,7 +121370,7 @@ function getVisibleChatStackEl(id) {
     // Hydration can re-render the header while the same modal is already playing.
     if (active?.key === key) {
       if (active.result?.found && validUrl(active.result.url))
-        updateButton(!enabled() ? 'off' : !audio.paused ? 'playing' : 'paused', active.result);
+        updateButton(!enabled() ? 'off' : !currentMedia().paused ? 'playing' : 'paused', active.result);
       else updateButton('loading');
       return;
     }
@@ -121394,11 +121411,11 @@ function getVisibleChatStackEl(id) {
       const candidate = remaining.shift();
       if (candidate && validUrl(candidate.url) && !active.attemptedUrls.has(candidate.url)) { next=candidate; break; }
     }
-    audio.pause();
-    audio.removeAttribute('src');
-    audio.load();
+    pauseAll();
+    for (const element of [audio,video]) { element.removeAttribute('src'); element.load(); }
     if (next) {
-      active.result = {...active.result,title:next.title || active.result.title,url:next.url};
+      active.result = {...active.result,title:next.title || active.result.title,url:next.url,
+        mediaType:next.mediaType||'audio'};
       active.recovering = false;
       play();
       return;
@@ -121438,10 +121455,10 @@ function getVisibleChatStackEl(id) {
   function toggle() {
     if (!active || !enabled()) return;
     if (!active.result?.found) { open(active.name,'games'); return; }
-    if (!audio.paused) {
+    if (!currentMedia().paused) {
       manuallyPaused = true;
       if (active.mediaTimeout) { clearTimeout(active.mediaTimeout); active.mediaTimeout = null; }
-      audio.pause();
+      pauseAll();
       updateButton('paused', active.result);
       resumeBackground();
     } else play(true);
@@ -121450,7 +121467,7 @@ function getVisibleChatStackEl(id) {
     if (!active) return;
     suspended = true;
     if (active.mediaTimeout) { clearTimeout(active.mediaTimeout); active.mediaTimeout = null; }
-    audio.pause();
+    pauseAll();
     if (active.result?.found) updateButton('paused', active.result);
   }
   function resume() {
@@ -121461,19 +121478,19 @@ function getVisibleChatStackEl(id) {
   function settingsChanged() {
     if (!enabled()) {
       if (active?.mediaTimeout) { clearTimeout(active.mediaTimeout); active.mediaTimeout = null; }
-      audio.pause();
+      pauseAll();
       if (active) updateButton(active.result?.found ? 'off' : 'missing',active.result);
       resumeBackground();
     } else if (active?.result?.found) play();
   }
-  audio.addEventListener('error', () => {
-    if (!active || !audio.getAttribute('src')) return;
+  for (const element of [audio,video]) element.addEventListener('error', () => {
+    if (!active || currentMedia()!==element || !element.getAttribute('src')) return;
     recoverPlayback();
   });
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
       if (active?.mediaTimeout) { clearTimeout(active.mediaTimeout); active.mediaTimeout = null; }
-      audio.pause();
+      pauseAll();
     } else if (active?.result?.found && !manuallyPaused) play();
   });
   let hoverWarmTimer = 0;
@@ -121517,7 +121534,7 @@ function getVisibleChatStackEl(id) {
     window.runPsnAfterHomeInteractive(initialWarm);
   else document.addEventListener('DOMContentLoaded',initialWarm,{once:true});
   window.psnGameTheme = { open, stop, toggle, suspend, resume, settingsChanged, prefetch, getCachedStatus,
-    isActive:() => !!active && !audio.paused };
+    isActive:() => !!active && !currentMedia().paused };
 })();
 </script>
 
