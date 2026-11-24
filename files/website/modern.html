@@ -32,10 +32,18 @@
 			var items=queue.splice(0);
 			for(var i=0;i<items.length;i++){try{items[i]();}catch(e){console.error('[Deferred init]',e);}}
 		}
-		function scheduleAfterHome(){
-			var run=function(){runQueue(afterHome);};
-			if('requestIdleCallback' in window)window.requestIdleCallback(run,{timeout:900});
-			else setTimeout(run,80);
+		var afterHomeScheduled=false;
+		function scheduleAfterHome(continuation){
+			if(afterHomeScheduled||!afterHome.length)return;
+			afterHomeScheduled=true;
+			var run=function(){
+				afterHomeScheduled=false;
+				var callback=afterHome.shift();
+				if(callback){try{callback();}catch(e){console.error('[Deferred init]',e);}}
+				scheduleAfterHome(true);
+			};
+			if(!continuation&&'requestIdleCallback' in window)window.requestIdleCallback(run,{timeout:900});
+			else setTimeout(run,0);
 		}
 		window.__psnFlushHomeDeferredWork=function(){
 			if(homeReady)return;
@@ -47,7 +55,7 @@
 		window.runPsnAfterHomeInteractive=function(callback,options){
 			if(typeof callback!=='function')return;
 			if(homeReady||isHomeReady()){
-				homeReady=true;
+				if(!homeReady)window.__psnFlushHomeDeferredWork();
 				if(options&&options.beforeReveal)callback();
 				else if('requestIdleCallback' in window)window.requestIdleCallback(callback,{timeout:900});
 				else setTimeout(callback,80);
@@ -66,19 +74,32 @@
 	<script>(function(){
 		if (/PS3|PlayStation 3|NetFront/i.test(navigator.userAgent || '') || navigator.platform === 'PlayStation 3' || typeof fetch !== 'function') return;
 		const url = 'https://raw.githubusercontent.com/FlexBy420/psn-trophy-scraper/main/all.json.gz';
-		let pending = null;
-		window.__psnGetTrophyCatalogBlob = function() {
-			if (pending) return pending;
+		let pending = null, retryAfter = 0;
+		async function downloadCatalog(cache, source = url) {
 			const controller = typeof AbortController === 'function' ? new AbortController() : null;
 			const timeout = controller ? setTimeout(() => controller.abort(), 120000) : null;
-			const task = fetch(url, {cache:'force-cache', signal:controller ? controller.signal : undefined})
-				.then(response => { if (!response.ok) throw new Error('Failed to load trophy database'); return response.blob(); })
-				.finally(() => clearTimeout(timeout));
+			try {
+				const response = await fetch(source, {cache, credentials:'omit', referrerPolicy:'no-referrer', signal:controller ? controller.signal : undefined});
+				if (!response.ok) throw new Error('Trophy database HTTP ' + response.status);
+				const blob = await response.blob();
+				if (!blob.size) throw new Error('Empty trophy download');
+				return blob;
+			} finally { clearTimeout(timeout); }
+		}
+		window.__psnGetTrophyCatalogBlob = function() {
+			if (pending && (!retryAfter || Date.now() < retryAfter)) return pending;
+			retryAfter = 0;
+			const task = downloadCatalog('force-cache').catch(error => {
+				if (navigator.onLine === false || error.name === 'AbortError') throw error;
+				// Recover a failed/corrupt cached response without a second simultaneous transfer.
+				return downloadCatalog('reload', url + '?psn-catalog=1');
+			});
 			pending = task;
-			task.catch(() => { if (pending === task) pending = null; });
+			task.catch(() => { if (pending === task) retryAfter = Date.now() + 30000; });
 			return task;
 		};
-		window.__psnReleaseTrophyCatalogBlob = function() { pending = null; };
+		window.__psnReleaseTrophyCatalogBlob = function() { pending = null; retryAfter = 0; };
+		window.addEventListener('online', () => { if (retryAfter) { pending = null; retryAfter = 0; } });
 		const connection = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
 		if (!document.hidden && navigator.onLine !== false && !connection?.saveData && !/^(slow-2g|2g)$/.test(connection?.effectiveType || '')) window.__psnGetTrophyCatalogBlob().catch(()=>{});
 	})();</script>
@@ -216,7 +237,13 @@
 	<link rel="icon" type="image/png" sizes="32x32" href="https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/favicon/favicon-32x32.png">
 	<link rel="icon" type="image/png" sizes="16x16" href="https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/favicon/favicon-16x16.png">
 	<link rel="apple-touch-icon" sizes="180x180" href="https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/favicon/apple-touch-icon.png">	
-	<link rel="manifest" href="../../resources/interface/modern/images/favicon/site.webmanifest">
+	<script>(function(){
+		if (location.protocol === 'file:') return;
+		const manifest = document.createElement('link');
+		manifest.rel = 'manifest';
+		manifest.href = '../../resources/interface/modern/images/favicon/site.webmanifest';
+		document.head.appendChild(manifest);
+	})();</script>
 	<link rel="preconnect" href="https://raw.githubusercontent.com" crossorigin>
 	<link rel="dns-prefetch" href="//raw.githubusercontent.com">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
@@ -8945,8 +8972,8 @@ html.psn-scroll-nav-active #psn-floating-status-dock {--psn-status-right:82px;}
 				</div>
 				
 				<div class="ps5-form-group">
-					<label class="ps5-form-label">PSN™ ID</label>
-					<input type="text" id="new-psn-id" class="ps5-auth-input" placeholder="Enter your PSN™ ID" maxlength="16" autocapitalize="none" autocomplete="off" spellcheck="false" pattern="[A-Za-z][A-Za-z0-9_-]{2,15}" title="3-16 characters. Start with a letter. Use letters, numbers, hyphens, and underscores only.">
+					<label for="new-psn-id" class="ps5-form-label">PSN™ ID</label>
+					<input type="text" id="new-psn-id" name="username" class="ps5-auth-input" placeholder="Enter your PSN™ ID" maxlength="16" autocapitalize="none" autocomplete="username" spellcheck="false" pattern="[A-Za-z][A-Za-z0-9_-]{2,15}" title="3-16 characters. Start with a letter. Use letters, numbers, hyphens, and underscores only.">
 					<div id="psn-id-rules-hint" class="psn-id-rules-hint"><strong>ID rules:</strong> Use 3–16 characters. Must start with a letter and can only include letters, numbers, _ or -.</div>                                   
 				</div>
 		
@@ -8994,6 +9021,7 @@ html.psn-scroll-nav-active #psn-floating-status-dock {--psn-status-right:82px;}
 
         <div id="login-input-overlay" class="ps5-overlay-screen">
             <form class="ps5-auth-container" style="max-width: 380px;" id="psn-login-form" autocomplete="on" onsubmit="event.preventDefault(); confirmLogin()">
+                <input type="hidden" name="username" autocomplete="username" id="login-psn-username">
                 <img id="login-avatar-preview" class="ps5-avatar-selected-preview" style="width: 120px; height: 120px;" src="">
                 <h2 class="ps5-auth-title" id="login-username-display" data-no-translate="true" translate="no" style="margin-bottom: 30px; font-weight: 600;">Username</h2>
                 
@@ -10850,6 +10878,7 @@ html.psn-scroll-nav-active #psn-floating-status-dock {--psn-status-right:82px;}
 						<button type="button" class="sys-modal-close" onclick="closeSelfDeleteAccountModal(event)" aria-label="Close" onmouseenter="if(typeof playUiHover==='function') playUiHover()"><i class="fas fa-times"></i></button>
 					</div>
 					<form class="sys-modal-body self-delete-account-body" id="psn-delete-account-form" onsubmit="event.preventDefault()">
+						<input type="hidden" name="username" autocomplete="username" id="self-delete-account-username">
 						<div class="self-delete-account-warning">
 							<i class="fas fa-exclamation-triangle"></i>
 							<div>This permanently removes your account from the server and signs out every active session. There is no Undo for account deletion.</div>
@@ -13400,6 +13429,8 @@ P
 		const cancelButton = modal.querySelector('.self-delete-account-cancel');
 		const closeButton = modal.querySelector('.sys-modal-close');
 		if (user) user.textContent = userName;
+		const usernameField = document.getElementById('self-delete-account-username');
+		if (usernameField) usernameField.value = userName;
 		if (password) password.value = '';
 		if (name) { name.value = ''; name.placeholder = userName; }
 		if (word) word.value = '';
@@ -19055,6 +19086,8 @@ P
 
 			if (avatarPreview) avatarPreview.src = avatarUrl;
 			if (nameDisplay) nameDisplay.innerText = username;
+			const usernameField = document.getElementById('login-psn-username');
+			if (usernameField) usernameField.value = username;
 			if (passInput) passInput.value = '';
 
 			const loginOverlay = document.getElementById('login-input-overlay');
@@ -20374,7 +20407,7 @@ P
 			const lastNeeded = Math.min(items.length, rawStart + baseVisibleCount);
 			const hysteresis = Math.max(2, Math.floor(buffer / 2));
 
-			if (!force && currentStart >= 0 && currentEnd >= 0 && firstNeeded >= currentStart + hysteresis && lastNeeded <= currentEnd - hysteresis) {
+			if (!force && currentStart >= 0 && currentEnd >= 0 && firstNeeded >= currentStart + (currentStart === 0 ? 0 : hysteresis) && lastNeeded <= currentEnd - (currentEnd === items.length ? 0 : hysteresis)) {
 				return;
 			}
 
@@ -20425,10 +20458,9 @@ P
 				} else if (suppressReveal) {
 					resetExploreRevealCard(card, false);
 				} else if (data.initialRevealDone && !card.classList.contains('anim-reveal')) {
-					card.classList.remove('anim-reveal');
-					card.classList.add('no-anim');
-					card.style.opacity = '';
-					card.style.animation = '';
+					if (!card.classList.contains('no-anim')) card.classList.add('no-anim');
+					if (card.style.opacity) card.style.opacity = '';
+					if (card.style.animation) card.style.animation = '';
 				}
 				desiredNodes.push(getExploreSnapSlot(card));
 			}
@@ -21194,6 +21226,7 @@ P
 			window.__loginRevealBusy = false;
 			window.__exploreBootRevealActive = false;
 			isLoggingIn = false;
+			window.scheduleEmojiPickerPrebuild?.();
 		} catch (e) {
 			console.warn('[Boot] Could not force-unlock Home interaction:', e);
 		}
@@ -34493,6 +34526,7 @@ P
 		const isGamesAppsOrDemos = isGamesOrApps || cat === 'demos';
 		const usesGroupedStoreKey = cat === 'games' || cat === 'guides' || cat === 'soundtracks';
 		const pauseEvery = highPriority ? Number.POSITIVE_INFINITY : (isBootLoginVisualActive() ? 180 : 900);
+		let bootSliceStarted = performance.now();
 
 		for (let textIndex = 0; textIndex < texts.length; textIndex++) {
 			const text = texts[textIndex];
@@ -34505,6 +34539,10 @@ P
 			const lines = sharedRows || text.split('\n');
 
 			for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+				if (highPriority && (lineIndex & 63) === 0 && !document.body?.classList.contains('psn-home-interactive') && performance.now() - bootSliceStarted >= 8) {
+					await new Promise(resolve => setTimeout(resolve, 0));
+					bootSliceStarted = performance.now();
+				}
 				const row = lines[lineIndex];
 				const line = sharedRows ? row.line : row;
 				if (!line || line.length < 15) continue;
@@ -34606,10 +34644,15 @@ P
 		}
 
 		const data = Object.values(tempGroupMap);
-		data.forEach(game => {
+		for (let i = 0; i < data.length; i++) {
+			if ((i & 63) === 0 && !document.body?.classList.contains('psn-home-interactive') && performance.now() - bootSliceStarted >= 8) {
+				await new Promise(resolve => setTimeout(resolve, 0));
+				bootSliceStarted = performance.now();
+			}
+			const game = data[i];
 			game.size = formatSizeFromBytes(game.sizeBytes);
 			if (typeof window.applyContentMetadataOverrideToItem === 'function') window.applyContentMetadataOverrideToItem(game, cat);
-		});
+		}
 		data.sort((a, b) => a.cleanName.localeCompare(b.cleanName));
 
 		if (typeof sysData !== 'undefined') {
@@ -37643,10 +37686,11 @@ P
         const horizontalRectCache = new WeakMap();
         const scanPlan = getSkeletonViewportScanPlan(container, targets, rootRect, margin);
 
+        const measured = [];
         if (scanPlan) {
             for (let index = 0; index < scanPlan.start; index++) {
                 const el = targets[index];
-                if (el && el.isConnected) el.classList.add('no-skeleton-anim');
+                if (el && el.isConnected) measured.push([el, true]);
             }
 
             for (let index = scanPlan.start; index < scanPlan.end; index++) {
@@ -37655,14 +37699,11 @@ P
                 const rect = scanPlan.rectCache.get(el) || el.getBoundingClientRect();
                 if (!scanPlan.rectCache.has(el)) scanPlan.rectCache.set(el, rect);
 
-                if (isRevealRectVisibleNow(el, rect, rootRect, margin, horizontalRectCache)) {
-                    el.classList.remove('no-skeleton-anim');
-                } else {
-                    el.classList.add('no-skeleton-anim');
-                }
+                measured.push([el, !isRevealRectVisibleNow(el, rect, rootRect, margin, horizontalRectCache)]);
 
                 if (rect.top > rootRect.bottom + margin) break;
             }
+            for (const [el, paused] of measured) el.classList.toggle('no-skeleton-anim', paused);
             return;
         }
 
@@ -37671,20 +37712,17 @@ P
             const rect = el.getBoundingClientRect();
             const inHorizontalStrip = !!el.closest('.horizontal-scroll');
 
-            if (isRevealRectVisibleNow(el, rect, rootRect, margin, horizontalRectCache)) {
-                el.classList.remove('no-skeleton-anim');
-            } else {
-                el.classList.add('no-skeleton-anim');
-            }
+            measured.push([el, !isRevealRectVisibleNow(el, rect, rootRect, margin, horizontalRectCache)]);
 
             if (!inHorizontalStrip && rect.top > rootRect.bottom + margin) break;
         }
+        for (const [el, paused] of measured) el.classList.toggle('no-skeleton-anim', paused);
     };
 
     window.setupAllVisibleSkeletonAnimations = function(root = document) {
         const containers = root.querySelectorAll ? root.querySelectorAll('.games-grid, .horizontal-scroll, .hero-carousel, #dynamic-servers-container') : [];
         containers.forEach(container => {
-            if (typeof setupSkeletonAnimations === 'function') setupSkeletonAnimations(container);
+            if (container.getClientRects().length && typeof setupSkeletonAnimations === 'function') setupSkeletonAnimations(container);
         });
     };
 
@@ -38741,8 +38779,8 @@ P
 			return response.blob();
 		});
 	}
-	async function loadExternalTrophyDbOnMainThread({ background = false } = {}) {
-		const compressed = await getExternalTrophyCatalogBlob();
+	async function loadExternalTrophyDbOnMainThread({ background = false, blob = null } = {}) {
+		const compressed = blob || await getExternalTrophyCatalogBlob();
 		if (background && !externalTrophyForegroundRequested && !document.body?.classList.contains('psn-home-interactive')) {
 			await new Promise(resolve => {
 				const wake = () => { if (externalTrophyForegroundWake === wake) externalTrophyForegroundWake = null; resolve(); };
@@ -38781,7 +38819,7 @@ P
 	let externalTrophyWorkerRequest = 0;
 	const externalTrophyWorkerMatches = new Map();
 
-	function loadExternalTrophyDbInWorker() {
+	function loadExternalTrophyDbInWorker(blob) {
 		if (externalTrophyWorkerDisabled || !window.Worker || !window.Blob || !window.URL) return Promise.reject(new Error('Trophy worker unavailable'));
 		const workerSource = `
 			${readExternalTrophyCatalog.toString()}
@@ -38851,11 +38889,10 @@ P
 					} else if (msg.type === 'error') fail(new Error(msg.message || 'Trophy worker failed'));
 				};
 				// Blob cloning shares immutable bytes; retain them until the worker is ready so fallback can reuse the download.
-				getExternalTrophyCatalogBlob().then(blob => {
-					if (failed) return;
+				if (!failed) {
 					timer = setTimeout(() => fail(new Error('Trophy worker timeout')), 45000);
 					worker.postMessage({type:'load',blob});
-				}).catch(fail);
+				}
 			} catch (error) { fail(error); }
 		});
 	}
@@ -38867,13 +38904,16 @@ P
 		}
 		if (externalTrophyWorkerReady || externalTrophyDbGames) return true;
 		if (externalTrophyDbPromise) return externalTrophyDbPromise;
-		const workerAvailable = !externalTrophyWorkerDisabled && window.Worker && window.Blob && window.URL;
-		const task = workerAvailable
-			? loadExternalTrophyDbInWorker().catch(err => {
-				console.warn('[System] Trophy worker unavailable. Falling back to main thread.', err);
-				return loadExternalTrophyDbOnMainThread({ background });
-			})
-			: loadExternalTrophyDbOnMainThread({ background });
+		// A network failure is not a worker failure. Both paths share the downloaded blob.
+		const task = getExternalTrophyCatalogBlob().then(blob => {
+			const workerAvailable = !externalTrophyWorkerDisabled && window.Worker && window.Blob && window.URL;
+			return workerAvailable
+				? loadExternalTrophyDbInWorker(blob).catch(err => {
+					console.warn('[System] Trophy worker unavailable. Falling back to main thread.', err);
+					return loadExternalTrophyDbOnMainThread({ background, blob });
+				})
+				: loadExternalTrophyDbOnMainThread({ background, blob });
+		});
 		externalTrophyDbPromise = task.catch(err => { externalTrophyDbPromise = null; throw err; });
 		return externalTrophyDbPromise;
 	}
@@ -42310,6 +42350,14 @@ P
 
 	const GAME_DB_LANGUAGE_CACHE_KEY = 'psn_gamedb_languages_v4_';
 	const GAME_DB_LANGUAGE_TTL = 30 * 24 * 60 * 60 * 1000;
+	const GAME_DB_LANGUAGE_MISSING_KEY = 'psn_gamedb_language_missing_v1';
+	const GAME_DB_LANGUAGE_MISSING_TTL = 60 * 60 * 1000;
+	function readGameDbMissingLanguages() {
+		try {
+			const entries = JSON.parse(localStorage.getItem(GAME_DB_LANGUAGE_MISSING_KEY) || '[]');
+			return new Map(Array.isArray(entries) ? entries.filter(entry => Array.isArray(entry) && typeof entry[0] === 'string' && Date.now() - Number(entry[1]) < GAME_DB_LANGUAGE_MISSING_TTL).slice(-128) : []);
+		} catch (e) { return new Map(); }
+	}
 	const gameDbLanguageMemory = new Map();
 	const gameDbLanguagePending = new Map();
 	function rememberGameDbLanguageMemory(key, record) {
@@ -42403,7 +42451,7 @@ P
 		const key = `${platform}:${serial}`;
 		const now = Date.now();
 		const cached = gameDbLanguageMemory.get(key);
-		if (cached && now - cached.at < (cached.failed ? 2 * 60 * 1000 : cached.languages.length ? GAME_DB_LANGUAGE_TTL : 10 * 60 * 1000)) return cached.languages;
+		if (cached && now - cached.at < (cached.failed ? 2 * 60 * 1000 : cached.languages.length ? GAME_DB_LANGUAGE_TTL : cached.missing ? GAME_DB_LANGUAGE_MISSING_TTL : 10 * 60 * 1000)) return cached.languages;
 		try {
 			const stored = JSON.parse(localStorage.getItem(GAME_DB_LANGUAGE_CACHE_KEY + key) || 'null');
 			if (stored && Array.isArray(stored.languages) && stored.languages.length && now - Number(stored.at) < GAME_DB_LANGUAGE_TTL) {
@@ -42412,12 +42460,23 @@ P
 			}
 		} catch (e) {}
 		if (gameDbLanguagePending.has(key)) return gameDbLanguagePending.get(key);
+		const missingAt = readGameDbMissingLanguages().get(key);
+		if (missingAt) {
+			rememberGameDbLanguageMemory(key, { at:missingAt, languages:[], missing:true });
+			return [];
+		}
 		const pending = (async () => {
 			const response = await fetch(`https://raw.githubusercontent.com/niemasd/GameDB-${platform}/main/games/${serial}/language.txt`);
 			if (!response.ok && response.status !== 404) throw new Error('GameDB language lookup unavailable');
 			const languages = response.ok ? extractGameDbLanguages(await response.text()) : [];
-			const record = { at: Date.now(), languages };
+			const record = { at: Date.now(), languages, missing:response.status === 404 };
 			rememberGameDbLanguageMemory(key, record);
+			if (record.missing && !window.__psnCacheRepairInProgress) {
+				const missing = readGameDbMissingLanguages();
+				missing.delete(key);
+				missing.set(key, record.at);
+				try { localStorage.setItem(GAME_DB_LANGUAGE_MISSING_KEY, JSON.stringify(Array.from(missing).slice(-128))); } catch (e) {}
+			}
 			if (languages.length && !window.__psnCacheRepairInProgress) {
 				try { localStorage.setItem(GAME_DB_LANGUAGE_CACHE_KEY + key, JSON.stringify(record)); } catch (e) {}
 			}
@@ -55467,6 +55526,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 				window.syncBrowseSurpriseButtonState(preRevealCount);
 			}
 			target.style.display = 'block';
+			if (viewId === 'view-chat' || viewId === 'view-social') window.scheduleEmojiPickerPrebuild?.(true);
 			if (viewId === 'view-explore' && typeof window.renderRecentlyVisited === 'function') window.renderRecentlyVisited();
             psnCurrentViewCache = target;
 			if (viewId === 'view-explore' && typeof resumeExploreVirtualViewportObserver === 'function') resumeExploreVirtualViewportObserver();
@@ -56192,7 +56252,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
             return Math.max(0, (container.scrollWidth || 0) - (container.clientWidth || 0));
         };
 
-        window.syncCarouselArrowState = function(containerOrId) {
+        function measureCarouselArrowState(containerOrId) {
             const container = typeof containerOrId === 'string' ? document.getElementById(containerOrId) : containerOrId;
             if (!container || !container.classList || !container.classList.contains('horizontal-scroll')) return false;
             const wrapper = container.closest ? container.closest('.carousel-wrapper') : null;
@@ -56225,8 +56285,14 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
                 }
             }
 
+            return { leftArrow, rightArrow, leftVisible, rightVisible };
+        }
+
+        function applyCarouselArrowState(state) {
+            if (!state) return false;
+            const { leftArrow, rightArrow, leftVisible, rightVisible } = state;
             const apply = (arrow, visible) => {
-                if (!arrow) return;
+                if (!arrow || !arrow.isConnected) return;
                 const wasVisible = arrow.classList.contains('carousel-arrow-visible');
                 if (wasVisible && !visible) {
                     const activatedAt = Number(arrow.__psnCarouselActivatedAt || 0);
@@ -56242,6 +56308,10 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
             apply(leftArrow, leftVisible);
             apply(rightArrow, rightVisible);
             return true;
+        }
+
+        window.syncCarouselArrowState = function(containerOrId) {
+            return applyCarouselArrowState(measureCarouselArrowState(containerOrId));
         };
 
         window.scheduleCarouselArrowSync = function(container) {
@@ -56250,8 +56320,10 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
             if (syncFrame) return true;
             syncFrame = requestAnimationFrame(() => {
                 syncFrame = 0;
-                for (const item of pending) window.syncCarouselArrowState(item);
+                const batch = Array.from(pending);
                 pending.clear();
+                const measured = batch.filter(item => item.isConnected).map(measureCarouselArrowState);
+                measured.forEach(applyCarouselArrowState);
             });
             return true;
         };
@@ -78972,45 +79044,28 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			const largeScrollJump = Number.isFinite(lastScrollTop)
 				&& Math.abs(metricScrollTop - lastScrollTop) > Math.max(600, metricClientHeight * 1.5);
 
-			if (dividerSetChanged) {
+			const previousPassedIndex = lastPassedIndex;
+			const stableBoundary =
+				(lastPassedIndex < 0 || (Number.isFinite(stickyState.lastPassedOffset) && stickyState.lastPassedOffset <= cutoff)) &&
+				(lastPassedIndex + 1 >= dividerCount || (Number.isFinite(stickyState.lastNextOffset) && stickyState.lastNextOffset > cutoff));
+			if (dividerSetChanged || largeScrollJump || !stableBoundary) {
 				lastPassedIndex = findLastPassedDividerIndex(dividerCount, cutoff);
-				reconcileDateDividerOpacity(dividerCount, lastPassedIndex);
-				stickyState.forceReconcile = false;
-			} else if (largeScrollJump) {
-				const nextPassedIndex = findLastPassedDividerIndex(dividerCount, cutoff);
-				if (nextPassedIndex > lastPassedIndex) {
-					for (let i = lastPassedIndex + 1; i <= nextPassedIndex; i++) {
-						const divider = dividers[i];
-						if (divider && divider.style.opacity !== '0') divider.style.opacity = '0';
-					}
-				} else if (nextPassedIndex < lastPassedIndex) {
-					for (let i = lastPassedIndex; i > nextPassedIndex; i--) {
-						const divider = dividers[i];
-						if (divider && divider.style.opacity !== '1') divider.style.opacity = '1';
-					}
-				}
-				lastPassedIndex = nextPassedIndex;
-			} else {
-				const stableBoundary =
-					(lastPassedIndex < 0 || (Number.isFinite(stickyState.lastPassedOffset) && stickyState.lastPassedOffset <= cutoff)) &&
-					(lastPassedIndex + 1 >= dividerCount || (Number.isFinite(stickyState.lastNextOffset) && stickyState.lastNextOffset > cutoff));
-				if (!stableBoundary) {
-					while (lastPassedIndex + 1 < dividerCount && dividers[lastPassedIndex + 1].offsetTop <= cutoff) {
-						lastPassedIndex++;
-						const div = dividers[lastPassedIndex];
-						if (div.style.opacity !== '0') div.style.opacity = '0';
-					}
-					while (lastPassedIndex >= 0 && dividers[lastPassedIndex].offsetTop > cutoff) {
-						const div = dividers[lastPassedIndex];
-						if (div.style.opacity !== '1') div.style.opacity = '1';
-						lastPassedIndex--;
-					}
-				}
 			}
-
 			if (dividerSetChanged || largeScrollJump || lastPassedIndex !== stickyState.lastPassedIndex || Number.isNaN(stickyState.lastNextOffset)) {
 				stickyState.lastPassedOffset = lastPassedIndex >= 0 ? dividers[lastPassedIndex].offsetTop : NaN;
 				stickyState.lastNextOffset = lastPassedIndex + 1 < dividerCount ? dividers[lastPassedIndex + 1].offsetTop : Infinity;
+			}
+			if (dividerSetChanged) {
+				reconcileDateDividerOpacity(dividerCount, lastPassedIndex);
+				stickyState.forceReconcile = false;
+			} else if (lastPassedIndex !== previousPassedIndex) {
+				const start = Math.min(previousPassedIndex, lastPassedIndex) + 1;
+				const end = Math.max(previousPassedIndex, lastPassedIndex);
+				const opacity = lastPassedIndex > previousPassedIndex ? '0' : '1';
+				for (let i = start; i <= end; i++) {
+					const divider = dividers[i];
+					if (divider && divider.style.opacity !== opacity) divider.style.opacity = opacity;
+				}
 			}
 			stickyState.lastScrollHeight = metricScrollHeight;
 			stickyState.lastPassedIndex = lastPassedIndex;
@@ -79025,7 +79080,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			if (box.dataset.lastLabel !== currentLabel) box.dataset.lastLabel = currentLabel;
 	
 			if (anyDividerPassed && !currentIsToday && currentLabel !== "HIDDEN_TOP") {
-				if (floatingSpan && floatingSpan.innerText !== currentLabel) floatingSpan.innerText = currentLabel;
+				if (floatingSpan && floatingSpan.textContent !== currentLabel) floatingSpan.innerText = currentLabel;
 				if (floatingPill.style.display !== 'flex') floatingPill.style.display = 'flex';
 				const nextTop = threshold + 'px';
 				if (floatingPill.style.top !== nextTop) floatingPill.style.top = nextTop;
@@ -82825,10 +82880,10 @@ function getVisibleChatStackEl(id) {
 		return entries;
 	})();
 
-	function buildEmojiPicker() {
+	function buildEmojiPicker(background = false) {
 		if (isEmojiPickerBuilt || document.getElementById('chat-input-emoji-picker')) return;
 
-		if ((window.matchMedia && window.matchMedia('(max-width: 768px)').matches) || window.innerWidth <= 768) {
+		if (!background && ((window.matchMedia && window.matchMedia('(max-width: 768px)').matches) || window.innerWidth <= 768)) {
 			const btn = document.getElementById('btn-emoji-picker');
 			if (btn) btn.style.display = 'none';
 		}
@@ -82906,41 +82961,95 @@ function getVisibleChatStackEl(id) {
 		const searchMetric = { cat:{emojis:[]}, catIndex:-1, canvasId:'chat-emoji-canvas-search', categoryTop:0, gridHeight:CHAT_EMOJI_CELL_HEIGHT_PX, rowCount:1, ready:false, canvas:resultCanvas, hover:searchResults.querySelector('.chat-emoji-hover-preview') };
 		searchMetric.hoverGlyph = searchMetric.hover.querySelector('.chat-emoji-hover-glyph');
 		if (resultCanvas) resultCanvas.__emojiRasterMetric = searchMetric;
-		const rasterizeEmojiCategory = function(metric) {
-			if (!metric || metric.ready || metric.drawing || !metric.canvas) return false;
-			const canvas = metric.canvas;
-			const dpr = Math.max(1, Math.min(Number(window.devicePixelRatio) || 1, CHAT_EMOJI_RASTER_DPR_MAX));
-			canvas.width = Math.max(1, Math.round(CHAT_EMOJI_CANVAS_WIDTH_PX * dpr));
-			canvas.height = Math.max(1, Math.round(metric.gridHeight * dpr));
-			canvas.style.width = CHAT_EMOJI_CANVAS_WIDTH_PX + 'px';
-			canvas.style.height = metric.gridHeight + 'px';
-			const ctx = canvas.getContext('2d', { alpha:true, desynchronized:true }) || canvas.getContext('2d');
-			if (!ctx) return false;
-			ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-			ctx.clearRect(0, 0, CHAT_EMOJI_CANVAS_WIDTH_PX, metric.gridHeight);
-			ctx.font = '22px "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", sans-serif';
-			ctx.textAlign = 'center';
-			ctx.textBaseline = 'middle';
-			metric.drawing = true;
-			let index = 0;
-			const drawBatch = () => {
+		const rasterQueue = [];
+		let rasterHandle = 0;
+		let rasterScheduleKind = '';
+		let rasterWarmRequested = false;
+		const canDrawEmojiRaster = () => !document.hidden && (picker.classList.contains('is-open') || document.body.classList.contains('psn-home-interactive')) && (!picker.classList.contains('is-open') || !contentArea.classList.contains('is-searching'));
+		const cancelEmojiRasterSchedule = function() {
+			if (!rasterScheduleKind) return;
+			if (rasterScheduleKind === 'frame') cancelAnimationFrame(rasterHandle);
+			else if (rasterScheduleKind === 'idle') cancelIdleCallback(rasterHandle);
+			else clearTimeout(rasterHandle);
+			rasterHandle = 0;
+			rasterScheduleKind = '';
+		};
+		const scheduleEmojiRasterBatch = function() {
+			if (!rasterQueue.length || !canDrawEmojiRaster()) { cancelEmojiRasterSchedule(); return; }
+			const active = picker.classList.contains('is-open') && rasterQueue[0].urgent;
+			const kind = active ? 'frame' : (typeof requestIdleCallback === 'function' && typeof cancelIdleCallback === 'function' ? 'idle' : 'timer');
+			if (rasterScheduleKind === kind) return;
+			cancelEmojiRasterSchedule();
+			rasterScheduleKind = kind;
+			const run = (deadline) => {
+				rasterHandle = 0;
+				rasterScheduleKind = '';
+				if (!rasterQueue.length || !canDrawEmojiRaster()) return;
+				if (kind === 'idle' && deadline.timeRemaining() < 2) { scheduleEmojiRasterBatch(); return; }
+				const job = rasterQueue[0];
+				const metric = job.metric;
+				const canvas = metric.canvas;
 				const started = performance.now();
+				const budget = kind === 'idle' ? Math.min(4, deadline.timeRemaining()) : (kind === 'frame' ? 6 : 3);
+				if (!job.ctx) {
+					const dpr = Math.max(1, Math.min(Number(window.devicePixelRatio) || 1, CHAT_EMOJI_RASTER_DPR_MAX));
+					canvas.width = Math.max(1, Math.round(CHAT_EMOJI_CANVAS_WIDTH_PX * dpr));
+					canvas.height = Math.max(1, Math.round(metric.gridHeight * dpr));
+					canvas.style.width = CHAT_EMOJI_CANVAS_WIDTH_PX + 'px';
+					canvas.style.height = metric.gridHeight + 'px';
+					const ctx = canvas.getContext('2d', { alpha:true, desynchronized:true }) || canvas.getContext('2d');
+					if (!ctx) {
+						rasterQueue.shift(); metric.drawing = false; metric.rasterUnavailable = true;
+						scheduleEmojiRasterBatch(); return;
+					}
+					ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+					ctx.clearRect(0, 0, CHAT_EMOJI_CANVAS_WIDTH_PX, metric.gridHeight);
+					ctx.font = '22px "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", sans-serif';
+					ctx.textAlign = 'center';
+					ctx.textBaseline = 'middle';
+					job.ctx = ctx;
+				}
 				let drawn = 0;
-				while (index < metric.cat.emojis.length && drawn < 24 && performance.now() - started < 6) {
+				while (job.index < metric.cat.emojis.length && drawn < 24 && (drawn === 0 || performance.now() - started < budget)) {
+					const index = job.index++;
 					const emoji = metric.cat.emojis[index];
 					const row = Math.floor(index / CHAT_EMOJI_COLUMNS);
 					const col = index % CHAT_EMOJI_COLUMNS;
-					if (emoji) ctx.fillText(emoji, (col * CHAT_EMOJI_COLUMN_STEP_PX) + (CHAT_EMOJI_CELL_WIDTH_PX / 2), (row * CHAT_EMOJI_ROW_STEP_PX) + (CHAT_EMOJI_CELL_HEIGHT_PX / 2));
-					index++;
+					if (emoji) job.ctx.fillText(emoji, (col * CHAT_EMOJI_COLUMN_STEP_PX) + (CHAT_EMOJI_CELL_WIDTH_PX / 2), (row * CHAT_EMOJI_ROW_STEP_PX) + (CHAT_EMOJI_CELL_HEIGHT_PX / 2));
 					drawn++;
 				}
-				if (index < metric.cat.emojis.length) { requestAnimationFrame(drawBatch); return; }
-				metric.drawing = false;
-				metric.ready = true;
-				canvas.dataset.emojiRasterReady = '1';
-				if (picker.classList.contains('is-open')) scheduleEmojiRasterWarm();
+				if (job.index >= metric.cat.emojis.length) {
+					rasterQueue.shift();
+					metric.drawing = false;
+					metric.ready = true;
+					canvas.dataset.emojiRasterReady = '1';
+					if (rasterMetrics.every(item => item.ready)) {
+						picker.dataset.emojiRasterWarm = '1';
+						picker.__emojiRasterWarmComplete = true;
+					}
+				}
+				scheduleEmojiRasterBatch();
 			};
-			requestAnimationFrame(drawBatch);
+			if (kind === 'frame') rasterHandle = requestAnimationFrame(run);
+			else if (kind === 'idle') rasterHandle = requestIdleCallback(run);
+			else rasterHandle = setTimeout(run, 40);
+		};
+		const rasterizeEmojiCategory = function(metric, urgent = true) {
+			if (!metric || metric.ready || metric.rasterUnavailable || !metric.canvas) return false;
+			const existing = metric.drawing ? rasterQueue.findIndex(job => job.metric === metric) : -1;
+			if (existing >= 0) {
+				if (urgent) {
+					const job = rasterQueue[existing];
+					job.urgent = true;
+					if (existing > 0) { rasterQueue.splice(existing, 1); rasterQueue.unshift(job); }
+				}
+			} else {
+				metric.drawing = true;
+				const job = { metric, urgent, index:0, ctx:null };
+				if (urgent) rasterQueue.unshift(job);
+				else rasterQueue.push(job);
+			}
+			scheduleEmojiRasterBatch();
 			return true;
 		};
 
@@ -82982,8 +83091,10 @@ function getVisibleChatStackEl(id) {
 			const drawBatch = function() {
 				emojiRasterFrame = 0;
 				if (version !== emojiSearchVersion || !picker.classList.contains('is-open')) return;
-				const until = Math.min(index + 96, matches.length);
-				for (; index < until; index++) {
+				const started = performance.now();
+				const until = Math.min(index + 48, matches.length);
+				let drawn = 0;
+				for (; index < until && (drawn === 0 || performance.now() - started < 6); index++, drawn++) {
 					const row = Math.floor(index / CHAT_EMOJI_COLUMNS);
 					const col = index % CHAT_EMOJI_COLUMNS;
 					bufferCtx.fillText(matches[index], (col * CHAT_EMOJI_COLUMN_STEP_PX) + (CHAT_EMOJI_CELL_WIDTH_PX / 2), (row * CHAT_EMOJI_ROW_STEP_PX) + (CHAT_EMOJI_CELL_HEIGHT_PX / 2));
@@ -83016,6 +83127,7 @@ function getVisibleChatStackEl(id) {
 		const updateEmojiSearch = function(rawValue, translatedQuery = '', pending = false) {
 			const query = normalizeChatEmojiSearch(rawValue);
 			contentArea.classList.toggle('is-searching', !!query);
+			scheduleEmojiRasterBatch();
 			if (!query) {
 				cancelSearchRender();
 				searchResults.classList.remove('is-empty');
@@ -83095,26 +83207,14 @@ function getVisibleChatStackEl(id) {
 			searchResults.classList.remove('is-empty');
 			contentArea.scrollTop = 0;
 			setEmojiNavActive(0);
+			scheduleEmojiRasterBatch();
 		};
-		let warmMetricIndex = 0;
-		let warmHandle = 0;
-		const warmEmojiRaster = function(deadline) {
-			warmHandle = 0;
-			if (!picker.classList.contains('is-open')) return;
-			while (warmMetricIndex < rasterMetrics.length && rasterMetrics[warmMetricIndex].ready) warmMetricIndex++;
-			if (warmMetricIndex >= rasterMetrics.length) {
-				picker.dataset.emojiRasterWarm = '1';
-				picker.__emojiRasterWarmComplete = true;
-				return;
-			}
-			const metric = rasterMetrics[warmMetricIndex];
-			if (!metric.drawing) rasterizeEmojiCategory(metric);
-		};
-
 		const scheduleEmojiRasterWarm = function() {
-			if (!picker.classList.contains('is-open') || warmMetricIndex >= rasterMetrics.length || warmHandle) return;
-			if (typeof requestIdleCallback === 'function') warmHandle = requestIdleCallback(warmEmojiRaster);
-			else warmHandle = setTimeout(function() { warmEmojiRaster(null); }, 24);
+			if (!rasterWarmRequested) {
+				rasterWarmRequested = true;
+				for (const metric of rasterMetrics) rasterizeEmojiCategory(metric, false);
+			}
+			scheduleEmojiRasterBatch();
 		};
 
 		const metricFromCanvas = function(canvas) {
@@ -83186,7 +83286,7 @@ function getVisibleChatStackEl(id) {
 					const top = contentArea.scrollTop, bottom = top + contentArea.clientHeight + 120;
 					for (const metric of rasterMetrics) {
 						if (metric.categoryTop > bottom) break;
-						if (!metric.ready && !metric.drawing && metric.categoryTop + metric.gridHeight >= top) rasterizeEmojiCategory(metric);
+						if (!metric.ready && metric.categoryTop + metric.gridHeight >= top) rasterizeEmojiCategory(metric);
 					}
 				}
 			}, { passive:true });
@@ -83242,47 +83342,64 @@ function getVisibleChatStackEl(id) {
 			});
 		}
 
-		warmMetricIndex = 0;
 		const emojiOpenObserver = new MutationObserver(() => {
 			if (picker.classList.contains('is-open')) {
 				if (rasterMetrics[0] && !rasterMetrics[0].ready) rasterizeEmojiCategory(rasterMetrics[0]);
-				scheduleEmojiRasterWarm();
+			} else {
+				for (const job of rasterQueue) job.urgent = false;
 			}
+			scheduleEmojiRasterWarm();
 		});
 		emojiOpenObserver.observe(picker, { attributes:true, attributeFilter:['class'] });
+		document.addEventListener('visibilitychange', scheduleEmojiRasterBatch);
 		picker.__emojiRasterMetrics = rasterMetrics;
 		picker.__syncEmojiCategoryNav = syncEmojiNavToScroll;
-		syncEmojiNavToScroll();
-		picker.__ensureEmojiRasterReady = function() {
-			rasterMetrics.forEach(rasterizeEmojiCategory);
-			warmMetricIndex = rasterMetrics.length;
-			if (warmHandle) {
-				if (typeof cancelIdleCallback === 'function') cancelIdleCallback(warmHandle);
-				else clearTimeout(warmHandle);
-				warmHandle = 0;
-			}
-			picker.dataset.emojiRasterWarm = '1';
-			picker.__emojiRasterWarmComplete = true;
+		setEmojiNavActive(0);
+		picker.__ensureEmojiRasterReady = scheduleEmojiRasterWarm;
+		picker.__prioritizeEmojiRaster = () => {
+			if (rasterMetrics[0] && !rasterMetrics[0].ready) rasterizeEmojiCategory(rasterMetrics[0]);
+			scheduleEmojiRasterWarm();
 		};
 		isEmojiPickerBuilt = true;
+		scheduleEmojiRasterWarm();
 	}
 
-
-	function scheduleEmojiPickerPrebuild() {
+	let emojiPickerPrebuildKind = '';
+	let emojiPickerPrebuildHandle = 0;
+	let emojiPickerPrebuildPriority = false;
+	function scheduleEmojiPickerPrebuild(priority = false) {
+		if (!document.body?.classList.contains('psn-home-interactive') || document.hidden) return;
+		if (isEmojiPickerBuilt) {
+			const picker = document.getElementById('chat-input-emoji-picker');
+			if (priority) picker?.__prioritizeEmojiRaster?.();
+			else picker?.__ensureEmojiRasterReady?.();
+			return;
+		}
+		if (emojiPickerPrebuildKind) {
+			if (!priority || emojiPickerPrebuildPriority) return;
+			if (emojiPickerPrebuildKind === 'idle') cancelIdleCallback(emojiPickerPrebuildHandle);
+			else clearTimeout(emojiPickerPrebuildHandle);
+		}
+		emojiPickerPrebuildPriority = priority;
 		const run = function() {
-			if ((window.matchMedia && window.matchMedia('(max-width: 768px)').matches) || window.innerWidth <= 768) return;
-			if (!isEmojiPickerBuilt && document.getElementById('chat-input')) buildEmojiPicker();
-
+			emojiPickerPrebuildKind = '';
+			emojiPickerPrebuildHandle = 0;
+			emojiPickerPrebuildPriority = false;
+			if (!document.body?.classList.contains('psn-home-interactive') || document.hidden) return;
+			if (!isEmojiPickerBuilt && document.getElementById('chat-input')) buildEmojiPicker(true);
 		};
-		const schedule = function() {
-			if (typeof requestIdleCallback === 'function') requestIdleCallback(run, { timeout:2400 });
-			else setTimeout(run, 1400);
-		};
-		if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', schedule, { once:true });
-		else schedule();
+		if (typeof requestIdleCallback === 'function' && typeof cancelIdleCallback === 'function') {
+			emojiPickerPrebuildKind = 'idle';
+			emojiPickerPrebuildHandle = priority ? requestIdleCallback(run, {timeout:800}) : requestIdleCallback(run);
+		} else {
+			emojiPickerPrebuildKind = 'timer';
+			emojiPickerPrebuildHandle = setTimeout(run, priority ? 80 : 160);
+		}
 	}
-
-	scheduleEmojiPickerPrebuild();
+	document.addEventListener('visibilitychange', () => {
+		if (!document.hidden) scheduleEmojiPickerPrebuild();
+	});
+	window.scheduleEmojiPickerPrebuild = scheduleEmojiPickerPrebuild;
 
 	window.sendReaction = function(msgId, emoji) {
 		const myName = localStorage.getItem('psn_username') || "Guest";
@@ -94402,6 +94519,8 @@ function getVisibleChatStackEl(id) {
 				
 				if (avatarPreview) avatarPreview.src = avatarUrl;
 				if (nameDisplay) nameDisplay.innerText = currentLoginUser;
+				const usernameField = document.getElementById('login-psn-username');
+				if (usernameField) usernameField.value = currentLoginUser;
 			}
 		});
 	
@@ -94461,6 +94580,16 @@ function getVisibleChatStackEl(id) {
 			renderProfilePs3Status(user, false);
 		};
 
+		const snapshotOnlineWireRow = row => {
+			const copy = row.slice();
+			if (copy[12] && typeof copy[12] === 'object') copy[12] = JSON.stringify(copy[12]);
+			return { row:copy, encodedStatus:!!(row[12] && typeof row[12] === 'object') };
+		};
+		const restoreOnlineWireRow = entry => {
+			const row = entry.row.slice();
+			if (entry.encodedStatus) row[12] = JSON.parse(row[12]);
+			return row;
+		};
 		socketChat.on('online_list', function(users) {
 			const countElement = document.getElementById('online-count');
 			if (users && users.onlineListDeltaV1 === 1) {
@@ -94471,11 +94600,11 @@ function getVisibleChatStackEl(id) {
 				}
 				const next = new Map(previous.byName);
 				(users.removed || []).forEach(name => next.delete(name));
-				(users.changed || []).forEach(row => { if (Array.isArray(row) && row.length >= 13) next.set(row[1], JSON.stringify(row)); });
+				(users.changed || []).forEach(row => { if (Array.isArray(row) && row.length >= 13) next.set(row[1], snapshotOnlineWireRow(row)); });
 				socketChat.__onlineListWireSnapshot = { version: users.version, byName: next };
-				users = { onlineListCompactV1: 1, rows: Array.from(next.values(), value => JSON.parse(value)) };
+				users = { onlineListCompactV1: 1, rows: Array.from(next.values(), restoreOnlineWireRow) };
 			} else if (users && users.onlineListCompactV1 === 1 && Array.isArray(users.rows) && Number(users.version) > 0) {
-				socketChat.__onlineListWireSnapshot = { version: users.version, byName: new Map(users.rows.filter(row => Array.isArray(row) && row.length >= 13).map(row => [row[1], JSON.stringify(row)])) };
+				socketChat.__onlineListWireSnapshot = { version: users.version, byName: new Map(users.rows.filter(row => Array.isArray(row) && row.length >= 13).map(row => [row[1], snapshotOnlineWireRow(row)])) };
 			} else {
 				socketChat.__onlineListWireSnapshot = null;
 			}
@@ -95807,7 +95936,7 @@ function getVisibleChatStackEl(id) {
 			while (realtimeFeedPersistedDots.size > 4) realtimeFeedPersistedDots.delete(realtimeFeedPersistedDots.keys().next().value);
 		}
 		window.persistRealtimeFeedDot = persistRealtimeFeedDot;
-		let realtimeFeedCacheFrame = 0;
+		let realtimeFeedCacheIdle = 0;
 		let realtimeFeedCacheTimer = 0;
 		function persistRealtimeFeedSnapshot(kind, key, data) {
 			if (window.__psnCacheRepairInProgress) return;
@@ -95826,9 +95955,9 @@ function getVisibleChatStackEl(id) {
 		}
 		window.persistRealtimeFeedSnapshot = persistRealtimeFeedSnapshot;
 		function flushRealtimeFeedCacheWrites() {
-			if (realtimeFeedCacheFrame) cancelAnimationFrame(realtimeFeedCacheFrame);
+			if (realtimeFeedCacheIdle) cancelIdleCallback(realtimeFeedCacheIdle);
 			if (realtimeFeedCacheTimer) clearTimeout(realtimeFeedCacheTimer);
-			realtimeFeedCacheFrame = realtimeFeedCacheTimer = 0;
+			realtimeFeedCacheIdle = realtimeFeedCacheTimer = 0;
 			if (!realtimeFeedCacheWrites.size) return;
 			const owner = String(localStorage.getItem('psn_username') || '').trim();
 			const scheduled = Array.from(realtimeFeedCacheWrites);
@@ -95843,10 +95972,10 @@ function getVisibleChatStackEl(id) {
 			const owner = String(localStorage.getItem('psn_username') || '').trim();
 			if (!owner) return;
 			realtimeFeedCacheWrites.set(kind, owner);
-			if (realtimeFeedCacheFrame || realtimeFeedCacheTimer) return;
-			if (document.hidden || typeof requestAnimationFrame !== 'function')
-				realtimeFeedCacheTimer = setTimeout(flushRealtimeFeedCacheWrites, 0);
-			else realtimeFeedCacheFrame = requestAnimationFrame(flushRealtimeFeedCacheWrites);
+			if (realtimeFeedCacheIdle || realtimeFeedCacheTimer) return;
+			if (!document.hidden && typeof requestIdleCallback === 'function' && typeof cancelIdleCallback === 'function')
+				realtimeFeedCacheIdle = requestIdleCallback(flushRealtimeFeedCacheWrites, { timeout:500 });
+			else realtimeFeedCacheTimer = setTimeout(flushRealtimeFeedCacheWrites, 0);
 		}
 		window.scheduleRealtimeFeedCacheWrite = scheduleRealtimeFeedCacheWrite;
 		window.flushRealtimeFeedCacheWrites = flushRealtimeFeedCacheWrites;
@@ -97567,6 +97696,8 @@ function getVisibleChatStackEl(id) {
 		if (name && typeof getAllUsers === 'function' && getAllUsers().includes(name)) {
 			if (avatarPreview) avatarPreview.src = localStorage.getItem(`${name}_psn_avatar`) || (typeof AVAILABLE_AVATARS !== 'undefined' ? AVAILABLE_AVATARS[0] : '');
 			if (nameDisplay) nameDisplay.innerText = name;
+			const usernameField = document.getElementById('login-psn-username');
+			if (usernameField) usernameField.value = name;
 			if (passInput) {
 				passInput.value = '';
 				passInput.style.borderColor = '';
@@ -98526,8 +98657,15 @@ function getVisibleChatStackEl(id) {
         }
 
         const history = Array.isArray(window.messageHistory) ? window.messageHistory : [];
-        if (!history.length || !getChatMentionHistoryIndices().length) return { count:0, target:null, targetIndex:-1, targetId:'' };
-        const rows = Array.from(box.querySelectorAll('[id^="msg-row-"]:not(.psn-undo-delete-pending)'));
+        if (!history.length) return { count:0, target:null, targetIndex:-1, targetId:'' };
+        const mentionIndices = getChatMentionHistoryIndices();
+        if (!mentionIndices.length) return { count:0, target:null, targetIndex:-1, targetId:'' };
+        const rows = [];
+        const pendingDeleteIds = new Set();
+        box.querySelectorAll('[id^="msg-row-"]').forEach(row => {
+            if (row.classList.contains('psn-undo-delete-pending')) pendingDeleteIds.add(String(row.getAttribute('data-chat-msg-id') || row.id || '').replace(/^msg-row-/, ''));
+            else rows.push(row);
+        });
         let rowLow = 0;
         let rowHigh = rows.length;
         while (rowLow < rowHigh) {
@@ -98542,13 +98680,12 @@ function getVisibleChatStackEl(id) {
             if (resolved > -1) visibleThroughIndex = resolved;
         }
 
-        const pendingDeleteIds = new Set(Array.from(box.querySelectorAll('[id^="msg-row-"].psn-undo-delete-pending')).map(row => String(row.getAttribute('data-chat-msg-id') || row.id || '').replace(/^msg-row-/, '')));
         const indices = pendingDeleteIds.size
-            ? getChatMentionHistoryIndices().filter(index => {
+            ? mentionIndices.filter(index => {
                 const message = history[index];
                 return !message || !pendingDeleteIds.has(getChatMessageTimeKey(message));
             })
-            : getChatMentionHistoryIndices();
+            : mentionIndices;
         let low = 0;
         let high = indices.length;
         while (low < high) {
@@ -100601,18 +100738,13 @@ function getVisibleChatStackEl(id) {
 		const onlinePlayersTitleCount = PSN_STATIC_NAV_DOM.onlinePlayersTitleCount;
 		if (onlinePlayersTitleCount) window.setLiveCountText(onlinePlayersTitleCount, `${activeCount} ${friendsOnly ? (activeCount === 1 ? 'friend' : 'friends') : (activeCount === 1 ? 'player' : 'players')}`, activeCount);
 		const rolePriority = { admin: 3, mod: 2, trusted: 1, user: 0 };
-		const sortRoleByName = new Map();
 		const sortRoleByUser = new Map();
-		for (const user of others) {
-			const name = String(user && (user.name || user) || '');
-			const role = typeof window.getPsnUserRole === 'function' ? window.getPsnUserRole(name, user) : (user && user.isAdmin ? 'admin' : 'user');
-			sortRoleByName.set(name, role);
-			sortRoleByUser.set(user, role);
-		}
 		const roleBuckets = [[], [], [], []];
 		for (const user of others) {
 			const name = String(user && (user.name || user) || '');
-			roleBuckets[rolePriority[sortRoleByName.get(name)] || 0].push(user);
+			const role = typeof window.getPsnUserRole === 'function' ? window.getPsnUserRole(name, user) : (user && user.isAdmin ? 'admin' : 'user');
+			sortRoleByUser.set(user, role);
+			roleBuckets[rolePriority[role] || 0].push(user);
 		}
 		const orderedUsers = me ? [me] : [];
 		for (let priority = roleBuckets.length - 1; priority >= 0; priority--) {
@@ -116424,16 +116556,18 @@ function getVisibleChatStackEl(id) {
 			if (document.hidden) applyRecordState(host);
 		}
 
-		function syncTarget(target) {
-			if (!(target instanceof Element)) return;
+		function readTargetAnimations(target) {
 			let current = [];
 			try { current = target.getAnimations ? target.getAnimations() : []; } catch (e) { current = []; }
 			const infinite = new Set();
 			for (const animation of current) {
 				if (isInfiniteAnimation(animation) && getAnimationHost(animation) === target) infinite.add(animation);
 			}
+			return infinite;
+		}
+
+		function syncTarget(target, infinite, affectedOwners) {
 			const previous = sourceAnimations.get(target);
-			const affectedOwners = new Set();
 
 			if (previous) {
 				for (const animation of previous) {
@@ -116449,18 +116583,23 @@ function getVisibleChatStackEl(id) {
 				const owner = animationOwner.get(animation);
 				if (owner) affectedOwners.add(owner);
 			});
-			affectedOwners.forEach(owner => { if (records.has(owner)) applyRecordState(owner); });
 		}
 
 		function flushTargetSync() {
 			syncFrame = 0;
+			const start = performance.now();
+			const measured = [];
+			const affectedOwners = new Set();
 			let processed = 0;
+			// Read animation state before registering or pausing any animation.
 			for (const target of pendingSyncTargets) {
 				pendingSyncTargets.delete(target);
-				if (target.isConnected) syncTarget(target);
-				if (++processed >= 12) break;
+				if (target.isConnected) measured.push([target, readTargetAnimations(target)]);
+				if (++processed >= 12 || performance.now() - start >= 6) break;
 			}
-			if (pendingSyncTargets.size) syncFrame = requestAnimationFrame(flushTargetSync);
+			for (const [target, infinite] of measured) syncTarget(target, infinite, affectedOwners);
+			affectedOwners.forEach(owner => { if (records.has(owner)) applyRecordState(owner); });
+			if (pendingSyncTargets.size && !syncFrame) syncFrame = requestAnimationFrame(flushTargetSync);
 		}
 
 		function queueTargetSync(target) {
@@ -116482,7 +116621,7 @@ function getVisibleChatStackEl(id) {
 		document.addEventListener('animationstart', event => {
 			queueTargetSync(event.target);
 		}, true);
-		document.addEventListener('animationcancel', event => { queueTargetSync(event.target); }, true);
+		document.addEventListener('animationcancel', event => { if (sourceAnimations.has(event.target) || pendingSyncTargets.has(event.target)) queueTargetSync(event.target); }, true);
 		document.addEventListener('animationend', event => { if (records.has(event.target) || sourceAnimations.has(event.target)) queueTargetSync(event.target); }, true);
 
 		let animationCleanupObserver = null;
@@ -116873,7 +117012,7 @@ function getVisibleChatStackEl(id) {
                 pageFadeBottom.setAttribute('aria-hidden', 'true');
                 document.body.append(pageFadeTop, pageFadeBottom);
             }
-            const g = measured || measurePageFade(main, showTop);
+            const g = measured === undefined ? measurePageFade(main, showTop) : measured;
             if (!g) return;
             const geometry = [Math.round(g.left),Math.round(g.width),Math.round(g.top),Math.round(g.bottom)].join(',');
             if (pageFadeGeometry !== geometry) {
@@ -116897,9 +117036,11 @@ function getVisibleChatStackEl(id) {
             if (full || !sizes || now - sizes.at > 1500) {
                 const vertical = directions ? directions.vertical : el.matches(edgeSelector);
                 const horizontal = directions ? directions.horizontal : el.matches(horizontalSelector);
-                const visible = el.clientWidth > 0 && el.clientHeight > 0;
-                const maxY = vertical && visible ? Math.max(0, el.scrollHeight - el.clientHeight) : 0;
-                const maxX = horizontal && visible ? Math.max(0, el.scrollWidth - el.clientWidth) : 0;
+                const width = el.clientWidth;
+                const height = el.clientHeight;
+                const visible = width > 0 && height > 0;
+                const maxY = vertical && visible ? Math.max(0, el.scrollHeight - height) : 0;
+                const maxX = horizontal && visible ? Math.max(0, el.scrollWidth - width) : 0;
                 sizes = { hasY:maxY > 4, hasX:maxX > 4, maxY, maxX, at:now };
                 edgeSizes.set(el, sizes);
             }
@@ -116926,6 +117067,7 @@ function getVisibleChatStackEl(id) {
         function flushScheduledEdges() {
             pendingEdgeFrame = 0;
             const measurements = [];
+            const start = performance.now();
             let processed = 0;
             for (const el of pendingEdges) {
                 pendingEdges.delete(el);
@@ -116933,7 +117075,7 @@ function getVisibleChatStackEl(id) {
                 edgesNeedingMeasure.delete(el);
                 const state = measureEdge(el, full);
                 if (state) measurements.push([el, state]);
-                if (++processed >= 12) break;
+                if (++processed >= 12 || performance.now() - start >= 6) break;
             }
             for (const [el, state] of measurements) applyEdgeState(el, state);
             if (pendingEdges.size) pendingEdgeFrame = requestAnimationFrame(flushScheduledEdges);
@@ -117065,12 +117207,15 @@ function getVisibleChatStackEl(id) {
                 }
             }
             const processed = [];
+            const start = performance.now();
             let scanned = 0;
             for (const root of pendingRoots) {
                 processed.push(root);
-                if (isCoveredByQueuedAncestor(root, pendingRoots) || !root.isConnected) continue;
-                scan(root);
-                if (++scanned >= 12) break;
+                if (!isCoveredByQueuedAncestor(root, pendingRoots) && root.isConnected) {
+                    scan(root);
+                    scanned++;
+                }
+                if (scanned >= 12 || performance.now() - start >= 6) break;
             }
             for (const root of processed) pendingRoots.delete(root);
             if (pendingRoots.size) pendingScanFrame = requestAnimationFrame(flushEdgeChanges);
