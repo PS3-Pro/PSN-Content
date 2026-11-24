@@ -38573,7 +38573,7 @@ P
 	}
 
 	async function loadExternalTrophyDbOnMainThread() {
-		const response = await fetch(EXTERNAL_TROPHY_DB_URL, { cache: 'force-cache' });
+		const response = await fetch(EXTERNAL_TROPHY_DB_URL, { cache: 'no-cache' });
 		if (!response.ok) throw new Error('Failed to load trophy database');
 		const buffer = await response.arrayBuffer();
 		let text = '';
@@ -38623,7 +38623,7 @@ P
 			self.onmessage = async function(event) {
 				if (!event.data || event.data.type !== 'load') return;
 				try {
-					const response = await fetch(EXTERNAL_TROPHY_DB_URL, { cache: 'force-cache' });
+					const response = await fetch(EXTERNAL_TROPHY_DB_URL, { cache: 'no-cache' });
 					if (!response.ok) throw new Error('Failed to load trophy database');
 					const buffer = await response.arrayBuffer();
 					let text = '';
@@ -38761,7 +38761,54 @@ P
 	}
 
 
+	// Keep the old site's tolerant trophy lookup while protecting different sequels.
+	function gameTrophyComparableTitle(value) {
+	  const roman = {ii:'2',iii:'3',iv:'4',v:'5',vi:'6',vii:'7',viii:'8',ix:'9',x:'10',xi:'11',xii:'12',xiii:'13',xiv:'14',xv:'15'};
+	  return String(value || '').replace(/\b(?:xv|xiv|xiii|xii|xi|x|ix|viii|vii|vi|v|iv|iii|ii)\b/gi, n => roman[n.toLowerCase()] || n);
+	}
+	function gameTrophyTitleMatchScore(left, right) {
+	  if (!left || !right) return 0;
+	  const a = gameTrophyComparableTitle(left);
+	  const b = gameTrophyComparableTitle(right);
+	  if (a === b) return 120;
+	  const aNums = [...a.matchAll(/\b\d+\b/g)].map(x => x[0]).sort().join(',');
+	  const bNums = [...b.matchAll(/\b\d+\b/g)].map(x => x[0]).sort().join(',');
+	  if (aNums !== bNums) return 0; // Never merge different sequels.
+	  const short = a.length < b.length ? a : b;
+	  const long = a.length < b.length ? b : a;
+	  if (short.length >= 6 && (long.startsWith(short + ' ') || long.endsWith(' ' + short))) {
+	    return Math.max(89, 106 - Math.min(17, Math.abs(long.length - short.length) / 2));
+	  }
+	  const aTokens = [...new Set(a.split(' ').filter(x => x.length > 1))];
+	  const bTokens = [...new Set(b.split(' ').filter(x => x.length > 1))];
+	  if (!aTokens.length || !bTokens.length) return 0;
+	  const shared = aTokens.filter(x => bTokens.includes(x)).length;
+	  const coverage = shared / Math.max(aTokens.length, bTokens.length);
+	  return coverage >= .72 && shared >= 2 ? 67 + coverage * 24 : 0;
+	}
+	function gameTrophySearchTokens(title) {
+	  const skip = new Set(['the','and','for','with','from','into','game','edition','ps3','playstation','part']);
+	  return [...new Set(gameTrophyComparableTitle(title).split(' ').filter(x => x.length >= 3 && !skip.has(x) && !/^\d+$/.test(x)))];
+	}
+	function gameTrophyCandidateTitles(search, inverted) {
+	  const lists = gameTrophySearchTokens(search).map(token => inverted.get(token))
+	    .filter(list => list && list.length).sort((a,b) => a.length-b.length);
+	  if (!lists.length) return [];
+	  // A rare subtitle token can belong to a different game. Search the union,
+	  // not just the rarest token, or valid base-title trophies disappear.
+	  const seen = new Set(), candidates = [];
+	  for (const list of lists) {
+	    for (const title of list) {
+	      if (seen.has(title)) continue;
+	      seen.add(title);
+	      candidates.push(title);
+	      if (candidates.length >= 4000) return candidates;
+	    }
+	  }
+	  return candidates;
+	}
 	let externalTrophyExactIndex = null;
+	let externalTrophyTokenIndex = null;
 	function findExternalTrophyGame(localGame = {}) {
 		if (!Array.isArray(externalTrophyDbGames) || !externalTrophyDbGames.length) return null;
 		const localTitle = normalizeGameTrophyTitle(localGame.cleanName || localGame.name || localGame.title || '');
@@ -38770,19 +38817,38 @@ P
 		if (externalTrophyMatchCache.has(cacheKey)) return externalTrophyMatchCache.get(cacheKey);
 		if (!externalTrophyExactIndex) {
 			externalTrophyExactIndex = new Map();
+			externalTrophyTokenIndex = new Map();
 			for (const entry of externalTrophyDbGames) {
 				if (!/ps3|playstation 3/i.test(String(entry.platform || ''))) continue;
 				const title = normalizeGameTrophyTitle(entry.title);
 				if (!title) continue;
-				if (!externalTrophyExactIndex.has(title)) externalTrophyExactIndex.set(title, new Map());
+				if (!externalTrophyExactIndex.has(title)) {
+					externalTrophyExactIndex.set(title, new Map());
+					for (const token of gameTrophySearchTokens(title)) {
+						if (!externalTrophyTokenIndex.has(token)) externalTrophyTokenIndex.set(token, []);
+						externalTrophyTokenIndex.get(token).push(title);
+					}
+				}
 				externalTrophyExactIndex.get(title).set(entry.npCommunicationId, entry);
 			}
 		}
-		const matches = externalTrophyExactIndex.get(localTitle);
-		const resolved = !matches ? null : matches.size === 1 ? matches.values().next().value : undefined;
-		externalTrophyMatchCache.set(cacheKey, resolved);
+		let matched = externalTrophyExactIndex.get(localTitle);
+		let ambiguous = false;
+		if (!matched) {
+			let bestScore = 0, runnerUp = 0, bestTitle = '';
+			for (const candidate of gameTrophyCandidateTitles(localTitle, externalTrophyTokenIndex)) {
+				const score = gameTrophyTitleMatchScore(localTitle, candidate);
+				if (score > bestScore) {runnerUp = bestScore; bestScore = score; bestTitle = candidate;}
+				else if (score > runnerUp) runnerUp = score;
+			}
+			// Similar-title fallback: never guess when two different matches are nearly tied.
+			if (bestScore >= 84 && bestScore - runnerUp >= 4) matched = externalTrophyExactIndex.get(bestTitle);
+			else if (bestScore >= 84) ambiguous = true;
+		}
+		const result = ambiguous ? undefined : !matched ? null : matched.size === 1 ? matched.values().next().value : undefined;
+		externalTrophyMatchCache.set(cacheKey, result);
 		while (externalTrophyMatchCache.size > EXTERNAL_TROPHY_MATCH_CACHE_MAX) externalTrophyMatchCache.delete(externalTrophyMatchCache.keys().next().value);
-		return resolved;
+		return result;
 	}
 
 	const trophyMatchPending = new Map();
@@ -38805,6 +38871,7 @@ P
 	const trophyDbKnown = new Map();
 	const trophyDbGameById = new Map();
 	const trophyDbWritePending = new Set();
+	const trophyDbPositiveProbes = new Set();
 	let activeModalTrophyGame = null;
 	function gameTrophyCacheKey(game) {
 		return `ps3|${normalizeGameTrophyTitle(game.cleanName || game.name || game.title || '')}`;
@@ -38823,7 +38890,7 @@ P
 		const title = game.cleanName || game.name || game.title || '';
 		const key=gameTrophyCacheKey(game);
 		if (trophyDbWritePending.has(key)) return;
-		if (match && normalizeGameTrophyTitle(match.title) !== normalizeGameTrophyTitle(title)) return;
+		if (match && gameTrophyTitleMatchScore(normalizeGameTrophyTitle(match.title), normalizeGameTrophyTitle(title)) < 84) return;
 		const body=JSON.stringify({platform:'ps3',title,hasTrophies:!!match,game:match||null});
 		const keepalive = new Blob([body]).size < 60000;
 		trophyDbWritePending.add(key);
@@ -38838,6 +38905,10 @@ P
 						const data=await response.json();
 						if(data.ok&&data.saved)return;
 					}
+					if(response.status===503){
+						const issue=await response.json().catch(()=>null);
+						if(issue?.reason==='trophy_source_stale')return;
+					}
 					if(response.status>=400&&response.status<500&&response.status!==429)return;
 				}catch(err){}
 				if(attempt<2)await new Promise(resolve=>setTimeout(resolve,500*(attempt+1)));
@@ -38845,20 +38916,43 @@ P
 		};
 		save().catch(()=>{}).finally(()=>trophyDbWritePending.delete(key));
 	}
+	async function probePositiveTrophyCache(title) {
+		const controller=new AbortController();
+		const timer=setTimeout(()=>controller.abort(),1200);
+		try {
+			const response=await fetch(`${gameTrophyServerBase()}/api/game-trophies/cache?platform=ps3&title=${encodeURIComponent(title)}`,
+				{signal:controller.signal,cache:'no-store'});
+			if (!response.ok) return null;
+			const data=await response.json();
+			const candidate=data.ok&&data.known===true&&data.hasTrophies===true?data.game:null;
+			return candidate&&Array.isArray(candidate.trophies)&&candidate.trophies.length&&
+				/ps3|playstation 3/i.test(String(candidate.platform||''))&&
+				gameTrophyTitleMatchScore(normalizeGameTrophyTitle(candidate.title),title)>=84?candidate:null;
+		} catch(_) {return null;}
+		finally {clearTimeout(timer);}
+	}
 	function prepareGameTrophyMatch(game, category, immediate = false) {
 		if (!isPs3TrophyGame(game, category)) return Promise.resolve(null);
 		const title=normalizeGameTrophyTitle(game.cleanName || game.name || game.title || '');
 		if (!title) return Promise.resolve(null);
 		const key=gameTrophyCacheKey(game);
-		if (trophyDbKnown.has(key)) return Promise.resolve(trophyDbKnown.get(key));
+		if (trophyDbKnown.has(key) && (!immediate || trophyDbKnown.get(key)!==null || trophyDbPositiveProbes.has(key)))
+			return Promise.resolve(trophyDbKnown.get(key));
 		const pending=trophyMatchPending.get(key);
 		if (pending) return pending;
 		const task=(async()=>{
 			if (externalTrophyDbGames) {
-				const match=findExternalTrophyGame(game);
+				let match=findExternalTrophyGame(game);
+				let verifiedInDb=false;
+				if (match === null && immediate && !trophyDbPositiveProbes.has(key)) {
+					trophyDbPositiveProbes.add(key);
+					while (trophyDbPositiveProbes.size>100) trophyDbPositiveProbes.delete(trophyDbPositiveProbes.values().next().value);
+					const verified=await probePositiveTrophyCache(title);
+					if (verified) { match=verified; verifiedInDb=true; }
+				}
 				if (match !== undefined) {
 					keepTrophyDbKnown(key,match);
-					saveGameTrophyDbMatch(game,match);
+					if (!verifiedInDb && (match || immediate)) saveGameTrophyDbMatch(game,match);
 				}
 				return match;
 			}
@@ -38893,7 +38987,7 @@ P
 			const match=findExternalTrophyGame(game);
 			if (match !== undefined) {
 				keepTrophyDbKnown(key,match);
-				saveGameTrophyDbMatch(game,match);
+				if (match || immediate) saveGameTrophyDbMatch(game,match);
 			}
 			return match;
 		})();
@@ -121081,6 +121175,7 @@ function getVisibleChatStackEl(id) {
       const host = url.hostname.toLowerCase();
       return url.protocol === 'https:' &&
         ((host === 'api.audius.co' && /^\/v1\/tracks\/[a-z0-9_-]{3,64}\/stream$/i.test(url.pathname)) ||
+        (host === 'youtube.ps3-pro.workers.dev' && /^\/audio\/[a-z0-9_-]{11}\.m4a$/i.test(url.pathname)) ||
         ((host === 'archive.org' || host.endsWith('.archive.org')) &&
         /\.(?:mp3|m4a|ogg|opus|aac)$/i.test(url.pathname)));
     } catch (_) { return false; }
@@ -121173,7 +121268,7 @@ function getVisibleChatStackEl(id) {
     if (inflight.has(cacheKey)) return inflight.get(cacheKey);
     const base = String(typeof getMetadataServerBaseCompat === 'function'
       ? getMetadataServerBaseCompat() : 'https://psn-content-fd6j.onrender.com').replace(/\/+$/, '');
-    const pending = fetch(base + '/api/game-theme?v=gts11&name=' + encodeURIComponent(name) +
+    const pending = fetch(base + '/api/game-theme?v=gts13&name=' + encodeURIComponent(name) +
       (skip ? '&skip=' + encodeURIComponent(skip) : ''), { cache:'default' })
       .then(response => { if (!response.ok) throw new Error('Game theme lookup unavailable'); return response.json(); })
       .then(result => {
@@ -121299,7 +121394,7 @@ function getVisibleChatStackEl(id) {
     const previous = String(active.result.provider || '').toLowerCase().replace(/[^a-z]/g,'');
     if (previous) active.failedProviders.add(previous);
     const skip = [...active.failedProviders].sort().join(',');
-    if (active.failedProviders.size >= 2) {
+    if (active.failedProviders.size >= 3) {
       active.recovering=false;
       active.result = null;
       updateButton('blocked');
