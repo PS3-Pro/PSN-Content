@@ -2179,32 +2179,42 @@ let ssPreviewMinuteUsed = 0;
 let ssPreviewDailyUsed = 0;
 let ssPreviewDailyDate = '';
 const ssPreviewQuota = { minuteMax:SS_PREVIEW_FALLBACK_MINUTE_MAX,
-  dayMax:SS_PREVIEW_FALLBACK_DAILY_MAX, threadsMax:1, source:'unknown', reportedToday:null,
-  reportedAtLocalUsed:0, checkedAt:0, nextCheck:0, blockedUntil:0 };
-let ssPreviewQuotaPending = null;
+  dayMax:SS_PREVIEW_FALLBACK_DAILY_MAX, threadsMax:SS_PREVIEW_USER && SS_PREVIEW_PASSWORD ? 2 : 1, source:'unknown', reportedToday:null,
+  reportedAtLocalUsed:0, checkedAt:0, blockedUntil:0 };
 let ssProviderActive = 0;
+let ssProviderImagesActive = 0;
+let ssProviderVideosActive = 0;
 const ssProviderWaiters = [];
 function ssProviderPump() {
   const max = Math.min(4,Math.max(1,ssPreviewQuota.threadsMax || 1));
   while (ssProviderActive < max && ssProviderWaiters.length) {
-    const job = ssProviderWaiters.shift();
+    // Reserve capacity for gameplay when parallel requests are available.
+    const index = ssProviderWaiters.findIndex(job =>
+      (job.kind !== 'image' || ssProviderImagesActive < Math.max(1,max-1)) &&
+      (job.kind !== 'video' || ssProviderVideosActive < 3));
+    if (index < 0) break;
+    const job = ssProviderWaiters.splice(index,1)[0];
     if (job.done) continue;
     job.done=true;
     clearTimeout(job.timeout);
     if (job.signal) job.signal.removeEventListener('abort',job.cancel);
     ssProviderActive++;
+    if (job.kind === 'image') ssProviderImagesActive++;
+    if (job.kind === 'video') ssProviderVideosActive++;
     let released=false;
     job.resolve(()=>{
       if (released) return;
       released=true;
       ssProviderActive--;
+      if (job.kind === 'image') ssProviderImagesActive--;
+      if (job.kind === 'video') ssProviderVideosActive--;
       ssProviderPump();
     });
   }
 }
 function ssProviderAcquire(kind='search',signal) {
   if (signal?.aborted) return Promise.reject(Object.assign(new Error('aborted'),{name:'AbortError'}));
-  if (ssProviderWaiters.length >= 40)
+  if (ssProviderWaiters.length >= (kind==='video'?40:36))
     return Promise.reject(Object.assign(new Error('ScreenScraper queue busy'),{status:503,code:'provider_queue_full'}));
   return new Promise((resolve,reject)=>{
     const job={kind,signal,resolve,reject,done:false,timeout:null,cancel:null};
@@ -2217,6 +2227,7 @@ function ssProviderAcquire(kind='search',signal) {
       if (idx!==-1) ssProviderWaiters.splice(idx,1);
       reject(Object.assign(new Error(reason),{status:503,code:'provider_queue_timeout',
         name:reason==='aborted'?'AbortError':'Error'}));
+      ssProviderPump();
     };
     job.cancel=()=>cancel('aborted');
     if (signal) signal.addEventListener('abort',job.cancel,{once:true});
@@ -2242,7 +2253,7 @@ function ssPreviewQuotaRoll() {
   if (ssPreviewDailyDate !== day) {
     ssPreviewDailyDate=day; ssPreviewDailyUsed=0;
     ssPreviewQuota.reportedToday=null; ssPreviewQuota.reportedAtLocalUsed=0;
-    ssPreviewQuota.nextCheck=0; ssPreviewQuota.source='unknown';
+    ssPreviewQuota.source='unknown';
     ssPreviewQuota.minuteMax=SS_PREVIEW_FALLBACK_MINUTE_MAX;
     ssPreviewQuota.dayMax=SS_PREVIEW_FALLBACK_DAILY_MAX;
     ssPreviewQuota.blockedUntil=0;
@@ -2266,7 +2277,7 @@ function ssPreviewQuotaFromResponse(data) {
     ssPreviewQuotaRoll();
     if (perMin) ssPreviewQuota.minuteMax=perMin;
     if (perDay) ssPreviewQuota.dayMax=perDay;
-    if (threads) {ssPreviewQuota.threadsMax=Math.min(4,threads);ssProviderPump();}
+    if (threads) ssPreviewQuota.threadsMax=Math.min(4,threads);
     const used=ssPreviewQuotaInteger(user.requeststoday, 1000000);
     if (used!==null) {
       ssPreviewQuota.reportedToday=used;
@@ -2305,33 +2316,6 @@ function ssPreviewQuotaNoteRate(status) {
     }
     ssPreviewQuota.blockedUntil=Math.max(ssPreviewQuota.blockedUntil,hi+5000);
   }
-}
-async function ssPreviewMaybeRefreshQuota() {
-  if (!SS_PREVIEW_USER || !SS_PREVIEW_PASSWORD) return;
-  ssPreviewQuotaRoll();
-  if (Date.now()<ssPreviewQuota.nextCheck) return;
-  if (ssPreviewQuotaPending) return ssPreviewQuotaPending;
-  ssPreviewQuota.nextCheck=Date.now()+20*60*1000;
-  ssPreviewQuotaPending=(async()=>{
-    const release = await ssProviderAcquire('info');
-    try {
-      ssPreviewQuotaReserve('search');
-      const url=new URL('https://api.screenscraper.fr/api2/ssuserInfos.php');
-    url.searchParams.set('devid',SS_PREVIEW_DEVID);
-    url.searchParams.set('devpassword',SS_PREVIEW_DEVPASSWORD);
-    url.searchParams.set('softname','PSN-Content');
-    url.searchParams.set('output','json');
-    url.searchParams.set('ssid',SS_PREVIEW_USER);
-    url.searchParams.set('sspassword',SS_PREVIEW_PASSWORD);
-    const response=await requestMetadataJson(url,{timeoutMs:6000,headers:{'User-Agent':'PSN-Content/1.0 ScreenScraper-Preview'}});
-      if (!response.ok) {ssPreviewQuotaNoteRate(Number(response.status));ssPreviewQuota.nextCheck=Date.now()+60000;return;}
-      if (!ssPreviewQuotaFromResponse(response.data)) ssPreviewQuota.nextCheck=Date.now()+60000;
-      else console.info('[ScreenScraper quota]',JSON.stringify({
-        threads:ssPreviewQuota.threadsMax,perMinute:ssPreviewQuota.minuteMax,
-        perDay:ssPreviewQuota.dayMax,usedToday:ssPreviewQuota.reportedToday}));
-    } finally { release(); }
-  })().catch(()=>{ssPreviewQuota.nextCheck=Date.now()+60000;}).finally(()=>{ssPreviewQuotaPending=null;});
-  return ssPreviewQuotaPending;
 }
 const ssPreviewCache = new Map();
 const ssPreviewInflight = new Map();
@@ -2831,7 +2815,6 @@ function ssPreviewFetchUpstream(name, systemId, key) {
     };
     let bestMediaRank = 0;
     for (const searchName of searches) {
-      await ssPreviewMaybeRefreshQuota();
       const release = await ssProviderAcquire('search');
       let response;
       try {
@@ -2848,10 +2831,10 @@ function ssPreviewFetchUpstream(name, systemId, key) {
         url.searchParams.set('sspassword', SS_PREVIEW_PASSWORD);
       }
         response = await requestMetadataJson(url, { timeoutMs:9000, headers:{ 'User-Agent':'PSN-Content/1.0 ScreenScraper-Preview' } });
+        ssPreviewQuotaNoteRate(Number(response.status));
+        if (response.ok) ssPreviewQuotaFromResponse(response.data);
       } finally {release();}
-      ssPreviewQuotaNoteRate(Number(response.status));
       if (Number(response.status) === 404) continue; // Try alternate article ordering.
-      if (response.ok) ssPreviewQuotaFromResponse(response.data);
       if (!response.ok || !response.data || typeof response.data !== 'object') {
         const error = new Error('ScreenScraper search unavailable.');
         error.status = [429,430].includes(Number(response.status)) ? 429 : 502;
@@ -2928,7 +2911,6 @@ function ssPreviewLookup(name, systemId, options = null) {
     (!requireArtwork || (!result.found && !result.extras) || result.extras?.artworkChecked === true);
   const cached = ssPreviewGetCached(key);
   if (ready(cached)) return Promise.resolve(cached);
-  if (cached) ssPreviewCache.delete(key);
   if (ssPreviewInflight.has(key)) return ssPreviewInflight.get(key);
   const work = ssPreviewLoadDatabase(key, systemId).then(result =>
     ready(result) ? result : ssPreviewFetchUpstream(name, systemId, key).catch(error => {
@@ -3088,17 +3070,8 @@ app.get('/api/gameplay-video', async (req,res) => {
   const failure = ssVideoFailures.get(key);
   if (failure && failure.until > Date.now()) return fail(failure.error.status || 502,
     failure.error.code || 'upstream_unavailable',failure.error.upstreamStatus || 0);
-  if(ssVideoActive>=3) {
-    let closed=false;
-    const onClose=()=>{closed=true;};
-    res.once('close',onClose);
-    const until=Date.now()+3500;
-    while(!closed && !res.destroyed && ssVideoActive>=3 && Date.now()<until)
-      await new Promise(resolve=>setTimeout(resolve,100));
-    res.off('close',onClose);
-    if(closed||res.destroyed)return;
-    if(ssVideoActive>=3)return fail(503,'video_stream_busy');
-  }
+  // Wait for the shared provider scheduler instead of polling every 100 ms.
+  if (ssVideoActive>=12) return fail(503,'video_stream_busy');
   ssVideoActive++;
   const controller = new AbortController();
   const deadline = setTimeout(() => controller.abort(),120000);
@@ -3111,7 +3084,6 @@ app.get('/api/gameplay-video', async (req,res) => {
   };
   res.once('close',()=>{controller.abort();release();});
   try {
-    await ssPreviewMaybeRefreshQuota();
     if (res.destroyed) return;
     const mediaUrl = ssVideoUpstreamUrl(video);
     let upstream;
@@ -3128,6 +3100,7 @@ app.get('/api/gameplay-video', async (req,res) => {
         upstream=await ssVideoRequest(mediaUrl,controller.signal,'');
       } catch (second) {releaseProvider();throw second;}
     }
+    upstream.once('end',releaseProvider);
     upstream.once('close',releaseProvider);
     res.once('close',releaseProvider);
     if (res.destroyed) {upstream.destroy();return;}
@@ -3199,8 +3172,8 @@ app.get('/api/gameplay-video', async (req,res) => {
         values: [video.g,video.s], query_timeout: 2500
       }).catch(()=>{});
     }
-    if (error && error.code !== 'provider_cooldown' &&
-        ![429,430].includes(Number(error.upstreamStatus)) && error.name !== 'AbortError')
+    if (error && !['provider_cooldown','provider_queue_full','provider_queue_timeout'].includes(error.code) &&
+        ![429,430,503].includes(Number(error.upstreamStatus)) && error.name !== 'AbortError')
       ssVideoFailures.set(key,{error,until:Date.now()+(error?.upstreamStatus === 429 ? 120000 :
         [401,403].includes(error?.upstreamStatus) ? 300000 : 30000)});
     fail(error?.status || 502,error?.code || 'video_stream_failed',error?.upstreamStatus || 0);
@@ -4145,6 +4118,7 @@ app.get('/api/game-theme', async (req,res) => {
 app.options('/api/gameplay-preview', (req, res) => { setMetadataCors(res); res.status(204).end(); });
 app.get('/api/gameplay-preview', async (req, res) => {
   setMetadataCors(res);
+  res.setHeader('Access-Control-Expose-Headers','Retry-After');
   res.setHeader('Cache-Control', 'no-store');
   if (!SS_PREVIEW_ENABLED) return res.status(503).json({ ok:false, configured:false });
   const name = String(req.query && req.query.name || '').trim().slice(0, 140);
@@ -4162,7 +4136,7 @@ app.get('/api/gameplay-preview', async (req, res) => {
   } catch (error) {
     const reason = ['api_auth','api_rate_limit','api_unavailable','api_rejected','provider_cooldown','provider_queue_full'].includes(error && error.code) ? error.code : 'api_unavailable';
     if(error?.status===429||error?.status===503)
-      res.setHeader('Retry-After',String(Math.min(3600,Math.max(2,Number(error.retryAfter)||60))));
+      res.setHeader('Retry-After',String(Math.min(3600,Math.max(2,Number(error.retryAfter)||(error.status===503?5:60)))));
     return res.status([429,503].includes(Number(error?.status)) ? error.status : 502).json({ ok:false, configured:true, retry:true, reason, upstreamStatus:Number(error && error.upstreamStatus) || 0 });
   }
 });
@@ -4211,7 +4185,6 @@ async function ssExtraFetchImage(data) {
   const controller=new AbortController();
   const timer=setTimeout(()=>controller.abort(),18000);
   try {
-    await ssPreviewMaybeRefreshQuota();
     const release=await ssProviderAcquire('image',controller.signal);
     let body;
     try {
@@ -4263,7 +4236,6 @@ app.get('/api/screenscraper-manual',async(req,res)=>{
   if(SS_PREVIEW_USER && SS_PREVIEW_PASSWORD){url.searchParams.set('ssid',SS_PREVIEW_USER);url.searchParams.set('sspassword',SS_PREVIEW_PASSWORD);}
   const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),18000);
   try {
-    await ssPreviewMaybeRefreshQuota();
     const release=await ssProviderAcquire('image',controller.signal);
     let pdf;
     try {

@@ -120726,7 +120726,7 @@ function getVisibleChatStackEl(id) {
   const cache = new Map(), pending = new Map(), failures = new Map();
   let lookupBlockedUntil=0, videoBlockedUntil=0, recentVideoErrors=[];
   const cardVideos=new Map(), modalVideos=new WeakMap();
-  const MAX_CARD_VIDEOS=12, VIDEO_RECHECK_MS=12*60*60*1000, HOVER_REVEAL_DELAY_MS=320, HOVER_LOOKUP_DELAY_MS=180;
+  const MAX_CARD_VIDEOS=12, VIDEO_RECHECK_MS=12*60*60*1000, HOVER_REVEAL_DELAY_MS=320;
   const sessionPrefix='psn-ss-gameplay-v2:';
   function sessionResult(info,clear=false) {
     try {
@@ -120778,7 +120778,7 @@ function getVisibleChatStackEl(id) {
       .then(async response=>{
         if(response.status===429||response.status===503){
           const retrySeconds=Number(response.headers.get('Retry-After'))||(response.status===429?60:5);
-          lookupBlockedUntil=Math.max(lookupBlockedUntil,Date.now()+Math.min(120000,Math.max(response.status===429?10000:5000,retrySeconds*1000)));
+          if(response.status===429)lookupBlockedUntil=Math.max(lookupBlockedUntil,Date.now()+Math.min(120000,Math.max(10000,retrySeconds*1000)));
           return {ok:false,data:{ok:false,reason:response.status===429?'rate_limited':'api_unavailable'}};
         }
         const data=await response.json().catch(()=>null);
@@ -120849,6 +120849,13 @@ function getVisibleChatStackEl(id) {
   }
   function parkVideo(video) {
     if(!video||video.error||!video.dataset.previewKey)return;
+    // Do not let abandoned, still-buffering previews occupy provider slots.
+    let complete=false;
+    try{complete=Number.isFinite(video.duration)&&video.duration>0&&video.buffered.length===1&&video.buffered.start(0)<.1&&video.buffered.end(0)>=video.duration-.1;}catch(_){}
+    if(!complete&&(video.readyState<2||video.networkState===2)){
+      for(const [node,old] of cardVideos)if(old===video)cardVideos.delete(node);
+      dispose(video);return;
+    }
     const key=video.dataset.previewKey;
     const previous=parkedVideos.get(key);
     if(previous&&previous!==video)dispose(previous);
@@ -120901,7 +120908,10 @@ function getVisibleChatStackEl(id) {
       const now=Date.now();
       recentVideoErrors=recentVideoErrors.filter(t=>now-t<30000);recentVideoErrors.push(now);
       if(recentVideoErrors.length>=3)videoBlockedUntil=Math.max(videoBlockedUntil,now+Math.min(60000,5000*2**Math.min(4,recentVideoErrors.length-3)));
-      failures.set(info.key,now+15000);cache.delete(info.key);sessionResult(info,true);
+      for(const [key,until] of failures)if(until<=now)failures.delete(key);
+      failures.set(info.key,now+15000);
+      while(failures.size>250)failures.delete(failures.keys().next().value);
+      cache.delete(info.key);sessionResult(info,true);
       if(regionWarm?.video===video){regionWarm.video=null;regionWarm.state='error';regionWarm.retryAfter=now+30000;}
       if(parkedVideos.get(info.key)===video)parkedVideos.delete(info.key);
       for(const [node,old] of cardVideos)if(old===video)cardVideos.delete(node);
@@ -120936,7 +120946,7 @@ function getVisibleChatStackEl(id) {
     if(!system||name.length<3||name.length>140)return null;
     return {name,system,isPort,isMinis:platform==='minis',key:(isPort?'port':platform==='minis'?'minis':system)+':'+normalized(name)};
   }
-  window.__psnPrefetchRegionsGameplay=function(game,category='games',options={}) {
+  window.__psnPrefetchRegionsGameplay=function(game,category='games') {
     if(document.hidden)return;
     const info=regionGameInfo(game,category);
     if(!info)return;
@@ -120968,8 +120978,7 @@ function getVisibleChatStackEl(id) {
       if(!hoverSupported||document.hidden||connection?.saveData||/^(slow-2g|2g)$/.test(connection?.effectiveType||''))return;
       const url=validProxy(data.fallbackUrl);
       if(!url)return;
-      if(!options.skipFanart)await window.__psnWaitRegionsFanart?.(game,category);
-      if(regionWarm!==warm||document.hidden||hasPreparedVideo(info.key))return;
+      if(regionWarm!==warm||document.hidden||(active&&active.key!==info.key)||hasPreparedVideo(info.key))return;
       const host=document.createElement('div');
       host.setAttribute('aria-hidden','true');
       host.style.cssText='position:fixed;left:-10000px;top:0;width:1px;height:1px;overflow:hidden;visibility:hidden;pointer-events:none;';
@@ -120988,7 +120997,7 @@ function getVisibleChatStackEl(id) {
   window.__psnPrefetchBrowseGameplay=function(game,category='games') {
     const info=regionGameInfo(game,category);
     if(!info||hasPreparedVideo(info.key))return;
-    window.__psnPrefetchRegionsGameplay(game,category,{skipFanart:true});
+    window.__psnPrefetchRegionsGameplay(game,category);
   };
   let browseSinglePreviewTimer=0,browseSinglePreviewRequest=0;
   window.__psnScheduleBrowseSingleGameplay=function(game,category='games') {
@@ -121065,7 +121074,7 @@ function getVisibleChatStackEl(id) {
   function stop(keepProgress=false) {
     if(!active)return;
     const old=active;active=null;
-    clearTimeout(old.timer);clearTimeout(old.lookupTimer);
+    clearTimeout(old.timer);
     if(!keepProgress)hideProgress(old);
     if(old.video){
       old.video.pause();old.video.classList.remove('is-ready');
@@ -121084,11 +121093,17 @@ function getVisibleChatStackEl(id) {
   function cachedVideo(current,info,parent) {
     const video=(current.modal?modalVideos.get(parent):cardVideos.get(parent)) ||
       adoptParkedVideo(info,parent,current.modal) ||
-      (regionWarm?.key===info.key && regionWarm.video?.readyState>=2 ? adoptRegionVideo(info,parent,current.modal) : null);
+      adoptRegionVideo(info,parent,current.modal);
     if(!video||!video.isConnected||video.dataset.previewKey!==info.key)return false;
-    if(Date.now()-Number(video.dataset.preparedAt||0)>VIDEO_RECHECK_MS||video.readyState<2)return false;
+    if(video.error||Date.now()-Number(video.dataset.preparedAt||0)>VIDEO_RECHECK_MS)return false;
     current.video=video;
     if(!current.modal)rememberCard(parent,video);
+    if(video.readyState<2){
+      if(!current.progress)armProgress(current,parent);
+      updateProgress(current,video);
+      video.play().then(()=>revealVideo(current,video)).catch(()=>{if(active===current){showProgressStatus(current,'error');stop(true);}});
+      return true;
+    }
     current.timer=setTimeout(()=>{
       if(active!==current||!current.card.isConnected||!current.card.matches(':hover')||document.hidden)return;
       video.play().then(()=>revealVideo(current,video)).catch(()=>{if(active===current){if(!current.progress)armProgress(current,parent);showProgressStatus(current,'error');stop(true);}});
@@ -121144,16 +121159,18 @@ function getVisibleChatStackEl(id) {
     const info=modal?modalIdentity(modal):identity(card);
     if(!info)return false;
     rearmAfterModal=false;
-    const current={card,modal:!!modal,timer:null,lookupTimer:null,lookup:null,video:null,progress:null,bufferRatio:0,revealAt:Date.now()+HOVER_REVEAL_DELAY_MS};active=current;
+    if(regionWarm&&regionWarm.key!==info.key&&regionWarm.video?.networkState===2){
+      const warm=regionWarm;regionWarm=null;
+      parkVideo(warm.video);warm.host?.remove();
+    }
+    const current={card,key:info.key,modal:!!modal,timer:null,lookup:null,video:null,progress:null,bufferRatio:0,revealAt:Date.now()+HOVER_REVEAL_DELAY_MS};active=current;
     const parent=modal?card:card.querySelector('.game-img-container');
     if(parent&&cachedVideo(current,info,parent))return true;
     armProgress(current,parent);
     if((failures.get(info.key)||0)>Date.now()||Date.now()<videoBlockedUntil){showProgressStatus(current,'error');return true;}
-    current.lookupTimer=setTimeout(()=>{
-      if(active!==current||document.hidden||!card.isConnected||!card.matches(':hover'))return;
-      current.lookup=getResult(info);
-      play(current,info);
-    },HOVER_LOOKUP_DELAY_MS);
+    if(active!==current||document.hidden||!card.isConnected||!card.matches(':hover'))return false;
+    current.lookup=getResult(info);
+    play(current,info);
     return true;
   }
   if(!hoverSupported)return;
@@ -121172,8 +121189,8 @@ function getVisibleChatStackEl(id) {
   },{passive:true});
   document.addEventListener('visibilitychange',()=>{if(document.hidden)stop();});
   document.addEventListener('click',event=>{if(active?.modal&&event.target.closest('.modal-cover-wrapper'))stop();},true);
-  window.addEventListener('blur',stop);
-  document.addEventListener('pointerdown',stop,{passive:true});
+  window.addEventListener('blur',()=>stop());
+  document.addEventListener('pointerdown',()=>stop(),{passive:true});
   document.addEventListener('scroll',()=>{if(active&&(!active.card.isConnected||!active.card.matches(':hover')))stop();},{passive:true,capture:true});
 })();
 </script>
