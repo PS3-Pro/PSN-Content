@@ -2184,7 +2184,7 @@ const SS_PREVIEW_PASSWORD = String(process.env.SCREENSCRAPER_PASSWORD || 'LuanTe
 const SS_PREVIEW_ENABLED = process.env.SCREENSCRAPER_PREVIEWS_ENABLED !== '0' && !!SS_PREVIEW_DEVID && !!SS_PREVIEW_DEVPASSWORD;
 if (SS_PREVIEW_ENABLED && !(SS_PREVIEW_USER && SS_PREVIEW_PASSWORD))
   console.warn('[ScreenScraper] No member login configured; set SCREENSCRAPER_USER and SCREENSCRAPER_PASSWORD on Render to use member quota.');
-const SS_PREVIEW_RETRO_SYSTEMS = new Map([[31, [31, 114, 61, 59]], [142, [142, 70, 61, 59]]]);
+const SS_PREVIEW_RETRO_SYSTEMS = new Map([[31, [59, 61, 31, 114]], [142, [59, 61, 142, 70]]]);
 const SS_PREVIEW_SYSTEM_IDS = new Set([57, 58, 59, 61, 62, 60, ...SS_PREVIEW_RETRO_SYSTEMS.keys()]);
 const ssPreviewValidMediaSystem = value => Number.isSafeInteger(value) && value >= 1 && value <= 2000;
 const SS_PREVIEW_POSITIVE_MS = 24 * 60 * 60 * 1000;
