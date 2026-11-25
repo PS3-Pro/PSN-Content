@@ -2491,6 +2491,14 @@ function ssPreviewSearchVariants(value) {
     if (terms.length >= 3 && /^(?:[2-9]|II|III|IV|V|VI|VII|VIII|IX)$/i.test(terms.at(-1))) variants.push(terms.slice(0,-1).join(' '));
   }
   if (spacedInitials !== unwrapped) variants.push(spacedInitials);
+  const punctuationFree=ssPreviewInitialsVariant(unwrapped).replace(/[.?!…]+/g,' ').replace(/\s*[-:;–—]+\s*/g,' ').replace(/\s+/g,' ').trim();
+  if (punctuationFree && punctuationFree!==unwrapped) variants.push(punctuationFree);
+  // Discover by an existing phrase when decorative punctuation obscures a title.
+  // Never invent edition labels: validate any HD suffix only on returned candidates.
+  if (/[.?!…]$/.test(unwrapped) && punctuationFree.split(' ').length>=3) {
+    const tail=punctuationFree.split(' ').slice(1).join(' ');
+    if (tail.length>=8) variants.push(tail);
+  }
   const conjunction = ssPreviewConjunctionVariant(unwrapped);
   const possessive = ssPreviewPossessiveVariant(unwrapped);
   // Try common spelling combinations early, not only each substitution alone.
@@ -2945,8 +2953,8 @@ async function ssPreviewLoadDatabase(key, systemId, legacyKey='', serial='', wan
       if (!row) return null;
       const gameId = Number(row.game_id);
       if (gameId === 0 && row.extras?.negative === true) {
-        if (row.extras.titleSearchVersion !== 4 || (refreshInitialsMiss && row.extras.initialsSearchVersion !== 2)) return null;
-        const payload = {found:false,provider:'screenscraper',reason:row.extras.reason || 'no_match'};
+        if (row.extras.titleSearchVersion !== 6 || (refreshInitialsMiss && row.extras.initialsSearchVersion !== 2)) return null;
+        const payload = {found:false,provider:'screenscraper',reason:row.extras.reason || 'no_match',lookupSource:'postgresql'};
         ssPreviewSetCached(row.cache_key,payload);
         return payload;
       }
@@ -2955,7 +2963,7 @@ async function ssPreviewLoadDatabase(key, systemId, legacyKey='', serial='', wan
       const mediaSystem = systemId === 0 ? Number(extras?.system) : systemId;
       if (!ssPreviewValidMediaSystem(mediaSystem)) return null;
       const type = String(row.media_type || '');
-      if (!type && (extras?.titleSearchVersion !== 4 || (refreshInitialsMiss && extras?.initialsSearchVersion !== 2))) return null;
+      if (!type && (![4,5,6].includes(extras?.titleSearchVersion) || (refreshInitialsMiss && extras?.initialsSearchVersion !== 2))) return null;
       if (!Number.isSafeInteger(gameId) || gameId <= 0 || !['', 'video', 'video-normalized'].includes(type)) return null;
       const apiHost = ssPreviewAllowedMediaHost(row.api_host) ? row.api_host : 'api.screenscraper.fr';
       const video = type ? {
@@ -2966,6 +2974,7 @@ async function ssPreviewLoadDatabase(key, systemId, legacyKey='', serial='', wan
       const payload = video
         ? {found:true, url:video.url, video, extras, provider:'screenscraper'}
         : {found:false, extras, provider:'screenscraper', reason:'no_video'};
+      payload.lookupSource='postgresql';
       const remaining=Number(new Date(row.expires_at))-Date.now();
       ssPreviewSetCached(row.cache_key, payload, (!video||extras?.inferredBase)&&Number.isFinite(remaining)?Math.max(0,Math.min(remaining,SS_PREVIEW_POSITIVE_MS)):null);
       return payload;
@@ -2994,7 +3003,7 @@ function ssPreviewPersistDatabase(key, systemId, result, aliases=[], protectPrim
   if (type && !['video', 'video-normalized'].includes(type)) return;
   const host = video && ssPreviewAllowedMediaHost(video.apiHost)
     ? video.apiHost : 'api.screenscraper.fr';
-  const metadata = isNegative ? {negative:true,reason:result.reason || 'no_match',initialsSearchVersion:2,titleSearchVersion:4} : (result.extras ? {...result.extras,initialsSearchVersion:2,titleSearchVersion:4} : null);
+  const metadata = isNegative ? {negative:true,reason:result.reason || 'no_match',initialsSearchVersion:2,titleSearchVersion:6} : (result.extras ? {...result.extras,initialsSearchVersion:2,titleSearchVersion:6} : null);
   const persistent = !!video && !result.extras?.inferredBase;
   queryDbWithRetry(`
     INSERT INTO screenscraper_game_cache
@@ -3182,7 +3191,7 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
       if (!video) return;
       publishedVideo = true;
       publishedVideoSource=video;
-      demand.publish({found:true,url:video.url,video,provider:'screenscraper'});
+      demand.publish({found:true,url:video.url,video,provider:'screenscraper',lookupSource:lookupTrace.length?'screenscraper':'cached_identity_or_details',lookupTrace:lookupTrace.map(trace=>({...trace}))});
     }
     if (systemId && knownGameId) {
       detailedIds.add(knownGameId);
@@ -3245,6 +3254,7 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
       const games = Array.isArray(rawGames) ? rawGames : (Array.isArray(rawGames.jeu) ? rawGames.jeu : (rawGames.jeu ? [rawGames.jeu] : (rawGames.id ? [rawGames] : [])));
       candidates += games.length;
       trace.candidates=games.length;
+      trace.sample=games.slice(0,4).map(game=>({id:Number(game?.id)||null,system:ssPreviewGameSystem(game)||null,name:(ssPreviewNames(game)[0]||'').slice(0,140)}));
       const minScore = systemId === 0 ? 0.95 : 0.78; // Cross-platform matches must be unambiguous.
       for (const game of games.slice(0, 30)) {
         const mediaSystem = Number(game && (game.systemeid || (game.systeme && game.systeme.id)));
@@ -3296,7 +3306,8 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
     // ID supplied by the API, never a title-specific override.
     const confirmMedia = async () => {
       if (!bestGame || (!((demand.wantsVideo && bestMediaRank<2) ||
-          (demand.retro && demand.wantsExtras && !extrasSufficient()))) ||
+          (demand.retro && demand.wantsExtras && !extrasSufficient()) ||
+          (!demand.retro && demand.wantsExtras && !ssPreviewExtractExtras(bestGame,ssPreviewGameSystem(bestGame))?.images.length))) ||
           (!bestSerialMatch && !inferredValid() && (bestScore !== 1 || (systemId===0 ? exactSources.get(ssPreviewGameSystem(bestGame))?.size!==1 : exactGameIds.size!==1)))) return;
       const id = Number(bestGame.id), platform = ssPreviewGameSystem(bestGame);
       if (detailedIds.has(id)) return;
@@ -3433,7 +3444,7 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
     }
     return result;
   })();
-  return work.catch(error=>{error.lookupTrace=lookupTrace;throw error;}).finally(() => { ssPreviewQueued--; });
+  return work.then(result=>({...result,lookupSource:result.lookupSource || (lookupTrace.length ? 'screenscraper' : 'cached_identity_or_details'),lookupTrace})).catch(error=>{error.lookupTrace=lookupTrace;throw error;}).finally(() => { ssPreviewQueued--; });
 }
 function ssPreviewLookup(name, systemId, options = null) {
   const normalized = normalizeSsPreviewTitle(name);
@@ -3471,7 +3482,7 @@ function ssPreviewLookup(name, systemId, options = null) {
        (!retroDetail || result.extras.retroDetailsChecked===true || ssRetroExtrasComplete(result.extras))));
   const rawCached = ssPreviewGetCached(key);
   const cached = rawCached?.extras?.inferredBase && !catalogBase ? null : rawCached;
-  if (ready(cached)) return Promise.resolve(cached);
+  if (ready(cached)) return Promise.resolve({...cached,lookupSource:'memory'});
   const existing = ssPreviewInflight.get(key);
   if (existing) {
     existing.wantsExtras ||= wantsExtras;
@@ -3487,7 +3498,7 @@ function ssPreviewLookup(name, systemId, options = null) {
   const refreshInitialsMiss = ssPreviewInitialsVariant(searchName) !== searchName;
   const work = ssPreviewLoadDatabase(key, systemId,serial ? legacyKey : '',serial,normalized,refreshInitialsMiss,catalogBase).then(({primary,legacy}) => {
     // The previous lookup may have populated RAM while its asynchronous DB write is still pending.
-    if (cached) primary=cached;
+    if (cached) primary={...cached,lookupSource:'memory'};
     const complete = result => ready(result,demand.wantsVideo,demand.wantsExtras,demand.retro);
     if (primary?.found) demand.publish(primary);
     if (complete(primary) && (primary.extras || primary.found)) return primary;
@@ -4792,9 +4803,9 @@ app.get('/api/gameplay-preview', async (req, res) => {
   try {
     const options={titleId:isPort?'':ssPreviewSerial(req.query?.titleId),catalogBase:req.query?.catalogBase==='1'};
     const result = await ssPreviewLookupCategory(name,systemId,isMinis,options);
-    if (!result.found) return res.json({ok:true,configured:true,found:false,provider:'screenscraper',reason:result.reason,candidates:result.candidates || 0});
+    if (!result.found) return res.json({ok:true,configured:true,found:false,provider:'screenscraper',reason:result.reason,candidates:result.candidates ?? null,lookupSource:result.lookupSource,lookupTrace:result.lookupTrace});
     return res.json({ok:true,configured:true,found:true,url:result.url,
-      fallbackUrl:`/api/gameplay-video?token=${ssPreviewVideoToken(result.video)}`,provider:'screenscraper'});
+      fallbackUrl:`/api/gameplay-video?token=${ssPreviewVideoToken(result.video)}`,provider:'screenscraper',lookupSource:result.lookupSource,lookupTrace:result.lookupTrace});
   } catch (error) {
     const details = ssPreviewPublicError(error);
     if(error?.status===429||error?.status===503)
@@ -4817,7 +4828,7 @@ app.get('/api/screenscraper-extras', async (req,res) => {
     const options={englishSummary:true,artwork:true,titleId:isPort?'':ssPreviewSerial(req.query?.titleId),catalogBase:req.query?.catalogBase==='1'};
     const result = await ssPreviewLookupCategory(name,system,isMinis,options);
     if (result.partial) res.setHeader('Cache-Control','no-store');
-    return res.json({ok:true,found:!!result.extras,extras:ssExtraPublic(result.extras),...(result.partial?{partial:true,retry:true}:{})});
+    return res.json({ok:true,found:!!result.extras,extras:ssExtraPublic(result.extras),reason:result.reason,lookupSource:result.lookupSource,lookupTrace:result.lookupTrace,...(result.partial?{partial:true,retry:true}:{})});
   } catch (e) {res.setHeader('Cache-Control','no-store');if([429,503].includes(Number(e?.status)))res.setHeader('Retry-After',String(Math.min(3600,Math.max(2,Number(e.retryAfter)||5))));return res.status([429,503].includes(Number(e?.status)) ? e.status : 502).json({ok:false,retry:true,...ssPreviewPublicError(e)});}
 });
 
