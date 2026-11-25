@@ -49,8 +49,8 @@ function scheduleCompletion(){
   return completionWake;
 }
 const recentCacheEvents = [];
-function record(kind,key,bytes=0){
-  recentCacheEvents.push({kind,key:key?.split('/').pop(),bytes});
+function record(kind,key,bytes=0,details={}){
+  recentCacheEvents.push({kind,key:key?.split('/').pop(),bytes,...details});
   if(recentCacheEvents.length>40)recentCacheEvents.shift();
 }
 function confirmationKey(clientId,url){return clientId+'|'+url;}
@@ -411,6 +411,7 @@ async function handle(request,key,done,localOnly=false,clientId='') {
   const id=confirmationKey(clientId,request.url);
   interruptBackground();
   let response, upstreamAbort;
+  const networkStarted=performance.now();
   let onAbort=()=>upstreamAbort?.abort();
   const abortListener=()=>onAbort();
   // Detach the single capture candidate from the media element's abort signal.
@@ -422,6 +423,9 @@ async function handle(request,key,done,localOnly=false,clientId='') {
   }
   const cleanup=()=>request.signal.removeEventListener('abort',abortListener);
   try {response=await fetch(upstreamAbort?new Request(request,{signal:upstreamAbort.signal}):request);} catch (error) {cleanup();done();throw error;}
+  const timing=String(response.headers.get('Server-Timing')||'');
+  const duration=name=>{const value=new RegExp('(?:^|,\\s*)'+name+';dur=([0-9.]+)').exec(timing);return value?Number(value[1]):null;};
+  record('network-headers',key,0,{status:response.status,range:request.headers.get('Range')||'',headersMs:Math.round(performance.now()-networkStarted),providerQueueMs:duration('provider_queue'),providerHeadersMs:duration('upstream_headers')});
   const completeSize=completeLength(response),unknown=unknownComplete(response),part=completeSize||unknown?null:partialInfo(response);
   const total=Number((response.headers.get('Content-Range')||'').split('/')[1]||response.headers.get('Content-Length'));
   if(total>MAX_FILE){completionAttempts.set(key,Date.now()+60000);while(completionAttempts.size>128)completionAttempts.delete(completionAttempts.keys().next().value);}
