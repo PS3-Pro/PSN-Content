@@ -2747,7 +2747,7 @@ let ssPreviewDbPruneAfter = 0;
 async function ssPreviewLoadDatabase(key, systemId, legacyKey='', serial='', wanted='') {
   try {
     const rows = (await pool.query({text:`
-      SELECT cache_key, game_id, media_type, api_host, extras
+      SELECT cache_key, game_id, media_type, api_host, extras, expires_at
       FROM screenscraper_game_cache
       WHERE cache_key = ANY($1::text[]) AND system_id = $2 AND expires_at > NOW()`,
       values:[legacyKey && legacyKey!==key ? [key,legacyKey] : [key],systemId],query_timeout:2500})).rows;
@@ -2773,7 +2773,8 @@ async function ssPreviewLoadDatabase(key, systemId, legacyKey='', serial='', wan
       const payload = video
         ? {found:true, url:video.url, video, extras, provider:'screenscraper'}
         : {found:false, extras, provider:'screenscraper', reason:'no_video'};
-      ssPreviewSetCached(row.cache_key, payload);
+      const remaining=Number(new Date(row.expires_at))-Date.now();
+      ssPreviewSetCached(row.cache_key, payload, !video&&Number.isFinite(remaining)?Math.max(0,Math.min(remaining,SS_PREVIEW_POSITIVE_MS)):null);
       return payload;
     };
     return {primary:decode(rows.find(entry=>entry.cache_key===key)),
@@ -3229,7 +3230,7 @@ app.options('/api/gameplay-video', (req,res) => {
 app.get('/api/gameplay-video', async (req,res) => {
   setMetadataCors(res);
   res.setHeader('Access-Control-Expose-Headers',
-    'Content-Type, Content-Range, Content-Length, X-PSN-Video-Error, X-PSN-Video-Upstream, X-PSN-Video-Cache');
+    'Content-Type, Content-Range, Content-Length, Content-Encoding, Accept-Ranges, Server-Timing, X-PSN-Video-Error, X-PSN-Video-Upstream, X-PSN-Video-Cache');
   res.setHeader('Cache-Control','no-store');
   const fail = (status, reason, upstreamStatus = 0, retryAfter = 0) => {
     if (res.headersSent || res.destroyed) return;
@@ -3270,14 +3271,18 @@ app.get('/api/gameplay-video', async (req,res) => {
     if (res.destroyed) return;
     const mediaUrl = ssVideoUpstreamUrl(video);
     let upstream;
+    const started=Date.now();
     let releaseProvider=await ssProviderAcquire('video',controller.signal);
+    let providerWait=Date.now()-started;
     try {
       ssPreviewQuotaReserve();
       upstream = await ssVideoRequest(mediaUrl,controller.signal,range);
     } catch (error) {
       releaseProvider();
       if (!range || ![403,416].includes(Number(error && error.upstreamStatus))) throw error;
+      const retryQueueAt=Date.now();
       releaseProvider=await ssProviderAcquire('video',controller.signal);
+      providerWait+=Date.now()-retryQueueAt;
       try {
         ssPreviewQuotaReserve();
         upstream=await ssVideoRequest(mediaUrl,controller.signal,'');
@@ -3304,6 +3309,7 @@ app.get('/api/gameplay-video', async (req,res) => {
     res.setHeader('Cache-Control','private, max-age=86400');
     res.setHeader('ETag','"psn-'+crypto.createHash('sha256').update(String(req.query.token)).digest('hex').slice(0,24)+'"');
     res.setHeader('X-PSN-Video-Cache','STREAM');
+    res.setHeader('Server-Timing',`provider_queue;dur=${providerWait}, upstream_headers;dur=${Math.max(0,Date.now()-started-providerWait)}`);
     let size = 0;
     let prefix = Buffer.alloc(0);
     const partialStart = upstreamPartial ? /^bytes (\d+)-(\d+)\//.exec(String(upstream.headers['content-range'])) : null;
@@ -3354,16 +3360,18 @@ app.get('/api/gameplay-video', async (req,res) => {
           ssPreviewCache.delete(cacheKey);
       }
       pool.query({
-        text: `UPDATE screenscraper_game_cache SET media_type='', refreshed_at=NOW()
+        text: `UPDATE screenscraper_game_cache SET media_type='', refreshed_at=NOW(), expires_at=NOW()+INTERVAL '15 minutes'
           WHERE game_id=$1 AND media_type IN ('video','video-normalized')
             AND (system_id=$2 OR (system_id=0 AND extras->>'system'=$2::text))`,
         values: [video.g,video.s], query_timeout: 2500
       }).catch(()=>{});
     }
     if (error && !['provider_cooldown','provider_queue_full','provider_queue_timeout'].includes(error.code) &&
-        ![429,430,431,503].includes(Number(error.upstreamStatus)) && error.name !== 'AbortError')
-      ssVideoFailures.set(key,{error,until:Date.now()+(error?.upstreamStatus === 429 ? 120000 :
-        [401,403].includes(error?.upstreamStatus) ? 300000 : 30000)});
+        ![429,430,431,503].includes(Number(error.upstreamStatus)) && error.name !== 'AbortError') {
+      ssVideoFailures.delete(key);
+      ssVideoFailures.set(key,{error,until:Date.now()+([401,403].includes(error?.upstreamStatus) ? 300000 : 30000)});
+      while(ssVideoFailures.size>512)ssVideoFailures.delete(ssVideoFailures.keys().next().value);
+    }
     fail(error?.status || 502,error?.code || 'video_stream_failed',error?.upstreamStatus || 0,error?.retryAfter || 0);
   }
 });
