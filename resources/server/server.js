@@ -2184,7 +2184,8 @@ const SS_PREVIEW_PASSWORD = String(process.env.SCREENSCRAPER_PASSWORD || 'LuanTe
 const SS_PREVIEW_ENABLED = process.env.SCREENSCRAPER_PREVIEWS_ENABLED !== '0' && !!SS_PREVIEW_DEVID && !!SS_PREVIEW_DEVPASSWORD;
 if (SS_PREVIEW_ENABLED && !(SS_PREVIEW_USER && SS_PREVIEW_PASSWORD))
   console.warn('[ScreenScraper] No member login configured; set SCREENSCRAPER_USER and SCREENSCRAPER_PASSWORD on Render to use member quota.');
-const SS_PREVIEW_SYSTEM_IDS = new Set([57, 58, 59, 61, 62, 60]); // Explicit PlayStation categories
+const SS_PREVIEW_RETRO_SYSTEMS = new Map([[31, [31, 114, 61, 59]], [142, [142, 70, 61, 59]]]);
+const SS_PREVIEW_SYSTEM_IDS = new Set([57, 58, 59, 61, 62, 60, ...SS_PREVIEW_RETRO_SYSTEMS.keys()]);
 const ssPreviewValidMediaSystem = value => Number.isSafeInteger(value) && value >= 1 && value <= 2000;
 const SS_PREVIEW_POSITIVE_MS = 24 * 60 * 60 * 1000;
 const SS_PREVIEW_NEGATIVE_MS = 3 * 60 * 1000;
@@ -3382,6 +3383,46 @@ async function ssPreviewLookupMinis(name, options = null) {
     return (psp.extras.images?.length||0)>(ps3.extras.images?.length||0)?psp:ps3;
   }
   return psp?.found?psp:ps3;
+}
+
+async function ssPreviewLookupRetro(name, systemId, options = null) {
+  const platforms=SS_PREVIEW_RETRO_SYSTEMS.get(systemId);
+  const deadline=Date.now()+SS_PREVIEW_LOOKUP_BUDGET_MS;
+  const artwork=options?.artwork===true;
+  let best=null, incomplete=null;
+  for (let i=0;i<platforms.length;i++) {
+    const platform=platforms[i];
+    if (deadline-Date.now()<100) {
+      incomplete ||= Object.assign(new Error('ScreenScraper lookup deadline reached.'),{status:502,code:'lookup_timeout',upstreamStatus:0});
+      break;
+    }
+    // PSN identifiers describe the re-release, not the original cartridge/CD.
+    const titleId=(platform===59 || platform===61) && /^NP[A-Z]{2}\d{5}$/.test(options?.titleId||'') ? options.titleId : '';
+    try {
+      // Leave a small share of the common budget for the remaining platforms.
+      const platformDeadline=deadline-(platforms.length-i-1)*1000;
+      if (platformDeadline-Date.now()<100) {
+        incomplete ||= Object.assign(new Error('ScreenScraper lookup deadline reached.'),{status:502,code:'lookup_timeout',upstreamStatus:0});
+        continue;
+      }
+      const result=await ssPreviewLookup(name,platform,{...options,titleId,lookupDeadline:platformDeadline});
+      if (!artwork && result?.found) return result;
+      if (artwork && result?.extras?.images?.some(item=>item.kind==='artwork')) return result;
+      if (!best || (!best.extras && result?.extras)) best=result;
+    } catch (error) {
+      if (!['api_timeout','lookup_timeout','api_connection','api_incomplete_response','api_unavailable'].includes(error?.code)) throw error;
+      incomplete ||= error;
+    }
+  }
+  // A failed platform lookup is not proof that the game has no media.
+  if (incomplete) throw incomplete;
+  return best || {found:false,extras:null,provider:'screenscraper',reason:'no_match'};
+}
+
+function ssPreviewLookupCategory(name,systemId,isMinis,options) {
+  if (isMinis) return ssPreviewLookupMinis(name,options);
+  if (SS_PREVIEW_RETRO_SYSTEMS.has(systemId)) return ssPreviewLookupRetro(name,systemId,options);
+  return ssPreviewLookup(name,systemId,options);
 }
 
 function ssVideoHttpError(http, code, upstream = 0) {
@@ -4600,7 +4641,7 @@ app.get('/api/gameplay-preview', async (req, res) => {
   }
   try {
     const options={titleId:isPort?'':ssPreviewSerial(req.query?.titleId)};
-    const result = await (isMinis ? ssPreviewLookupMinis(name,options) : ssPreviewLookup(name, systemId,options));
+    const result = await ssPreviewLookupCategory(name,systemId,isMinis,options);
     if (!result.found) return res.json({ok:true,configured:true,found:false,provider:'screenscraper',reason:result.reason,candidates:result.candidates || 0});
     return res.json({ok:true,configured:true,found:true,url:result.url,
       fallbackUrl:`/api/gameplay-video?token=${ssPreviewVideoToken(result.video)}`,provider:'screenscraper'});
@@ -4624,7 +4665,7 @@ app.get('/api/screenscraper-extras', async (req,res) => {
   if ((!isPort && !SS_PREVIEW_SYSTEM_IDS.has(system)) || (isMinis && system !== 59) || name.length < 3 || !normalizeSsPreviewTitle(name)) return res.status(400).json({ok:false});
   try {
     const options={englishSummary:true,artwork:true,titleId:isPort?'':ssPreviewSerial(req.query?.titleId)};
-    const result = await (isMinis ? ssPreviewLookupMinis(name,options) : ssPreviewLookup(name,system,options));
+    const result = await ssPreviewLookupCategory(name,system,isMinis,options);
     return res.json({ok:true,found:!!result.extras,extras:ssExtraPublic(result.extras)});
   } catch (e) {res.setHeader('Cache-Control','no-store');if([429,503].includes(Number(e?.status)))res.setHeader('Retry-After',String(Math.min(3600,Math.max(2,Number(e.retryAfter)||5))));return res.status([429,503].includes(Number(e?.status)) ? e.status : 502).json({ok:false,retry:true,...ssPreviewPublicError(e)});}
 });

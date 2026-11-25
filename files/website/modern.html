@@ -42920,6 +42920,7 @@ P
 		modal.style.display = 'flex';
 		window.psnGameTheme?.open(currentCat==='updates' ? window.psnUpdateMediaGame(game,currentCat) : (modalDisplayName || game.cleanName || game.title || ''),currentCat);
 		window.__psnPrepareGameModalFanart?.(modal,game,currentCat,hydrationToken);
+		window.__psnPrepareModalGameplay?.(modal);
 		if (cardMorphMotionSource && typeof window.prepareGameModalCardMorphOpening === 'function') {
 			if (!window.prepareGameModalCardMorphOpening(modal, cardMorphMotionSource)) {
 				modal.classList.remove('psn-card-morph-opening');
@@ -42975,6 +42976,7 @@ P
 			if (options.silent !== true && typeof playUiBack === 'function') playUiBack();
 			if (typeof window.cancelPsnSharedCoverMotions === 'function') window.cancelPsnSharedCoverMotions('modal');
 			modal.classList.remove('psn-card-morph-opening', 'psn-card-morph-opened', 'psn-card-morph-closing');
+			window.__psnReleaseModalGameplay?.();
 			modal.classList.remove('show');
 			delete modal.dataset.gamePlayersToken;
 			delete modal.dataset.openHydrationToken;
@@ -120513,7 +120515,7 @@ function getVisibleChatStackEl(id) {
 
 <script>
 (() => {
-  const platformIds = {ps3:59,ps2:58,ps1:57,psx:57,psp:61,minis:59,psv:62,psvita:62,vita:62,ps4:60};
+  const platformIds = {ps3:59,ps2:58,ps1:57,psx:57,psp:61,minis:59,psv:62,psvita:62,vita:62,ps4:60,pce:31,pcengine:31,neogeo:142};
   const memory = new Map();
   const pending = new Map();
   let extrasBlockedUntil=0;
@@ -120885,7 +120887,7 @@ function getVisibleChatStackEl(id) {
   const mouseHover=window.matchMedia?.('(any-hover: hover) and (any-pointer: fine)');
   const reducedMotion=window.matchMedia?.('(prefers-reduced-motion: reduce)');
   const TOUCH_PRELOAD_MS=150, TOUCH_HOLD_MS=350, TOUCH_MOVE_LIMIT=12;
-  const systems = {ps3:59,ps2:58,ps1:57,psx:57,psp:61,minis:59,psv:62,psvita:62,vita:62,ps4:60};
+  const systems = {ps3:59,ps2:58,ps1:57,psx:57,psp:61,minis:59,psv:62,psvita:62,vita:62,ps4:60,pce:31,pcengine:31,neogeo:142};
   const cache = new Map(), pending = new Map(), failures = new Map();
   let lookupBlockedUntil=0, videoBlockedUntil=0, recentVideoErrors=[];
   const mediaLookupFailures=new Map();
@@ -121167,7 +121169,7 @@ function getVisibleChatStackEl(id) {
     const titleId=!isPort&&/^[A-Z]{4}\d{5}$/.test(serial)?serial:'';
     return {name,system,isPort,titleId,isMinis:platform==='minis',key:(isPort?'port':platform==='minis'?'minis':system)+':'+(titleId||normalized(name))};
   }
-  let regionWarm=null, parkedHost=null;
+  let regionWarm=null, parkedHost=null, modalWarm=null, handoff=null;
   const parkedVideos=new Map();
   function getParkedHost() {
     if(!parkedHost||!parkedHost.isConnected){
@@ -121189,6 +121191,8 @@ function getVisibleChatStackEl(id) {
     if(active?.video)live.add(active.video);
     if(regionWarm?.video)live.add(regionWarm.video);
     if(touchPress?.video)live.add(touchPress.video);
+    if(modalWarm?.video)live.add(modalWarm.video);
+    if(handoff?.video)live.add(handoff.video);
     let foreign=0;
     if(previewScope){
       for(const video of parkedVideos.values())if(video.__psnPreviewScope!==previewScope)foreign++;
@@ -121243,6 +121247,9 @@ function getVisibleChatStackEl(id) {
       if(video!==active?.video)dispose(video);
     }
     if(parkedVideos.has(key))return true;
+    if(active?.video?.dataset.previewKey===key&&usablePrepared(active.video))return true;
+    if(modalWarm?.key===key&&usablePrepared(modalWarm.video))return true;
+    if(handoff?.video?.dataset.previewKey===key&&usablePrepared(handoff.video))return true;
     if(touchPress?.info?.key===key&&touchPress.video?.isConnected&&!touchPress.video.error&&!touchPress.video.__psnPreviewDisposed)return true;
     if(regionWarm?.key===key&&regionWarm.video?.isConnected&&!regionWarm.video.error&&now-Number(regionWarm.video.dataset.preparedAt||0)<=VIDEO_RECHECK_MS)return true;
     for(const video of cardVideos.values())if(video.dataset.previewKey===key)return true;
@@ -121266,6 +121273,8 @@ function getVisibleChatStackEl(id) {
     video.addEventListener('error',()=>{
       if(video.__psnPreviewDisposed)return;
       const now=Date.now();
+      if(modalWarm?.video===video)modalWarm.video=null;
+      if(handoff?.video===video){clearTimeout(handoff.timer);handoff=null;}
       if(isLocalSource(video.dataset.previewUrl)){
         localBypass.delete(info.key);localBypass.set(info.key,now+60000);
         while(localBypass.size>250)localBypass.delete(localBypass.keys().next().value);
@@ -121316,6 +121325,92 @@ function getVisibleChatStackEl(id) {
     bindPreviewEvents(video,info);
     return video;
   }
+  function usablePrepared(video,requireConnected=true) {
+    return !!(video&&(!requireConnected||video.isConnected)&&!video.error&&!video.__psnPreviewDisposed&&Date.now()-Number(video.dataset.preparedAt||0)<=VIDEO_RECHECK_MS);
+  }
+  function moveToWarmHost(video) {
+    for(const [node,old] of cardVideos)if(old===video)cardVideos.delete(node);
+    video.pause();video.classList.remove('is-ready');
+    getParkedHost().appendChild(video);
+  }
+  function finishPrepared(video) {
+    if(!video)return;
+    if(video.__psnModalCacheConfirmed&&!isLocalSource(video.dataset.previewUrl)){
+      const controller=navigator.serviceWorker?.controller;
+      if(controller?.scriptURL===videoCacheWorkerUrl){try{controller.postMessage({type:'psn-gameplay-cache-finish',url:video.dataset.previewUrl});}catch(_){}}
+    }
+    parkVideo(video,!!video.__psnModalCacheConfirmed&&localWorkerVersion>=5);
+  }
+  function releaseHandoff() {
+    const old=handoff;handoff=null;
+    if(old){clearTimeout(old.timer);finishPrepared(old.video);}
+  }
+  function holdForModal(video) {
+    if(!usablePrepared(video)){dispose(video);return;}
+    releaseHandoff();moveToWarmHost(video);
+    const entry={video,timer:null};handoff=entry;
+    entry.timer=setTimeout(()=>{if(handoff===entry)releaseHandoff();},900);
+  }
+  function takeHandoff(info,parent,isModal) {
+    if(handoff?.video?.dataset.previewKey!==info.key)return null;
+    const entry=handoff;handoff=null;clearTimeout(entry.timer);
+    const video=entry.video;
+    if(!usablePrepared(video)){dispose(video);return null;}
+    parent.appendChild(video);
+    if(isModal)modalVideos.set(parent,video);else rememberCard(parent,video);
+    return video;
+  }
+  function takeModalWarm(info,parent,isModal) {
+    if(!isModal||modalWarm?.key!==info.key||!modalWarm.video)return null;
+    const video=modalWarm.video;modalWarm.video=null;
+    if(!usablePrepared(video)){dispose(video);return null;}
+    parent.appendChild(video);modalVideos.set(parent,video);
+    return video;
+  }
+  function releaseModalWarm() {
+    const old=modalWarm;modalWarm=null;
+    if(active?.modal)stop();
+    if(old?.video)finishPrepared(old.video);
+  }
+  window.__psnReleaseModalGameplay=releaseModalWarm;
+  window.__psnPrepareModalGameplay=function(root) {
+    const cover=root?.querySelector('.modal-cover-wrapper:not(.no-trailer)');
+    const info=cover&&modalIdentity(cover);
+    if(!info||document.hidden||reducedMotion?.matches){releaseModalWarm();return;}
+    if(modalWarm?.key===info.key){
+      if(active?.modal&&active.card!==cover)stop();
+      modalWarm.cover=cover;return;
+    }
+    releaseModalWarm();
+    const warm={key:info.key,cover,video:null};modalWarm=warm;
+    if(active&&!active.modal)stop(false,active.key===info.key);
+    const adopt=()=>{
+      let video=takeHandoff(info,getParkedHost(),true)||adoptParkedVideo(info,getParkedHost(),true)||adoptRegionVideo(info,getParkedHost(),true);
+      if(!video){
+        for(const candidate of cardVideos.values())if(candidate.dataset.previewKey===info.key&&usablePrepared(candidate)){video=candidate;break;}
+      }
+      if(video){modalVideos.delete(getParkedHost());moveToWarmHost(video);warm.video=video;return true;}
+      return false;
+    };
+    if(adopt())return;
+    const connection=navigator.connection||navigator.mozConnection||navigator.webkitConnection;
+    if(connection?.saveData||/^(slow-2g|2g)$/.test(connection?.effectiveType||''))return;
+    getResult(info).then(data=>{
+      if(modalWarm!==warm||!warm.cover.isConnected||!modalVisible()||document.hidden||reducedMotion?.matches)return;
+      if(active?.modal&&active.key===info.key)return;
+      if(adopt()||hasPreparedVideo(info.key))return;
+      const url=data?.found?validSource(data):'';
+      if(!url||(failures.get(info.key)||0)>Date.now()||Date.now()<videoBlockedUntil)return;
+      trimParkedVideos(1);
+      const video=document.createElement('video');
+      video.className='psn-gameplay-preview-video';video.muted=true;video.defaultMuted=true;video.playsInline=true;
+      video.loop=true;video.preload='auto';video.setAttribute('aria-hidden','true');video.setAttribute('disablepictureinpicture','');
+      video.dataset.previewUrl=url;video.dataset.previewKey=info.key;video.dataset.preparedAt=String(Date.now());
+      video.__psnPreviewScope=previewScope;
+      warm.video=video;bindPreviewEvents(video,info);
+      getParkedHost().appendChild(video);setPreviewSource(video,url);
+    }).catch(()=>{});
+  };
   function regionGameInfo(game,category) {
     game=window.psnUpdateMediaGame(game,category);
     const cat=String(category||'').toLowerCase();
@@ -121453,7 +121548,7 @@ function getVisibleChatStackEl(id) {
     bar.firstElementChild.style.width='0%';
     bar.classList.add('is-loading','is-checking');
   }
-  function stop(keepProgress=false) {
+  function stop(keepProgress=false,transfer=false) {
     if(!active)return;
     const old=active;active=null;
     syncGameplayPriority();
@@ -121461,13 +121556,22 @@ function getVisibleChatStackEl(id) {
     clearTimeout(old.timer);
     if(!keepProgress)hideProgress(old);
     if(old.video){
-      if(old.cacheConfirmed&&!isLocalSource(old.video.dataset.previewUrl)){
+      if(old.modal&&modalVideos.get(old.card)===old.video)modalVideos.delete(old.card);
+      if(old.cacheConfirmed&&old.modal)old.video.__psnModalCacheConfirmed=true;
+      if(old.modal&&modalWarm?.key===old.key&&usablePrepared(old.video,false)&&!document.hidden){
+        if(modalWarm.video&&modalWarm.video!==old.video)finishPrepared(modalWarm.video);
+        moveToWarmHost(old.video);modalWarm.video=old.video;return;
+      }
+      if(transfer&&usablePrepared(old.video)){
+        if(old.cacheConfirmed)old.video.__psnModalCacheConfirmed=true;
+        holdForModal(old.video);return;
+      }
+      if((old.cacheConfirmed||old.video.__psnModalCacheConfirmed)&&!isLocalSource(old.video.dataset.previewUrl)){
         const controller=navigator.serviceWorker?.controller;
         if(controller?.scriptURL===videoCacheWorkerUrl){try{controller.postMessage({type:'psn-gameplay-cache-finish',url:old.video.dataset.previewUrl});}catch(_){}}
       }
       old.video.pause();old.video.classList.remove('is-ready');
-      if(old.modal&&modalVideos.get(old.card)===old.video)modalVideos.delete(old.card);
-      parkVideo(old.video,old.cacheConfirmed&&localWorkerVersion>=5);
+      parkVideo(old.video,(old.cacheConfirmed||old.video.__psnModalCacheConfirmed)&&localWorkerVersion>=5);
     }
   }
   function previewAllowed(current) {
@@ -121494,7 +121598,7 @@ function getVisibleChatStackEl(id) {
   }
   function cachedVideo(current,info,parent) {
     const video=(current.modal?modalVideos.get(parent):cardVideos.get(parent)) ||
-      adoptParkedVideo(info,parent,current.modal) ||
+      takeModalWarm(info,parent,current.modal) || takeHandoff(info,parent,current.modal) || adoptParkedVideo(info,parent,current.modal) ||
       adoptRegionVideo(info,parent,current.modal);
     if(!video||!video.isConnected||video.dataset.previewKey!==info.key)return false;
     if(video.error||Date.now()-Number(video.dataset.preparedAt||0)>VIDEO_RECHECK_MS)return false;
@@ -121519,6 +121623,7 @@ function getVisibleChatStackEl(id) {
     const data=await (current.lookup||getResult(info));
     if(!previewAllowed(current))return;
     current.lookupDone=performance.now();
+    if(cachedVideo(current,info,parent))return;
     if(!data?.local&&((failures.get(info.key)||0)>Date.now()||Date.now()<videoBlockedUntil)){showProgressStatus(current,'error');return;}
     if(!data?.found){
       // Only a verified 'no_video' means the ScreenScraper found this game.
@@ -121529,7 +121634,7 @@ function getVisibleChatStackEl(id) {
     if(!url){showProgressStatus(current,'error');return;}
     if(!data.local&&(localBypass.get(info.key)||0)>Date.now()){const fresh=new URL(url);fresh.searchParams.set('psn-cache-bypass','1');url=fresh.href;}
     let video=(current.modal?modalVideos.get(parent):cardVideos.get(parent)) ||
-      adoptParkedVideo(info,parent,current.modal) || adoptRegionVideo(info,parent,current.modal);
+      takeModalWarm(info,parent,current.modal) || takeHandoff(info,parent,current.modal) || adoptParkedVideo(info,parent,current.modal) || adoptRegionVideo(info,parent,current.modal);
     if(video&&(video.dataset.previewKey!==info.key||video.dataset.previewUrl!==url||Date.now()-Number(video.dataset.preparedAt||0)>VIDEO_RECHECK_MS)) {
       if(current.modal)modalVideos.delete(parent);else cardVideos.delete(parent);
       dispose(video);video=null;
@@ -121557,7 +121662,7 @@ function getVisibleChatStackEl(id) {
   }
   function startPreview(target,touch=false,prepared=null) {
     if(document.hidden||reducedMotion?.matches)return false;
-    const modal=touch?null:modalFrom(target);
+    const modal=modalFrom(target);
     if(!modal&&modalVisible())return false;
     const card=modal||cardFrom(target);
     if(!card||(active&&active.card===card))return false;
@@ -121605,6 +121710,7 @@ function getVisibleChatStackEl(id) {
   }
   function prepareTouchPress(press) {
     if(touchPress!==press||press.confirming||!press.card.isConnected||document.hidden||modalVisible()||reducedMotion?.matches)return;
+    if(press.modal)return;
     const info=identity(press.card);
     if(!info||hasPreparedVideo(info.key)||(failures.get(info.key)||0)>Date.now()||Date.now()<videoBlockedUntil)return;
     const connection=navigator.connection||navigator.mozConnection||navigator.webkitConnection;
@@ -121627,16 +121733,16 @@ function getVisibleChatStackEl(id) {
       getParkedHost().appendChild(video);setPreviewSource(video,url);
     }).catch(()=>{if(touchPress===press)releaseTouchWarm(press);});
   }
-  function releaseTouchWarm(press) {
+  function releaseTouchWarm(press,transfer=false) {
     clearTimeout(press.preloadTimer);
-    if(press.video){const video=press.video;press.video=null;parkVideo(video);}
+    if(press.video){const video=press.video;press.video=null;if(transfer)holdForModal(video);else parkVideo(video);}
   }
-  function cancelTouchPress(stopPreview=false) {
+  function cancelTouchPress(stopPreview=false,transfer=false) {
     const press=touchPress;touchPress=null;
     if(press){
       syncGameplayPriority();
       clearTimeout(press.timer);
-      releaseTouchWarm(press);
+      releaseTouchWarm(press,transfer&&!press.activated);
       if(stopPreview&&press.activated&&active?.touch&&active.card===press.card)stop();
     }
   }
@@ -121649,7 +121755,7 @@ function getVisibleChatStackEl(id) {
     if(mouseInput(event)&&!touchPress){lastPointerType='mouse';startPreview(event.target);}
   },{passive:true});
   window.addEventListener('psn-game-modal-closed',()=>{
-    if(active?.modal)stop();
+    releaseModalWarm();
     rearmAfterModal=!reducedMotion?.matches;
     // Rearm only on a real mouse movement, never a sticky touch :hover.
     if(lastPointerType==='mouse'&&rearmAfterModal){
@@ -121662,17 +121768,19 @@ function getVisibleChatStackEl(id) {
     lastPointerType=event.pointerType;
     heldClick=null;
     cancelTouchPress(true);
-    stop();
-    if(reducedMotion?.matches||document.hidden||modalVisible()||(event.pointerType!=='touch'&&event.pointerType!=='pen')||event.isPrimary===false||event.button!==0)return;
+    const modal=modalFrom(event.target);
+    const clickedCard=cardFrom(event.target);
+    stop(false,!!(clickedCard&&active?.card===clickedCard&&!active.modal));
+    if(reducedMotion?.matches||document.hidden||(!modal&&modalVisible())||(event.pointerType!=='touch'&&event.pointerType!=='pen')||event.isPrimary===false||event.button!==0)return;
     if(event.target?.closest?.('button,a,input,select,textarea,label,[role="button"],.btn-mini,.btn-mini-round,.fav-btn,.wish-btn,.action-btn'))return;
-    const card=cardFrom(event.target);
+    const card=modal||clickedCard;
     if(!card)return;
-    const press={card,pointerId:event.pointerId,x:event.clientX,y:event.clientY,activated:false,confirming:false,timer:null,preloadTimer:null,info:null,lookup:null,video:null};
+    const press={card,modal:!!modal,pointerId:event.pointerId,x:event.clientX,y:event.clientY,activated:false,confirming:false,timer:null,preloadTimer:null,info:null,lookup:null,video:null};
     touchPress=press;
     press.preloadTimer=setTimeout(()=>prepareTouchPress(press),TOUCH_PRELOAD_MS);
     press.timer=setTimeout(()=>{
       if(touchPress!==press)return;
-      if(!card.isConnected||document.hidden||modalVisible()){cancelTouchPress(true);return;}
+      if(!card.isConnected||document.hidden||(press.modal?!modalVisible():modalVisible())){cancelTouchPress(true);return;}
       press.confirming=true;
       press.activated=startPreview(card,true,press);
       releaseTouchWarm(press);
@@ -121688,7 +121796,7 @@ function getVisibleChatStackEl(id) {
     }
   },{passive:true});
   window.addEventListener('pointerup',event=>{
-    if(touchPress?.pointerId===event.pointerId)cancelTouchPress();
+    if(touchPress?.pointerId===event.pointerId)cancelTouchPress(false,true);
   },{capture:true,passive:true});
   window.addEventListener('pointercancel',event=>{
     if(touchPress?.pointerId===event.pointerId)cancelTouchPress(true);
@@ -121703,10 +121811,10 @@ function getVisibleChatStackEl(id) {
   document.addEventListener('pointerout',event=>{
     if(event.pointerType==='mouse'&&active&&!active.touch&&active.card.contains(event.target)&&(!event.relatedTarget||!active.card.contains(event.relatedTarget)))stop();
   },{passive:true});
-  document.addEventListener('visibilitychange',()=>{if(document.hidden){cancelTouchPress(true);stop();}});
+  document.addEventListener('visibilitychange',()=>{if(document.hidden){cancelTouchPress(true);releaseModalWarm();releaseHandoff();stop();}});
   document.addEventListener('click',event=>{if(active?.modal&&event.target.closest('.modal-cover-wrapper'))stop();},true);
   window.addEventListener('blur',()=>{cancelTouchPress(true);stop();});
-  window.addEventListener('pagehide',()=>{cancelTouchPress(true);stop();});
+  window.addEventListener('pagehide',()=>{cancelTouchPress(true);releaseModalWarm();releaseHandoff();stop();});
   document.addEventListener('scroll',event=>{
     const card=touchPress?.card||(active?.touch?active.card:null);
     if(card&&(!card.isConnected||event.target===document||event.target?.contains?.(card))){cancelTouchPress(true);if(active?.touch)stop();}
