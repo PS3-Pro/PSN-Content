@@ -2806,7 +2806,7 @@ function ssPreviewExtractExtras(game, system) {
     const key = type+':'+safeRegion;
     if (used.has(key)) continue;
     used.add(key);
-    images.push({type,kind,region:safeRegion});
+    images.push({type,kind,region:safeRegion,system,gameId:id});
   }
   const genres = game.genres && typeof game.genres === 'object' ? ssExtraLocalized(game.genres) : '';
   return {gameId:id, system, images, artworkChecked:true,
@@ -2817,9 +2817,50 @@ function ssPreviewExtractExtras(game, system) {
 }
 function ssExtraPublic(extras) {
   if (!extras) return null;
-  const {identity,...publicExtras}=extras;
+  const {identity,sourceCandidates,...publicExtras}=extras;
   return {...publicExtras,images:extras.images.map(item=>({...item,
-    url:(item.kind==='manual'?'/api/screenscraper-manual?token=':'/api/screenscraper-image?token=')+ssExtraImageToken(extras.system,extras.gameId,item.type,item.region)}))};
+    url:(item.kind==='manual'?'/api/screenscraper-manual?token=':'/api/screenscraper-image?token=')+ssExtraImageToken(item.system ?? extras.system,item.gameId ?? extras.gameId,item.type,item.region)}))};
+}
+function ssRetroCover(item) {
+  return item.kind==='artwork' && ['box-2D-front','box-2D'].includes(item.type);
+}
+function ssRetroExtrasComplete(extras) {
+  const images=extras?.images || [];
+  return !!extras?.summary && images.some(ssRetroCover) &&
+    images.some(item=>item.kind==='background') &&
+    images.filter(item=>item.kind==='screenshot').length>=3;
+}
+function ssRetroMergeExtras(primary, incoming) {
+  if (!incoming) return primary;
+  const merged=primary ? {...primary,images:[...primary.images]} : {...incoming,images:[]};
+  const higherHasCover=merged.images.some(ssRetroCover);
+  const higherArtwork=new Set(merged.images.filter(item=>item.kind==='artwork').map(item=>item.type));
+  const seen=new Set(merged.images.map(item=>`${item.system}:${item.gameId}:${item.type}:${item.region}`));
+  for (const item of incoming.images || []) {
+    const image={...item,system:item.system ?? incoming.system,gameId:item.gameId ?? incoming.gameId};
+    const key=`${image.system}:${image.gameId}:${image.type}:${image.region}`;
+    if (seen.has(key)) continue;
+    const count=merged.images.filter(v=>v.kind===image.kind).length;
+    if (image.kind==='screenshot' && count>=3) continue;
+    if (['background','manual'].includes(image.kind) && count) continue;
+    if (image.kind==='artwork') {
+      if ((ssRetroCover(image) && higherHasCover) || higherArtwork.has(image.type)) continue;
+      if (count>=5) {
+        // Do not let optional artwork crowd out a missing front cover.
+        if (!ssRetroCover(image) || merged.images.some(ssRetroCover)) continue;
+        const index=merged.images.findLastIndex(v=>v.kind==='artwork' && !ssRetroCover(v));
+        if (index<0) continue;
+        merged.images.splice(index,1);
+      }
+    }
+    seen.add(key); merged.images.push(image);
+  }
+  for (const field of ['summary','developer','publisher','players','rating','releaseDate','genres']) {
+    if ((merged[field]==null || merged[field]==='') && incoming[field]!=null && incoming[field]!=='') merged[field]=incoming[field];
+  }
+  merged.summaryEnglishChecked=!!merged.summary || (primary?.summaryEnglishChecked!==false && incoming.summaryEnglishChecked===true);
+  merged.artworkChecked=primary?.artworkChecked!==false && incoming.artworkChecked===true;
+  return merged;
 }
 // Report transport failures without exposing authenticated URLs or credentials.
 const SS_PREVIEW_TRANSPORT_CODES = new Set(['ETIMEDOUT','ECONNRESET','ECONNREFUSED','EPIPE','ENOTFOUND','EAI_AGAIN','ENETUNREACH','EHOSTUNREACH','RESPONSE_ABORTED','ERR_STREAM_PREMATURE_CLOSE']);
@@ -3062,7 +3103,7 @@ async function ssPreviewRequestInfo(systemId, serial, gameId=0, deadline=Date.no
     return Array.isArray(game)?(game.length===1?game[0]:null):game||null;
   } finally { if (probe) ssPreviewSerialProbeActive=false; }
 }
-function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, legacyKey='', legacy=null, demand, resumeAlternates=false, deadline=Date.now()+SS_PREVIEW_LOOKUP_BUDGET_MS) {
+function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, legacyKey='', legacy=null, demand, resumeAlternates=false, deadline=Date.now()+SS_PREVIEW_LOOKUP_BUDGET_MS, knownVideo=null) {
   if (ssPreviewQueued >= 80) {
     const busy = new Error('ScreenScraper search queue temporarily busy.');
     busy.status = 503;
@@ -3094,30 +3135,39 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
       return (hasVideo ? 2 : 0) + (hasFanart ? 1 : 0);
     };
     let bestMediaRank = 0;
+    let confirmedDetailId = 0;
     let bestSerialMatch = false;
     const exactGameIds = new Set();
+    const exactSources = new Map();
     const candidateScores = new Map();
     const strongFuzzy = () => systemId !== 0 && bestScore >= 0.94 && bestScore < 1 &&
       wanted.split(' ').length >= 3 && [...candidateScores].every(([id,score])=>id===Number(bestGame?.id) || bestScore-score>=0.04);
     const detailedIds = new Set();
     let incompleteSearch = null;
+    let partialMediaError = null;
     const normalSufficient = () => bestSerialMatch || (bestScore === 1 &&
       (systemId === 0 ? bestMediaRank >= 2 : (!tryAlternateMedia ? bestMediaRank > 0 : bestMediaRank === 3)));
     const videoSufficient = () => bestSerialMatch || ((bestScore === 1 || strongFuzzy()) && bestMediaRank >= 2);
-    const sufficient = () => (!demand.wantsExtras || normalSufficient()) && (!demand.wantsVideo || videoSufficient());
-    let publishedVideo = false;
+    const retroConfirmed = () => demand.retro && !!bestGame && Number(bestGame.id)===confirmedDetailId && (bestSerialMatch || bestScore===1);
+    const extrasSufficient = () => demand.retro ? (retroConfirmed() || (bestScore===1 && ssRetroExtrasComplete(ssPreviewExtractExtras(bestGame,ssPreviewGameSystem(bestGame))))) : normalSufficient();
+    const sufficient = () => !!partialMediaError || ((!demand.wantsExtras || extrasSufficient()) && (!demand.wantsVideo || videoSufficient() || retroConfirmed()));
+    let publishedVideo = false, publishedVideoSource = null;
     function publishVideo() {
       if (publishedVideo || !videoSufficient()) return;
       const video = ssPreviewFindVideo(bestGame, systemId);
       if (!video) return;
       publishedVideo = true;
+      publishedVideoSource=video;
       demand.publish({found:true,url:video.url,video,provider:'screenscraper'});
     }
     if (systemId && knownGameId) {
       detailedIds.add(knownGameId);
       const game = await ssPreviewRequestInfo(systemId,'',knownGameId,deadline);
-      if (ssPreviewGameUsable(game,systemId) && Number(game.id)===knownGameId) {
-        bestGame=game;bestScore=1;bestMediaRank=mediaRank(game);bestSerialMatch=!!serial && ssPreviewRomSerials(game).includes(serial);candidates=1;
+      if (ssPreviewGameUsable(game,systemId) && Number(game.id)===knownGameId &&
+          (!demand.candidateGameId || ssPreviewNames(game).some(title=>matchName(title)===wanted))) {
+        bestGame=game;confirmedDetailId=knownGameId;bestScore=1;bestMediaRank=mediaRank(game);bestSerialMatch=!!serial && ssPreviewRomSerials(game).includes(serial);candidates=1;
+      } else if (demand.candidateGameId) {
+        throw Object.assign(new Error('ScreenScraper source candidate could not be confirmed.'),{status:502,code:'api_rejected',upstreamStatus:0});
       }
     }
     if (!bestGame && legacy) {
@@ -3176,7 +3226,13 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
         const mediaSystem = Number(game && (game.systemeid || (game.systeme && game.systeme.id)));
         if (!ssPreviewGameUsable(game,systemId)) continue;
         const score = Math.max(0, ...ssPreviewNames(game).map(title => ssPreviewTitleSimilarity(wanted, matchName(title))));
-        if (score === 1) exactGameIds.add(Number(game.id));
+        if (score === 1) {
+          exactGameIds.add(Number(game.id));
+          if (systemId===0) {
+            if (!exactSources.has(mediaSystem)) exactSources.set(mediaSystem,new Set());
+            exactSources.get(mediaSystem).add(Number(game.id));
+          }
+        }
         if (score >= minScore) candidateScores.set(Number(game.id),Math.max(score,candidateScores.get(Number(game.id))||0));
         if (score < minScore || (exactOnly && score !== 1)) continue;
         const rank = mediaRank(game);
@@ -3189,25 +3245,32 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
           bestSerialMatch = serialMatch;
         }
         // With a serial, inspect all returned candidates before choosing a name-only hit.
-        if ((!serial || bestSerialMatch) && bestScore === 1 && sufficient()) break;
+        if (systemId!==0 && (!serial || bestSerialMatch) && bestScore === 1 && sufficient()) break;
       }
       trace.bestScore=bestScore;
     };
     // Search results may omit media. Confirm an unambiguous match using the
     // ID supplied by the API, never a title-specific override.
     const confirmMedia = async () => {
-      if (!bestGame || !demand.wantsVideo || bestMediaRank >= 2 ||
-          (!bestSerialMatch && (bestScore !== 1 || exactGameIds.size !== 1))) return;
+      if (!bestGame || (!((demand.wantsVideo && bestMediaRank<2) ||
+          (demand.retro && demand.wantsExtras && !extrasSufficient()))) ||
+          (!bestSerialMatch && (bestScore !== 1 || (systemId===0 ? exactSources.get(ssPreviewGameSystem(bestGame))?.size!==1 : exactGameIds.size!==1)))) return;
       const id = Number(bestGame.id), platform = ssPreviewGameSystem(bestGame);
       if (detailedIds.has(id)) return;
       detailedIds.add(id);
-      const game = await ssPreviewRequestInfo(platform,'',id,deadline);
+      let game;
+      try { game = await ssPreviewRequestInfo(platform,'',id,deadline); }
+      catch (error) {
+        if (!demand.retro || !demand.wantsExtras) throw error;
+        partialMediaError=error;
+        return;
+      }
       if (!ssPreviewGameUsable(game,platform) || Number(game.id)!==id ||
           (!ssPreviewNames(game).some(title=>matchName(title)===wanted) &&
            !(serial && ssPreviewRomSerials(game).includes(serial)))) {
         throw Object.assign(new Error('ScreenScraper game details could not be confirmed.'),{status:502,code:'api_rejected',upstreamStatus:0});
       }
-      bestGame=game;bestMediaRank=mediaRank(game);
+      bestGame=game;confirmedDetailId=id;bestMediaRank=mediaRank(game);
       bestSerialMatch ||= !!serial && ssPreviewRomSerials(game).includes(serial);
       publishVideo();
     };
@@ -3219,7 +3282,7 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
         incompleteSearch=error;
       }
       publishVideo();
-      if (!publishedVideo) await confirmMedia();
+      if (!publishedVideo || (demand.retro && demand.wantsExtras)) await confirmMedia();
     };
     let nextSearch = searches.length;
     if (!bestGame) {
@@ -3237,7 +3300,7 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
         }
       }
       publishVideo();
-      if (!publishedVideo) await confirmMedia();
+      if (!publishedVideo || (demand.retro && demand.wantsExtras)) await confirmMedia();
     } else if (resumeAlternates) {
       publishVideo();
       nextSearch = 1;
@@ -3258,17 +3321,30 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
       }
     }
     publishVideo();
-    if (!publishedVideo) await confirmMedia();
+    if (!publishedVideo || (demand.retro && demand.wantsExtras)) await confirmMedia();
     const minScore = systemId === 0 ? 0.95 : 0.78;
     const mediaSystem = Number(bestGame && (bestGame.systemeid || (bestGame.systeme && bestGame.systeme.id)));
     const validMatch = !!bestGame && bestScore >= minScore && ssPreviewValidMediaSystem(mediaSystem) &&
       (bestSerialMatch || bestScore===1 || [...candidateScores].every(([id,score])=>id===Number(bestGame.id) || bestScore-score>=0.04));
-    const video = validMatch ? ssPreviewFindVideo(bestGame, systemId) : null;
+    const previousVideo=demand.retro ? (publishedVideoSource || knownVideo) : null;
+    const video = validMatch ? (ssPreviewFindVideo(bestGame, systemId) ||
+      (previousVideo?.gameId===Number(bestGame.id) && previousVideo?.system===mediaSystem ? previousVideo : null)) : null;
     const extras = validMatch ? ssPreviewExtractExtras(bestGame, mediaSystem) : null;
     if (extras && !video && !detailedIds.has(Number(bestGame.id)) && !demand.wantsVideo) extras.videoChecked=false;
-    if (extras && nextSearch<searches.length) {
-      if (!normalSufficient()) extras.artworkChecked=false;
+    if (extras && retroConfirmed()) {
+      extras.retroDetailsChecked=true;
+      extras.artworkChecked=true;
+      extras.videoChecked=true;
+    }
+    if (extras && nextSearch<searches.length && !retroConfirmed()) {
+      if (!extrasSufficient()) extras.artworkChecked=false;
       if (!videoSufficient()) extras.videoChecked=false;
+    }
+    if (extras && systemId===0) {
+      // Only use other platforms discovered by an exact regional-title match.
+      extras.sourceCandidates=bestScore===1 && exactSources.get(mediaSystem)?.size===1
+        ? [...exactSources].filter(([platform,ids])=>platform!==mediaSystem && ids.size===1)
+          .slice(0,4).map(([system,ids])=>({system,gameId:[...ids][0]})) : [];
     }
     const aliases=[];
     if (extras && systemId) {
@@ -3284,10 +3360,17 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
       if (legacyKey && bestScore===1 && (names.includes(legacyWanted) || names.includes(wanted))) aliases.push(legacyKey);
     }
     // Never persist a miss when a search timed out or media confirmation failed.
-    if (!video && incompleteSearch) throw incompleteSearch;
+    if (!video && incompleteSearch && !(demand.retro && demand.wantsExtras && extras)) throw incompleteSearch;
     const result = video
       ? { found:true, url:video.url, video, extras, provider:'screenscraper' }
       : { found:false, extras, provider:'screenscraper', reason: !candidates ? 'no_match' : !validMatch ? 'no_close_match' : 'no_video', candidates };
+    if (demand.retro && demand.wantsExtras && extras && (partialMediaError || incompleteSearch ||
+        (!retroConfirmed() && !ssRetroExtrasComplete(extras)))) {
+      // Keep the confirmed search payload useful without persisting an incomplete miss.
+      extras.artworkChecked=false;
+      if (!video) extras.videoChecked=false;
+      return {...result,partial:true,partialReason:partialMediaError?.code || incompleteSearch?.code};
+    }
     const verifiedSerial = !serial || !!extras?.identity?.serials?.includes(serial);
     if (serial && extras && !verifiedSerial) {
       // Name-only identification is useful, but not a permanent serial mapping.
@@ -3317,32 +3400,40 @@ function ssPreviewLookup(name, systemId, options = null) {
   const conjunctionKey = ssPreviewConjunctionVariant(searchName) !== searchName ? 'amp1:' : '';
   const legacyKey = `${systemId}:${articleKey}${editionKey}${numeralKey}${gotyKey}${apostropheKey}${regionalKey}${conjunctionKey}${normalized}`;
   const serial=systemId ? ssPreviewSerial(options?.titleId) : '';
-  const key=serial ? `${systemId}:serial1:${serial}` : legacyKey;
+  const candidateId=Number(options?.candidateGameId)||0;
+  // Exact Ports alternatives have their own cache keys; do not overwrite a standalone name mapping.
+  const key=candidateId ? `${systemId}:source1:${candidateId}` : serial ? `${systemId}:serial1:${serial}` : legacyKey;
   const requireEnglish = options?.englishSummary === true;
   const requireArtwork = options?.artwork === true;
   const wantsExtras = requireEnglish || requireArtwork;
   const wantsVideo = !wantsExtras;
-  const ready = (result,video=wantsVideo,extras=wantsExtras) => !!result &&
+  const retro=options?.retro===true;
+  const ready = (result,video=wantsVideo,extras=wantsExtras,retroDetail=retro) => !!result &&
+    (!candidateId || Number(result.video?.gameId || result.extras?.gameId)===candidateId) &&
+    (systemId!==0 || !result.extras || Array.isArray(result.extras.sourceCandidates) ||
+      ((!video || result.found) && (!extras || ssRetroExtrasComplete(result.extras)))) &&
     (!video || result.found || result.extras?.videoChecked !== false) &&
     (!extras || (!result.found && !result.extras) ||
-      (result.extras?.summaryEnglishChecked === true && result.extras?.artworkChecked === true));
+      (result.extras?.summaryEnglishChecked === true && result.extras?.artworkChecked === true &&
+       (!retroDetail || result.extras.retroDetailsChecked===true || ssRetroExtrasComplete(result.extras))));
   const cached = ssPreviewGetCached(key);
   if (ready(cached)) return Promise.resolve(cached);
   const existing = ssPreviewInflight.get(key);
   if (existing) {
     existing.wantsExtras ||= wantsExtras;
     existing.wantsVideo ||= wantsVideo;
+    existing.retro ||= retro;
     return wantsVideo ? existing.video : existing.full;
   }
   let publish;
   const earlyVideo = new Promise(resolve => {publish=resolve;});
-  const demand = {wantsExtras,wantsVideo,publish};
+  const demand = {wantsExtras,wantsVideo,publish,retro,candidateGameId:candidateId};
   const memoryLegacy=serial ? ssPreviewGetCached(legacyKey) : null;
   const refreshInitialsMiss = ssPreviewInitialsVariant(searchName) !== searchName;
   const work = ssPreviewLoadDatabase(key, systemId,serial ? legacyKey : '',serial,normalized,refreshInitialsMiss).then(({primary,legacy}) => {
     // The previous lookup may have populated RAM while its asynchronous DB write is still pending.
     if (cached) primary=cached;
-    const complete = result => ready(result,demand.wantsVideo,demand.wantsExtras);
+    const complete = result => ready(result,demand.wantsVideo,demand.wantsExtras,demand.retro);
     if (primary?.found) demand.publish(primary);
     if (complete(primary) && (primary.extras || primary.found)) return primary;
     if (!legacy && memoryLegacy && ssPreviewLegacyCompatible(memoryLegacy.extras,serial,normalized)) legacy=memoryLegacy;
@@ -3356,10 +3447,11 @@ function ssPreviewLookup(name, systemId, options = null) {
     if (primary?.found) demand.publish(primary);
     if (complete(primary)) return primary;
     return ssPreviewFetchUpstream(name,systemId,key,serial,
-      Number(primary?.video?.gameId || primary?.extras?.gameId)||0,serial ? legacyKey : '',legacy,demand,
-      primary?.extras?.artworkChecked===false || primary?.extras?.videoChecked===false,options?.lookupDeadline).catch(error=>{
+      candidateId || Number(primary?.video?.gameId || primary?.extras?.gameId)||0,serial ? legacyKey : '',legacy,demand,
+      primary?.extras?.artworkChecked===false || primary?.extras?.videoChecked===false,options?.lookupDeadline,primary?.video).catch(error=>{
       if (complete(primary)) return primary;
       if (complete(legacy)) return legacy;
+      if (demand.retro && demand.wantsExtras && primary?.extras) return {...primary,partial:true,partialReason:error?.code};
       throw error;
     });
   });
@@ -3370,58 +3462,61 @@ function ssPreviewLookup(name, systemId, options = null) {
   return wantsVideo ? demand.video : demand.full;
 }
 
-async function ssPreviewLookupMinis(name, options = null) {
-  options={...options,lookupDeadline:Date.now()+SS_PREVIEW_LOOKUP_BUDGET_MS};
-  const ps3=await ssPreviewLookup(name,59,options);
-  if (options?.artwork) {
-    if (ps3?.extras?.images?.some(item=>item.kind==='artwork')) return ps3;
-  } else if (ps3?.found) return ps3;
-  const psp=await ssPreviewLookup(name,61,options);
-  if (options?.artwork) {
-    if (!ps3?.extras) return psp?.extras?psp:ps3;
-    if (!psp?.extras) return ps3;
-    return (psp.extras.images?.length||0)>(ps3.extras.images?.length||0)?psp:ps3;
-  }
-  return psp?.found?psp:ps3;
-}
-
-async function ssPreviewLookupRetro(name, systemId, options = null) {
-  const platforms=SS_PREVIEW_RETRO_SYSTEMS.get(systemId);
+async function ssPreviewLookupSources(name, platforms, options = null) {
   const deadline=Date.now()+SS_PREVIEW_LOOKUP_BUDGET_MS;
-  const artwork=options?.artwork===true;
-  let best=null, incomplete=null;
-  for (let i=0;i<platforms.length;i++) {
-    const platform=platforms[i];
-    if (deadline-Date.now()<100) {
-      incomplete ||= Object.assign(new Error('ScreenScraper lookup deadline reached.'),{status:502,code:'lookup_timeout',upstreamStatus:0});
-      break;
-    }
-    // PSN identifiers describe the re-release, not the original cartridge/CD.
+  const artwork=options?.artwork===true || options?.englishSummary===true;
+  const sources=platforms.map(system=>({system}));
+  let best=null, merged=null, incomplete=null;
+  const timeout=()=>Object.assign(new Error('ScreenScraper lookup deadline reached.'),{status:502,code:'lookup_timeout',upstreamStatus:0});
+  for (let i=0;i<sources.length;i++) {
+    const {system:platform,gameId}=sources[i];
+    if (deadline-Date.now()<100) { incomplete ||= timeout(); break; }
+    // A Sony digital ID identifies the re-release, never the original cartridge/CD.
     const titleId=(platform===59 || platform===61) && /^NP[A-Z]{2}\d{5}$/.test(options?.titleId||'') ? options.titleId : '';
     try {
-      // Leave a small share of the common budget for the remaining platforms.
-      const platformDeadline=deadline-(platforms.length-i-1)*1000;
-      if (platformDeadline-Date.now()<100) {
-        incomplete ||= Object.assign(new Error('ScreenScraper lookup deadline reached.'),{status:502,code:'lookup_timeout',upstreamStatus:0});
-        continue;
+      // Reserve a small share for other sources; Ports discover sources from the first query.
+      const platformDeadline=deadline-Math.max(sources.length-i-1,platform===0?1:0)*1000;
+      if (platformDeadline-Date.now()<100) { incomplete ||= timeout(); continue; }
+      const result=await ssPreviewLookup(name,platform,{...options,titleId,retro:true,lookupDeadline:platformDeadline,candidateGameId:gameId});
+      if (gameId && Number(result?.video?.gameId || result?.extras?.gameId)!==gameId) {
+        // Never merge a different edition from a stale or ambiguous name cache.
+        incomplete ||= timeout(); continue;
       }
-      const result=await ssPreviewLookup(name,platform,{...options,titleId,lookupDeadline:platformDeadline});
       if (!artwork && result?.found) return result;
-      if (artwork && result?.extras?.images?.some(item=>item.kind==='artwork')) return result;
+      if (result?.partial) incomplete ||= timeout();
       if (!best || (!best.extras && result?.extras)) best=result;
+      if (artwork && result?.extras) {
+        merged=ssRetroMergeExtras(merged,result.extras);
+        if (result.extras.artworkChecked===false) incomplete ||= timeout();
+        if (ssRetroExtrasComplete(merged)) break;
+      }
+      if (['api_rate_limit','api_auth','provider_cooldown','provider_queue_full'].includes(result?.partialReason)) break;
+      if (platform===0) {
+        for (const candidate of result?.extras?.sourceCandidates || []) {
+          if (ssPreviewValidMediaSystem(candidate.system) && Number.isSafeInteger(candidate.gameId) && candidate.gameId>0 &&
+              !sources.some(source=>source.system===candidate.system)) sources.push(candidate);
+        }
+      }
     } catch (error) {
-      if (!['api_timeout','lookup_timeout','api_connection','api_incomplete_response','api_unavailable'].includes(error?.code)) throw error;
+      // Preserve already confirmed media, including when another platform times out.
+      if (!['api_timeout','lookup_timeout','api_connection','api_incomplete_response','api_unavailable','api_rejected','provider_queue_timeout','provider_queue_full','provider_cooldown','api_rate_limit','api_auth'].includes(error?.code)) throw error;
       incomplete ||= error;
+      if (['api_rate_limit','api_auth','provider_cooldown','provider_queue_full'].includes(error.code)) break;
     }
   }
-  // A failed platform lookup is not proof that the game has no media.
+  // Source records stay separate in PostgreSQL; a mixed record never overwrites them.
+  if (artwork && merged) return {...best,extras:merged,partial:!!incomplete};
   if (incomplete) throw incomplete;
   return best || {found:false,extras:null,provider:'screenscraper',reason:'no_match'};
 }
 
 function ssPreviewLookupCategory(name,systemId,isMinis,options) {
-  if (isMinis) return ssPreviewLookupMinis(name,options);
-  if (SS_PREVIEW_RETRO_SYSTEMS.has(systemId)) return ssPreviewLookupRetro(name,systemId,options);
+  if (isMinis) return ssPreviewLookupSources(name,[59,61],options);
+  if (SS_PREVIEW_RETRO_SYSTEMS.has(systemId)) return ssPreviewLookupSources(name,SS_PREVIEW_RETRO_SYSTEMS.get(systemId),options);
+  // The catalogue labels PSP re-releases as PSP, not as a separate Remasters category.
+  if ((systemId===61 && !ssPreviewPhysicalSerial(options?.titleId)) ||
+      (systemId===59 && /\bpsp[\s-]+remaster(?:ed|s)?\b/i.test(name))) return ssPreviewLookupSources(name,[59,61],options);
+  if (systemId===0) return ssPreviewLookupSources(name,[0],options);
   return ssPreviewLookup(name,systemId,options);
 }
 
@@ -4666,7 +4761,8 @@ app.get('/api/screenscraper-extras', async (req,res) => {
   try {
     const options={englishSummary:true,artwork:true,titleId:isPort?'':ssPreviewSerial(req.query?.titleId)};
     const result = await ssPreviewLookupCategory(name,system,isMinis,options);
-    return res.json({ok:true,found:!!result.extras,extras:ssExtraPublic(result.extras)});
+    if (result.partial) res.setHeader('Cache-Control','no-store');
+    return res.json({ok:true,found:!!result.extras,extras:ssExtraPublic(result.extras),...(result.partial?{partial:true,retry:true}:{})});
   } catch (e) {res.setHeader('Cache-Control','no-store');if([429,503].includes(Number(e?.status)))res.setHeader('Retry-After',String(Math.min(3600,Math.max(2,Number(e.retryAfter)||5))));return res.status([429,503].includes(Number(e?.status)) ? e.status : 502).json({ok:false,retry:true,...ssPreviewPublicError(e)});}
 });
 
