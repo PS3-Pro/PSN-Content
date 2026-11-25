@@ -2491,6 +2491,11 @@ function ssPreviewSearchVariants(value) {
     if (terms.length >= 3 && /^(?:[2-9]|II|III|IV|V|VI|VII|VIII|IX)$/i.test(terms.at(-1))) variants.push(terms.slice(0,-1).join(' '));
   }
   if (spacedInitials !== unwrapped) variants.push(spacedInitials);
+  const conjunction = ssPreviewConjunctionVariant(unwrapped);
+  const possessive = ssPreviewPossessiveVariant(unwrapped);
+  const combined = ssPreviewConjunctionVariant(possessive);
+  // The combined spelling is especially useful when both characters differ.
+  if (/[’']/.test(unwrapped) && conjunction !== unwrapped && combined !== conjunction) variants.push(combined);
   const punctuationFree=ssPreviewInitialsVariant(unwrapped).replace(/[.?!…]+/g,' ').replace(/\s*[-:;–—]+\s*/g,' ').replace(/\s+/g,' ').trim();
   if (punctuationFree && punctuationFree!==unwrapped) variants.push(punctuationFree);
   // Discover by an existing phrase when decorative punctuation obscures a title.
@@ -2499,12 +2504,7 @@ function ssPreviewSearchVariants(value) {
     const tail=punctuationFree.split(' ').slice(1).join(' ');
     if (tail.length>=8) variants.push(tail);
   }
-  const conjunction = ssPreviewConjunctionVariant(unwrapped);
-  const possessive = ssPreviewPossessiveVariant(unwrapped);
-  // Try common spelling combinations early, not only each substitution alone.
-  // "Akiba's Trip - Undead & Undressed" -> "Akibas Trip - Undead And Undressed".
   if (conjunction !== unwrapped) variants.push(conjunction);
-  const combined = ssPreviewConjunctionVariant(possessive);
   if (combined !== unwrapped && combined !== conjunction) variants.push(combined);
   // Known regional names are more useful than a punctuation-only retry.
   const regionalAlias = ssPreviewRegionalAlias(unwrapped);
@@ -3146,6 +3146,10 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
     const dottedInitials = ssPreviewInitialsVariant(ssPreviewSearchName(name)) !== ssPreviewSearchName(name);
     const matchName = value => ssPreviewMatchTitle(value,dottedInitials);
     const wanted = matchName(name);
+    const pendingIdentityKey = `${systemId}:${key}:${wanted}`;
+    const pendingIdentity = ssPreviewPendingDetails.get(pendingIdentityKey);
+    if (pendingIdentity && pendingIdentity.until<=Date.now()) ssPreviewPendingDetails.delete(pendingIdentityKey);
+    const resumeIdentity = !knownGameId && systemId!==0 && pendingIdentity?.until>Date.now() ? pendingIdentity.id : 0;
     const legacyWanted = normalizeSsPreviewTitle(name);
     let bestGame = null;
     let bestScore = 0;
@@ -3193,12 +3197,14 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
       publishedVideoSource=video;
       demand.publish({found:true,url:video.url,video,provider:'screenscraper',lookupSource:lookupTrace.length?'screenscraper':'cached_identity_or_details',lookupTrace:lookupTrace.map(trace=>({...trace}))});
     }
-    if (systemId && knownGameId) {
-      detailedIds.add(knownGameId);
-      const game = await ssPreviewRequestInfo(systemId,'',knownGameId,deadline);
-      if (ssPreviewGameUsable(game,systemId) && Number(game.id)===knownGameId &&
-          (!demand.candidateGameId || ssPreviewNames(game).some(title=>matchName(title)===wanted))) {
-        bestGame=game;confirmedDetailId=knownGameId;bestScore=1;bestMediaRank=mediaRank(game);bestSerialMatch=!!serial && ssPreviewRomSerials(game).includes(serial);candidates=1;
+    const detailGameId=knownGameId || resumeIdentity;
+    if (systemId && detailGameId) {
+      detailedIds.add(detailGameId);
+      const game = await ssPreviewRequestInfo(systemId,'',detailGameId,deadline);
+      if (resumeIdentity) ssPreviewPendingDetails.delete(pendingIdentityKey);
+      if (ssPreviewGameUsable(game,systemId) && Number(game.id)===detailGameId &&
+          (!(demand.candidateGameId || resumeIdentity) || ssPreviewNames(game).some(title=>matchName(title)===wanted))) {
+        bestGame=game;confirmedDetailId=detailGameId;bestScore=1;bestMediaRank=mediaRank(game);bestSerialMatch=!!serial && ssPreviewRomSerials(game).includes(serial);candidates=1;
       } else if (demand.candidateGameId) {
         throw Object.assign(new Error('ScreenScraper source candidate could not be confirmed.'),{status:502,code:'api_rejected',upstreamStatus:0});
       }
@@ -3251,7 +3257,8 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
       }
       const data = response.data.response || {};
       const rawGames = data.jeux || data.jeu || [];
-      const games = Array.isArray(rawGames) ? rawGames : (Array.isArray(rawGames.jeu) ? rawGames.jeu : (rawGames.jeu ? [rawGames.jeu] : (rawGames.id ? [rawGames] : [])));
+      const games = (Array.isArray(rawGames) ? rawGames : (Array.isArray(rawGames.jeu) ? rawGames.jeu : (rawGames.jeu ? [rawGames.jeu] : (rawGames.id ? [rawGames] : []))))
+        .filter(game=>Number.isSafeInteger(Number(game?.id)) && Number(game.id)>0);
       candidates += games.length;
       trace.candidates=games.length;
       trace.sample=games.slice(0,4).map(game=>({id:Number(game?.id)||null,system:ssPreviewGameSystem(game)||null,name:(ssPreviewNames(game)[0]||'').slice(0,140)}));
@@ -3315,6 +3322,14 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
       let game;
       try { game = await ssPreviewRequestInfo(platform,'',id,deadline); }
       catch (error) {
+        // A retry can resume the exact identity instead of spending its budget on the same names.
+        if (systemId!==0 && bestScore===1 && exactGameIds.size===1 &&
+            [...candidateScores].every(([other,score])=>other===id || score<=0.96) &&
+            ['api_timeout','lookup_timeout','api_connection','api_incomplete_response','provider_queue_timeout'].includes(error?.code)) {
+          ssPreviewPendingDetails.delete(pendingIdentityKey);
+          ssPreviewPendingDetails.set(pendingIdentityKey,{id,until:Date.now()+5*60*1000});
+          while (ssPreviewPendingDetails.size>512) ssPreviewPendingDetails.delete(ssPreviewPendingDetails.keys().next().value);
+        }
         if (!demand.retro || !demand.wantsExtras) throw error;
         partialMediaError=error;
         return;
@@ -3446,6 +3461,8 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
   })();
   return work.then(result=>({...result,lookupSource:result.lookupSource || (lookupTrace.length ? 'screenscraper' : 'cached_identity_or_details'),lookupTrace})).catch(error=>{error.lookupTrace=lookupTrace;throw error;}).finally(() => { ssPreviewQueued--; });
 }
+// Short-lived exact identities awaiting media details; never treated as a completed lookup.
+const ssPreviewPendingDetails = new Map();
 function ssPreviewLookup(name, systemId, options = null) {
   const normalized = normalizeSsPreviewTitle(name);
   const searchName = ssPreviewSearchName(name);
