@@ -71,38 +71,6 @@
 			if(document.body)arm();else document.addEventListener('DOMContentLoaded',arm,{once:true});
 		};
 	})();</script>
-	<script>(function(){
-		if (/PS3|PlayStation 3|NetFront/i.test(navigator.userAgent || '') || navigator.platform === 'PlayStation 3' || typeof fetch !== 'function') return;
-		const url = 'https://raw.githubusercontent.com/FlexBy420/psn-trophy-scraper/main/all.json.gz';
-		let pending = null, retryAfter = 0;
-		async function downloadCatalog(cache, source = url) {
-			const controller = typeof AbortController === 'function' ? new AbortController() : null;
-			const timeout = controller ? setTimeout(() => controller.abort(), 120000) : null;
-			try {
-				const response = await fetch(source, {cache, credentials:'omit', referrerPolicy:'no-referrer', signal:controller ? controller.signal : undefined});
-				if (!response.ok) throw new Error('Trophy database HTTP ' + response.status);
-				const blob = await response.blob();
-				if (!blob.size) throw new Error('Empty trophy download');
-				return blob;
-			} finally { clearTimeout(timeout); }
-		}
-		window.__psnGetTrophyCatalogBlob = function() {
-			if (pending && (!retryAfter || Date.now() < retryAfter)) return pending;
-			retryAfter = 0;
-			const task = downloadCatalog('force-cache').catch(error => {
-				if (navigator.onLine === false || error.name === 'AbortError') throw error;
-				// Recover a failed/corrupt cached response without a second simultaneous transfer.
-				return downloadCatalog('reload', url + '?psn-catalog=1');
-			});
-			pending = task;
-			task.catch(() => { if (pending === task) retryAfter = Date.now() + 30000; });
-			return task;
-		};
-		window.__psnReleaseTrophyCatalogBlob = function() { pending = null; retryAfter = 0; };
-		window.addEventListener('online', () => { if (retryAfter) { pending = null; retryAfter = 0; } });
-		const connection = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
-		if (!document.hidden && navigator.onLine !== false && !connection?.saveData && !/^(slow-2g|2g)$/.test(connection?.effectiveType || '')) window.__psnGetTrophyCatalogBlob().catch(()=>{});
-	})();</script>
 	<script>
 	window.psnHeroFallbackImage = 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(
 		'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900">' +
@@ -38739,48 +38707,24 @@ P
 		};
 	}
 
-	async function readExternalTrophyCatalog(response) {
-		if (!response.ok) throw new Error('Failed to load trophy database');
-		if (response.body && typeof DecompressionStream === 'function' && typeof ReadableStream === 'function') {
-			const reader = response.body.getReader();
-			const initial = [];
-			const magic = [];
-			while (magic.length < 2) {
-				const part = await reader.read();
-				if (part.done) break;
-				initial.push(part.value);
-				for (const byte of part.value) { magic.push(byte); if (magic.length === 2) break; }
-			}
-			const stream = new ReadableStream({
-				async pull(controller) {
-					if (initial.length) { controller.enqueue(initial.shift()); return; }
-					const part = await reader.read();
-					if (part.done) controller.close(); else controller.enqueue(part.value);
-				},
-				cancel(reason) { return reader.cancel(reason); }
-			});
-			return new Response(magic[0] === 31 && magic[1] === 139 ? stream.pipeThrough(new DecompressionStream('gzip')) : stream).json();
-		}
+	async function readExternalTrophyCatalog() {
+		const response = await fetch(EXTERNAL_TROPHY_DB_URL, { cache: 'force-cache' });
+		if (!response.ok) throw new Error('Trophy database HTTP ' + response.status);
 		const buffer = await response.arrayBuffer();
-		const bytes = new Uint8Array(buffer);
-		if (bytes[0] === 31 && bytes[1] === 139) {
-			if (typeof DecompressionStream !== 'function') throw new Error('Gzip decompression unavailable');
-			return new Response(new Blob([buffer]).stream().pipeThrough(new DecompressionStream('gzip'))).json();
+		let text = '';
+		if (typeof DecompressionStream === 'function') {
+			try {
+				const stream = new Blob([buffer]).stream().pipeThrough(new DecompressionStream('gzip'));
+				text = await new Response(stream).text();
+			} catch (err) {}
 		}
-		return JSON.parse(new TextDecoder('utf-8').decode(buffer));
+		if (!text) text = new TextDecoder('utf-8').decode(buffer);
+		return JSON.parse(text);
 	}
 
 	let externalTrophyForegroundRequested = false;
 	let externalTrophyForegroundWake = null;
-	function getExternalTrophyCatalogBlob() {
-		if (typeof window.__psnGetTrophyCatalogBlob === 'function') return window.__psnGetTrophyCatalogBlob();
-		return fetch(EXTERNAL_TROPHY_DB_URL, {cache:'force-cache'}).then(response => {
-			if (!response.ok) throw new Error('Failed to load trophy database');
-			return response.blob();
-		});
-	}
-	async function loadExternalTrophyDbOnMainThread({ background = false, blob = null } = {}) {
-		const compressed = blob || await getExternalTrophyCatalogBlob();
+	async function loadExternalTrophyDbOnMainThread({ background = false } = {}) {
 		if (background && !externalTrophyForegroundRequested && !document.body?.classList.contains('psn-home-interactive')) {
 			await new Promise(resolve => {
 				const wake = () => { if (externalTrophyForegroundWake === wake) externalTrophyForegroundWake = null; resolve(); };
@@ -38789,7 +38733,7 @@ P
 				else wake();
 			});
 		}
-		const data = await readExternalTrophyCatalog(new Response(compressed));
+		const data = await readExternalTrophyCatalog();
 		const games = [], entries = [], exact = new Map();
 		const ids = Object.keys(data || {});
 		for (let i = 0; i < ids.length; i++) {
@@ -38808,7 +38752,6 @@ P
 		if (!games.length) throw new Error('Empty trophy database');
 		externalTrophyTitleIndex = {entries,exact};
 		externalTrophyDbGames = games;
-		window.__psnReleaseTrophyCatalogBlob?.();
 		window.psnTrophyPrefetchReady = true;
 		return games;
 	}
@@ -38819,9 +38762,10 @@ P
 	let externalTrophyWorkerRequest = 0;
 	const externalTrophyWorkerMatches = new Map();
 
-	function loadExternalTrophyDbInWorker(blob) {
+	function loadExternalTrophyDbInWorker() {
 		if (externalTrophyWorkerDisabled || !window.Worker || !window.Blob || !window.URL) return Promise.reject(new Error('Trophy worker unavailable'));
 		const workerSource = `
+			const EXTERNAL_TROPHY_DB_URL = ${JSON.stringify(EXTERNAL_TROPHY_DB_URL)};
 			${readExternalTrophyCatalog.toString()}
 			${normalizeExternalTrophyGame.toString()}
 			${normalizeGameTrophyTitle.toString()}
@@ -38833,7 +38777,7 @@ P
 				const msg = event.data || {};
 				try {
 					if (msg.type === 'load') {
-						const data = await readExternalTrophyCatalog(new Response(msg.blob));
+						const data = await readExternalTrophyCatalog();
 						const games = Object.keys(data || {}).map(id => normalizeExternalTrophyGame(id, data[id])).filter(game => game.title && game.trophies.length);
 						if (!games.length) throw new Error('Empty trophy database');
 						index = buildExternalTrophyTitleIndex(games);
@@ -38848,7 +38792,7 @@ P
 		`;
 		return new Promise((resolve,reject) => {
 			let worker, url, timer, failed = false;
-			const fail = error => {
+			const fail = (error, disableWorker = true) => {
 				if (failed) return;
 				failed = true;
 				clearTimeout(timer);
@@ -38862,7 +38806,7 @@ P
 					for (const pending of externalTrophyWorkerMatches.values()) { clearTimeout(pending.timer); pending.reject(error); }
 					externalTrophyWorkerMatches.clear();
 				}
-				externalTrophyWorkerDisabled = true;
+				if (disableWorker) externalTrophyWorkerDisabled = true;
 				reject(error);
 			};
 			try {
@@ -38877,7 +38821,6 @@ P
 						clearTimeout(timer);
 						if (url) { URL.revokeObjectURL(url); url = ''; }
 						externalTrophyWorkerReady = true;
-						window.__psnReleaseTrophyCatalogBlob?.();
 						window.psnTrophyPrefetchReady = true;
 						resolve(true);
 					} else if (msg.type === 'match') {
@@ -38886,12 +38829,12 @@ P
 						externalTrophyWorkerMatches.delete(msg.id);
 						clearTimeout(pending.timer);
 						pending.resolve(msg.game || null);
-					} else if (msg.type === 'error') fail(new Error(msg.message || 'Trophy worker failed'));
+					} else if (msg.type === 'error') fail(new Error(msg.message || 'Trophy worker failed'), externalTrophyWorkerReady);
 				};
-				// Blob cloning shares immutable bytes; retain them until the worker is ready so fallback can reuse the download.
+				// Fetch directly in the worker, as in the working legacy implementation.
 				if (!failed) {
 					timer = setTimeout(() => fail(new Error('Trophy worker timeout')), 45000);
-					worker.postMessage({type:'load',blob});
+					worker.postMessage({type:'load'});
 				}
 			} catch (error) { fail(error); }
 		});
@@ -38904,16 +38847,13 @@ P
 		}
 		if (externalTrophyWorkerReady || externalTrophyDbGames) return true;
 		if (externalTrophyDbPromise) return externalTrophyDbPromise;
-		// A network failure is not a worker failure. Both paths share the downloaded blob.
-		const task = getExternalTrophyCatalogBlob().then(blob => {
-			const workerAvailable = !externalTrophyWorkerDisabled && window.Worker && window.Blob && window.URL;
-			return workerAvailable
-				? loadExternalTrophyDbInWorker(blob).catch(err => {
-					console.warn('[System] Trophy worker unavailable. Falling back to main thread.', err);
-					return loadExternalTrophyDbOnMainThread({ background, blob });
-				})
-				: loadExternalTrophyDbOnMainThread({ background, blob });
-		});
+		const workerAvailable = !externalTrophyWorkerDisabled && window.Worker && window.Blob && window.URL;
+		const task = workerAvailable
+			? loadExternalTrophyDbInWorker().catch(err => {
+				console.warn('[System] Trophy worker load failed. Trying direct fallback.', err);
+				return loadExternalTrophyDbOnMainThread({ background });
+			})
+			: loadExternalTrophyDbOnMainThread({ background });
 		externalTrophyDbPromise = task.catch(err => { externalTrophyDbPromise = null; throw err; });
 		return externalTrophyDbPromise;
 	}
@@ -39112,7 +39052,7 @@ P
 			readCachedGameTrophyMatch(title,controller).then(cached => {
 				cacheDone = true;
 				if (settled) return;
-				if (cached && (cached.match || !localResult?.match)) { finish(cached); return; }
+				if (cached?.match) { finish(cached); return; }
 				if (localResult) { finish(localResult); return; }
 				if (localError) { settled = true; reject(localError); return; }
 			});
@@ -39266,10 +39206,17 @@ P
 		statusEl.className = 'modal-trophies-loading';
 		statusEl.innerHTML = '<span class="modal-trophies-skeleton"></span>';
 		prepareGameTrophyMatch(localGame,currentCat).then(renderMatch)
-			.catch(() => {
+			.catch(error => {
 				if (token !== modalTrophyLookupToken || !statusEl.isConnected || document.getElementById('modal-trophies-status') !== statusEl) return;
-				statusEl.className = 'modal-trophies-loading';
-				statusEl.textContent = '—';
+				console.warn('[TROPHIES] Catalog lookup failed:', error);
+				statusEl.className = '';
+				const retry = document.createElement('button');
+				retry.type = 'button';
+				retry.className = 'modal-trophies-link';
+				retry.textContent = 'Retry';
+				retry.title = 'Trophy catalog unavailable. Try again';
+				retry.addEventListener('click', event => { event.stopPropagation(); updateModalTrophyStatus(localGame,currentCat); }, {once:true});
+				statusEl.replaceChildren(retry);
 			});
 	}
 
