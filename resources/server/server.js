@@ -2184,7 +2184,7 @@ const SS_PREVIEW_PASSWORD = String(process.env.SCREENSCRAPER_PASSWORD || 'LuanTe
 const SS_PREVIEW_ENABLED = process.env.SCREENSCRAPER_PREVIEWS_ENABLED !== '0' && !!SS_PREVIEW_DEVID && !!SS_PREVIEW_DEVPASSWORD;
 if (SS_PREVIEW_ENABLED && !(SS_PREVIEW_USER && SS_PREVIEW_PASSWORD))
   console.warn('[ScreenScraper] No member login configured; set SCREENSCRAPER_USER and SCREENSCRAPER_PASSWORD on Render to use member quota.');
-const SS_PREVIEW_RETRO_SYSTEMS = new Map([[31, [59, 61, 31, 114]], [142, [59, 61, 142, 70]]]);
+const SS_PREVIEW_RETRO_SYSTEMS = new Map([[57, [57, 59, 61]], [58, [58, 59]], [31, [59, 61, 31, 114]], [142, [59, 61, 142, 70]]]);
 const SS_PREVIEW_SYSTEM_IDS = new Set([57, 58, 59, 61, 62, 60, ...SS_PREVIEW_RETRO_SYSTEMS.keys()]);
 const ssPreviewValidMediaSystem = value => Number.isSafeInteger(value) && value >= 1 && value <= 2000;
 const SS_PREVIEW_POSITIVE_MS = 24 * 60 * 60 * 1000;
@@ -3614,8 +3614,11 @@ async function ssPreviewLookupSources(name, platforms, options = null) {
   for (let i=0;i<sources.length;i++) {
     const {system:platform,gameId}=sources[i];
     if (deadline+detailBudget.used-Date.now()<100) { incomplete ||= timeout(); break; }
-    // A Sony digital ID identifies the re-release, never the original cartridge/CD.
-    const titleId=(platform===59 || platform===61) && /^NP[A-Z]{2}\d{5}$/.test(options?.titleId||'') ? options.titleId : '';
+    // Keep the existing PS1/PS2 identity on the original platform. Never probe
+    // a physical PS1/PS2 serial against a later console; digital IDs are cache keys.
+    const originalClassic=i===0 && (platform===57 || platform===58);
+    const titleId=originalClassic ? ssPreviewSerial(options?.titleId) :
+      (platform===59 || platform===61) && /^NP[A-Z]{2}\d{5}$/.test(options?.titleId||'') ? options.titleId : '';
     try {
       // Reserve a small share for other sources; Ports discover sources from the first query.
       const platformDeadline=deadline+detailBudget.used-Math.max(sources.length-i-1,platform===0?1:0)*1000;
