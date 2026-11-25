@@ -2463,6 +2463,15 @@ function ssPreviewNumberVariant(value) {
     return SS_PREVIEW_ROMAN_NUMERALS[roman] || SS_PREVIEW_ARABIC_NUMERALS[token] || token;
   });
 }
+function ssPreviewMatchTitle(value, dottedInitials=false) {
+  const initials=ssPreviewInitialsVariant(value);
+  const title=dottedInitials ? initials.replace(/\b(?:[a-z]\s+)+[a-z]\b/gi, letters=>letters.replace(/\s+/g,'')) : initials;
+  return normalizeSsPreviewTitle(title).replace(/\b0+(?=\d)\d*\b/g, token=>token.replace(/^0+(?=\d)/,''));
+}
+function ssPreviewPaddedNumberVariant(value) {
+  // Only pad standalone sequel numbers, not years, model names or dotted initials.
+  return String(value || '').replace(/\b(?:0?[1-9])\b/g, token=>token.length===1 ? `0${token}` : token.slice(1));
+}
 function ssPreviewSearchVariants(value) {
   const title = ssPreviewSearchName(value);
   // Keep edition terms but remove decorative brackets for ScreenScraper lookup.
@@ -2491,7 +2500,15 @@ function ssPreviewSearchVariants(value) {
   // Known regional names are more useful than a punctuation-only retry.
   const regionalAlias = ssPreviewRegionalAlias(unwrapped);
   if (regionalAlias) variants.push(regionalAlias);
+  // The internal name may use a dash while regional names retain a spaced colon.
+  const colon = unwrapped.replace(/\s+-\s+/g, ' : ');
+  const padded = ssPreviewPaddedNumberVariant(unwrapped);
+  if (padded !== unwrapped) variants.push(padded.replace(/\s+-\s+/g, ' : '));
+  if (colon !== unwrapped) variants.push(colon);
   variants.push(plain);
+  // A franchise prefix is discovery-only; the full title still decides the match.
+  const prefix = unwrapped.split(/\s+-\s+/)[0].replace(/\s+(?:0?\d|II|III|IV|V|VI|VII|VIII|IX)$/i,'').trim();
+  if (prefix !== unwrapped && prefix.split(/\s+/).length >= 2) variants.push(prefix);
   if (possessive !== unwrapped) variants.push(possessive);
   // Try numerals only as fallbacks; ordinary titles still need only one request.
   const alternate = ssPreviewNumberVariant(unwrapped);
@@ -2500,6 +2517,7 @@ function ssPreviewSearchVariants(value) {
     const alternatePlain = ssPreviewNumberVariant(plain);
     if (alternatePlain !== alternate) variants.push(alternatePlain);
   }
+  if (padded !== unwrapped) variants.push(padded);
   // ScreenScraper may index "The Last of Us" as "Last of Us, The".
   const first = /^(the|an|a)\s+(.+)$/i.exec(unwrapped);
   const last = /^(.+?),\s*(the|an|a)$/i.exec(unwrapped);
@@ -2554,7 +2572,7 @@ function ssPreviewNames(game) {
 
 function ssPreviewTitleSimilarity(a, b) {
   if (!a || !b) return 0;
-  if (a === b || a.replace(/\s+/g, '') === b.replace(/\s+/g, '')) return 1;
+  if (a === b) return 1;
   // Similar names are useful for punctuation and minor catalog differences, but
   // must never silently substitute another sequel, edition, or DLC.
   const variantMarkers = [
@@ -2568,7 +2586,11 @@ function ssPreviewTitleSimilarity(a, b) {
   if (signature(a) !== signature(b)) return 0;
   const numbers = title => (title.match(/\b\d+\b/g) || []).join(',');
   if (numbers(a) !== numbers(b)) return 0;
+  if (a.replace(/\s+/g, '') === b.replace(/\s+/g, '')) return 1;
   const aa = a.split(' '), bb = b.split(' ');
+  const meaningful = words => words.filter(word=>!['the','a','an','of','and','de','la','le'].includes(word));
+  const coreA=meaningful(aa), coreB=meaningful(bb);
+  if (coreA.length>=3 && coreA.join(' ')===coreB.join(' ')) return 0.96;
   const left = new Set(aa), right = new Set(bb);
   const unmatched = [...right];
   let shared = 0;
@@ -2864,7 +2886,7 @@ async function ssPreviewLoadDatabase(key, systemId, legacyKey='', serial='', wan
       if (!row) return null;
       const gameId = Number(row.game_id);
       if (gameId === 0 && row.extras?.negative === true) {
-        if (refreshInitialsMiss && row.extras.initialsSearchVersion !== 2) return null;
+        if (row.extras.titleSearchVersion !== 3 || (refreshInitialsMiss && row.extras.initialsSearchVersion !== 2)) return null;
         const payload = {found:false,provider:'screenscraper',reason:row.extras.reason || 'no_match'};
         ssPreviewSetCached(row.cache_key,payload);
         return payload;
@@ -2873,7 +2895,7 @@ async function ssPreviewLoadDatabase(key, systemId, legacyKey='', serial='', wan
       const mediaSystem = systemId === 0 ? Number(extras?.system) : systemId;
       if (!ssPreviewValidMediaSystem(mediaSystem)) return null;
       const type = String(row.media_type || '');
-      if (!type && refreshInitialsMiss && extras?.initialsSearchVersion !== 2) return null;
+      if (!type && (extras?.titleSearchVersion !== 3 || (refreshInitialsMiss && extras?.initialsSearchVersion !== 2))) return null;
       if (!Number.isSafeInteger(gameId) || gameId <= 0 || !['', 'video', 'video-normalized'].includes(type)) return null;
       const apiHost = ssPreviewAllowedMediaHost(row.api_host) ? row.api_host : 'api.screenscraper.fr';
       const video = type ? {
@@ -2912,7 +2934,7 @@ function ssPreviewPersistDatabase(key, systemId, result, aliases=[], protectPrim
   if (type && !['video', 'video-normalized'].includes(type)) return;
   const host = video && ssPreviewAllowedMediaHost(video.apiHost)
     ? video.apiHost : 'api.screenscraper.fr';
-  const metadata = isNegative ? {negative:true,reason:result.reason || 'no_match',initialsSearchVersion:2} : (result.extras ? {...result.extras,initialsSearchVersion:2} : null);
+  const metadata = isNegative ? {negative:true,reason:result.reason || 'no_match',initialsSearchVersion:2,titleSearchVersion:3} : (result.extras ? {...result.extras,initialsSearchVersion:2,titleSearchVersion:3} : null);
   const persistent = !!video;
   queryDbWithRetry(`
     INSERT INTO screenscraper_game_cache
@@ -3053,8 +3075,7 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
     const searches = ssPreviewSearchVariants(name);
     // Keep existing persistent keys, but compare dotted initialisms as letters.
     const dottedInitials = ssPreviewInitialsVariant(ssPreviewSearchName(name)) !== ssPreviewSearchName(name);
-    const matchName = value => normalizeSsPreviewTitle(dottedInitials
-      ? ssPreviewInitialsVariant(value).replace(/\b(?:[a-z]\s+)+[a-z]\b/gi, letters=>letters.replace(/\s+/g,'')) : ssPreviewInitialsVariant(value));
+    const matchName = value => ssPreviewMatchTitle(value,dottedInitials);
     const wanted = matchName(name);
     const legacyWanted = normalizeSsPreviewTitle(name);
     let bestGame = null;
@@ -3074,11 +3095,14 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
     let bestMediaRank = 0;
     let bestSerialMatch = false;
     const exactGameIds = new Set();
+    const candidateScores = new Map();
+    const strongFuzzy = () => systemId !== 0 && bestScore >= 0.94 && bestScore < 1 &&
+      wanted.split(' ').length >= 3 && [...candidateScores].every(([id,score])=>id===Number(bestGame?.id) || bestScore-score>=0.04);
     const detailedIds = new Set();
     let incompleteSearch = null;
     const normalSufficient = () => bestSerialMatch || (bestScore === 1 &&
       (systemId === 0 ? bestMediaRank >= 2 : (!tryAlternateMedia ? bestMediaRank > 0 : bestMediaRank === 3)));
-    const videoSufficient = () => bestSerialMatch || (bestScore === 1 && bestMediaRank >= 2);
+    const videoSufficient = () => bestSerialMatch || ((bestScore === 1 || strongFuzzy()) && bestMediaRank >= 2);
     const sufficient = () => (!demand.wantsExtras || normalSufficient()) && (!demand.wantsVideo || videoSufficient());
     let publishedVideo = false;
     function publishVideo() {
@@ -3152,6 +3176,7 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
         if (!ssPreviewGameUsable(game,systemId)) continue;
         const score = Math.max(0, ...ssPreviewNames(game).map(title => ssPreviewTitleSimilarity(wanted, matchName(title))));
         if (score === 1) exactGameIds.add(Number(game.id));
+        if (score >= minScore) candidateScores.set(Number(game.id),Math.max(score,candidateScores.get(Number(game.id))||0));
         if (score < minScore || (exactOnly && score !== 1)) continue;
         const rank = mediaRank(game);
         const serialMatch = !!serial && ssPreviewRomSerials(game).includes(serial);
@@ -3235,7 +3260,8 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
     if (!publishedVideo) await confirmMedia();
     const minScore = systemId === 0 ? 0.95 : 0.78;
     const mediaSystem = Number(bestGame && (bestGame.systemeid || (bestGame.systeme && bestGame.systeme.id)));
-    const validMatch = !!bestGame && bestScore >= minScore && ssPreviewValidMediaSystem(mediaSystem);
+    const validMatch = !!bestGame && bestScore >= minScore && ssPreviewValidMediaSystem(mediaSystem) &&
+      (bestSerialMatch || bestScore===1 || [...candidateScores].every(([id,score])=>id===Number(bestGame.id) || bestScore-score>=0.04));
     const video = validMatch ? ssPreviewFindVideo(bestGame, systemId) : null;
     const extras = validMatch ? ssPreviewExtractExtras(bestGame, mediaSystem) : null;
     if (extras && !video && !detailedIds.has(Number(bestGame.id)) && !demand.wantsVideo) extras.videoChecked=false;
