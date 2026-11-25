@@ -1673,7 +1673,7 @@ function requestMetadataJson(rawUrl, options = {}) {
     };
 
     const hardDeadline = options.hardDeadline === true;
-    const timeoutMs = Math.max(1000, Number(options.timeoutMs || METADATA_PROXY_TIMEOUT_MS));
+    const timeoutMs = Math.max(hardDeadline ? 100 : 1000, Number(options.timeoutMs || METADATA_PROXY_TIMEOUT_MS));
     let deadline;
     const fail = error => { clearTimeout(deadline); reject(error); };
     const timeoutError = () => Object.assign(new Error('Metadata upstream timeout.'),{code:'ETIMEDOUT'});
@@ -2236,7 +2236,7 @@ function ssProviderPump() {
     });
   }
 }
-function ssProviderAcquire(kind='search',signal) {
+function ssProviderAcquire(kind='search',signal,maxWaitMs=Infinity) {
   if (signal?.aborted) return Promise.reject(Object.assign(new Error('aborted'),{name:'AbortError'}));
   if (kind !== 'info') ssPreviewRefreshQuota();
   if (ssProviderWaiters.length >= (kind==='video'?40:36))
@@ -2256,7 +2256,7 @@ function ssProviderAcquire(kind='search',signal) {
     };
     job.cancel=()=>cancel('aborted');
     if (signal) signal.addEventListener('abort',job.cancel,{once:true});
-    job.timeout=setTimeout(()=>cancel('queue_timeout'),kind==='video'||kind==='video-background'?18000:12000);
+    job.timeout=setTimeout(()=>cancel('queue_timeout'),Math.min(maxWaitMs,kind==='video'||kind==='video-background'?18000:12000));
     const weight={video:0,search:1,info:1,image:2,'video-background':3};
     const priority=weight[kind]??2;
     const idx=ssProviderWaiters.findIndex(other=>(weight[other.kind]??2)>priority);
@@ -2815,7 +2815,7 @@ async function ssPreviewRequestMetadata(url, timeoutMs, stage, headers) {
   }
 }
 function ssPreviewPublicError(error) {
-  const reason = ['api_auth','api_rate_limit','api_unavailable','api_rejected','api_timeout','api_connection','api_incomplete_response','provider_cooldown','provider_queue_full','provider_queue_timeout'].includes(error?.code) ? error.code : 'api_unavailable';
+  const reason = ['api_auth','api_rate_limit','api_unavailable','api_rejected','api_timeout','api_connection','api_incomplete_response','lookup_timeout','provider_cooldown','provider_queue_full','provider_queue_timeout'].includes(error?.code) ? error.code : 'api_unavailable';
   return {reason,upstreamStatus:Number(error?.upstreamStatus)||0,
     ...(error?.upstreamStage ? {upstreamStage:error.upstreamStage,upstreamElapsedMs:error.upstreamElapsedMs,transportCode:error.transportCode} : {})};
 }
@@ -2964,15 +2964,25 @@ function ssPreviewRomSerials(game, regionalOnly=false) {
 let ssPreviewSerialUnsupportedUntil = 0;
 let ssPreviewSerialSupported=false;
 let ssPreviewSerialProbeActive=false;
-async function ssPreviewRequestInfo(systemId, serial, gameId=0) {
+const SS_PREVIEW_LOOKUP_BUDGET_MS = 8000;
+const SS_PREVIEW_SEARCH_TIMEOUT_MS = 4000;
+const SS_PREVIEW_SEARCH_QUEUE_MS = 2000;
+function ssPreviewRemaining(deadline,cap=Infinity) {
+  const remaining = deadline-Date.now();
+  // Incomplete searches must remain retryable, never become cached misses.
+  if (remaining < 100) throw Object.assign(new Error('ScreenScraper lookup deadline reached.'),{status:502,code:'lookup_timeout',upstreamStatus:0});
+  return Math.min(cap,remaining);
+}
+async function ssPreviewRequestInfo(systemId, serial, gameId=0, deadline=Date.now()+SS_PREVIEW_LOOKUP_BUDGET_MS) {
   if (!systemId || (!gameId && (!serial || Date.now()<ssPreviewSerialUnsupportedUntil ||
       (!ssPreviewSerialSupported && ssPreviewSerialProbeActive)))) return null;
   const probe=!gameId && !ssPreviewSerialSupported;
   if (probe) ssPreviewSerialProbeActive=true;
   try {
-    const release = await ssProviderAcquire('search');
+    const release = await ssProviderAcquire('search',undefined,ssPreviewRemaining(deadline,SS_PREVIEW_SEARCH_QUEUE_MS));
     let response;
     try {
+      ssPreviewRemaining(deadline);
       ssPreviewQuotaReserve('search');
       const url = new URL('https://api.screenscraper.fr/api2/jeuInfos.php');
       url.searchParams.set('devid',SS_PREVIEW_DEVID);
@@ -2986,7 +2996,7 @@ async function ssPreviewRequestInfo(systemId, serial, gameId=0) {
         url.searchParams.set('ssid',SS_PREVIEW_USER);
         url.searchParams.set('sspassword',SS_PREVIEW_PASSWORD);
       }
-      response=await ssPreviewRequestMetadata(url,9000,gameId?'game_info':'serial_lookup',{'User-Agent':'PSN-Content/1.0 ScreenScraper-Preview'});
+      response=await ssPreviewRequestMetadata(url,ssPreviewRemaining(deadline,SS_PREVIEW_SEARCH_TIMEOUT_MS),gameId?'game_info':'serial_lookup',{'User-Agent':'PSN-Content/1.0 ScreenScraper-Preview'});
       ssPreviewQuotaNoteRate(Number(response.status),'search');
       if (response.data) ssPreviewQuotaFromResponse(response.data);
     } finally { release(); }
@@ -3014,7 +3024,7 @@ async function ssPreviewRequestInfo(systemId, serial, gameId=0) {
     return Array.isArray(game)?(game.length===1?game[0]:null):game||null;
   } finally { if (probe) ssPreviewSerialProbeActive=false; }
 }
-function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, legacyKey='', legacy=null, demand, resumeAlternates=false) {
+function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, legacyKey='', legacy=null, demand, resumeAlternates=false, deadline=Date.now()+SS_PREVIEW_LOOKUP_BUDGET_MS) {
   if (ssPreviewQueued >= 80) {
     const busy = new Error('ScreenScraper search queue temporarily busy.');
     busy.status = 503;
@@ -3060,7 +3070,7 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
       demand.publish({found:true,url:video.url,video,provider:'screenscraper'});
     }
     if (systemId && knownGameId) {
-      const game = await ssPreviewRequestInfo(systemId,'',knownGameId);
+      const game = await ssPreviewRequestInfo(systemId,'',knownGameId,deadline);
       if (ssPreviewGameUsable(game,systemId) && Number(game.id)===knownGameId) {
         bestGame=game;bestScore=1;bestMediaRank=mediaRank(game);bestSerialMatch=!!serial && ssPreviewRomSerials(game).includes(serial);candidates=1;
       }
@@ -3071,9 +3081,10 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
       return legacy;
     }
     const searchByName = async searchName => {
-      const release = await ssProviderAcquire('search');
+      const release = await ssProviderAcquire('search',undefined,ssPreviewRemaining(deadline,SS_PREVIEW_SEARCH_QUEUE_MS));
       let response;
       try {
+        ssPreviewRemaining(deadline);
         ssPreviewQuotaReserve('search');
         const url = new URL('https://api.screenscraper.fr/api2/jeuRecherche.php');
       url.searchParams.set('devid', SS_PREVIEW_DEVID);
@@ -3086,7 +3097,7 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
         url.searchParams.set('ssid', SS_PREVIEW_USER);
         url.searchParams.set('sspassword', SS_PREVIEW_PASSWORD);
       }
-        response = await ssPreviewRequestMetadata(url,9000,'name_search',{'User-Agent':'PSN-Content/1.0 ScreenScraper-Preview'});
+        response = await ssPreviewRequestMetadata(url,ssPreviewRemaining(deadline,SS_PREVIEW_SEARCH_TIMEOUT_MS),'name_search',{'User-Agent':'PSN-Content/1.0 ScreenScraper-Preview'});
         ssPreviewQuotaNoteRate(Number(response.status),'search');
         if (response.data) ssPreviewQuotaFromResponse(response.data);
       } finally {release();}
@@ -3146,7 +3157,7 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
       // Digital PSN serials are often absent. Only probe serials after a name miss
       // or an uncertain match, not when the game is identified but lacks media.
       if (systemId && serial && !bestSerialMatch && bestScore !== 1) {
-        const game = await ssPreviewRequestInfo(systemId,serial);
+        const game = await ssPreviewRequestInfo(systemId,serial,0,deadline);
         const romSerials = ssPreviewRomSerials(game);
         const exactName = ssPreviewNames(game).some(title=>matchName(title)===wanted);
         if (ssPreviewGameUsable(game,systemId) && (romSerials.length ? romSerials.includes(serial) : exactName)) {
@@ -3258,8 +3269,9 @@ function ssPreviewLookup(name, systemId, options = null) {
     if (complete(primary)) return primary;
     return ssPreviewFetchUpstream(name,systemId,key,serial,
       Number(primary?.video?.gameId || primary?.extras?.gameId)||0,serial ? legacyKey : '',legacy,demand,
-      primary?.extras?.artworkChecked===false || primary?.extras?.videoChecked===false).catch(error=>{
-      if (primary || legacy) return primary || legacy;
+      primary?.extras?.artworkChecked===false || primary?.extras?.videoChecked===false,options?.lookupDeadline).catch(error=>{
+      if (complete(primary)) return primary;
+      if (complete(legacy)) return legacy;
       throw error;
     });
   });
@@ -3271,6 +3283,7 @@ function ssPreviewLookup(name, systemId, options = null) {
 }
 
 async function ssPreviewLookupMinis(name, options = null) {
+  options={...options,lookupDeadline:Date.now()+SS_PREVIEW_LOOKUP_BUDGET_MS};
   const ps3=await ssPreviewLookup(name,59,options);
   if (options?.artwork) {
     if (ps3?.extras?.images?.some(item=>item.kind==='artwork')) return ps3;
