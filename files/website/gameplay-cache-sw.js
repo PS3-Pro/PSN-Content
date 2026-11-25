@@ -10,16 +10,36 @@ const LOCAL_PREFIX = new URL('./__psn_gameplay_cache__/',self.registration.scope
 const INDEX_KEY = new URL('./__psn_gameplay_cache_index__', self.registration.scope).href;
 let indexPromise, indexQueue = Promise.resolve();
 const SERVER = 'https://psn-content-jh5h.onrender.com';
-let capturing = false;
+let capturing = null, completion = null;
+const confirmed = new Map(), completionAttempts = new Map();
+const recentCacheEvents = [];
+function record(kind,key,bytes=0){
+  recentCacheEvents.push({kind,key:key?.split('/').pop(),bytes});
+  if(recentCacheEvents.length>40)recentCacheEvents.shift();
+}
+function confirmationKey(clientId,url){return clientId+'|'+url;}
+function wasConfirmed(id){return (confirmed.get(id)||0)>Date.now();}
 
 self.addEventListener('install',event=>event.waitUntil(self.skipWaiting()));
 self.addEventListener('activate', event => event.waitUntil(self.clients.claim()));
 self.addEventListener('message',event=>{
-  if(event.data?.type==='psn-gameplay-cache-version')event.ports[0]?.postMessage({version:2});
+  if(event.data?.type==='psn-gameplay-cache-version')event.ports[0]?.postMessage({version:4});
+  if(event.data?.type==='psn-gameplay-cache-diagnostics')event.ports[0]?.postMessage({events:recentCacheEvents.slice(),capturing:!!capturing,completing:!!completion});
+  if(event.data?.type==='psn-gameplay-cache-confirm'||event.data?.type==='psn-gameplay-cache-finish'){
+    const url=event.data.url;
+    if(typeof url!=='string'||!event.source?.id)return;
+    try{if(!mediaKey(new Request(url,{mode:'cors'}),true))return;}catch(_){return;}
+    const id=confirmationKey(event.source.id,url);
+    for(const [key,until] of confirmed)if(until<=Date.now())confirmed.delete(key);
+    confirmed.set(id,Date.now()+30000);
+    while(confirmed.size>64)confirmed.delete(confirmed.keys().next().value);
+    if(capturing?.id===id){capturing.confirm();if(event.data.type==='psn-gameplay-cache-finish')capturing.finish?.();}
+    if(event.data.type==='psn-gameplay-cache-finish')event.waitUntil(finishShownVideo(url,id));
+  }
 });
 
-function mediaKey(request) {
-  if (request.method !== 'GET' || request.destination !== 'video' || request.mode !== 'cors') return null;
+function mediaKey(request, message=false) {
+  if (request.method !== 'GET' || (!message && request.destination !== 'video') || request.mode !== 'cors') return null;
   try {
     const url = new URL(request.url);
     if (url.origin !== SERVER || url.pathname !== '/api/gameplay-video') return null;
@@ -43,16 +63,20 @@ function parseRange(value, size) {
   if (a === null) return b > 0 ? [Math.max(0,size-b),size-1] : null;
   return a < size && (b === null || b >= a) ? [a,Math.min(b === null ? size-1 : b,size-1)] : null;
 }
-function completeLength(response) {
-  const length = Number(response.headers.get('Content-Length'));
-  if (!Number.isSafeInteger(length) || length < 12 || length > MAX_FILE ||
-      !/^video\/mp4(?:;|$)/i.test(response.headers.get('Content-Type') || '') ||
-      response.headers.get('Content-Encoding') && response.headers.get('Content-Encoding') !== 'identity') return 0;
-  if (response.status === 200) return length;
-  if (response.status !== 206) return 0;
-  const range = /^bytes 0-(\d+)\/(\d+)$/.exec(response.headers.get('Content-Range') || '');
-  return range && Number(range[1]) === length-1 && Number(range[2]) === length ? length : 0;
+function mp4Response(response){
+  return /^video\/mp4(?:;|$)/i.test(response.headers.get('Content-Type')||'')&&
+    (!response.headers.get('Content-Encoding')||response.headers.get('Content-Encoding')==='identity');
 }
+function completeLength(response) {
+  if(!mp4Response(response))return 0;
+  const declared=response.headers.get('Content-Length');
+  if(response.status===200)return validSize(Number(declared))?Number(declared):0;
+  if(response.status!==206)return 0;
+  const range=/^bytes 0-(\d+)\/(\d+)$/.exec(response.headers.get('Content-Range')||'');
+  const total=Number(range?.[2]);
+  return range&&validSize(total)&&Number(range[1])===total-1&&(!declared||Number(declared)===total)?total:0;
+}
+function unknownComplete(response){return response.status===200&&mp4Response(response)&&!response.headers.has('Content-Length');}
 function validSize(size) {
   return Number.isSafeInteger(size) && size >= 12 && size <= MAX_FILE;
 }
@@ -183,7 +207,7 @@ function partialInfo(response){
   const m=/^bytes (\d+)-(\d+)\/(\d+)$/.exec(response.headers.get('Content-Range')||'');
   if(!m)return null;
   const [start,end,total]=m.slice(1).map(Number),size=end-start+1;
-  if(![start,end,total].every(Number.isSafeInteger)||!validSize(total)||start<0||end>=total||size<=0||size>MAX_PART||size!==Number(response.headers.get('Content-Length')))return null;
+  if(![start,end,total].every(Number.isSafeInteger)||!validSize(total)||start<0||end>=total||size<=0||size>MAX_PART||(response.headers.has('Content-Length')&&size!==Number(response.headers.get('Content-Length'))))return null;
   return {start,end,total,size};
 }
 function partPrefix(request,key){
@@ -234,55 +258,175 @@ async function savePart(request,key,part,chunks){
   const url=prefix+[part.start,part.end,part.total,Date.now()].join('-');
   await cache.put(url,new Response(new Blob(chunks,{type:'video/mp4'}),{headers:{'Content-Type':'video/mp4','Content-Length':String(part.size)}}));
 }
-async function handle(request,key,done,localOnly=false) {
+async function readPrefix(request,key){
+  const cache=await caches.open(PARTS_CACHE),prefix=partPrefix(request,key);
+  const entries=(await cache.keys()).filter(req=>req.url.startsWith(prefix)).map(req=>({req,p:parsePart(req.url)})).filter(x=>x.p);
+  let offset=0,total=0;const chunks=[];
+  while(true){
+    const next=entries.filter(x=>x.p.start<=offset&&x.p.end>=offset&&(!total||x.p.total===total)).sort((a,b)=>b.p.end-a.p.end)[0];
+    if(!next)break;
+    const saved=await cache.match(next.req);if(!saved)break;
+    const bytes=new Uint8Array(await saved.arrayBuffer());if(bytes.length!==next.p.size)break;
+    total=next.p.total;chunks.push(bytes.subarray(offset-next.p.start));offset=next.p.end+1;
+  }
+  return {chunks,offset,total};
+}
+async function removeParts(key){
+  const cache=await caches.open(PARTS_CACHE);
+  for(const req of await cache.keys())if(req.url.startsWith(key+'?part='))await cache.delete(req);
+}
+async function finishShownVideo(url,id){
+  let request,key;
+  try{request=new Request(url,{mode:'cors',credentials:'omit'});key=mediaKey(request,true);}catch(_){return;}
+  if(!key)return;
+  if(capturing?.id===id)capturing.finish?.();
+  // One bounded background completion per worker. An already running capture takes priority.
+  if(completion)return completion.id===id?completion.promise:undefined;
+  const job={id,promise:null};completion=job;
+  job.promise=(async()=>{
+    try{
+      const cache=await caches.open(CACHE);
+      if(capturing){
+        if(capturing.id===id)capturing.finish?.();
+        let timer;try{await Promise.race([capturing.done,new Promise(resolve=>{timer=setTimeout(resolve,12000);})]);}finally{clearTimeout(timer);}
+      }
+      if(capturing)return;
+      const hit=await cache.match(key);if(hit){hit.body?.cancel().catch(()=>{});return;}
+      const prefix=await readPrefix(request,key);
+      if(capturing)return;
+      // A foreground fetch may have completed while the prefix was being read.
+      const second=await cache.match(key);if(second){second.body?.cancel().catch(()=>{});return;}
+      if(capturing)return;
+      if(prefix.total&&prefix.offset===prefix.total){await save(cache,key,prefix.chunks,prefix.total);const saved=await cache.match(key);if(saved){saved.body?.cancel().catch(()=>{});await removeParts(key);record('assembled',key,prefix.total);}return;}
+      if((completionAttempts.get(key)||0)>Date.now())return;
+      completionAttempts.delete(key);completionAttempts.set(key,Date.now()+60000);
+      while(completionAttempts.size>128)completionAttempts.delete(completionAttempts.keys().next().value);
+      const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),120000);
+      const slot={id,confirm(){},done:job.promise};capturing=slot;
+      try{
+        const headers=new Headers();if(prefix.offset)headers.set('Range','bytes='+prefix.offset+'-');
+        const response=await fetch(new Request(request,{headers,signal:controller.signal}));
+        const full=completeLength(response),unknown=unknownComplete(response);
+        const range=/^bytes (\d+)-(\d+)\/(\d+)$/.exec(response.headers.get('Content-Range')||'');
+        const tail=!!(prefix.offset&&response.status===206&&mp4Response(response)&&range&&Number(range[1])===prefix.offset&&Number(range[3])===prefix.total&&Number(range[2])===prefix.total-1&&(!response.headers.has('Content-Length')||Number(response.headers.get('Content-Length'))===prefix.total-prefix.offset));
+        if(!response.body||(!full&&!unknown&&!tail)){response.body?.cancel().catch(()=>{});return;}
+        const chunks=tail?prefix.chunks:[];let size=tail?prefix.offset:0;const expected=tail?prefix.total:full;
+        const reader=response.body.getReader();
+        try{while(true){const item=await reader.read();if(item.done)break;size+=item.value.byteLength;if(size>MAX_FILE||(expected&&size>expected)){await reader.cancel();return;}chunks.push(item.value);}}finally{reader.releaseLock();}
+        if(!validSize(size)||(expected&&size!==expected))return;
+        await save(cache,key,chunks,size);
+        const saved=await cache.match(key);if(saved){saved.body?.cancel().catch(()=>{});await removeParts(key);record('completed',key,size);}
+      }finally{clearTimeout(timer);if(capturing===slot)capturing=null;}
+    }catch(_){record('completion-error',key);}
+  })().finally(()=>{if(completion===job)completion=null;});
+  return job.promise;
+}
+async function handle(request,key,done,localOnly=false,clientId='') {
   let cache;
   try {
     cache = await caches.open(CACHE);
     const bypass=!localOnly&&new URL(request.url).searchParams.get('psn-cache-bypass')==='1';
     const hit=bypass?null:await cachedResponse(cache,key,request);
-    if(hit){touch(cache,key).catch(()=>{}).finally(done);return hit;}
-    if(!localOnly&&!bypass){const partial=await cachedPart(request,key).catch(()=>null);if(partial){done();return partial;}}
+    if(hit){record('hit',key);touch(cache,key).catch(()=>{}).finally(done);return hit;}
+    if(!localOnly&&!bypass){const partial=await cachedPart(request,key).catch(()=>null);if(partial){record('range-hit',key);done();return partial;}}
   } catch (_) {cache=null;}
   if(localOnly){done();return new Response(null,{status:404,headers:{'Cache-Control':'no-store'}});}
-  let response;
-  try {response=await fetch(request);} catch (error) {done();throw error;}
-  const completeSize=completeLength(response),part=completeSize?null:partialInfo(response);
-  const size=completeSize||part?.size;
-  if (!cache || capturing || !size || !response.body) {done();return response;}
-  // Pass bytes through as the player reads them. No second fetch or clone draining abandoned downloads.
-  capturing=true;
+  const id=confirmationKey(clientId,request.url);
+  let response, upstreamAbort;
+  let onAbort=()=>upstreamAbort?.abort();
+  const abortListener=()=>onAbort();
+  // Detach the single capture candidate from the media element's abort signal.
+  // Speculative transfers are still aborted; a genuinely shown preview may finish its existing response.
+  if(cache&&!capturing){
+    upstreamAbort=new AbortController();
+    request.signal.addEventListener('abort',abortListener,{once:true});
+    if(request.signal.aborted)upstreamAbort.abort();
+  }
+  const cleanup=()=>request.signal.removeEventListener('abort',abortListener);
+  try {response=await fetch(upstreamAbort?new Request(request,{signal:upstreamAbort.signal}):request);} catch (error) {cleanup();done();throw error;}
+  const completeSize=completeLength(response),unknown=unknownComplete(response),part=completeSize||unknown?null:partialInfo(response);
+  const total=Number((response.headers.get('Content-Range')||'').split('/')[1]||response.headers.get('Content-Length'));
+  if(total>MAX_FILE){completionAttempts.set(key,Date.now()+60000);while(completionAttempts.size>128)completionAttempts.delete(completionAttempts.keys().next().value);}
+  const size=completeSize||part?.size||0;
+  if (!cache || capturing || (!size&&!unknown) || !response.body || !upstreamAbort) {
+    record('network-uncached',key,size||0);done();return response;
+  }
   const reader=response.body.getReader();
-  let chunks=[],received=0,collect=true;
-  const release=()=>{if(!collect)return;collect=false;chunks=[];capturing=false;clearTimeout(timer);done();};
-  const timer=setTimeout(release,120000);
+  let chunks=[],received=0,collect=true,finished=false,playerClosed=false,playerController;
+  let confirmedPlayback=wasConfirmed(id),pumping=null,drainRequested=false;
+  let resolveCapture;const captureDone=new Promise(resolve=>{resolveCapture=resolve;});
+  const capture={id,done:captureDone,confirm(){if(collect&&!finished)confirmedPlayback=true;},finish(){if(collect&&!finished){confirmedPlayback=true;drainRequested=true;pump();}}};
+  capturing=capture;
+  const release=()=>{
+    if(!collect)return;
+    collect=false;chunks=[];if(capturing===capture)capturing=null;clearTimeout(timer);resolveCapture();done();
+  };
+  const closePlayer=()=>{if(!playerClosed){playerClosed=true;try{playerController.close();}catch(_){}}};
+  const cancelUpstream=()=>{upstreamAbort.abort();reader.cancel().catch(()=>{});cleanup();};
+  const commit=async()=>{
+    if(!collect)return;
+    const complete=chunks;chunks=[];clearTimeout(timer);
+    try{
+      if(part){await savePart(request,key,part,complete);record('range-saved',key,received);}
+      else{
+        await save(cache,key,complete,received);
+        const saved=await cache.match(key);
+        if(saved){
+          saved.body?.cancel().catch(()=>{});record('saved',key,received);await removeParts(key);
+        }else {completionAttempts.set(key,Date.now()+60000);while(completionAttempts.size>128)completionAttempts.delete(completionAttempts.keys().next().value);record('storage-skipped',key,size);}
+      }
+    }catch(_){record('storage-error',key,size);}finally{release();}
+  };
+  const abandon=()=>{
+    if(finished)return;
+    playerClosed=true;
+    if(confirmedPlayback&&collect){drainRequested=true;pump();return;}
+    finished=true;record('cancelled',key,received);cancelUpstream();release();
+  };
+  const timer=setTimeout(()=>{
+    if(!collect)return;
+    record('capture-timeout',key,received);release();drainRequested=false;
+    if(playerClosed){finished=true;cancelUpstream();}
+  },120000);
+  function pump(){
+    if(pumping||finished)return pumping;
+    pumping=(async()=>{
+      try{
+        do{
+          const item=await reader.read();
+          if(finished)return;
+          if(item.done){
+            finished=true;cleanup();closePlayer();
+            if(collect&&(unknown?validSize(received):received===size))await commit();else release();
+            return;
+          }
+          if(collect){
+            received+=item.value.byteLength;
+            if(received<=(unknown?MAX_FILE:size))chunks.push(item.value);else{completionAttempts.set(key,Date.now()+60000);while(completionAttempts.size>128)completionAttempts.delete(completionAttempts.keys().next().value);release();}
+          }
+          if(!playerClosed){try{playerController.enqueue(item.value);}catch(_){playerClosed=true;}}
+          // Do not depend on the player making another pull to observe EOF.
+          if(collect&&!unknown&&received===size){
+            finished=true;cleanup();closePlayer();
+            reader.cancel().catch(()=>{});await commit();return;
+          }
+          if(playerClosed&&!(confirmedPlayback&&collect)){abandon();return;}
+        }while(drainRequested&&collect);
+      }catch(error){
+        finished=true;cleanup();release();
+        if(!playerClosed){playerClosed=true;try{playerController.error(error);}catch(_){}}
+      }
+    })().finally(()=>{pumping=null;if(drainRequested&&collect&&!finished)pump();});
+    return pumping;
+  }
   const stream=new ReadableStream({
-    async pull(controller) {
-      try {
-        const item=await reader.read();
-        if(item.done){
-          controller.close();
-          if(collect && received===size){
-            const complete=chunks;chunks=[];
-            clearTimeout(timer);
-            try {
-              if(part)await savePart(request,key,part,complete);
-              else {
-                await save(cache,key,complete,size);
-                if(await cache.match(key)){
-                  const parts=await caches.open(PARTS_CACHE);
-                  for(const req of await parts.keys())if(req.url.startsWith(key+'?part='))await parts.delete(req);
-                }
-              }
-            } catch (_) {} finally {release();}
-          } else release();
-          return;
-        }
-        if(collect){received+=item.value.byteLength;if(received<=size)chunks.push(item.value);else release();}
-        controller.enqueue(item.value);
-      } catch(error){release();controller.error(error);}
-    },
-    cancel(reason){release();return reader.cancel(reason).catch(()=>{});}
+    start(controller){playerController=controller;},
+    pull(){return pump();},
+    cancel(){abandon();}
   });
+  onAbort=abandon;
+  if(request.signal.aborted)abandon();
+  record('capture-start',key,size);
   return new Response(stream,{status:response.status,statusText:response.statusText,headers:response.headers});
 }
 self.addEventListener('fetch',event=>{
@@ -293,5 +437,5 @@ self.addEventListener('fetch',event=>{
   if(!key)return;
   let done;
   event.waitUntil(new Promise(resolve=>{done=resolve;}));
-  event.respondWith(handle(request,key,done,localOnly));
+  event.respondWith(handle(request,key,done,localOnly,event.clientId));
 });

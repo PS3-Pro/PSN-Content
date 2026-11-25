@@ -120981,7 +120981,7 @@ function getVisibleChatStackEl(id) {
     const timer=setTimeout(()=>channel.port1.close(),1000);
     channel.port1.onmessage=event=>{
       clearTimeout(timer);channel.port1.close();
-      if(navigator.serviceWorker.controller===controller&&event.data?.version===2)localWorkerReady=true;
+      if(navigator.serviceWorker.controller===controller&&(event.data?.version>=2&&event.data?.version<=4))localWorkerReady=true;
     };
     try{controller.postMessage({type:'psn-gameplay-cache-version'},[channel.port2]);}catch(_){clearTimeout(timer);channel.port1.close();}
   }
@@ -120994,7 +120994,22 @@ function getVisibleChatStackEl(id) {
       return navigator.serviceWorker.register(videoCacheWorkerUrl);
     }).then(()=>checkVideoCacheWorker()).catch(()=>{});
   }
-  window.runPsnAfterHomeInteractive?.(initVideoCacheWorker);
+  // Register independently of the home queue so the first preview can be captured.
+  initVideoCacheWorker();
+  window.__psnGameplayCacheStatus=async()=>{
+    const controller=navigator.serviceWorker?.controller;
+    let entries=0,bytes=0;
+    try{const store=await caches.open(localVideoCache);const keys=await store.keys();entries=keys.length;
+      for(const key of keys){const response=await store.match(key);bytes+=Number(response?.headers.get('Content-Length'))||0;response?.body?.cancel().catch(()=>{});}
+    }catch(_){}
+    const worker=await new Promise(resolve=>{
+      if(!controller||typeof MessageChannel!=='function')return resolve(null);
+      const channel=new MessageChannel(),timer=setTimeout(()=>{channel.port1.close();resolve(null);},1000);
+      channel.port1.onmessage=e=>{clearTimeout(timer);channel.port1.close();resolve(e.data);};
+      try{controller.postMessage({type:'psn-gameplay-cache-diagnostics'},[channel.port2]);}catch(_){clearTimeout(timer);channel.port1.close();resolve(null);}
+    });
+    return {controlled:controller?.scriptURL===videoCacheWorkerUrl,ready:localWorkerReady,entries,bytes,worker};
+  };
   let videoPersistenceRequested=false;
   function requestVideoCachePersistence(){
     if(videoPersistenceRequested||!navigator.storage?.persist)return;
@@ -121522,6 +121537,10 @@ function getVisibleChatStackEl(id) {
     clearTimeout(old.timer);
     if(!keepProgress)hideProgress(old);
     if(old.video){
+      if(old.cacheConfirmed&&!isLocalSource(old.video.dataset.previewUrl)){
+        const controller=navigator.serviceWorker?.controller;
+        if(controller?.scriptURL===videoCacheWorkerUrl){try{controller.postMessage({type:'psn-gameplay-cache-finish',url:old.video.dataset.previewUrl});}catch(_){}}
+      }
       old.video.pause();old.video.classList.remove('is-ready');
       if(old.modal&&modalVideos.get(old.card)===old.video)modalVideos.delete(old.card);
       parkVideo(old.video);
@@ -121538,7 +121557,16 @@ function getVisibleChatStackEl(id) {
     if(delay>0) {
       clearTimeout(current.timer);
       current.timer=setTimeout(()=>revealVideo(current,video),delay);
-    } else if(video.readyState>=2&&!video.paused){video.classList.add('is-ready');hideProgress(current);}
+    } else if(video.readyState>=2&&!video.paused){
+      video.classList.add('is-ready');hideProgress(current);
+      if(!current.cacheConfirmed&&!isLocalSource(video.dataset.previewUrl)){
+        current.cacheConfirmed=true;
+        const controller=navigator.serviceWorker?.controller;
+        if(controller?.scriptURL===videoCacheWorkerUrl){
+          try{controller.postMessage({type:'psn-gameplay-cache-confirm',url:video.dataset.previewUrl});}catch(_){}
+        }
+      }
+    }
   }
   function cachedVideo(current,info,parent) {
     const video=(current.modal?modalVideos.get(parent):cardVideos.get(parent)) ||
@@ -121758,6 +121786,7 @@ function getVisibleChatStackEl(id) {
   document.addEventListener('visibilitychange',()=>{if(document.hidden){cancelTouchPress(true);stop();}});
   document.addEventListener('click',event=>{if(active?.modal&&event.target.closest('.modal-cover-wrapper'))stop();},true);
   window.addEventListener('blur',()=>{cancelTouchPress(true);stop();});
+  window.addEventListener('pagehide',()=>{cancelTouchPress(true);stop();});
   document.addEventListener('scroll',event=>{
     const card=touchPress?.card||(active?.touch?active.card:null);
     if(card&&(!card.isConnected||event.target===document||event.target?.contains?.(card))){cancelTouchPress(true);if(active?.touch)stop();}
