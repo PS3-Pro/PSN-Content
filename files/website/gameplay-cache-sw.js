@@ -12,6 +12,42 @@ let indexPromise, indexQueue = Promise.resolve();
 const SERVER = 'https://psn-content-jh5h.onrender.com';
 let capturing = null, completion = null;
 const confirmed = new Map(), completionAttempts = new Map();
+const foregroundClients = new Set(), deferred = new Map();
+let completionWake=null;
+const IDLE_DELAY=900, MAX_DEFERRED=4;
+function enqueueCompletion(url,id,retries=0){
+  if(retries>2)return;
+  const old=deferred.get(id);
+  deferred.delete(id);deferred.set(id,{url,id,retries:Math.max(retries,old?.retries||0),until:Date.now()+300000});
+  while(deferred.size>MAX_DEFERRED)deferred.delete(deferred.keys().next().value);
+}
+function interruptBackground(){
+  if(completion&&!completion.interrupted&&!completion.networkDone){
+    completion.interrupted=true;completion.controller.abort();
+    record('background-paused',completion.key);
+  }
+  if(capturing?.background)capturing.interrupt();
+}
+function scheduleCompletion(){
+  if(completionWake)return completionWake;
+  if(!deferred.size||completion)return Promise.resolve();
+  completionWake=(async()=>{
+    await new Promise(resolve=>setTimeout(resolve,IDLE_DELAY));
+    // A closed tab must not hold the priority lock forever.
+    for(const id of [...foregroundClients]){
+      try{if(!await self.clients.get(id))foregroundClients.delete(id);}catch(_){}
+    }
+    if(foregroundClients.size||completion||capturing)return;
+    for(const [id,job] of deferred)if(job.until<=Date.now())deferred.delete(id);
+    const job=[...deferred.values()].pop();if(!job)return;
+    deferred.delete(job.id);
+    return finishShownVideo(job.url,job.id,job.retries);
+  })().finally(()=>{
+    completionWake=null;
+    if(!foregroundClients.size&&!capturing&&!completion&&deferred.size)return scheduleCompletion();
+  });
+  return completionWake;
+}
 const recentCacheEvents = [];
 function record(kind,key,bytes=0){
   recentCacheEvents.push({kind,key:key?.split('/').pop(),bytes});
@@ -23,8 +59,12 @@ function wasConfirmed(id){return (confirmed.get(id)||0)>Date.now();}
 self.addEventListener('install',event=>event.waitUntil(self.skipWaiting()));
 self.addEventListener('activate', event => event.waitUntil(self.clients.claim()));
 self.addEventListener('message',event=>{
-  if(event.data?.type==='psn-gameplay-cache-version')event.ports[0]?.postMessage({version:4});
-  if(event.data?.type==='psn-gameplay-cache-diagnostics')event.ports[0]?.postMessage({events:recentCacheEvents.slice(),capturing:!!capturing,completing:!!completion});
+  if(event.data?.type==='psn-gameplay-cache-version')event.ports[0]?.postMessage({version:5});
+  if(event.data?.type==='psn-gameplay-cache-priority'&&event.source?.id){
+    if(event.data.busy===true){foregroundClients.add(event.source.id);interruptBackground();}
+    else {foregroundClients.delete(event.source.id);event.waitUntil(scheduleCompletion());}
+  }
+  if(event.data?.type==='psn-gameplay-cache-diagnostics')event.ports[0]?.postMessage({events:recentCacheEvents.slice(),capturing:!!capturing,completing:!!completion,foreground:foregroundClients.size,deferred:deferred.size});
   if(event.data?.type==='psn-gameplay-cache-confirm'||event.data?.type==='psn-gameplay-cache-finish'){
     const url=event.data.url;
     if(typeof url!=='string'||!event.source?.id)return;
@@ -34,7 +74,7 @@ self.addEventListener('message',event=>{
     confirmed.set(id,Date.now()+30000);
     while(confirmed.size>64)confirmed.delete(confirmed.keys().next().value);
     if(capturing?.id===id){capturing.confirm();if(event.data.type==='psn-gameplay-cache-finish')capturing.finish?.();}
-    if(event.data.type==='psn-gameplay-cache-finish')event.waitUntil(finishShownVideo(url,id));
+    if(event.data.type==='psn-gameplay-cache-finish'){enqueueCompletion(url,id);event.waitUntil(scheduleCompletion());}
   }
 });
 
@@ -241,7 +281,12 @@ async function cachedPart(request,key){
   }
   return null;
 }
-async function savePart(request,key,part,chunks){
+let partsQueue=Promise.resolve();
+function savePart(request,key,part,chunks){
+  const task=partsQueue.then(()=>writePart(request,key,part,chunks));
+  partsQueue=task.catch(()=>{});return task;
+}
+async function writePart(request,key,part,chunks){
   let estimate;try{estimate=await self.navigator.storage?.estimate?.();}catch(_){}
   if(estimate?.quota>0&&estimate.quota-estimate.usage<64*MIB)return;
   const cache=await caches.open(PARTS_CACHE),prefix=partPrefix(request,key),keys=await cache.keys();
@@ -258,7 +303,25 @@ async function savePart(request,key,part,chunks){
   const url=prefix+[part.start,part.end,part.total,Date.now()].join('-');
   await cache.put(url,new Response(new Blob(chunks,{type:'video/mp4'}),{headers:{'Content-Type':'video/mp4','Content-Length':String(part.size)}}));
 }
+// Keep received bytes on an intentional priority interruption, without another request.
+async function saveInterrupted(request,key,chunks,start,total){
+  if(!validSize(total)||!chunks.length||start>=total)return;
+  let offset=start,used=0,pieces=[],size=0;
+  for(const bytes of chunks){
+    let pos=0;
+    while(pos<bytes.byteLength&&used<MAX_PARTS_BYTES&&offset+size<total){
+      const take=Math.min(bytes.byteLength-pos,MAX_PART-size,MAX_PARTS_BYTES-used,total-offset-size);
+      if(!take)break;
+      pieces.push(bytes.subarray(pos,pos+take));pos+=take;used+=take;size+=take;
+      if(size===MAX_PART){await savePart(request,key,{start:offset,end:offset+size-1,total,size},pieces);offset+=size;pieces=[];size=0;}
+    }
+    if(used>=MAX_PARTS_BYTES)break;
+  }
+  if(size)await savePart(request,key,{start:offset,end:offset+size-1,total,size},pieces);
+  if(used)record('interrupted-range-saved',key,used);
+}
 async function readPrefix(request,key){
+  await partsQueue;
   const cache=await caches.open(PARTS_CACHE),prefix=partPrefix(request,key);
   const entries=(await cache.keys()).filter(req=>req.url.startsWith(prefix)).map(req=>({req,p:parsePart(req.url)})).filter(x=>x.p);
   let offset=0,total=0;const chunks=[];
@@ -271,53 +334,67 @@ async function readPrefix(request,key){
   }
   return {chunks,offset,total};
 }
-async function removeParts(key){
-  const cache=await caches.open(PARTS_CACHE);
-  for(const req of await cache.keys())if(req.url.startsWith(key+'?part='))await cache.delete(req);
+function removeParts(key){
+  const task=partsQueue.then(async()=>{
+    const cache=await caches.open(PARTS_CACHE);
+    for(const req of await cache.keys())if(req.url.startsWith(key+'?part='))await cache.delete(req);
+  });
+  partsQueue=task.catch(()=>{});return task;
 }
-async function finishShownVideo(url,id){
+async function finishShownVideo(url,id,retries=0){
   let request,key;
   try{request=new Request(url,{mode:'cors',credentials:'omit'});key=mediaKey(request,true);}catch(_){return;}
-  if(!key)return;
-  if(capturing?.id===id)capturing.finish?.();
-  // One bounded background completion per worker. An already running capture takes priority.
-  if(completion)return completion.id===id?completion.promise:undefined;
-  const job={id,promise:null};completion=job;
+  if(!key||completion||capturing||foregroundClients.size)return;
+  const job={id,key,controller:new AbortController(),interrupted:false,promise:null};completion=job;
+  const allowed=()=>!job.interrupted&&!foregroundClients.size&&!capturing;
   job.promise=(async()=>{
+    let timer,downloaded=[],downloadStart=0,downloadTotal=0,attempted=false;
     try{
       const cache=await caches.open(CACHE);
-      if(capturing){
-        if(capturing.id===id)capturing.finish?.();
-        let timer;try{await Promise.race([capturing.done,new Promise(resolve=>{timer=setTimeout(resolve,12000);})]);}finally{clearTimeout(timer);}
-      }
-      if(capturing)return;
+      if(!allowed())return;
       const hit=await cache.match(key);if(hit){hit.body?.cancel().catch(()=>{});return;}
       const prefix=await readPrefix(request,key);
-      if(capturing)return;
-      // A foreground fetch may have completed while the prefix was being read.
+      if(!allowed())return;
       const second=await cache.match(key);if(second){second.body?.cancel().catch(()=>{});return;}
-      if(capturing)return;
-      if(prefix.total&&prefix.offset===prefix.total){await save(cache,key,prefix.chunks,prefix.total);const saved=await cache.match(key);if(saved){saved.body?.cancel().catch(()=>{});await removeParts(key);record('assembled',key,prefix.total);}return;}
+      if(!allowed())return;
+      if(prefix.total&&prefix.offset===prefix.total){job.networkDone=true;await save(cache,key,prefix.chunks,prefix.total);const saved=await cache.match(key);if(saved){saved.body?.cancel().catch(()=>{});await removeParts(key);record('assembled',key,prefix.total);}return;}
       if((completionAttempts.get(key)||0)>Date.now())return;
-      completionAttempts.delete(key);completionAttempts.set(key,Date.now()+60000);
+      completionAttempts.delete(key);completionAttempts.set(key,Date.now()+60000);attempted=true;
       while(completionAttempts.size>128)completionAttempts.delete(completionAttempts.keys().next().value);
-      const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),120000);
-      const slot={id,confirm(){},done:job.promise};capturing=slot;
+      timer=setTimeout(()=>job.controller.abort(),120000);
+      const headers=new Headers();if(prefix.offset)headers.set('Range','bytes='+prefix.offset+'-');
+      const backgroundUrl=new URL(url);backgroundUrl.searchParams.set('psn-background','1');
+      const response=await fetch(new Request(backgroundUrl.href,{mode:'cors',credentials:'omit',headers,signal:job.controller.signal}));
+      if(!allowed()){response.body?.cancel().catch(()=>{});return;}
+      const full=completeLength(response),unknown=unknownComplete(response);
+      const range=/^bytes (\d+)-(\d+)\/(\d+)$/.exec(response.headers.get('Content-Range')||'');
+      const tail=!!(prefix.offset&&response.status===206&&mp4Response(response)&&range&&Number(range[1])===prefix.offset&&Number(range[3])===prefix.total&&Number(range[2])===prefix.total-1&&(!response.headers.has('Content-Length')||Number(response.headers.get('Content-Length'))===prefix.total-prefix.offset));
+      if(!response.body||(!full&&!unknown&&!tail)){response.body?.cancel().catch(()=>{});return;}
+      let size=tail?prefix.offset:0;const expected=tail?prefix.total:full;
+      downloadStart=size;downloadTotal=expected;
+      const reader=response.body.getReader();
       try{
-        const headers=new Headers();if(prefix.offset)headers.set('Range','bytes='+prefix.offset+'-');
-        const response=await fetch(new Request(request,{headers,signal:controller.signal}));
-        const full=completeLength(response),unknown=unknownComplete(response);
-        const range=/^bytes (\d+)-(\d+)\/(\d+)$/.exec(response.headers.get('Content-Range')||'');
-        const tail=!!(prefix.offset&&response.status===206&&mp4Response(response)&&range&&Number(range[1])===prefix.offset&&Number(range[3])===prefix.total&&Number(range[2])===prefix.total-1&&(!response.headers.has('Content-Length')||Number(response.headers.get('Content-Length'))===prefix.total-prefix.offset));
-        if(!response.body||(!full&&!unknown&&!tail)){response.body?.cancel().catch(()=>{});return;}
-        const chunks=tail?prefix.chunks:[];let size=tail?prefix.offset:0;const expected=tail?prefix.total:full;
-        const reader=response.body.getReader();
-        try{while(true){const item=await reader.read();if(item.done)break;size+=item.value.byteLength;if(size>MAX_FILE||(expected&&size>expected)){await reader.cancel();return;}chunks.push(item.value);}}finally{reader.releaseLock();}
-        if(!validSize(size)||(expected&&size!==expected))return;
-        await save(cache,key,chunks,size);
-        const saved=await cache.match(key);if(saved){saved.body?.cancel().catch(()=>{});await removeParts(key);record('completed',key,size);}
-      }finally{clearTimeout(timer);if(capturing===slot)capturing=null;}
-    }catch(_){record('completion-error',key);}
+        while(allowed()){
+          const item=await reader.read();if(item.done)break;
+          size+=item.value.byteLength;
+          if(size>MAX_FILE||(expected&&size>expected)){await reader.cancel();downloaded=[];return;}
+          downloaded.push(item.value);
+        }
+        if(!allowed()){reader.cancel().catch(()=>{});return;}
+      }finally{reader.releaseLock();}
+      if(!validSize(size)||(expected&&size!==expected))return;
+      job.networkDone=true;
+      await save(cache,key,tail?[...prefix.chunks,...downloaded]:downloaded,size);
+      const saved=await cache.match(key);if(saved){saved.body?.cancel().catch(()=>{});await removeParts(key);record('completed',key,size);downloaded=[];}
+    }catch(_){if(!job.interrupted)record('completion-error',key);}
+    finally{
+      clearTimeout(timer);
+      if(job.interrupted){
+        if(attempted)completionAttempts.delete(key);
+        try{await saveInterrupted(request,key,downloaded,downloadStart,downloadTotal);}catch(_){}
+        enqueueCompletion(url,id,retries+1);
+      }
+    }
   })().finally(()=>{if(completion===job)completion=null;});
   return job.promise;
 }
@@ -332,6 +409,7 @@ async function handle(request,key,done,localOnly=false,clientId='') {
   } catch (_) {cache=null;}
   if(localOnly){done();return new Response(null,{status:404,headers:{'Cache-Control':'no-store'}});}
   const id=confirmationKey(clientId,request.url);
+  interruptBackground();
   let response, upstreamAbort;
   let onAbort=()=>upstreamAbort?.abort();
   const abortListener=()=>onAbort();
@@ -355,11 +433,23 @@ async function handle(request,key,done,localOnly=false,clientId='') {
   let chunks=[],received=0,collect=true,finished=false,playerClosed=false,playerController;
   let confirmedPlayback=wasConfirmed(id),pumping=null,drainRequested=false;
   let resolveCapture;const captureDone=new Promise(resolve=>{resolveCapture=resolve;});
-  const capture={id,done:captureDone,confirm(){if(collect&&!finished)confirmedPlayback=true;},finish(){if(collect&&!finished){confirmedPlayback=true;drainRequested=true;pump();}}};
+  const capture={id,done:captureDone,background:false,
+    confirm(){if(collect&&!finished)confirmedPlayback=true;},
+    finish(){if(collect&&!finished){confirmedPlayback=true;capture.background=true;if(playerClosed&&!foregroundClients.size){drainRequested=true;pump();}}},
+    interrupt(){
+      if(finished||!collect||!capture.background)return;
+      finished=true;drainRequested=false;
+      const receivedChunks=chunks;
+      if(!playerClosed){playerClosed=true;try{playerController.error(new DOMException('Preview superseded','AbortError'));}catch(_){}}
+      cancelUpstream();record('capture-paused',key,received);
+      const saved=saveInterrupted(request,key,receivedChunks,part?.start||0,part?.total||completeSize).catch(()=>{});
+      release(saved);
+    }};
   capturing=capture;
-  const release=()=>{
+  const release=(saving=Promise.resolve())=>{
     if(!collect)return;
-    collect=false;chunks=[];if(capturing===capture)capturing=null;clearTimeout(timer);resolveCapture();done();
+    collect=false;chunks=[];if(capturing===capture)capturing=null;clearTimeout(timer);
+    Promise.resolve(saving).finally(()=>{resolveCapture();const wake=scheduleCompletion();Promise.resolve(wake).finally(done);});
   };
   const closePlayer=()=>{if(!playerClosed){playerClosed=true;try{playerController.close();}catch(_){}}};
   const cancelUpstream=()=>{upstreamAbort.abort();reader.cancel().catch(()=>{});cleanup();};
@@ -380,7 +470,11 @@ async function handle(request,key,done,localOnly=false,clientId='') {
   const abandon=()=>{
     if(finished)return;
     playerClosed=true;
-    if(confirmedPlayback&&collect){drainRequested=true;pump();return;}
+    if(confirmedPlayback&&collect){
+      capture.background=true;
+      if(foregroundClients.size){capture.interrupt();return;}
+      drainRequested=true;pump();return;
+    }
     finished=true;record('cancelled',key,received);cancelUpstream();release();
   };
   const timer=setTimeout(()=>{

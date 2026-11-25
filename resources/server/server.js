@@ -2191,7 +2191,7 @@ function ssProviderPump() {
     // Reserve capacity for gameplay when parallel requests are available.
     const index = ssProviderWaiters.findIndex(job =>
       (job.kind !== 'image' || ssProviderImagesActive < Math.max(1,max-1)) &&
-      (job.kind !== 'video' || ssProviderVideosActive < 3));
+      (!['video','video-background'].includes(job.kind) || ssProviderVideosActive < 3));
     if (index < 0) break;
     const job = ssProviderWaiters.splice(index,1)[0];
     if (job.done) continue;
@@ -2200,14 +2200,14 @@ function ssProviderPump() {
     if (job.signal) job.signal.removeEventListener('abort',job.cancel);
     ssProviderActive++;
     if (job.kind === 'image') ssProviderImagesActive++;
-    if (job.kind === 'video') ssProviderVideosActive++;
+    if (job.kind === 'video'||job.kind === 'video-background') ssProviderVideosActive++;
     let released=false;
     job.resolve(()=>{
       if (released) return;
       released=true;
       ssProviderActive--;
       if (job.kind === 'image') ssProviderImagesActive--;
-      if (job.kind === 'video') ssProviderVideosActive--;
+      if (job.kind === 'video'||job.kind === 'video-background') ssProviderVideosActive--;
       ssProviderPump();
     });
   }
@@ -2231,8 +2231,8 @@ function ssProviderAcquire(kind='search',signal) {
     };
     job.cancel=()=>cancel('aborted');
     if (signal) signal.addEventListener('abort',job.cancel,{once:true});
-    job.timeout=setTimeout(()=>cancel('queue_timeout'),kind==='video'?18000:12000);
-    const weight={video:0,search:1,info:1,image:2};
+    job.timeout=setTimeout(()=>cancel('queue_timeout'),kind==='video'||kind==='video-background'?18000:12000);
+    const weight={video:0,search:1,info:1,image:2,'video-background':3};
     const priority=weight[kind]??2;
     const idx=ssProviderWaiters.findIndex(other=>(weight[other.kind]??2)>priority);
     if (idx<0) ssProviderWaiters.push(job);
@@ -3272,7 +3272,8 @@ app.get('/api/gameplay-video', async (req,res) => {
     const mediaUrl = ssVideoUpstreamUrl(video);
     let upstream;
     const started=Date.now();
-    let releaseProvider=await ssProviderAcquire('video',controller.signal);
+    const providerKind=req.query?.['psn-background']==='1'?'video-background':'video';
+    let releaseProvider=await ssProviderAcquire(providerKind,controller.signal);
     let providerWait=Date.now()-started;
     try {
       ssPreviewQuotaReserve();
@@ -3281,7 +3282,7 @@ app.get('/api/gameplay-video', async (req,res) => {
       releaseProvider();
       if (!range || ![403,416].includes(Number(error && error.upstreamStatus))) throw error;
       const retryQueueAt=Date.now();
-      releaseProvider=await ssProviderAcquire('video',controller.signal);
+      releaseProvider=await ssProviderAcquire(providerKind,controller.signal);
       providerWait+=Date.now()-retryQueueAt;
       try {
         ssPreviewQuotaReserve();
