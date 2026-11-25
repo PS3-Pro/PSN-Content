@@ -2588,6 +2588,8 @@ function ssPreviewTitleSimilarity(a, b) {
   const numbers = title => (title.match(/\b\d+\b/g) || []).join(',');
   if (numbers(a) !== numbers(b)) return 0;
   if (a.replace(/\s+/g, '') === b.replace(/\s+/g, '')) return 1;
+  // A missing or extra subtitle needs independent ambiguity checks, not fuzzy similarity.
+  if (a.startsWith(b+' ') || b.startsWith(a+' ')) return 0;
   const aa = a.split(' '), bb = b.split(' ');
   const meaningful = words => words.filter(word=>!['the','a','an','of','and','de','la','le'].includes(word));
   const coreA=meaningful(aa), coreB=meaningful(bb);
@@ -2629,6 +2631,21 @@ function ssPreviewTitleSimilarity(a, b) {
   return words >= 0.78 && chars >= 0.78 && score >= 0.85 ? score : 0;
 }
 
+// A base-title match is provisional. It must be supported by the local catalogue
+// and a single same-platform family candidate in the complete search response.
+function ssPreviewBaseTitleMatch(wanted, raw, systemId, serial, matchName) {
+  if (wanted.split(' ').length < 3 || wanted.length < 9) return 0;
+  const full=matchName(raw);
+  if (!full.startsWith(wanted+' ')) return 0;
+  const tail=full.slice(wanted.length+1);
+  if (tail==='hd') return systemId===59 && /^NP[A-Z]{2}\d{5}$/.test(serial) ? 0.93 : 0;
+  if (/\b(?:\d+|i|x|hd|4k|vr|remaster(?:ed)?|remake|edition|collection|bundle|trilogy|anthology|pack|expansion|dlc|demo|trial|beta|prologue|episode|chapter|part|directors? cut|goty)\b/.test(tail)) return 0;
+  const pieces=String(raw||'').split(/\s*[:：]\s*|\s+[-–—?]\s+/);
+  for(let i=1;i<pieces.length;i++) {
+    if (matchName(pieces.slice(0,i).join(' '))===wanted && matchName(pieces.slice(i).join(' '))===tail && tail.split(' ').length>=2) return 0.92;
+  }
+  return 0;
+}
 function ssPreviewMediaList(game) {
   const medias = game && game.medias;
   if (Array.isArray(medias)) return medias;
@@ -2916,7 +2933,7 @@ function ssPreviewSetCached(key, payload, ttl = null) {
 
 const SS_PREVIEW_DB_NO_VIDEO_DAYS = 1;
 let ssPreviewDbPruneAfter = 0;
-async function ssPreviewLoadDatabase(key, systemId, legacyKey='', serial='', wanted='', refreshInitialsMiss=false) {
+async function ssPreviewLoadDatabase(key, systemId, legacyKey='', serial='', wanted='', refreshInitialsMiss=false, catalogBase=false) {
   try {
     const rows = (await pool.query({text:`
       SELECT cache_key, game_id, media_type, api_host, extras, expires_at
@@ -2928,16 +2945,17 @@ async function ssPreviewLoadDatabase(key, systemId, legacyKey='', serial='', wan
       if (!row) return null;
       const gameId = Number(row.game_id);
       if (gameId === 0 && row.extras?.negative === true) {
-        if (row.extras.titleSearchVersion !== 3 || (refreshInitialsMiss && row.extras.initialsSearchVersion !== 2)) return null;
+        if (row.extras.titleSearchVersion !== 4 || (refreshInitialsMiss && row.extras.initialsSearchVersion !== 2)) return null;
         const payload = {found:false,provider:'screenscraper',reason:row.extras.reason || 'no_match'};
         ssPreviewSetCached(row.cache_key,payload);
         return payload;
       }
       const extras = row.extras && typeof row.extras === 'object' ? row.extras : null;
+      if (extras?.inferredBase && !catalogBase) return null;
       const mediaSystem = systemId === 0 ? Number(extras?.system) : systemId;
       if (!ssPreviewValidMediaSystem(mediaSystem)) return null;
       const type = String(row.media_type || '');
-      if (!type && (extras?.titleSearchVersion !== 3 || (refreshInitialsMiss && extras?.initialsSearchVersion !== 2))) return null;
+      if (!type && (extras?.titleSearchVersion !== 4 || (refreshInitialsMiss && extras?.initialsSearchVersion !== 2))) return null;
       if (!Number.isSafeInteger(gameId) || gameId <= 0 || !['', 'video', 'video-normalized'].includes(type)) return null;
       const apiHost = ssPreviewAllowedMediaHost(row.api_host) ? row.api_host : 'api.screenscraper.fr';
       const video = type ? {
@@ -2949,7 +2967,7 @@ async function ssPreviewLoadDatabase(key, systemId, legacyKey='', serial='', wan
         ? {found:true, url:video.url, video, extras, provider:'screenscraper'}
         : {found:false, extras, provider:'screenscraper', reason:'no_video'};
       const remaining=Number(new Date(row.expires_at))-Date.now();
-      ssPreviewSetCached(row.cache_key, payload, !video&&Number.isFinite(remaining)?Math.max(0,Math.min(remaining,SS_PREVIEW_POSITIVE_MS)):null);
+      ssPreviewSetCached(row.cache_key, payload, (!video||extras?.inferredBase)&&Number.isFinite(remaining)?Math.max(0,Math.min(remaining,SS_PREVIEW_POSITIVE_MS)):null);
       return payload;
     };
     return {primary:decode(rows.find(entry=>entry.cache_key===key)),
@@ -2960,7 +2978,7 @@ async function ssPreviewLoadDatabase(key, systemId, legacyKey='', serial='', wan
   }
 }
 function ssPreviewLegacyCompatible(extras,serial,wanted) {
-  if (!extras) return false; // The caller checks completeness for the requested media.
+  if (!extras || extras.inferredBase) return false; // The caller checks completeness for the requested media.
   const identity=extras.identity;
   if (!identity) return true; // Provisional name-level fallback only; never proof of a serial.
   if (identity.serials?.length && serial && !identity.serials.includes(serial)) return false;
@@ -2976,8 +2994,8 @@ function ssPreviewPersistDatabase(key, systemId, result, aliases=[], protectPrim
   if (type && !['video', 'video-normalized'].includes(type)) return;
   const host = video && ssPreviewAllowedMediaHost(video.apiHost)
     ? video.apiHost : 'api.screenscraper.fr';
-  const metadata = isNegative ? {negative:true,reason:result.reason || 'no_match',initialsSearchVersion:2,titleSearchVersion:3} : (result.extras ? {...result.extras,initialsSearchVersion:2,titleSearchVersion:3} : null);
-  const persistent = !!video;
+  const metadata = isNegative ? {negative:true,reason:result.reason || 'no_match',initialsSearchVersion:2,titleSearchVersion:4} : (result.extras ? {...result.extras,initialsSearchVersion:2,titleSearchVersion:4} : null);
+  const persistent = !!video && !result.extras?.inferredBase;
   queryDbWithRetry(`
     INSERT INTO screenscraper_game_cache
       (cache_key, system_id, game_id, media_type, api_host, extras, refreshed_at, expires_at)
@@ -3137,6 +3155,12 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
     let bestMediaRank = 0;
     let confirmedDetailId = 0;
     let bestSerialMatch = false;
+    let inferredId=0;
+    let unverifiedBase=false;
+    const familyIds=new Set();
+    const inferredScores=new Map();
+    const inferenceAllowed=()=>demand.catalogBase===true && systemId!==0 && !demand.retro;
+    const inferredValid=()=>inferenceAllowed() && inferredId>0 && Number(bestGame?.id)===inferredId && familyIds.size===1;
     const exactGameIds = new Set();
     const exactSources = new Map();
     const candidateScores = new Map();
@@ -3145,9 +3169,9 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
     const detailedIds = new Set();
     let incompleteSearch = null;
     let partialMediaError = null;
-    const normalSufficient = () => bestSerialMatch || (bestScore === 1 &&
+    const normalSufficient = () => bestSerialMatch || (inferredValid() && bestMediaRank>0) || (bestScore === 1 &&
       (systemId === 0 ? bestMediaRank >= 2 : (!tryAlternateMedia ? bestMediaRank > 0 : bestMediaRank === 3)));
-    const videoSufficient = () => bestSerialMatch || ((bestScore === 1 || strongFuzzy()) && bestMediaRank >= 2);
+    const videoSufficient = () => bestSerialMatch || ((bestScore === 1 || strongFuzzy() || inferredValid()) && bestMediaRank >= 2);
     const retroConfirmed = () => demand.retro && !!bestGame && Number(bestGame.id)===confirmedDetailId && (bestSerialMatch || bestScore===1);
     const extrasSufficient = () => demand.retro ? (retroConfirmed() || (bestScore===1 && ssRetroExtrasComplete(ssPreviewExtractExtras(bestGame,ssPreviewGameSystem(bestGame))))) : normalSufficient();
     const sufficient = () => !!partialMediaError || ((!demand.wantsExtras || extrasSufficient()) && (!demand.wantsVideo || videoSufficient() || retroConfirmed()));
@@ -3247,6 +3271,25 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
         // With a serial, inspect all returned candidates before choosing a name-only hit.
         if (systemId!==0 && (!serial || bestSerialMatch) && bestScore === 1 && sufficient()) break;
       }
+      if (systemId!==0 && !demand.retro && bestScore<1 && !bestSerialMatch && games.length<=30) {
+        const rows=[];
+        for(const game of games) {
+          if (!ssPreviewGameUsable(game,systemId)) continue;
+          const id=Number(game.id), names=ssPreviewNames(game);
+          if (names.some(title=>{const n=matchName(title);return n===wanted || n.startsWith(wanted+' ') || wanted.startsWith(n+' ');})) familyIds.add(id);
+          const score=Math.max(0,...names.map(title=>ssPreviewBaseTitleMatch(wanted,title,systemId,serial,matchName)));
+          if(score && !ssPreviewPhysicalSerial(serial)) {unverifiedBase=true;inferredScores.set(id,score);rows.push({game,id,score});}
+        }
+        if (inferenceAllowed() && !exactOnly && familyIds.size===1 && inferredScores.size===1) {
+          const hit=rows.find(row=>row.id===[...familyIds][0]);
+          if(hit && hit.score>bestScore && [...candidateScores].every(([id,score])=>id===hit.id || hit.score-score>=0.04)) {
+            bestGame=hit.game;bestScore=hit.score;bestMediaRank=mediaRank(hit.game);inferredId=hit.id;bestSerialMatch=!!serial && ssPreviewRomSerials(hit.game).includes(serial);
+          }
+        }
+        if(inferredId && familyIds.size!==1 && Number(bestGame?.id)===inferredId) {
+          bestGame=null;bestScore=0;bestMediaRank=0;inferredId=0;
+        }
+      }
       trace.bestScore=bestScore;
     };
     // Search results may omit media. Confirm an unambiguous match using the
@@ -3254,7 +3297,7 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
     const confirmMedia = async () => {
       if (!bestGame || (!((demand.wantsVideo && bestMediaRank<2) ||
           (demand.retro && demand.wantsExtras && !extrasSufficient()))) ||
-          (!bestSerialMatch && (bestScore !== 1 || (systemId===0 ? exactSources.get(ssPreviewGameSystem(bestGame))?.size!==1 : exactGameIds.size!==1)))) return;
+          (!bestSerialMatch && !inferredValid() && (bestScore !== 1 || (systemId===0 ? exactSources.get(ssPreviewGameSystem(bestGame))?.size!==1 : exactGameIds.size!==1)))) return;
       const id = Number(bestGame.id), platform = ssPreviewGameSystem(bestGame);
       if (detailedIds.has(id)) return;
       detailedIds.add(id);
@@ -3266,7 +3309,7 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
         return;
       }
       if (!ssPreviewGameUsable(game,platform) || Number(game.id)!==id ||
-          (!ssPreviewNames(game).some(title=>matchName(title)===wanted) &&
+          (!ssPreviewNames(game).some(title=>matchName(title)===wanted || (inferredValid() && ssPreviewBaseTitleMatch(wanted,title,systemId,serial,matchName))) &&
            !(serial && ssPreviewRomSerials(game).includes(serial)))) {
         throw Object.assign(new Error('ScreenScraper game details could not be confirmed.'),{status:502,code:'api_rejected',upstreamStatus:0});
       }
@@ -3325,7 +3368,7 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
     const minScore = systemId === 0 ? 0.95 : 0.78;
     const mediaSystem = Number(bestGame && (bestGame.systemeid || (bestGame.systeme && bestGame.systeme.id)));
     const validMatch = !!bestGame && bestScore >= minScore && ssPreviewValidMediaSystem(mediaSystem) &&
-      (bestSerialMatch || bestScore===1 || [...candidateScores].every(([id,score])=>id===Number(bestGame.id) || bestScore-score>=0.04));
+      (bestSerialMatch || bestScore===1 || (Number(bestGame.id)===inferredId ? inferredValid() : [...candidateScores].every(([id,score])=>id===Number(bestGame.id) || bestScore-score>=0.04)));
     const previousVideo=demand.retro ? (publishedVideoSource || knownVideo) : null;
     const video = validMatch ? (ssPreviewFindVideo(bestGame, systemId) ||
       (previousVideo?.gameId===Number(bestGame.id) && previousVideo?.system===mediaSystem ? previousVideo : null)) : null;
@@ -3371,6 +3414,14 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
       if (!video) extras.videoChecked=false;
       return {...result,partial:true,partialReason:partialMediaError?.code || incompleteSearch?.code};
     }
+    if (validMatch && inferredValid() && !bestSerialMatch) {
+      // Provisional inference: reuse for a day, never promote to a permanent serial mapping.
+      extras.inferredBase=true;
+      ssPreviewSetCached(key,result,30*60*1000);
+      ssPreviewPersistDatabase(key,systemId,result,[],true);
+      return result;
+    }
+    if (!validMatch && unverifiedBase && !inferenceAllowed()) return result;
     const verifiedSerial = !serial || !!extras?.identity?.serials?.includes(serial);
     if (serial && extras && !verifiedSerial) {
       // Name-only identification is useful, but not a permanent serial mapping.
@@ -3408,7 +3459,9 @@ function ssPreviewLookup(name, systemId, options = null) {
   const wantsExtras = requireEnglish || requireArtwork;
   const wantsVideo = !wantsExtras;
   const retro=options?.retro===true;
+  const catalogBase=options?.catalogBase===true && !retro && systemId!==0;
   const ready = (result,video=wantsVideo,extras=wantsExtras,retroDetail=retro) => !!result &&
+    (!result.extras?.inferredBase || catalogBase) &&
     (!candidateId || Number(result.video?.gameId || result.extras?.gameId)===candidateId) &&
     (systemId!==0 || !result.extras || Array.isArray(result.extras.sourceCandidates) ||
       ((!video || result.found) && (!extras || ssRetroExtrasComplete(result.extras)))) &&
@@ -3416,21 +3469,23 @@ function ssPreviewLookup(name, systemId, options = null) {
     (!extras || (!result.found && !result.extras) ||
       (result.extras?.summaryEnglishChecked === true && result.extras?.artworkChecked === true &&
        (!retroDetail || result.extras.retroDetailsChecked===true || ssRetroExtrasComplete(result.extras))));
-  const cached = ssPreviewGetCached(key);
+  const rawCached = ssPreviewGetCached(key);
+  const cached = rawCached?.extras?.inferredBase && !catalogBase ? null : rawCached;
   if (ready(cached)) return Promise.resolve(cached);
   const existing = ssPreviewInflight.get(key);
   if (existing) {
     existing.wantsExtras ||= wantsExtras;
     existing.wantsVideo ||= wantsVideo;
     existing.retro ||= retro;
+    existing.catalogBase ||= catalogBase;
     return wantsVideo ? existing.video : existing.full;
   }
   let publish;
   const earlyVideo = new Promise(resolve => {publish=resolve;});
-  const demand = {wantsExtras,wantsVideo,publish,retro,candidateGameId:candidateId};
+  const demand = {wantsExtras,wantsVideo,publish,retro,candidateGameId:candidateId,catalogBase};
   const memoryLegacy=serial ? ssPreviewGetCached(legacyKey) : null;
   const refreshInitialsMiss = ssPreviewInitialsVariant(searchName) !== searchName;
-  const work = ssPreviewLoadDatabase(key, systemId,serial ? legacyKey : '',serial,normalized,refreshInitialsMiss).then(({primary,legacy}) => {
+  const work = ssPreviewLoadDatabase(key, systemId,serial ? legacyKey : '',serial,normalized,refreshInitialsMiss,catalogBase).then(({primary,legacy}) => {
     // The previous lookup may have populated RAM while its asynchronous DB write is still pending.
     if (cached) primary=cached;
     const complete = result => ready(result,demand.wantsVideo,demand.wantsExtras,demand.retro);
@@ -3447,7 +3502,7 @@ function ssPreviewLookup(name, systemId, options = null) {
     if (primary?.found) demand.publish(primary);
     if (complete(primary)) return primary;
     return ssPreviewFetchUpstream(name,systemId,key,serial,
-      candidateId || Number(primary?.video?.gameId || primary?.extras?.gameId)||0,serial ? legacyKey : '',legacy,demand,
+      candidateId || (!primary?.extras?.inferredBase && Number(primary?.video?.gameId || primary?.extras?.gameId))||0,serial ? legacyKey : '',legacy,demand,
       primary?.extras?.artworkChecked===false || primary?.extras?.videoChecked===false,options?.lookupDeadline,primary?.video).catch(error=>{
       if (complete(primary)) return primary;
       if (complete(legacy)) return legacy;
@@ -4735,7 +4790,7 @@ app.get('/api/gameplay-preview', async (req, res) => {
     return res.status(400).json({ ok:false, error:'Invalid game or system.' });
   }
   try {
-    const options={titleId:isPort?'':ssPreviewSerial(req.query?.titleId)};
+    const options={titleId:isPort?'':ssPreviewSerial(req.query?.titleId),catalogBase:req.query?.catalogBase==='1'};
     const result = await ssPreviewLookupCategory(name,systemId,isMinis,options);
     if (!result.found) return res.json({ok:true,configured:true,found:false,provider:'screenscraper',reason:result.reason,candidates:result.candidates || 0});
     return res.json({ok:true,configured:true,found:true,url:result.url,
@@ -4759,7 +4814,7 @@ app.get('/api/screenscraper-extras', async (req,res) => {
   const system = isPort ? 0 : Number(req.query && req.query.system);
   if ((!isPort && !SS_PREVIEW_SYSTEM_IDS.has(system)) || (isMinis && system !== 59) || name.length < 3 || !normalizeSsPreviewTitle(name)) return res.status(400).json({ok:false});
   try {
-    const options={englishSummary:true,artwork:true,titleId:isPort?'':ssPreviewSerial(req.query?.titleId)};
+    const options={englishSummary:true,artwork:true,titleId:isPort?'':ssPreviewSerial(req.query?.titleId),catalogBase:req.query?.catalogBase==='1'};
     const result = await ssPreviewLookupCategory(name,system,isMinis,options);
     if (result.partial) res.setHeader('Cache-Control','no-store');
     return res.json({ok:true,found:!!result.extras,extras:ssExtraPublic(result.extras),...(result.partial?{partial:true,retry:true}:{})});

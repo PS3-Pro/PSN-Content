@@ -34652,6 +34652,7 @@ P
 			const data = await buildStoreCategoryData(cat, texts, priority, paths);
 			psnStoreRenderCache[cat] = data;
 			window.psnStoreCache[cat] = data;
+			if (cat === 'games') window.__psnPrepareScreenScraperBaseIndex?.();
 			if (typeof window.syncBrowseTypeFilterAvailability === 'function') window.syncBrowseTypeFilterAvailability();
 			if (typeof window.bumpPsnStoreCacheRevision === 'function') window.bumpPsnStoreCacheRevision();
 			if (typeof window.invalidatePsnStoreLookup === 'function') window.invalidatePsnStoreLookup();
@@ -120515,6 +120516,30 @@ function getVisibleChatStackEl(id) {
 
 <script>
 (() => {
+  let source=null, count=0, names=[];
+  const normalize=value=>String(value||'').replace(/[™®©]/g,' ').normalize('NFKD').replace(/[\u0300-\u036f]/g,'').replace(/[’']/g,'').replace(/&/g,' and ').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim().replace(/\b0+(?=\d)/g,'').replace(/\b(?:ii|iii|iv|v|vi|vii|viii|ix)\b/g,t=>({ii:'2',iii:'3',iv:'4',v:'5',vi:'6',vii:'7',viii:'8',ix:'9'})[t]);
+  function prepare(){
+    const items=window.psnStoreCache?.games;
+    if(!Array.isArray(items)||!items.length)return false;
+    if(source!==items||count!==items.length){
+      source=items;count=items.length;
+      names=[...new Set(items.map(item=>normalize(item?.cleanName||item?.name||item?.title||item?.rawName)).filter(Boolean))].sort();
+    }
+    return true;
+  }
+  function lower(value){let l=0,r=names.length;while(l<r){const m=(l+r)>>>1;if(names[m]<value)l=m+1;else r=m;}return l;}
+  window.__psnScreenScraperBaseHint=function(name){
+    const key=normalize(name);
+    if(key.length<9||key.split(' ').length<3||!prepare())return '';
+    if(names[lower(key)]!==key||names[lower(key+' ')]?.startsWith(key+' '))return '';
+    return '&catalogBase=1';
+  };
+  window.__psnPrepareScreenScraperBaseIndex=function(){
+    if(typeof requestIdleCallback==='function')requestIdleCallback(prepare);
+    else setTimeout(prepare,0);
+  };
+})();
+(() => {
   const platformIds = {ps3:59,ps2:58,ps1:57,psx:57,psp:61,minis:59,psv:62,psvita:62,vita:62,ps4:60,pce:31,pcengine:31,neogeo:142};
   const memory = new Map();
   const pending = new Map();
@@ -120536,7 +120561,7 @@ function getVisibleChatStackEl(id) {
     if(cached && now-cached.at<(cached.data?.partial?15000:15*60*1000)) return Promise.resolve(cached.data);
     if(pending.has(key)) return pending.get(key);
     if(now<extrasBlockedUntil)return Promise.resolve(null);
-    const url=baseServer()+'/api/screenscraper-extras?name='+encodeURIComponent(cleanName(name))+'&system='+system+(isPort?'&port=1':'')+(isMinis?'&minis=1':'')+(titleId?'&titleId='+encodeURIComponent(titleId):'');
+    const url=baseServer()+'/api/screenscraper-extras?name='+encodeURIComponent(cleanName(name))+'&system='+system+(isPort?'&port=1':'')+(isMinis?'&minis=1':'')+(titleId?'&titleId='+encodeURIComponent(titleId):'')+(window.__psnScreenScraperBaseHint?.(name)||'');
     const promise=fetch(url,{cache:'no-store'}).then(r=>{
       if(r.status===429){extrasBlockedUntil=Date.now()+Math.min(120000,Math.max(10000,(Number(r.headers.get('Retry-After'))||60)*1000));return null;}
       return r.ok?r.json():null;
@@ -120888,7 +120913,9 @@ function getVisibleChatStackEl(id) {
   const reducedMotion=window.matchMedia?.('(prefers-reduced-motion: reduce)');
   const TOUCH_PRELOAD_MS=150, TOUCH_HOLD_MS=350, TOUCH_MOVE_LIMIT=12;
   const systems = {ps3:59,ps2:58,ps1:57,psx:57,psp:61,minis:59,psv:62,psvita:62,vita:62,ps4:60,pce:31,pcengine:31,neogeo:142};
-  const cache = new Map(), pending = new Map(), failures = new Map();
+  const cache = new Map(), pending = new Map(), failures = new Map(), lookupRetryAfter = new Map();
+  const PREVIEW_RETRY_DELAYS=[2000,5000], MAX_PREVIEW_RETRY_WAIT=60000;
+  const lookupErrorStreak=new Map();
   let lookupBlockedUntil=0, videoBlockedUntil=0, recentVideoErrors=[];
   const mediaLookupFailures=new Map();
   const cardVideos=new Map(), modalVideos=new WeakMap();
@@ -120999,7 +121026,7 @@ function getVisibleChatStackEl(id) {
       if(clear){store.removeItem(key);sessionKeys?.delete(key);return null;}
       const saved=JSON.parse(store.getItem(key)||'null');
       if(saved?.expires>Date.now() && saved?.base===base() &&
-          (saved.data?.found===false || (saved.data?.found===true&&validProxy(saved.data.fallbackUrl)))){touchSessionKey(key);return saved;}
+          ((saved.data?.found===false && saved.matchVersion===4) || (saved.data?.found===true&&validProxy(saved.data.fallbackUrl)))){touchSessionKey(key);return saved;}
       // Keep the last positive identity after token expiry for offline cache lookup.
       if(saved&&!(saved.base===base()&&saved.data?.found===true&&validProxy(saved.data.fallbackUrl))){store.removeItem(key);sessionKeys?.delete(key);}
     }catch(_){}
@@ -121011,7 +121038,7 @@ function getVisibleChatStackEl(id) {
       const key=sessionPrefix+info.key;
       touchSessionKey(key);
       getLookupStorage().setItem(key,JSON.stringify({
-        expires,base:base(),data:data.found?{found:true,fallbackUrl:data.fallbackUrl}:{found:false,reason:data.reason}
+        expires,base:base(),matchVersion:4,data:data.found?{found:true,fallbackUrl:data.fallbackUrl}:{found:false,reason:data.reason}
       }));
     }catch(_){}
   }
@@ -121093,6 +121120,20 @@ function getVisibleChatStackEl(id) {
     })().finally(()=>localChecks.delete(info.key));
     localChecks.set(info.key,check);return check;
   }
+  function transientPreviewError(data) {
+    return data?.retry!==false&&data?.configured!==false&&!['api_auth','not_configured','invalid_video_url','api_rejected'].includes(data?.reason);
+  }
+  function rememberLookupBackoff(key,data) {
+    if(!transientPreviewError(data))return;
+    const now=Date.now(),old=lookupErrorStreak.get(key);
+    const count=old&&now-old.at<60000?Math.min(3,old.count+1):1;
+    const until=Math.max(now+(count===1?2000:count===2?5000:30000),data?.retryAt||0,lookupRetryAfter.get(key)||0);
+    lookupErrorStreak.delete(key);lookupErrorStreak.set(key,{count,at:now});
+    lookupRetryAfter.delete(key);lookupRetryAfter.set(key,until);
+    while(lookupErrorStreak.size>250)lookupErrorStreak.delete(lookupErrorStreak.keys().next().value);
+    while(lookupRetryAfter.size>250)lookupRetryAfter.delete(lookupRetryAfter.keys().next().value);
+    return until;
+  }
   function getNetworkResult(info,renew=false) {
     if(renew){cache.delete(info.key);sessionResult(info,true);}
     const entry=cache.get(info.key);
@@ -121102,28 +121143,36 @@ function getVisibleChatStackEl(id) {
     if(entry)cache.delete(info.key);
     if(!renew){const saved=sessionResult(info);if(saved){rememberResult(info.key,saved.data,saved.expires);return Promise.resolve(saved.data);}}
     if(pending.has(info.key))return pending.get(info.key);
-    if(Date.now()<lookupBlockedUntil||Date.now()<videoBlockedUntil||(failures.get(info.key)||0)>Date.now())return Promise.resolve({ok:false,reason:'rate_limited'});
-    const promise=fetch(base()+'/api/gameplay-preview?name='+encodeURIComponent(info.name)+'&system='+info.system+(info.isPort?'&port=1':'')+(info.isMinis?'&minis=1':'')+(info.titleId?'&titleId='+encodeURIComponent(info.titleId):''),{cache:'no-store'})
+    const blockedUntil=Math.max(lookupBlockedUntil,videoBlockedUntil,failures.get(info.key)||0,lookupRetryAfter.get(info.key)||0);
+    if(Date.now()<blockedUntil)return Promise.resolve({ok:false,retry:true,reason:'rate_limited',retryAt:blockedUntil});
+    const promise=fetch(base()+'/api/gameplay-preview?name='+encodeURIComponent(info.name)+'&system='+info.system+(info.isPort?'&port=1':'')+(info.isMinis?'&minis=1':'')+(info.titleId?'&titleId='+encodeURIComponent(info.titleId):'')+(window.__psnScreenScraperBaseHint?.(info.name)||''),{cache:'no-store'})
       .then(async response=>{
-        if(response.status===429||response.status===503){
-          const retrySeconds=Number(response.headers.get('Retry-After'))||(response.status===429?60:5);
-          if(response.status===429)lookupBlockedUntil=Math.max(lookupBlockedUntil,Date.now()+Math.min(120000,Math.max(10000,retrySeconds*1000)));
-          return {ok:false,data:{ok:false,reason:response.status===429?'rate_limited':'api_unavailable'}};
-        }
         const data=await response.json().catch(()=>null);
-        return {ok:response.ok,data:response.ok?data:{ok:false,reason:data?.reason||'api_unavailable'}};
+        if(response.status===429||response.status===503){
+          if(data?.configured===false)return {ok:false,data:{ok:false,retry:false,reason:'not_configured'}};
+          const header=response.headers?.get('Retry-After');
+          const seconds=header!=null&&header!==''?(Number.isFinite(Number(header))?Number(header):(Date.parse(header)-Date.now())/1000):NaN;
+          const retryAt=Date.now()+Math.max(1000,Number.isFinite(seconds)?seconds*1000:(response.status===429?60000:5000));
+          if(response.status===429)lookupBlockedUntil=Math.max(lookupBlockedUntil,retryAt);
+          return {ok:false,data:{...data,ok:false,retry:data?.retry!==false,reason:data?.reason||(response.status===429?'rate_limited':'api_unavailable'),retryAt}};
+        }
+        return {ok:response.ok,data:response.ok?data:{...data,ok:false,retry:response.status>=500&&data?.retry!==false,reason:data?.reason||'api_unavailable'}};
       })
       .then(({ok,data})=>{
-        if(ok&&data?.ok!==false&&typeof data?.found==='boolean'){
+        if(ok&&data?.ok!==false&&typeof data?.found==='boolean'&&(!data.found||validProxy(data.fallbackUrl))){
+          lookupRetryAfter.delete(info.key);lookupErrorStreak.delete(info.key);
           const expires=lookupExpiry(data);
           rememberResult(info.key,data,expires);
           saveSessionResult(info,data,expires);
           return data;
         }
-        return data||{ok:false,reason:'api_unavailable'};
+        const failure=data?.found===true?{ok:false,retry:false,reason:'invalid_video_url'}:(data||{ok:false,reason:'api_unavailable'});
+        const retryAt=rememberLookupBackoff(info.key,failure);
+        return retryAt?{...failure,retryAt}:failure;
       }).catch(()=>{
         lookupBlockedUntil=Math.max(lookupBlockedUntil,Date.now()+5000);
-        return {ok:false,reason:'network_error'};
+        const failure={ok:false,retry:true,reason:'network_error',retryAt:lookupBlockedUntil};
+        return {...failure,retryAt:rememberLookupBackoff(info.key,failure)};
       }).finally(()=>pending.delete(info.key));
     pending.set(info.key,promise);return promise;
   }
@@ -121304,7 +121353,15 @@ function getVisibleChatStackEl(id) {
       if(parkedVideos.get(info.key)===video)parkedVideos.delete(info.key);
       for(const [node,old] of cardVideos)if(old===video)cardVideos.delete(node);
       if(active?.modal&&modalVideos.get(active.card)===video)modalVideos.delete(active.card);
-      if(active?.video===video){if(!active.progress)armProgress(active,active.modal?active.card:active.card.querySelector('.game-img-container'));showProgressStatus(active,'error');stop(true);}
+      const current=active?.video===video?active:null;
+      if(current){
+        if(!current.progress)armProgress(current,current.modal?current.card:current.card.querySelector('.game-img-container'));
+        if(video.error?.code===2){
+          clearTimeout(current.timer);current.video=null;current.lookup=null;dispose(video);
+          retryPreview(current,info,{reason:'video_network_error',retry:true});return;
+        }
+        showProgressStatus(current,'error');stop(true);
+      }
       dispose(video);
     });
   }
@@ -121553,7 +121610,7 @@ function getVisibleChatStackEl(id) {
     const old=active;active=null;
     syncGameplayPriority();
     touchObserver?.disconnect();touchObserver=null;
-    clearTimeout(old.timer);
+    clearTimeout(old.timer);clearTimeout(old.retryTimer);
     if(!keepProgress)hideProgress(old);
     if(old.video){
       if(old.modal&&modalVideos.get(old.card)===old.video)modalVideos.delete(old.card);
@@ -121578,6 +121635,26 @@ function getVisibleChatStackEl(id) {
     // Pointer exit cancels mouse sessions; touch sessions stay active after release.
     return active===current&&current.card.isConnected&&!document.hidden&&
       (current.modal?modalVisible():!modalVisible());
+  }
+  // Retry only a user-requested preview, never speculative preloads or verified misses.
+  function retryPreview(current,info,data) {
+    if(!previewAllowed(current))return;
+    showProgressStatus(current,'error');
+    const attempt=current.retryCount||0;
+    const sample={key:info.key,input:current.touch?'touch':'mouse',source:'error',reason:data?.reason||'api_unavailable',attempt:attempt+1,lookupWaitMs:Math.round(performance.now()-current.started),firstPlayingMs:null};
+    videoSamples.push(sample);if(videoSamples.length>50)videoSamples.shift();
+    if(!transientPreviewError(data)||attempt>=PREVIEW_RETRY_DELAYS.length||current.retryTimer)return;
+    const wait=Math.max(PREVIEW_RETRY_DELAYS[attempt],(data?.retryAt||0)-Date.now(),lookupBlockedUntil-Date.now(),videoBlockedUntil-Date.now(),(failures.get(info.key)||0)-Date.now(),(lookupRetryAfter.get(info.key)||0)-Date.now());
+    if(wait>MAX_PREVIEW_RETRY_WAIT)return;
+    current.retryCount=attempt+1;
+    current.retryTimer=setTimeout(()=>{
+      current.retryTimer=null;
+      if(!previewAllowed(current)||(current.modal?modalIdentity(current.card):identity(current.card))?.key!==info.key)return;
+      const parent=current.modal?current.card:current.card.querySelector('.game-img-container');
+      if(!parent)return;
+      armProgress(current,parent);
+      current.lookup=getResult(info);play(current,info);
+    },wait+30);
   }
   function revealVideo(current,video) {
     if(current.video!==video||!previewAllowed(current))return;
@@ -121607,12 +121684,12 @@ function getVisibleChatStackEl(id) {
     if(video.readyState<2){
       if(!current.progress)armProgress(current,parent);
       updateProgress(current,video);
-      video.play().then(()=>revealVideo(current,video)).catch(()=>{if(active===current&&current.video===video){showProgressStatus(current,'error');stop(true);}});
+      video.play().then(()=>revealVideo(current,video)).catch(()=>{if(active===current&&current.video===video&&video.error?.code!==2){showProgressStatus(current,'error');stop(true);}});
       return true;
     }
     current.timer=setTimeout(()=>{
       if(!previewAllowed(current))return;
-      video.play().then(()=>revealVideo(current,video)).catch(()=>{if(active===current&&current.video===video){if(!current.progress)armProgress(current,parent);showProgressStatus(current,'error');stop(true);}});
+      video.play().then(()=>revealVideo(current,video)).catch(()=>{if(active===current&&current.video===video&&video.error?.code!==2){if(!current.progress)armProgress(current,parent);showProgressStatus(current,'error');stop(true);}});
     },Math.max(0,current.revealAt-Date.now()));
     return true;
   }
@@ -121624,14 +121701,15 @@ function getVisibleChatStackEl(id) {
     if(!previewAllowed(current))return;
     current.lookupDone=performance.now();
     if(cachedVideo(current,info,parent))return;
-    if(!data?.local&&((failures.get(info.key)||0)>Date.now()||Date.now()<videoBlockedUntil)){showProgressStatus(current,'error');return;}
+    if(!data?.local&&((failures.get(info.key)||0)>Date.now()||Date.now()<videoBlockedUntil)){retryPreview(current,info,{reason:'video_cooldown',retry:true});return;}
     if(!data?.found){
       // Only a verified 'no_video' means the ScreenScraper found this game.
-      showProgressStatus(current,data?.ok!==false&&data?.found===false ? (data.reason==='no_video'?'no-video':'no-match') : 'error');
+      if(data?.ok!==false&&data?.found===false)showProgressStatus(current,data.reason==='no_video'?'no-video':'no-match');
+      else retryPreview(current,info,data);
       return;
     }
     let url=validSource(data);
-    if(!url){showProgressStatus(current,'error');return;}
+    if(!url){retryPreview(current,info,{reason:'invalid_video_url',retry:false});return;}
     if(!data.local&&(localBypass.get(info.key)||0)>Date.now()){const fresh=new URL(url);fresh.searchParams.set('psn-cache-bypass','1');url=fresh.href;}
     let video=(current.modal?modalVideos.get(parent):cardVideos.get(parent)) ||
       takeModalWarm(info,parent,current.modal) || takeHandoff(info,parent,current.modal) || adoptParkedVideo(info,parent,current.modal) || adoptRegionVideo(info,parent,current.modal);
@@ -121653,7 +121731,7 @@ function getVisibleChatStackEl(id) {
     current.video=video;
     if(!current.modal)rememberCard(parent,video);
     if(video.readyState>=2)revealVideo(current,video);
-    video.play().catch(()=>{if(active===current&&current.video===video&&!video.classList.contains('is-ready')){showProgressStatus(current,'error');stop(true);}});
+    video.play().catch(()=>{if(active===current&&current.video===video&&!video.classList.contains('is-ready')&&video.error?.code!==2){showProgressStatus(current,'error');stop(true);}});
   }
   let rearmAfterModal=false;
   function modalVisible() {
