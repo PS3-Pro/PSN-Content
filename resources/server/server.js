@@ -2174,24 +2174,29 @@ const SS_PREVIEW_NEGATIVE_MS = 3 * 60 * 1000;
 const SS_PREVIEW_MAX_CACHE = 500;
 const SS_PREVIEW_FALLBACK_MINUTE_MAX = null;
 const SS_PREVIEW_FALLBACK_DAILY_MAX = null;
+const SS_PROVIDER_MAX_THREADS = 6;
+const SS_PROVIDER_QUOTA_REFRESH_MS = 30 * 60 * 1000;
 const ssPreviewMinuteTimes = [];
 let ssPreviewMinuteUsed = 0;
 let ssPreviewDailyUsed = 0;
 let ssPreviewDailyDate = '';
 const ssPreviewQuota = { minuteMax:SS_PREVIEW_FALLBACK_MINUTE_MAX,
-  dayMax:SS_PREVIEW_FALLBACK_DAILY_MAX, threadsMax:SS_PREVIEW_USER && SS_PREVIEW_PASSWORD ? 2 : 1, source:'unknown', reportedToday:null,
+  dayMax:SS_PREVIEW_FALLBACK_DAILY_MAX, threadsMax:1, source:'unknown', reportedToday:null,
   failedMax:null, failedToday:null, downloadSpeed:null, checkedAt:0, blockedUntil:0 };
 let ssProviderActive = 0;
 let ssProviderImagesActive = 0;
 let ssProviderVideosActive = 0;
+let ssProviderBackgroundActive = 0;
 const ssProviderWaiters = [];
 function ssProviderPump() {
-  const max = Math.min(4,Math.max(1,ssPreviewQuota.threadsMax || 1));
+  const max = Math.min(SS_PROVIDER_MAX_THREADS,Math.max(1,ssPreviewQuota.threadsMax || 1));
+  const videoMax = Math.max(1,max-1);
   while (ssProviderActive < max && ssProviderWaiters.length) {
     // Reserve capacity for gameplay when parallel requests are available.
     const index = ssProviderWaiters.findIndex(job =>
-      (job.kind !== 'image' || ssProviderImagesActive < Math.max(1,max-1)) &&
-      (!['video','video-background'].includes(job.kind) || ssProviderVideosActive < 3));
+      (job.kind !== 'image' || ssProviderImagesActive < Math.min(3,Math.max(1,max-1))) &&
+      ((job.kind !== 'video' && job.kind !== 'video-background') || ssProviderVideosActive < videoMax) &&
+      (job.kind !== 'video-background' || (ssProviderBackgroundActive === 0 && (max === 1 || ssProviderActive < max-1))));
     if (index < 0) break;
     const job = ssProviderWaiters.splice(index,1)[0];
     if (job.done) continue;
@@ -2201,6 +2206,7 @@ function ssProviderPump() {
     ssProviderActive++;
     if (job.kind === 'image') ssProviderImagesActive++;
     if (job.kind === 'video'||job.kind === 'video-background') ssProviderVideosActive++;
+    if (job.kind === 'video-background') ssProviderBackgroundActive++;
     let released=false;
     job.resolve(()=>{
       if (released) return;
@@ -2208,12 +2214,14 @@ function ssProviderPump() {
       ssProviderActive--;
       if (job.kind === 'image') ssProviderImagesActive--;
       if (job.kind === 'video'||job.kind === 'video-background') ssProviderVideosActive--;
+      if (job.kind === 'video-background') ssProviderBackgroundActive--;
       ssProviderPump();
     });
   }
 }
 function ssProviderAcquire(kind='search',signal) {
   if (signal?.aborted) return Promise.reject(Object.assign(new Error('aborted'),{name:'AbortError'}));
+  if (kind !== 'info') ssPreviewRefreshQuota();
   if (ssProviderWaiters.length >= (kind==='video'?40:36))
     return Promise.reject(Object.assign(new Error('ScreenScraper queue busy'),{status:503,code:'provider_queue_full'}));
   return new Promise((resolve,reject)=>{
@@ -2286,7 +2294,8 @@ function ssPreviewQuotaFromResponse(data) {
     ssPreviewQuotaRoll();
     if (perMin) ssPreviewQuota.minuteMax=perMin;
     if (perDay) ssPreviewQuota.dayMax=perDay;
-    if (threads) ssPreviewQuota.threadsMax=Math.min(4,threads);
+    const previousThreads=ssPreviewQuota.threadsMax;
+    if (threads>0) ssPreviewQuota.threadsMax=Math.min(SS_PROVIDER_MAX_THREADS,threads);
     if (failedMax>0) ssPreviewQuota.failedMax=failedMax;
     if (speed>0) ssPreviewQuota.downloadSpeed=speed;
     // Concurrent responses may arrive out of order; never roll counters backwards.
@@ -2294,9 +2303,38 @@ function ssPreviewQuotaFromResponse(data) {
     if (failedToday!==null) ssPreviewQuota.failedToday=Math.max(failedToday,ssPreviewQuota.failedToday ?? 0);
     ssPreviewQuota.source='screenscraper';
     ssPreviewQuota.checkedAt=Date.now();
+    if (threads>0 && previousThreads!==ssPreviewQuota.threadsMax) {
+      console.log('[SCREENSCRAPER QUOTA] providerThreads='+threads+' activeLimit='+ssPreviewQuota.threadsMax+' daily='+ssPreviewQuota.dayMax+' downloadKBps='+ssPreviewQuota.downloadSpeed);
+      ssProviderPump();
+    }
     return true;
   }
   return false;
+}
+let ssPreviewQuotaRefreshAt=0;
+function ssPreviewRefreshQuota() {
+  if (!SS_PREVIEW_ENABLED || !SS_PREVIEW_USER || !SS_PREVIEW_PASSWORD || Date.now()<ssPreviewQuotaRefreshAt) return;
+  ssPreviewQuotaRefreshAt=Date.now()+SS_PROVIDER_QUOTA_REFRESH_MS;
+  void (async()=>{
+    const release=await ssProviderAcquire('info');
+    try {
+      ssPreviewQuotaReserve('info');
+      const url=new URL('https://api.screenscraper.fr/api2/ssuserInfos.php');
+      url.searchParams.set('devid',SS_PREVIEW_DEVID);
+      url.searchParams.set('devpassword',SS_PREVIEW_DEVPASSWORD);
+      url.searchParams.set('softname','PSN-Content');
+      url.searchParams.set('output','json');
+      url.searchParams.set('ssid',SS_PREVIEW_USER);
+      url.searchParams.set('sspassword',SS_PREVIEW_PASSWORD);
+      const response=await requestMetadataJson(url,{timeoutMs:6000,headers:{'User-Agent':'PSN-Content/1.0'}});
+      ssPreviewQuotaNoteRate(Number(response.status),'info');
+      if (!response.ok || !ssPreviewQuotaFromResponse(response.data)) throw new Error('quota_unavailable');
+      console.log('[SCREENSCRAPER QUOTA] threads='+ssPreviewQuota.threadsMax+' daily='+ssPreviewQuota.dayMax+' downloadKBps='+ssPreviewQuota.downloadSpeed);
+    } finally {release();}
+  })().catch(()=>{
+    // Keep the last known limits and retry only on demand, after a short cooldown.
+    ssPreviewQuotaRefreshAt=Date.now()+5*60*1000;
+  });
 }
 let ssPreviewSearchBlockedUntil=0;
 function ssPreviewQuotaReserve(kind='video') {
@@ -23396,6 +23434,7 @@ async function startServer() {
       scheduleStartupGlobalRetention();
       scheduleContentDownloadIndexMaintenance(30000);
       schedulePsnStatsIndex(65000);
+      setTimeout(ssPreviewRefreshQuota,2000).unref();
     });
   } catch (err) {
     console.error('[STARTUP ERROR]:', err);
