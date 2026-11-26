@@ -7431,6 +7431,19 @@ function hasObjectPayload(value) {
   return !!(value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length > 0);
 }
 
+function discardInvalidTrophySnapshot(payload) {
+  if (!Object.prototype.hasOwnProperty.call(payload, 'trophiesData') || hasObjectPayload(payload.trophiesData)) return;
+  delete payload.trophiesData;
+  delete payload.trophies;
+  delete payload.xp;
+  delete payload.level;
+}
+
+function getSupporterTrophySeenStamp(trophy) {
+  const stamp = Number(trophy?.unlockAt);
+  return trophy?.unlocked === true && trophy.isNew === false && Number.isSafeInteger(stamp) && stamp > 0 ? stamp : null;
+}
+
 function countUnlockedTrophiesPayload(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return 0;
   return Object.values(value).reduce((count, trophy) => {
@@ -7573,7 +7586,7 @@ function getUserProfileCardStyleUpdatedAt(user = {}) {
 function getPublicProfileSettings(user = {}) {
   const profileCardStyle = getUserProfileCardStyle(user);
   const profileCardStyleUpdatedAt = getUserProfileCardStyleUpdatedAt(user) || normalizeTimestampValue(user.profileUpdatedAt) || Date.now();
-  const themeColor = normalizeThemeColorServer(user.themeColor || (user.settingsData && user.settingsData.themeColor) || "#0070cc");
+  const themeColor = getUserSystemTheme(user);
   const themeColorUpdatedAt = getUserThemeColorUpdatedAt(user) || 0;
   return {
     profileCardStyle,
@@ -7595,9 +7608,15 @@ function getProfileSettingsUpdatedAt(settings = {}, fallback = 0) {
   return normalizeTimestampValue(fallback);
 }
 
+function getUserSystemTheme(user = {}) {
+  const color = normalizeThemeColorServer(user.themeColor || user.settingsData?.themeColor || '#0070cc');
+  return color === 'rgb' && !(Number(user.supporterDonationAt) > 0) ? '#0070cc' : color;
+}
+
 function normalizeThemeColorServer(value, fallback = "#0070cc") {
   const raw = normalizeText(value, "").toLowerCase();
   if (!raw) return fallback;
+  if (raw === "rgb") return raw;
   const color = raw.startsWith("#") ? raw : `#${raw}`;
   return /^#[0-9a-f]{6}$/i.test(color) ? color : fallback;
 }
@@ -7635,7 +7654,12 @@ function reconcileIncomingThemeColor(currentUser = {}, incomingUser = {}, incomi
   );
   if (!incomingTheme) return { accepted: false, rejected: true };
 
-  const currentTheme = normalizeThemeColorServer(currentUser.themeColor || (currentUser.settingsData && currentUser.settingsData.themeColor) || "#0070cc");
+  const currentTheme = getUserSystemTheme(currentUser);
+  if (incomingTheme === 'rgb' && !(Number(currentUser.supporterDonationAt) > 0)) {
+    currentUser.themeColor = currentTheme;
+    currentUser.settingsData = { ...(currentUser.settingsData || {}), themeColor:currentTheme };
+    return { accepted:false, rejected:true, currentTheme };
+  }
   const currentUpdatedAt = getUserThemeColorUpdatedAt(currentUser);
   const incomingUpdatedAt = Math.max(
     getProfileThemeColorUpdatedAt(incomingSettings || {}),
@@ -8219,7 +8243,8 @@ function buildCompactUserSummary(name, userData = {}) {
     recentlyVisitedUpdatedAt: normalizeTimestampValue(source.recentlyVisitedUpdatedAt),
     ...(notificationState ? { notificationState } : {}),
     countersData: buildCompactCountersData(source.countersData),
-    themeColor: normalizeThemeColorServer(source.themeColor || (source.settingsData && source.settingsData.themeColor) || '#0070cc'),
+    ...(Number(source.supporterDonationAt) > 0 ? { supporterDonationAt:Number(source.supporterDonationAt) } : {}),
+    themeColor: getUserSystemTheme(source),
     themeColorUpdatedAt: getUserThemeColorUpdatedAt(source),
     profileCardStyle: getUserProfileCardStyle(source),
     profileCardEffect: getUserProfileCardStyle(source),
@@ -8456,7 +8481,7 @@ async function refreshSingleUserCacheFromDb(name, options = {}) {
   const hadCachedUser = Object.prototype.hasOwnProperty.call(userDatabase, safeName);
   if (userProfileWriteInFlight.has(safeName) && options.forceDuringWrite !== true) return userDatabase[safeName] || null;
 
-  const userRes = await queryDbWithRetry('SELECT data FROM users WHERE name = $1', [safeName], { attempts: 3, label: 'USER PROFILE READ' });
+  const userRes = options.savedData ? { rows:[{ data:options.savedData }] } : await queryDbWithRetry('SELECT data FROM users WHERE name = $1', [safeName], { attempts: 3, label: 'USER PROFILE READ' });
   if (!userRes.rows.length) {
     delete userDatabase[safeName];
     if (hadCachedUser) markUserNameIndexDirty();
@@ -11824,6 +11849,7 @@ async function buildWorkingUserForProfileUpdate(name, incoming = {}) {
 
   const columns = [...required];
   if (required.includes('libraryData')) columns.push('libraryPlayHistoryData');
+  if (required.includes('trophiesData')) columns.push('supporterDonationAt');
   const sqlFields = columns.map((key, i) => `data -> $${i + 2} AS section_${i}`).join(', ');
   const snapshot = await queryDbWithRetry(
     `SELECT ${sqlFields} FROM users WHERE name = $1`,
@@ -11844,6 +11870,9 @@ async function buildWorkingUserForProfileUpdate(name, incoming = {}) {
       base.libraryPlayHistoryData = history;
     } else if (dataKey === 'trophiesData') {
       base[dataKey] = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+      const donationAt = Number(payloads.get('supporterDonationAt'));
+      if (donationAt > 0) base.supporterDonationAt = donationAt;
+      else delete base.supporterDonationAt;
     } else if (dataKey === 'downloadsData') {
       base[dataKey] = normalizeDownloadHistoryRecordsServer(Array.isArray(raw) ? raw : []).history;
     } else {
@@ -11866,7 +11895,7 @@ function updateCompactUserCacheFromPatch(name, workingUser = {}, patch = {}) {
   Object.entries(PROFILE_HEAVY_SECTION_META).forEach(([dataKey, meta]) => {
     if (!Object.prototype.hasOwnProperty.call(patch, dataKey) || !meta.countKey) return;
     compact[meta.countKey] = dataKey === 'trophiesData'
-      ? countUnlockedTrophiesPayload(workingUser[dataKey] || {})
+      ? Number(patch.trophies) || 0
       : (Array.isArray(workingUser[dataKey]) ? workingUser[dataKey].length : Number(workingUser[meta.countKey] || 0));
   });
 
@@ -11905,7 +11934,7 @@ function buildLightProfileUserData(name, user = {}) {
     recentlyVisitedUpdatedAt: normalizeTimestampValue(user.recentlyVisitedUpdatedAt),
     ...(notificationState ? { notificationState } : {}),
     countersData: buildCompactCountersData(user.countersData),
-    themeColor: normalizeThemeColorServer(user.themeColor || (user.settingsData && user.settingsData.themeColor) || '#0070cc'),
+    themeColor: getUserSystemTheme(user),
     themeColorUpdatedAt: getUserThemeColorUpdatedAt(user),
     settingsData: buildCompactSettingsData(user)
   };
@@ -12326,18 +12355,45 @@ async function saveUser(name, options = {}) {
 
 async function patchUserData(name, patch = {}, label = 'USER DATA PATCH') {
   if (!name || !patch || typeof patch !== 'object' || Array.isArray(patch)) return false;
+  discardInvalidTrophySnapshot(patch);
   const outgoing = { ...patch };
   delete outgoing.passwordHash;
   delete outgoing.password;
+  delete outgoing.supporterDonationAt;
   const keys = Object.keys(outgoing);
   if (!keys.length) return true;
-
+  const writesTrophies = hasObjectPayload(outgoing.trophiesData);
+  const supporterSeenStamp = writesTrophies ? getSupporterTrophySeenStamp(outgoing.trophiesData.site_supporter) : null;
+  if (writesTrophies) {
+    outgoing.trophiesData = { ...outgoing.trophiesData };
+    delete outgoing.trophiesData.site_supporter;
+    outgoing.trophies = countUnlockedTrophiesPayload(outgoing.trophiesData);
+  }
+  // A stale client snapshot must never erase or manufacture the server-issued donation trophy.
+  const donationTrophyPatch = writesTrophies ? ` || jsonb_build_object('trophiesData',
+      ($1::jsonb->'trophiesData') || CASE
+        WHEN data->'supporterDonationAt' IS NOT NULL AND data#>>'{trophiesData,site_supporter,unlocked}' = 'true'
+        THEN jsonb_build_object('site_supporter', CASE
+          WHEN data#>>'{trophiesData,site_supporter,unlockAt}' = $3::text
+          THEN jsonb_set(data#>'{trophiesData,site_supporter}', '{isNew}', 'false'::jsonb)
+          ELSE data#>'{trophiesData,site_supporter}' END) ELSE '{}'::jsonb END,
+      'trophies', ($1::jsonb->>'trophies')::integer + CASE
+        WHEN data->'supporterDonationAt' IS NOT NULL AND data#>>'{trophiesData,site_supporter,unlocked}' = 'true' THEN 1 ELSE 0 END)` : '';
   const result = await runSerializedUserRowMutation(name, () => queryDbWithRetry(`
     UPDATE users
-    SET data = COALESCE(data, '{}'::jsonb) || $1::jsonb
+    SET data = COALESCE(data, '{}'::jsonb) || $1::jsonb ${donationTrophyPatch}
     WHERE name = $2
-    RETURNING name
-  `, [outgoing, name], { attempts: 2, label }));
+    RETURNING name${writesTrophies ? ", data#>'{trophiesData,site_supporter}' AS supporter_trophy, data->'supporterDonationAt' AS supporter_at" : ''}
+  `, writesTrophies ? [outgoing, name, supporterSeenStamp] : [outgoing, name], { attempts: 2, label }));
+  if (writesTrophies && result.rows.length) {
+    const row = result.rows[0];
+    patch.trophiesData = outgoing.trophiesData;
+    if (Number(row.supporter_at) > 0) {
+      if (row.supporter_trophy?.unlocked === true) patch.trophiesData.site_supporter = row.supporter_trophy;
+      if (userDatabase[name]) userDatabase[name].supporterDonationAt = Number(row.supporter_at);
+    }
+    patch.trophies = outgoing.trophies + (patch.trophiesData.site_supporter?.unlocked === true ? 1 : 0);
+  }
 
   if (!result.rows.length) return false;
   userCacheMeta[name] = Date.now();
@@ -14443,7 +14499,7 @@ function buildFullProfileSyncPayload(name, user = {}, sourceSocketId = null, opt
       recentlyVisitedUpdatedAt: normalizeTimestampValue(safe.recentlyVisitedUpdatedAt),
       ...(notificationState ? { notificationState } : {}),
       countersData: buildCompactCountersData(safe.countersData),
-      themeColor: normalizeThemeColorServer(safe.themeColor || (safe.settingsData && safe.settingsData.themeColor) || '#0070cc'),
+      themeColor: getUserSystemTheme(safe),
       themeColorUpdatedAt: getUserThemeColorUpdatedAt(safe),
       settingsData: { ...normalizeProfileRealtimeSettings(safe.settingsData || {}), ...getPublicProfileSettings(safe) }
     }
@@ -14512,7 +14568,7 @@ function buildProfileSyncPatchPayload(name, user = {}, changedKeys = [], sourceS
     if (notificationState) target.notificationState = notificationState;
   }
   if (include('countersData')) target.countersData = buildCompactCountersData(user.countersData);
-  if (include('themeColor')) target.themeColor = normalizeThemeColorServer(user.themeColor || (user.settingsData && user.settingsData.themeColor) || '#0070cc');
+  if (include('themeColor')) target.themeColor = getUserSystemTheme(user);
   if (include('themeColorUpdatedAt')) target.themeColorUpdatedAt = getUserThemeColorUpdatedAt(user);
   if (include('settingsData')) target.settingsData = { ...normalizeProfileRealtimeSettings(user.settingsData || {}), ...getPublicProfileSettings(user) };
 
@@ -14670,20 +14726,19 @@ async function notifyPs3PlayTimeAcrossInstances(payload = {}) {
 function emitSettingsRealtimeSync(name, sourceSocketId = null, extra = {}) {
   if (!name || !userDatabase[name]) return;
   const safe = normalizeUserRecord(name, userDatabase[name] || {});
+  const profileUpdatedAt = normalizeTimestampValue(safe.profileUpdatedAt) || Date.now();
+  const themeColor = getUserSystemTheme(safe);
+  const themeColorUpdatedAt = getUserThemeColorUpdatedAt(safe);
+  const settingsData = { ...normalizeProfileRealtimeSettings(safe.settingsData || {}), themeColor };
   const payload = {
     name,
     sourceSocketId,
-    profileUpdatedAt: normalizeTimestampValue(safe.profileUpdatedAt) || Date.now(),
+    profileUpdatedAt,
     settingsUpdatedAt: getProfileSettingsUpdatedAt(safe.settingsData || {}),
-    themeColor: normalizeThemeColorServer(safe.themeColor || (safe.settingsData && safe.settingsData.themeColor) || '#0070cc'),
-    themeColorUpdatedAt: getUserThemeColorUpdatedAt(safe),
-    settingsData: normalizeProfileRealtimeSettings(safe.settingsData || {}),
-    userData: {
-      profileUpdatedAt: normalizeTimestampValue(safe.profileUpdatedAt) || Date.now(),
-      themeColor: normalizeThemeColorServer(safe.themeColor || (safe.settingsData && safe.settingsData.themeColor) || '#0070cc'),
-      themeColorUpdatedAt: getUserThemeColorUpdatedAt(safe),
-      settingsData: normalizeProfileRealtimeSettings(safe.settingsData || {})
-    },
+    themeColor,
+    themeColorUpdatedAt,
+    settingsData,
+    userData: { profileUpdatedAt, themeColor, themeColorUpdatedAt, settingsData },
     ...extra
   };
   getSocketsByUserName(name).forEach(client => {
@@ -16658,7 +16713,7 @@ function getUserRewardNotices(userName) {
 
 async function mutateUserRewardNotices(userName, raw = {}) {
   const op = String(raw.op || '').toLowerCase();
-  const ids = Array.isArray(raw.ids) ? Array.from(new Set(raw.ids.map(v => String(v || '').replace(/^reward:/, '')).filter(id => /^rew_(?:[0-9]{1,3}|banner_[0-9]{1,3})$/.test(id)))).slice(0, 100) : [];
+  const ids = Array.isArray(raw.ids) ? Array.from(new Set(raw.ids.map(v => String(v || '').replace(/^reward:/, '')).filter(id => /^rew_(?:[0-9]{1,3}|banner_[0-9]{1,3}|theme_1)$/.test(id)))).slice(0, 100) : [];
   if (op === 'unlock' || op === 'import' || op === 'unlock_batch') {
     const items = (op === 'unlock' ? [raw.item] : raw.items);
     if (!Array.isArray(items) || items.length > 100) return { ok:false, changed:false };
@@ -19739,6 +19794,8 @@ io.on('connection', (socket) => {
     if (!name || !userDatabase[name]) { respond({ ok: false, error: 'Profile is not available.' }); return; }
     userData = (userData && typeof userData === "object") ? { ...userData } : {};
     delete userData.notificationState;
+    delete userData.supporterDonationAt;
+    discardInvalidTrophySnapshot(userData);
     const syncRequestId = normalizeText(userData._syncRequestId, '');
     const syncReason = normalizeText(userData._syncReason, '');
     const requestedSyncSections = Array.isArray(userData._syncSections)
@@ -19824,6 +19881,12 @@ io.on('connection', (socket) => {
         }
 
         if (hasObjectPayload(userData.trophiesData)) {
+            const supporterSeenStamp = getSupporterTrophySeenStamp(userData.trophiesData.site_supporter);
+            userData.trophiesData = { ...userData.trophiesData };
+            delete userData.trophiesData.site_supporter;
+            if (Number(workingUser.supporterDonationAt) > 0 && workingUser.trophiesData?.site_supporter?.unlocked === true) {
+                userData.trophiesData.site_supporter = workingUser.trophiesData.site_supporter;
+            }
             if (!shouldAcceptIncomingTrophies(workingUser, userData)) {
                 delete userData.trophiesData;
                 delete userData.trophies;
@@ -19831,6 +19894,10 @@ io.on('connection', (socket) => {
                 delete userData.xp;
             } else {
                 userData.trophiesData = mergeIncomingTrophiesPreservingUnlockState(workingUser.trophiesData, userData.trophiesData);
+                const supporter = userData.trophiesData.site_supporter;
+                if (Number(workingUser.supporterDonationAt) > 0 && supporter?.unlocked === true && supporterSeenStamp === Number(supporter.unlockAt)) {
+                    userData.trophiesData.site_supporter = { ...supporter, isNew:false };
+                }
                 userData.trophies = countUnlockedTrophiesPayload(userData.trophiesData);
             }
         }
@@ -20010,6 +20077,10 @@ io.on('connection', (socket) => {
             userProfileWriteInFlight.delete(name);
         }
 
+        if (hasObjectPayload(profileDbPatch.trophiesData)) {
+          workingUser.trophiesData = profileDbPatch.trophiesData;
+          workingUser.trophies = profileDbPatch.trophies;
+        }
         updateCompactUserCacheFromPatch(name, workingUser, profileDbPatch);
         emitPublicProfileListChanged(name, changedPublicListKeys, workingUser.profileUpdatedAt);
         const contentDownloadCountChangedKeys = Object.prototype.hasOwnProperty.call(profileDbPatch, 'downloadsData')
@@ -22462,6 +22533,62 @@ io.on('connection', (socket) => {
     } catch (err) {
       console.error('[ADMIN UNBAN ERROR]:', err);
       respond({ success: false, message: "Server error while unbanning user." });
+    }
+  });
+
+  socket.on('admin_confirm_donation', async (data = {}, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    if (socket.isAdmin !== true || !socket.userName) return respond({ success:false, message:'Admin only.' });
+    const name = normalizeText(data?.targetName, '').trim();
+    if (!name || name.length > 120) return respond({ success:false, message:'User not found.' });
+    try {
+      const stamp = Date.now();
+      const trophy = { unlocked:true, progress:1, isNew:true, unlockAt:stamp, unlockDate:new Date(stamp).toISOString() };
+      const { result, target, cachedDonationAt } = await runSerializedUserRowMutation(name, async () => {
+        const cachedDonationAt = Number(userDatabase[name]?.supporterDonationAt) || 0;
+        const result = await queryDbWithRetry(`
+        WITH granted AS (
+          UPDATE users SET data = COALESCE(data, '{}'::jsonb) || jsonb_build_object(
+            'supporterDonationAt', $2::bigint,
+            'trophiesData', (CASE WHEN jsonb_typeof(data->'trophiesData')='object' THEN data->'trophiesData' ELSE '{}'::jsonb END) || jsonb_build_object('site_supporter', $3::jsonb),
+            'trophies', (SELECT count(*) FROM jsonb_each(CASE WHEN jsonb_typeof(data->'trophiesData')='object' THEN data->'trophiesData' ELSE '{}'::jsonb END) AS t(id, state) WHERE id <> 'site_supporter' AND lower(COALESCE(state->>'unlocked','false')) IN ('true','1','yes')) + 1,
+            'xp', (CASE WHEN data->>'xp' ~ '^[0-9]{1,9}$' THEN (data->>'xp')::integer ELSE 0 END) + 90,
+            'level', ((CASE WHEN data->>'xp' ~ '^[0-9]{1,9}$' THEN (data->>'xp')::integer ELSE 0 END) + 90) / 100 + 1,
+            'profileUpdatedAt', GREATEST($2::bigint, CASE WHEN data->>'profileUpdatedAt' ~ '^[0-9]{1,18}$' THEN (data->>'profileUpdatedAt')::bigint + 1 ELSE 0 END)
+          ) WHERE name=$1 AND data->'supporterDonationAt' IS NULL RETURNING name,data
+        ), notice AS (
+          INSERT INTO user_reward_notices (user_name,reward_id,trophy_id,title,kind,image_url,created_at,seen,visited)
+          SELECT name,'rew_theme_1','site_supporter','RGB Glass Theme','theme','',$2::bigint,FALSE,FALSE FROM granted
+          ON CONFLICT (user_name,reward_id) DO NOTHING RETURNING user_name
+        ) SELECT data FROM granted
+        `, [name, stamp, trophy], { attempts:2, label:'DONATION REWARD GRANT' });
+        const target = await refreshSingleUserCacheFromDb(name, { forceDuringWrite:true, savedData:result.rows[0]?.data });
+        return { result, target, cachedDonationAt };
+      });
+      if (!target) return respond({ success:false, message:'User not found.' });
+      if (!(Number(target.supporterDonationAt) > 0)) return respond({ success:false, message:'Donation could not be confirmed.' });
+      if (!result.rows.length && cachedDonationAt === Number(target.supporterDonationAt)) {
+        deferServerTask('DONATION CACHE COMPACT', () => compactCachedUser(name), 250);
+        return respond({ success:true, already:true });
+      }
+      const keys = ['trophiesData','trophies','xp','level'];
+      invalidatePublicProfileListReads(name, keys);
+      emitPublicProfileListChanged(name, keys, target.profileUpdatedAt);
+      emitProfileSyncPatchFromUser(name, target, keys);
+      emitProfileCountsUpdate(name, target);
+      emitRewardNoticeChange(name);
+      if (result.rows.length) {
+        invalidateGlobalTrophyStatsCache();
+        scheduleTrophyStatsRefreshBroadcast(900);
+      }
+      deferServerTask('DONATION REWARD SYNC', () => notifyProfileSyncAcrossInstances(name, null, target.profileUpdatedAt, { keys, trophies:true, counts:true }), 0);
+      deferServerTask('DONATION NOTICE SYNC', () => notifyRewardNoticeChange(name), 0);
+      deferServerTask('DONATION CACHE COMPACT', () => compactCachedUser(name), 250);
+      if (result.rows.length) await addModerationLog('donation', `Confirmed donation from ${name}`, { targetName:name }, socket.userName);
+      respond({ success:true, already:!result.rows.length });
+    } catch (err) {
+      console.error('[DONATION REWARD ERROR]', err);
+      respond({ success:false, message:'Could not confirm donation.' });
     }
   });
 
