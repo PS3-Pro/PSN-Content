@@ -72,6 +72,49 @@
 		};
 	})();</script>
 	<script>
+const PSN_ENDPOINTS_URL = 'https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/server/endpoints.json';
+const serverUrls = [];
+let currentServerIndex = 0;
+let psnEndpointRequest = null, psnEndpointLoadedAt = 0, psnEndpointReconnectCheckAt = 0;
+let psnCanRefreshEndpointList = () => true;
+function parsePsnServerEndpoints(data) {
+  if (!Array.isArray(data?.servers) || !data.servers.length || data.servers.length > 16) throw new Error('Invalid server list');
+  return [...new Set(data.servers.map(value => {
+    if (typeof value !== 'string') throw new Error('Invalid server URL');
+    const url = new URL(value);
+    if (url.protocol !== 'https:' || !/^[a-z0-9-]+\.onrender\.com$/.test(url.hostname) || url.username || url.password || url.port || url.pathname !== '/' || url.search || url.hash) throw new Error('Invalid server origin');
+    return url.origin;
+  }))];
+}
+function loadPsnServerEndpoints(refresh = false) {
+  if (psnEndpointRequest) return psnEndpointRequest;
+  if (serverUrls.length && (!refresh || Date.now() - psnEndpointLoadedAt < 30000)) return Promise.resolve(true);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 7000);
+  psnEndpointRequest = (async () => {
+    try {
+      const response = await fetch(PSN_ENDPOINTS_URL, {cache:'no-cache',redirect:'error',signal:controller.signal});
+      if (!response.ok) throw new Error('HTTP '+response.status);
+      const text = await response.text();
+      if (text.length > 16384) throw new Error('Invalid configuration size');
+      const next = parsePsnServerEndpoints(JSON.parse(text));
+      if (serverUrls.length && !psnCanRefreshEndpointList()) return false;
+      const active = serverUrls[currentServerIndex];
+      serverUrls.splice(0,serverUrls.length,...next);
+      currentServerIndex = Math.max(0,serverUrls.indexOf(active));
+      psnEndpointLoadedAt = Date.now();
+      return true;
+    } catch (error) {
+      console.warn('[NETWORK] Server configuration unavailable:',error.message);
+      return false;
+    } finally {
+      clearTimeout(timeout);
+      psnEndpointRequest = null;
+    }
+  })();
+  return psnEndpointRequest;
+}
+loadPsnServerEndpoints();
 	window.psnHeroFallbackImage = 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(
 		'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900">' +
 		'<defs><linearGradient id="a" x2="1" y2="1"><stop stop-color="#061529"/><stop offset=".55" stop-color="#13365b"/><stop offset="1" stop-color="#090d1d"/></linearGradient>' +
@@ -4435,7 +4478,6 @@ body.psn-logout-desaturating .sidebar {
 .user-avatar-ps5 { width: 110px; height: 110px; border-radius: 50%; border: 2px solid rgba(255,255,255,0.1); overflow: hidden; background: transparent; display: flex; justify-content: center; align-items: center; box-shadow: 0 15px 35px rgba(0,0,0,0.4); margin-bottom: 15px; position: relative; transition: all 0.4s ease; background-size: cover; background-position: center; background-color: transparent; }
 .user-profile-card:hover .user-avatar-ps5 { border-color: rgb(var(--psn-tone-0070cc,0,112,204)); box-shadow: 0 0 30px rgba(var(--psn-tone-0070cc,0,112,204),0.5); transform: translateY(-8px); }
 .user-avatar-ps5 img { width: 100%; height: 100%; object-fit: cover; transition: filter 0.3s ease; }
-#ps5-boot-container.boot-intro-pending #user-select-screen .user-profile-card, #ps5-boot-container.boot-intro-pending #user-select-screen .manage-btn-round { animation: none !important; }
 #user-select-screen:not(.no-anim) .user-profile-card { animation: slideUp 0.6s ease-out forwards; }
 #user-select-screen:not(.no-anim) .manage-btn-round { opacity: 0; animation: slideUp 0.8s cubic-bezier(0.165,0.84,0.44,1) forwards; animation-delay: 0.4s; }
 .edit-mode .user-profile-card:hover .user-avatar-ps5 img { filter: brightness(0.4) blur(4px); }
@@ -11429,8 +11471,7 @@ html[data-psn-rgb-theme] .shared-content-link-modal .shared-content-link-card::b
 						<div style="font-size: 13px; color: var(--text-muted); margin-top: 6px;">Support the project, help keep it online and unlock exclusive rewards.</div>
 					</div>
 					<div class="support-project-actions">
-						<button type="button" class="ps5-pill-btn ps5-pill-secondary ps5-pill-compact support-project-donate" id="btn-support-donate" title="Patreon is not configured yet" disabled><i class="fas fa-heart"></i> DONATE</button>
-						<button type="button" class="ps5-pill-btn ps5-pill-secondary ps5-pill-compact" id="btn-support-link-patreon" title="Patreon is not configured yet" disabled><i class="fas fa-link"></i> LINK PATREON</button>
+						<button type="button" class="ps5-pill-btn ps5-pill-secondary ps5-pill-compact support-project-donate" id="btn-support-donate" onclick="openSupportDonationModal()"><i class="fas fa-heart"></i> DONATE</button>
 					</div>
 				</div>
 
@@ -11449,6 +11490,20 @@ html[data-psn-rgb-theme] .shared-content-link-modal .shared-content-link-card::b
 
 			</div>
 
+
+			<div id="modal-support-donation" class="sys-modal-overlay" style="display:none;z-index:6500;" onclick="if(event.target===this) closeSupportDonationModal()">
+				<div class="sys-modal-content" role="dialog" aria-modal="true" aria-labelledby="support-donation-title" style="width:min(440px,94vw);">
+					<div class="sys-modal-header"><h2 id="support-donation-title"><i class="fas fa-heart" style="color:#f5c35b;"></i> Support the Project</h2><button type="button" class="sys-modal-close" aria-label="Close" onclick="closeSupportDonationModal()"><i class="fas fa-times"></i></button></div>
+					<div class="sys-modal-body" style="display:flex;flex-direction:column;gap:14px;">
+						<div style="text-align:center;color:#f5c35b;font-size:32px;"><i class="fas fa-trophy"></i></div>
+						<div style="text-align:center;font-size:18px;color:#fff;">A Brighter Future</div>
+						<div style="text-align:center;color:var(--text-muted);font-size:13px;">Supporter badge and RGB Glass Theme</div>
+						<div id="support-donation-status" role="status" aria-live="polite" style="text-align:center;line-height:1.5;font-size:14px;">Connecting securely to Patreon…</div>
+						<button type="button" id="support-donation-continue" class="ps5-pill-btn ps5-pill-primary" onclick="startSupportDonation()">CONTINUE WITH PATREON</button>
+						<div style="font-size:12px;color:var(--text-muted);text-align:center;">Membership payment is handled by Patreon. Review the price and renewal terms before confirming.</div>
+					</div>
+				</div>
+			</div>
 
 			<div id="modal-self-delete-account" class="sys-modal-overlay self-delete-account-modal" style="display:none;">
 				<div class="sys-modal-content self-delete-account-card" role="dialog" aria-modal="true" aria-labelledby="self-delete-account-title">
@@ -13938,6 +13993,91 @@ P
 		}
 	};
 	
+	const psnDonation = {session:null,popup:null,busy:false,waiting:false,checking:false,refreshRequested:false,lastCheckAt:-Infinity,lastCheckedSocket:null,url:''};
+	function supportDonationModal() { return document.getElementById('modal-support-donation'); }
+	function supportDonationCurrent(session=psnDonation.session) { return !!session && session===psnDonation.session && isPsnAccountSessionCurrent(session) && supportDonationModal()?.style.display==='flex'; }
+	function supportDonationText(text) { document.getElementById('support-donation-status').textContent=text; }
+	function supportDonationButton(text,disabled=false) { const b=document.getElementById('support-donation-continue'); b.textContent=text; b.disabled=disabled; }
+	function closeSupportDonationPopup() { try { if(psnDonation.popup && !psnDonation.popup.closed) psnDonation.popup.close(); } catch (_) {} psnDonation.popup=null; }
+	function closeSupportDonationModal(success=false) {
+		if(success===true || psnDonation.busy) closeSupportDonationPopup();
+		else psnDonation.popup=null;
+		psnDonation.session=null; psnDonation.busy=false; psnDonation.waiting=false; psnDonation.checking=false; psnDonation.refreshRequested=false; psnDonation.lastCheckAt=-Infinity; psnDonation.lastCheckedSocket=null; psnDonation.url='';
+		document.removeEventListener('visibilitychange',resumeSupportDonation); window.removeEventListener('focus',resumeSupportDonation);
+		const modal=supportDonationModal(); if(!modal) return;
+		modal.classList.remove('show'); setTimeout(()=>{if(!psnDonation.session)modal.style.display='none';},300);
+	}
+	function finishSupportDonation() {
+		if (!supportDonationCurrent() || !psnDonation.waiting || !isRgbThemeUnlocked()) return false;
+		closeSupportDonationModal(true);
+		return true;
+	}
+	function supportDonationConfirmed(session=psnDonation.session) {
+		if (!supportDonationCurrent(session) || !psnDonation.waiting || finishSupportDonation()) return;
+		supportDonationText('Payment confirmed. Unlocking your rewards…');
+		supportDonationButton('CONFIRMED',true);
+		if (document.hidden || psnDonation.refreshRequested || typeof socketChat==='undefined' || !socketChat?.connected) return;
+		psnDonation.refreshRequested=true;
+		const socket=socketChat;
+		socket.timeout(20000).emit('request_profile_sync',{forceRefresh:true,sections:['trophiesData'],includeCore:true,reason:'patreon-payment',at:Date.now()},(err,result)=>{
+			if (!supportDonationCurrent(session)) return;
+			psnDonation.refreshRequested=false;
+			if (!finishSupportDonation()) {
+				supportDonationText('Payment confirmed. Reconnect or check again to restore your rewards.');
+				supportDonationButton('RECHECK / REOPEN PATREON');
+			}
+		});
+	}
+	// Recovery only on return/reconnect, never a repeating status poll.
+	function checkSupportDonation(session=psnDonation.session) {
+		if (!supportDonationCurrent(session) || !psnDonation.waiting || finishSupportDonation() || document.hidden || psnDonation.checking || psnDonation.refreshRequested) return;
+		if (typeof socketChat==='undefined' || !socketChat?.connected) return;
+		const socket=socketChat, now=performance.now();
+		if (psnDonation.lastCheckedSocket===socket.id && now-psnDonation.lastCheckAt<2100) return;
+		psnDonation.lastCheckAt=now; psnDonation.lastCheckedSocket=socket.id;
+		psnDonation.checking=true;
+		socket.timeout(8000).emit('patreon_status',{},(err,result)=>{
+			if (!supportDonationCurrent(session)) return;
+			psnDonation.checking=false;
+			if (socket!==socketChat || !socket.connected || !psnDonation.waiting || finishSupportDonation()) return;
+			if (!err && result?.success) {
+				if (result.paid) supportDonationConfirmed(session);
+				else if (result.linked && !psnDonation.url) supportDonationText('Patreon connected. Complete your membership payment, then return here.');
+			}
+		});
+	}
+	function resumeSupportDonation() { if(!document.hidden && psnDonation.waiting) checkSupportDonation(); }
+	function openSupportDonationModal() {
+		if(typeof socketChat==='undefined' || !socketChat?.connected || window.isProfileLoaded!==true) { if(typeof showToastNotification==='function') showToastNotification('Support the Project','Connect to the server first.'); return; }
+		const modal=supportDonationModal(); if(!modal || psnDonation.session) return;
+		psnDonation.session=capturePsnAccountSession();
+		if(modal.parentNode!==document.body) document.body.appendChild(modal);
+		modal.style.display='flex'; requestAnimationFrame(()=>requestAnimationFrame(()=>{if(psnDonation.session)modal.classList.add('show');}));
+		if(isRgbThemeUnlocked()) { supportDonationText('Thank you! Your supporter rewards are already unlocked.'); supportDonationButton('CONFIRMED',true); }
+		else { supportDonationText('Sign in to Patreon and complete your membership payment to unlock your rewards.'); supportDonationButton('CONTINUE WITH PATREON'); }
+		document.addEventListener('visibilitychange',resumeSupportDonation); window.addEventListener('focus',resumeSupportDonation);
+		if(!isRgbThemeUnlocked()) startSupportDonation();
+	}
+	function startSupportDonation() {
+		const session=psnDonation.session;
+		if(!supportDonationCurrent(session) || psnDonation.busy) return;
+		if(psnDonation.url) { window.open(psnDonation.url,'_blank','noopener,noreferrer'); psnDonation.url=''; supportDonationButton('RECHECK / REOPEN PATREON'); supportDonationText('Complete your payment in Patreon, then return here.'); return; }
+		if(typeof socketChat==='undefined' || !socketChat?.connected) { supportDonationText('Reconnect to the server and try again.'); return; }
+		psnDonation.busy=true; supportDonationButton('CONNECTING…',true);
+		closeSupportDonationPopup();
+		try { psnDonation.popup=window.open('about:blank','_blank','popup,width=540,height=760'); if(psnDonation.popup) psnDonation.popup.opener=null; } catch (_) { psnDonation.popup=null; }
+		socketChat.timeout(10000).emit('patreon_begin',{},(err,result)=>{
+			if(!supportDonationCurrent(session)) return;
+			psnDonation.busy=false;
+			let url; try {url=new URL(result?.url); if(url.origin!=='https://www.patreon.com' || url.pathname!=='/oauth2/authorize')url=null;}catch(_){url=null;}
+			if(err || !result?.success || !url) { closeSupportDonationPopup(); supportDonationText(result?.message || 'Could not open Patreon. Try again.'); supportDonationButton('TRY AGAIN'); return; }
+			psnDonation.waiting=true;
+			if(finishSupportDonation()) return;
+			try { if(!psnDonation.popup || psnDonation.popup.closed) throw new Error(); psnDonation.popup.location.replace(url.href); supportDonationButton('RECHECK / REOPEN PATREON'); supportDonationText('Complete your payment in Patreon, then return here.'); }
+			catch (_) { psnDonation.url=url.href; supportDonationButton('OPEN PATREON'); supportDonationText('Tap to open the secure Patreon page.'); }
+		});
+	}
+
 	function getSelfDeleteAccountModal() {
 		return document.getElementById('modal-self-delete-account');
 	}
@@ -22319,7 +22459,6 @@ P
     });
 </script>
 <script>
-    let currentKeyIndex = parseInt(localStorage.getItem('yt_key_index') || '0');
     
     const DEFAULT_RENDER_LIMIT = 56; 
     let renderLimit = DEFAULT_RENDER_LIMIT;
@@ -34518,6 +34657,12 @@ P
 		return '';
 	}
 
+	function getPsnGifSearchUrl(query, limit) {
+		const base = getMetadataServerBaseCompat();
+		if (!base) return 'about:blank';
+		return `${base}/api/metadata/gifs?${new URLSearchParams({q:query || '',limit:String(limit)})}`;
+	}
+
 	window.__psnLiveMetadataPending = window.__psnLiveMetadataPending instanceof Map ? window.__psnLiveMetadataPending : new Map();
 	const liveMetadataSuccessCache = new Map();
 	window.fetchPsnLiveMetadata = async function(options = {}) {
@@ -34556,15 +34701,8 @@ P
 		const pending = (async () => {
 			const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
 			const timer = controller ? setTimeout(() => controller.abort(), include === 'psn' ? 5000 : 7500) : null;
-			const headers = {};
 			try {
-				if (typeof RAWG_KEYS !== 'undefined' && Array.isArray(RAWG_KEYS) && RAWG_KEYS.length && typeof currentRawgKeyIndex !== 'undefined') {
-					const rawgKey = String(RAWG_KEYS[Math.max(0, Number(currentRawgKeyIndex) || 0) % RAWG_KEYS.length] || '').trim();
-					if (rawgKey) headers['X-RAWG-Key'] = rawgKey;
-				}
-			} catch (error) {}
-			try {
-				const response = await fetch(url, { cache: 'no-store', headers, signal: controller ? controller.signal : undefined });
+				const response = await fetch(url, { cache: 'no-store', signal: controller ? controller.signal : undefined });
 				if (!response.ok) return null;
 				const payload = await response.json();
 				return payload && payload.ok === true ? payload : null;
@@ -42233,15 +42371,6 @@ P
 		}
 	}
 
-	function isCurrentGameModalHydration(modalRoot, token, game, category) {
-		if (!modalRoot || !modalRoot.isConnected) return false;
-		if (String(modalRoot.dataset.openHydrationToken || '') !== String(token || '')) return false;
-		if (String(modalRoot.dataset.storeCategory || '') !== String(category || '')) return false;
-		if (String(modalRoot.dataset.titleId || '') !== String((game && (game.id || game.titleId)) || '')) return false;
-		if (String(modalRoot.dataset.contentId || '') !== String((game && game.contentId) || '')) return false;
-		return true;
-	}
-
 
 	const PSN_CONTENT_SHARE_HASH_KEY = 'share';
 	const PSN_CONTENT_SHARED_PENDING_KEY = 'psn_shared_content_pending_v2';
@@ -44500,21 +44629,8 @@ P
 
 	window.restoreContentReportMineCache();
 
-   const IGDB_CLIENT_ID = 'vwqel850270bn3woyontsoyqbc5v78';
-   const IGDB_CLIENT_SECRET = '75o86v0w2nf5ifutimju0oc6bp20qy';
 
-   const RAWG_KEYS = [
-		'666e45b739d5401f84ea3595f64f6b0d',
-		'092c6f79440d4fdfb1eaae48983e6210',
-		'01de0a7d61dd4b52a5247d9e8f74288e',
-		'9066e0788ec94a74880e6ebe07c2ef38',
-		'e31615be130d4337b57d39457daeae0c',
-		'1ea9bbaa98944b0ea3c15ecbfe839322',
-		'016b8133614a4dc988df84106a054ed4',
-		
-	];
 	
-	let currentRawgKeyIndex = parseInt(localStorage.getItem('rawg_key_index') || '0');
 
 	function clearModalSummaryAlignedHeight(modalRoot = document.getElementById('game-modal')) {
 		const summary = modalRoot?.querySelector('#modal-summary');
@@ -45273,14 +45389,10 @@ P
 			const base = getMetadataServerBase();
 			return fetchWithTimeout(`${base}${path}`, ms, options);
 		};
-		const rotateRawgKey = () => {
-			currentRawgKeyIndex = (currentRawgKeyIndex + 1) % RAWG_KEYS.length;
-			safeLocalStorageSet('rawg_key_index', currentRawgKeyIndex);
-		};
 		const getRawgFailureAction = (response) => {
 			if (!response || response.ok) return 'ok';
 			const status = Number(response.status || 0);
-			if (status === 401 || status === 403 || status === 429) return 'rotate-key';
+			if (status === 401 || status === 403 || status === 429) return 'skip-rawg';
 			if (status >= 500 && status <= 599) return 'skip-rawg';
 			return 'skip-query';
 		};
@@ -45512,31 +45624,28 @@ P
 		for (const searchSpec of metadataSearchSpecs) {
 			if (!isCurrentRequest()) return;
 			if (rawgHandledByLiveEndpoint) break rawgSearchLoop;
-			for (let attempt = 0; attempt < RAWG_KEYS.length; attempt++) {
-				const activeKey = RAWG_KEYS[currentRawgKeyIndex];
+			rawgSpec: {
 				try {
-					const searchRes = await fetchWithTimeout(`https://api.rawg.io/api/games?key=${activeKey}&search=${encodeURIComponent(searchSpec.query)}&page_size=5`, 4000);
+					const searchRes = await fetchMetadataProxy(`/api/metadata/rawg-search?q=${encodeURIComponent(searchSpec.query)}`, 7500);
 					const searchAction = getRawgFailureAction(searchRes);
-					if (searchAction === 'rotate-key') { console.warn(`[Metadata] RAWG request returned HTTP ${searchRes.status}; rotating API key.`); rotateRawgKey(); continue; }
 					if (searchAction === 'skip-rawg') { console.warn(`[Metadata] RAWG is temporarily unavailable (HTTP ${searchRes.status}). Falling back.`); break rawgSearchLoop; }
-					if (searchAction === 'skip-query') break;
+					if (searchAction === 'skip-query') break rawgSpec;
 					const searchData = await searchRes.json();
-					if (searchData.error) { console.warn('[Metadata] RAWG returned an API error; rotating API key.'); rotateRawgKey(); continue; }
-					if (!Array.isArray(searchData.results) || !searchData.results.length) break;
+					if (searchData.error) break rawgSearchLoop;
+					if (!Array.isArray(searchData.results) || !searchData.results.length) break rawgSpec;
 					const match = pickMetadataCandidate(searchData.results, searchSpec.target, searchSpec.minScore, psnStoreMeta.releaseYear, metadataPlatformHint);
-					if (!match.candidate) { console.warn(`[Metadata] RAWG rejected low-confidence ${searchSpec.kind} match for "${gameName}" (closest: "${match.best?.name || 'none'}", score ${match.score}/${searchSpec.minScore}).`); break; }
+					if (!match.candidate) { console.warn(`[Metadata] RAWG rejected low-confidence ${searchSpec.kind} match for "${gameName}" (closest: "${match.best?.name || 'none'}", score ${match.score}/${searchSpec.minScore}).`); break rawgSpec; }
 					const slug = match.candidate.slug;
-					if (!slug) break;
-					const safeRawgFetch = (url, timeout) => fetchWithTimeout(url, timeout).then(response => ({ response })).catch(error => ({ error }));
+					if (!slug) break rawgSpec;
+					const safeRawgFetch = (url, timeout) => fetchMetadataProxy(url, timeout).then(response => ({ response })).catch(error => ({ error }));
 					const [detailsResult, screensResult] = await Promise.all([
-						safeRawgFetch(`https://api.rawg.io/api/games/${slug}?key=${activeKey}`, 3500),
-						safeRawgFetch(`https://api.rawg.io/api/games/${slug}/screenshots?key=${activeKey}`, 3500)
+						safeRawgFetch(`/api/metadata/rawg-details?slug=${encodeURIComponent(slug)}`, 7500),
+						safeRawgFetch(`/api/metadata/rawg-screenshots?slug=${encodeURIComponent(slug)}`, 7500)
 					]);
 					if (detailsResult.error) break rawgSearchLoop;
 					const detailsAction = getRawgFailureAction(detailsResult.response);
-					if (detailsAction === 'rotate-key') { rotateRawgKey(); continue; }
 					if (detailsAction === 'skip-rawg') break rawgSearchLoop;
-					if (detailsAction === 'skip-query') break;
+					if (detailsAction === 'skip-query') break rawgSpec;
 					const detailsData = await detailsResult.response.json();
 					let screenshots = [];
 					if (!screensResult.error && screensResult.response && screensResult.response.ok) {
@@ -45559,16 +45668,11 @@ P
 		for (const searchSpec of metadataSearchSpecs) {
 			if (!isCurrentRequest()) return;
 			try {
-				const igdbHeaders = {};
-				if (IGDB_CLIENT_ID && IGDB_CLIENT_SECRET) {
-					igdbHeaders['X-IGDB-Client-ID'] = IGDB_CLIENT_ID;
-					igdbHeaders['X-IGDB-Client-Secret'] = IGDB_CLIENT_SECRET;
-				}
-				const response = await fetchMetadataProxy(`/api/metadata/igdb?q=${encodeURIComponent(searchSpec.query)}`, 7000, { headers: igdbHeaders });
+				const response = await fetchMetadataProxy(`/api/metadata/igdb?q=${encodeURIComponent(searchSpec.query)}`, 7000);
 				let data = {};
 				try { data = await response.json(); } catch (error) {}
 				if (response.status === 503 && data.configured === false) {
-					if (!window.__igdbConfigWarningShown) { window.__igdbConfigWarningShown = true; console.info('[Metadata] IGDB fallback is ready but disabled until IGDB_CLIENT_ID and IGDB_CLIENT_SECRET are filled in the HTML or configured on the server.'); }
+					if (!window.__igdbConfigWarningShown) { window.__igdbConfigWarningShown = true; console.info('[Metadata] IGDB fallback is ready but disabled until the server credentials are configured.'); }
 					break igdbSearchLoop;
 				}
 				if (!response.ok || !Array.isArray(data.results)) {
@@ -45680,13 +45784,6 @@ P
 		}
 	};
 
-    const YOUTUBE_KEYS = [
-        "AIzaSyD0GuR-DWp_R0lK9Coek7IgUDZMsUgUHKY",
-		"AIzaSyBy0bITjqt8esJbYaTsF9VQm5RDXi6jMe4",
-		"AIzaSyA7BLi2670xT-MEpfmHsJ6hDngcTNeTqnw",
-		"AIzaSyA7mqWX-SYQNJTLylpoeQ1E8MyfNfx6LAc",
-		"AIzaSyAysS0RhGtVpxqQhx3jt21o8b1PtJW2O8o",
-    ];
 
    window.trailerResults = [];
 	window.trailerIndex = 0;
@@ -46033,42 +46130,18 @@ P
 	};
 
 	async function fetchYouTubeVideoPage(query, maxResults = 10, pageToken = '') {
-		if (currentKeyIndex >= YOUTUBE_KEYS.length) {
-			console.error('All YouTube API keys exceeded their quota.');
-			return { videos: [], nextPageToken: '', error: 'All YouTube API keys exceeded their quota.' };
-		}
-
-		const apiKey = YOUTUBE_KEYS[currentKeyIndex];
-		let apiUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=${maxResults}&q=${query}&key=${apiKey}`;
-
-		if (pageToken) {
-			apiUrl += `&pageToken=${encodeURIComponent(pageToken)}`;
-		}
-
 		try {
-			const response = await fetch(apiUrl);
-
-			if (response.status === 403) {
-				console.warn(`Key ${currentKeyIndex + 1} exceeded. Rotating...`);
-				currentKeyIndex++;
-				safeLocalStorageSet('yt_key_index', currentKeyIndex);
-				return await fetchYouTubeVideoPage(query, maxResults, pageToken);
-			}
-
+			const base = getMetadataServerBaseCompat();
+			if (!base) throw new Error('Server unavailable');
+			const params = new URLSearchParams({q:decodeURIComponent(query),limit:String(maxResults)});
+			if (pageToken) params.set('pageToken',pageToken);
+			const response = await fetch(`${base}/api/metadata/youtube-search?${params}`);
+			if (!response.ok) throw new Error('YouTube request failed');
 			const data = await response.json();
-			const videos = (data.items || [])
-				.map(item => trailerNormalizeResult(item, 'YouTube Video'))
-				.filter(Boolean);
-
-			return {
-				videos: videos,
-				nextPageToken: data.nextPageToken || '',
-				error: ''
-			};
-
+			return {videos:(data.items || []).map(item => trailerNormalizeResult(item, 'YouTube Video')).filter(Boolean),nextPageToken:data.nextPageToken || '',error:''};
 		} catch (error) {
 			console.error('Error during YouTube request:', error);
-			return { videos: [], nextPageToken: '', error: 'YouTube request failed' };
+			return {videos:[],nextPageToken:'',error:'YouTube request failed'};
 		}
 	}
 
@@ -49492,10 +49565,7 @@ P
 		const grid = document.getElementById('admin-gif-grid');
 		if (!grid) return;
 		grid.innerHTML = '<div style="grid-column:1/-1; text-align:center; padding:25px; color:var(--ps-blue);"><i class="fas fa-circle-notch fa-spin"></i></div>';
-		const key = (typeof GIPHY_API_KEY !== 'undefined' && GIPHY_API_KEY) ? GIPHY_API_KEY : 'V7AwEOnKtaK6OxZvft9PzpHAvCdlhK0E';
-		const endpoint = query
-			? `https://api.giphy.com/v1/gifs/search?api_key=${key}&q=${encodeURIComponent(query)}&limit=18&rating=g`
-			: `https://api.giphy.com/v1/gifs/trending?api_key=${key}&limit=18&rating=g`;
+		const endpoint = getPsnGifSearchUrl(query, 18);
 		try {
 			const res = await fetch(endpoint);
 			const json = await res.json();
@@ -74102,6 +74172,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	}
 	window.invalidatePsnAccountSessionCallbacks = function() {
 		window.__psnAccountSessionGeneration++;
+		if(psnDonation.session) closeSupportDonationModal();
 		pendingTrophyUnlockVisualRefresh = false;
 		trophyUnlockVisualToken++;
 	};
@@ -75420,12 +75491,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 	};
 </script>
 <script>
-    const serverUrls = [
-		"https://psn-content-jh5h.onrender.com",
-		
 
-	];
-	let currentServerIndex = 0;
 
 	window.__chatServerMaxHistory = 0;
 	function setChatHistoryLimitFromServer(value) {
@@ -83156,14 +83222,6 @@ function getVisibleChatStackEl(id) {
 		finishChatToolbarFormat(input);
 	}
 
-	function insertChatBulletPoint(preferSavedRange) {
-		return insertChatList('insertUnorderedList', preferSavedRange);
-	}
-
-	function insertChatNumberedList(preferSavedRange) {
-		return insertChatList('insertOrderedList', preferSavedRange);
-	}
-
 	function getChatToolbarCommandButton(command) {
 		const ids = {
 			bold: 'btn-bold',
@@ -84338,7 +84396,6 @@ function getVisibleChatStackEl(id) {
 		saveChatInputRange();
 	}
 	
-	const GIPHY_API_KEY = "V7AwEOnKtaK6OxZvft9PzpHAvCdlhK0E"; 
 
 	function getGifPickerSkeletonHTML(count = 6) {
 		return Array.from({ length: count }, () => '<div class="pulse-skeleton modal-screenshot-skeleton chat-gif-skeleton" aria-hidden="true"></div>').join('');
@@ -84441,9 +84498,7 @@ function getVisibleChatStackEl(id) {
 	
 		grid.innerHTML = getGifPickerSkeletonHTML();
 	
-		let url = query 
-			? `https://api.giphy.com/v1/gifs/search?api_key=${GIPHY_API_KEY}&q=${encodeURIComponent(query)}&limit=20&rating=g`
-			: `https://api.giphy.com/v1/gifs/trending?api_key=${GIPHY_API_KEY}&limit=20&rating=g`;
+		const url = getPsnGifSearchUrl(query, 20);
 	
         const controller = new AbortController();
         gifPickerRequestController = controller;
@@ -88269,6 +88324,7 @@ function getVisibleChatStackEl(id) {
 
 
 	let loginServerAttempt = null;
+	psnCanRefreshEndpointList = () => !loginServerAttempt && !socketChat?.connected;
 	let loginServerAttemptSequence = 0;
 
 	function getLoginServerCount() {
@@ -88541,7 +88597,9 @@ function getVisibleChatStackEl(id) {
 		return false;
 	}
 
+	let psnEndpointLoginToken = 0;
 	window.clearLoginServerAttempt = function() {
+		psnEndpointLoginToken++;
 		clearLoginServerAttemptTimers(loginServerAttempt);
 		loginServerAttempt = null;
 	};
@@ -88606,6 +88664,16 @@ function getVisibleChatStackEl(id) {
 
 	window.sendLoginAuthentication = function(payload) {
 		if (!payload || !payload.name) return false;
+		if (!serverUrls.length) {
+			const token = ++psnEndpointLoginToken;
+			const generation = window.__psnAccountSessionGeneration;
+			loadPsnServerEndpoints().then(ok => {
+				if (token !== psnEndpointLoginToken || generation !== window.__psnAccountSessionGeneration) return;
+				if (ok) window.sendLoginAuthentication(payload);
+				else window.handleLoginServerUnavailable(payload.name,payload.isNewAccount === true ? 'create' : 'login');
+			});
+			return true;
+		}
 		window.__psnSessionEntryStarted = true;
 		if (typeof startBootPreloads === 'function') {
 			Promise.resolve(startBootPreloads('authentication-start')).catch(e => console.warn('[System] Login preload skipped.', e));
@@ -88684,13 +88752,21 @@ function getVisibleChatStackEl(id) {
 		return true;
 	};
 
-	window.retryServerConnection = function() {
+	window.retryServerConnection = async function() {
 		if (typeof playUiClick === 'function') playUiClick();
 		clearServerUnavailableRetryTimers();
 		pauseServerAutomaticReconnect();
 		serverUnavailableManualRetryActive = true;
 		serverUnavailableManualRetryStartedAt = Date.now();
 		setServerUnavailableRetrying(true);
+		const retryStartedAt = serverUnavailableManualRetryStartedAt;
+		const refreshed = await loadPsnServerEndpoints(true);
+		if (!serverUnavailableManualRetryActive || retryStartedAt !== serverUnavailableManualRetryStartedAt) return;
+		if (!refreshed) {
+			serverUnavailableManualRetryActive = false;
+			scheduleServerUnavailableRetryFailed();
+			return;
+		}
 		try {
 			if (socketChat && !socketChat.connected) {
 				if (socketChat.io) socketChat.io.uri = serverUrls[currentServerIndex];
@@ -93775,8 +93851,7 @@ function getVisibleChatStackEl(id) {
 		const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
 		directGifAbortController = controller;
 		grid.innerHTML = Array.from({length:6}, () => '<div class="pulse-skeleton modal-screenshot-skeleton chat-gif-skeleton" aria-hidden="true"></div>').join('');
-		const apiKey = typeof GIPHY_API_KEY !== 'undefined' ? GIPHY_API_KEY : 'V7AwEOnKtaK6OxZvft9PzpHAvCdlhK0E';
-		const url = query ? `https://api.giphy.com/v1/gifs/search?api_key=${apiKey}&q=${encodeURIComponent(query)}&limit=20&rating=g` : `https://api.giphy.com/v1/gifs/trending?api_key=${apiKey}&limit=20&rating=g`;
+		const url = getPsnGifSearchUrl(query, 20);
 		try {
 			const response = await fetch(url, controller ? { signal:controller.signal } : undefined);
 			if (!response.ok) throw new Error(`GIPHY ${response.status}`);
@@ -94146,6 +94221,14 @@ function getVisibleChatStackEl(id) {
 	}, true);
 
 	function initChat(options = {}) {
+		if (!serverUrls.length) {
+			const generation = window.__psnAccountSessionGeneration;
+			loadPsnServerEndpoints().then(ok => {
+				if (!ok || socketChat || generation !== window.__psnAccountSessionGeneration || (options.preAuthMaintenance && (loginServerAttempt || window.isProfileLoaded === true))) return;
+				initChat(options);
+			});
+			return;
+		}
 		const preAuthMaintenance = options.preAuthMaintenance === true && window.isProfileLoaded !== true && !loginServerAttempt;
 		window.__psnPreAuthMaintenanceSocket = preAuthMaintenance;
 		document.body.classList.remove('is-admin');
@@ -94610,6 +94693,7 @@ function getVisibleChatStackEl(id) {
 			const session = capturePsnAccountSession();
 			const id = String(data.noticeId || '');
 			if (!session.name || data.targetName !== session.name || !/^supporter:\d{1,16}$/.test(id)) return;
+			if(data.clear!==true && supportDonationCurrent() && psnDonation.waiting) supportDonationConfirmed();
 			const modal = document.getElementById('role-promotion-modal');
 			if (data.clear === true) {
 				if (pendingSupporterNotice?.noticeId === id) clearPendingSupporterNotice();
@@ -97721,6 +97805,7 @@ function getVisibleChatStackEl(id) {
 					return;
 				}
 				const userData = payload.userData || payload.data || {};
+				if (psnDonation.waiting && userData.trophiesData) finishSupportDonation();
 				const hydratedSections = [];
 				if (userData.trophiesData && typeof userData.trophiesData === 'object') hydratedSections.push('trophiesData');
 				if (Array.isArray(userData.downloadsData)) hydratedSections.push('downloadsData');
@@ -97745,6 +97830,8 @@ function getVisibleChatStackEl(id) {
 				console.warn('[PROFILE SYNC] Full profile hydration did not complete:', payload.error || 'Unknown error');
 				return;
 			}
+
+			if (psnDonation.waiting && !finishSupportDonation() && psnDonation.lastCheckedSocket !== socketChat.id) checkSupportDonation();
 
 			const wasInitialProfileSync = window.__initialProfileSyncInProgress === true;
 			const unchangedProfileSync = payload.unchanged === true;
@@ -98000,6 +98087,13 @@ function getVisibleChatStackEl(id) {
 				scheduleSessionServerUnavailable();
 			}
 			
+			if (!loginServerAttempt && Date.now() - psnEndpointReconnectCheckAt >= 30000) {
+				psnEndpointReconnectCheckAt = Date.now();
+				const failedSocket = socketChat;
+				loadPsnServerEndpoints(true).then(ok => {
+					if (ok && socketChat === failedSocket && !failedSocket.connected && !loginServerAttempt && failedSocket.io) failedSocket.io.uri = serverUrls[currentServerIndex];
+				});
+			}
 			if (!preAuthMaintenanceRuntime) {
 				currentServerIndex = (currentServerIndex + 1) % serverUrls.length;
 				console.log(`[NETWORK] Connection failed. Rotating to server: ${serverUrls[currentServerIndex]}`);
@@ -108199,6 +108293,7 @@ function getVisibleChatStackEl(id) {
 	window.setProfileCardStyle = setProfileCardStyle;
 
     function closeSysModal(event, modalId, options = {}) {
+		if(modalId==='modal-support-donation') { closeSupportDonationModal(); return; }
 		const modal = document.getElementById(modalId);
 		if (!modal) return;
 		const clickedClose = event && event.target && event.target.closest && event.target.closest('.sys-modal-close');
@@ -114068,12 +114163,6 @@ function getVisibleChatStackEl(id) {
 
 		const previous = nav.getAttribute('c-active') || '1';
 		const next = tabToOption[tab] || '0';
-		let activeOption = null;
-		for (const option of npsLiquidOptions) {
-			if (option.classList.contains('active')) { activeOption = option; break; }
-		}
-		const activeInput = activeOption?.querySelector('.nps-liquid-switcher__input');
-		const domAlreadyCurrent = previous === next && activeOption?.getAttribute('data-tab') === tab && !!activeInput?.checked;
 
 		const focusOption = npsLiquidOptions.find(option => option.getAttribute('data-tab') === tab);
 		if (focusOption) {
@@ -117124,6 +117213,7 @@ function getVisibleChatStackEl(id) {
 			var alreadyCounted = false;
 			try { alreadyCounted = sessionStorage.getItem(VISIT_SESSION_KEY) === '1'; } catch (e) {}
 
+			await loadPsnServerEndpoints();
 			var urls = getVisitServerUrls();
 			for (var i = 0; i < urls.length; i++) {
 				try {
@@ -120393,10 +120483,7 @@ function getVisibleChatStackEl(id) {
     const controller=new AbortController();socialGifAbort=controller;
     grid.innerHTML=socialGifSkeletons();
     grid.scrollTop=0;
-    const key=typeof GIPHY_API_KEY==='string'&&GIPHY_API_KEY?GIPHY_API_KEY:'V7AwEOnKtaK6OxZvft9PzpHAvCdlhK0E';
-    if(!key){grid.innerHTML='<div class="psn-social-gif-message">GIF search is unavailable.</div>';return;}
-    const endpoint=query?'search':'trending';
-    const uri=`https://api.giphy.com/v1/gifs/${endpoint}?api_key=${encodeURIComponent(key)}&limit=18&rating=g${query?'&q='+encodeURIComponent(query):''}`;
+    const uri=getPsnGifSearchUrl(query,18);
     try{
       const response=await fetch(uri,{signal:controller.signal});if(!response.ok)throw Error('GIF search failed');
       const data=await response.json();if(current!==socialGifRequest||picker.hidden)return;
@@ -121886,7 +121973,7 @@ function getVisibleChatStackEl(id) {
   function localMediaUrl(raw){
     try{
       const proxy=validProxy(raw);if(!proxy||!videoCacheWorkerUrl)return '';
-      const url=new URL(proxy);if(url.origin!=='https://psn-content-jh5h.onrender.com')return '';
+      const url=new URL(proxy);if(!serverUrls.includes(url.origin))return '';
       const token=url.searchParams.get('token')||'';
       if(!/^[A-Za-z0-9_-]+\.[a-f0-9]{64}$/.test(token))return '';
       const v=JSON.parse(atob(token.split('.')[0].replace(/-/g,'+').replace(/_/g,'/')));

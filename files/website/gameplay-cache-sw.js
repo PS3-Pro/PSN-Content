@@ -9,7 +9,40 @@ const MAX_FILE = 32 * MIB, MAX_PART = 4 * MIB, MAX_PARTS_BYTES = 16 * MIB, MAX_P
 const LOCAL_PREFIX = new URL('./__psn_gameplay_cache__/',self.registration.scope).href;
 const INDEX_KEY = new URL('./__psn_gameplay_cache_index__', self.registration.scope).href;
 let indexPromise, indexQueue = Promise.resolve();
-const SERVER = 'https://psn-content-jh5h.onrender.com';
+const ENDPOINTS_URL = 'https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/server/endpoints.json';
+let videoServerOrigins = new Set(), videoServerConfigRequest = null, videoServerConfigCheckedAt = 0;
+function parsePsnServerEndpoints(data) {
+  if (!Array.isArray(data?.servers) || !data.servers.length || data.servers.length > 16) throw new Error('Invalid server list');
+  return [...new Set(data.servers.map(value => {
+    if (typeof value !== 'string') throw new Error('Invalid server URL');
+    const url = new URL(value);
+    if (url.protocol !== 'https:' || !/^[a-z0-9-]+\.onrender\.com$/.test(url.hostname) || url.username || url.password || url.port || url.pathname !== '/' || url.search || url.hash) throw new Error('Invalid server origin');
+    return url.origin;
+  }))];
+}
+function isVideoServerCandidate(request, message=false) {
+  if (request.method !== 'GET' || (!message && request.destination !== 'video') || request.mode !== 'cors') return false;
+  try {
+    const url = new URL(request.url);
+    return url.protocol === 'https:' && /^[a-z0-9-]+\.onrender\.com$/.test(url.hostname) && !url.port && !url.username && !url.password && url.pathname === '/api/gameplay-video' && url.searchParams.has('token');
+  } catch (_) { return false; }
+}
+function ensureVideoServerConfig() {
+  if (videoServerConfigRequest) return videoServerConfigRequest;
+  if (Date.now() - videoServerConfigCheckedAt < 30000) return Promise.resolve();
+  videoServerConfigCheckedAt = Date.now();
+  videoServerConfigRequest = (async () => {
+    try {
+      const response = await fetch(ENDPOINTS_URL,{cache:'no-cache',redirect:'error',signal:AbortSignal.timeout(5000)});
+      if (!response.ok) throw new Error('HTTP '+response.status);
+      const text = await response.text();
+      if (text.length > 16384) throw new Error('Invalid configuration size');
+      videoServerOrigins = new Set(parsePsnServerEndpoints(JSON.parse(text)));
+    } catch (_) { videoServerOrigins.clear(); }
+    finally { videoServerConfigRequest = null; }
+  })();
+  return videoServerConfigRequest;
+}
 let capturing = null, completion = null;
 const confirmed = new Map(), completionAttempts = new Map();
 const foregroundClients = new Set(), deferred = new Map();
@@ -68,13 +101,19 @@ self.addEventListener('message',event=>{
   if(event.data?.type==='psn-gameplay-cache-confirm'||event.data?.type==='psn-gameplay-cache-finish'){
     const url=event.data.url;
     if(typeof url!=='string'||!event.source?.id)return;
-    try{if(!mediaKey(new Request(url,{mode:'cors'}),true))return;}catch(_){return;}
-    const id=confirmationKey(event.source.id,url);
+    const sourceId=event.source.id, type=event.data.type;
+    let request;
+    try{request=new Request(url,{mode:'cors'});if(!isVideoServerCandidate(request,true))return;}catch(_){return;}
+    event.waitUntil((async()=>{
+    await ensureVideoServerConfig();
+    if(!mediaKey(request,true))return;
+    const id=confirmationKey(sourceId,url);
     for(const [key,until] of confirmed)if(until<=Date.now())confirmed.delete(key);
     confirmed.set(id,Date.now()+30000);
     while(confirmed.size>64)confirmed.delete(confirmed.keys().next().value);
-    if(capturing?.id===id){capturing.confirm();if(event.data.type==='psn-gameplay-cache-finish')capturing.finish?.();}
-    if(event.data.type==='psn-gameplay-cache-finish'){enqueueCompletion(url,id);event.waitUntil(scheduleCompletion());}
+    if(capturing?.id===id){capturing.confirm();if(type==='psn-gameplay-cache-finish')capturing.finish?.();}
+    if(type==='psn-gameplay-cache-finish'){enqueueCompletion(url,id);await scheduleCompletion();}
+    })());
   }
 });
 
@@ -82,7 +121,7 @@ function mediaKey(request, message=false) {
   if (request.method !== 'GET' || (!message && request.destination !== 'video') || request.mode !== 'cors') return null;
   try {
     const url = new URL(request.url);
-    if (url.origin !== SERVER || url.pathname !== '/api/gameplay-video') return null;
+    if (!videoServerOrigins.has(url.origin) || url.pathname !== '/api/gameplay-video') return null;
     const token = url.searchParams.get('token') || '';
     if (!/^[A-Za-z0-9_-]+\.[a-f0-9]{64}$/.test(token)) return null;
     const raw = token.split('.')[0].replace(/-/g, '+').replace(/_/g, '/');
@@ -531,9 +570,13 @@ self.addEventListener('fetch',event=>{
   const request=event.request;
   const localOnly=request.method==='GET'&&request.destination==='video'&&request.url.startsWith(LOCAL_PREFIX)&&
     /^\d+-\d+-video(?:-normalized)?-(?:[a-z0-9-]+\.)*screenscraper\.fr$/i.test(request.url.slice(LOCAL_PREFIX.length));
-  const key=localOnly?request.url:mediaKey(request);
-  if(!key)return;
+  if(!localOnly&&!isVideoServerCandidate(request))return;
   let done;
   event.waitUntil(new Promise(resolve=>{done=resolve;}));
-  event.respondWith(handle(request,key,done,localOnly,event.clientId));
+  event.respondWith((async()=>{
+    if(!localOnly)await ensureVideoServerConfig();
+    const key=localOnly?request.url:mediaKey(request);
+    if(!key){done();return fetch(request);}
+    return handle(request,key,done,localOnly,event.clientId);
+  })().catch(error=>{done();throw error;}));
 });

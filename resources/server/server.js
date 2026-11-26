@@ -14,6 +14,23 @@ const { spawn } = require('child_process');
 const { isDeepStrictEqual } = require('node:util');
 const { monitorEventLoopDelay, performance } = require('node:perf_hooks');
 
+// Shared private configuration, mounted by Render at startup.
+const privateServerConfig = (() => {
+  try {
+    const config = JSON.parse(require('node:fs').readFileSync('/etc/secrets/server-secrets.json', 'utf8'));
+    if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('Invalid configuration');
+    return Object.freeze(config);
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw new Error('Invalid private server configuration.');
+    return Object.freeze({});
+  }
+})();
+function getPrivateServerValue(key) {
+  const value = privateServerConfig[key];
+  return (typeof value === 'string' ? value.trim() : '') || String(process.env[key] || '').trim();
+}
+const databaseUrl = getPrivateServerValue('DATABASE_URL');
+
 const app = express();
 app.use((req, res, next) => {
   if (req.method !== 'GET' || (!req.path.startsWith('/api/metadata/') && req.path !== '/api/game-trophies/cache')) return next();
@@ -470,9 +487,7 @@ const DEBUG_BANDWIDTH_ENABLED = process.env.DEBUG_BANDWIDTH === "1";
 const CHAT_SYNC_INTERVAL_MS = 3000;
 const KEEP_ALIVE_INTERVAL_MS = Math.max(60000, parseInt(process.env.KEEP_ALIVE_INTERVAL_MS || "600000", 10) || 600000);
 const KEEP_ALIVE_TIMEOUT_MS = Math.max(1000, parseInt(process.env.KEEP_ALIVE_TIMEOUT_MS || "10000", 10) || 10000);
-const KEEP_ALIVE_URLS = [
-  "https://psn-content-jh5h.onrender.com",
-];
+const PSN_ENDPOINTS_URL = 'https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/server/endpoints.json';
 const PROFILE_SYNC_INTERVAL_MS = Math.max(10000, parseInt(process.env.PROFILE_SYNC_INTERVAL_MS || "15000", 10) || 15000);
 const ENABLE_PROFILE_PERIODIC_SYNC = process.env.ENABLE_PROFILE_PERIODIC_SYNC === "1";
 const POST_AUTH_CHAT_HISTORY_DELAY_MS = Math.max(0, parseInt(process.env.POST_AUTH_CHAT_HISTORY_DELAY_MS || "180", 10) || 180);
@@ -541,7 +556,7 @@ const CONTENT_METADATA_SUGGESTIONS_MAX = 200;
 const CONTENT_METADATA_SUGGESTIONS_PER_USER_MAX = 50;
 
 const pgConnectionOptions = {
-  connectionString: process.env.DATABASE_URL,
+  connectionString: databaseUrl,
   ssl: { rejectUnauthorized: false },
   application_name: String(`psn-db-${INSTANCE_ID}`).slice(0, 63),
   connectionTimeoutMillis: PG_CONNECTION_TIMEOUT_MS,
@@ -572,7 +587,7 @@ function cleanupAdminPostgresBackupTokens(now = Date.now()) {
 }
 
 function getPgDumpConnectionEnv() {
-  const raw = String(process.env.DATABASE_URL || '').trim();
+  const raw = databaseUrl;
   if (!raw) throw new Error('DATABASE_URL is not configured.');
   const parsed = new URL(raw);
   const database = decodeURIComponent(String(parsed.pathname || '').replace(/^\/+/, ''));
@@ -1332,15 +1347,25 @@ function pingKeepAliveServer(rawUrl, redirectsLeft = 2) {
   });
 }
 
+function parsePsnServerEndpoints(data) {
+  if (!Array.isArray(data?.servers) || !data.servers.length || data.servers.length > 16) throw new Error('Invalid server list');
+  return [...new Set(data.servers.map(value => {
+    if (typeof value !== 'string') throw new Error('Invalid server URL');
+    const url = new URL(value);
+    if (url.protocol !== 'https:' || !/^[a-z0-9-]+\.onrender\.com$/.test(url.hostname) || url.username || url.password || url.port || url.pathname !== '/' || url.search || url.hash) throw new Error('Invalid server origin');
+    return url.origin;
+  }))];
+}
+
 function startKeepAlivePings() {
-  const urls = [...new Set(KEEP_ALIVE_URLS.map(value => String(value || '').trim()).filter(Boolean))];
-  if (!urls.length) {
-    console.log('[KEEP ALIVE] Disabled. Add server URLs to KEEP_ALIVE_URLS to enable it.');
-    return;
-  }
   if (keepAliveInterval) return;
 
   const runKeepAlive = runNonOverlappingTask('KEEP ALIVE', async () => {
+    const response = await fetch(PSN_ENDPOINTS_URL, {redirect:'error',cache:'no-cache',signal:AbortSignal.timeout(KEEP_ALIVE_TIMEOUT_MS)});
+    if (!response.ok) throw new Error('Server configuration HTTP '+response.status);
+    const text = await response.text();
+    if (text.length > 16384) throw new Error('Invalid configuration size');
+    const urls = parsePsnServerEndpoints(JSON.parse(text));
     const results = await Promise.all(urls.map(url => pingKeepAliveServer(url)));
     const failed = results.filter(result => !result.ok);
 
@@ -1355,7 +1380,7 @@ function startKeepAlivePings() {
     }
   });
 
-  console.log(`[KEEP ALIVE] Enabled for ${urls.length} server(s), every ${Math.round(KEEP_ALIVE_INTERVAL_MS / 60000)} minute(s).`);
+  console.log(`[KEEP ALIVE] Enabled (endpoints.json), every ${Math.round(KEEP_ALIVE_INTERVAL_MS / 60000)} minute(s).`);
   setTimeout(runKeepAlive, 5000);
   keepAliveInterval = setInterval(runKeepAlive, KEEP_ALIVE_INTERVAL_MS);
   if (typeof keepAliveInterval.unref === 'function') keepAliveInterval.unref();
@@ -1522,8 +1547,8 @@ app.post('/api/site-visits', async (req, res) => {
 // ============================================================================
 // Metadata proxy: PS Store / RAWG / IGDB / Steam
 // ============================================================================
-const DEFAULT_IGDB_CLIENT_ID = String(process.env.IGDB_CLIENT_ID || process.env.TWITCH_CLIENT_ID || '').trim();
-const DEFAULT_IGDB_CLIENT_SECRET = String(process.env.IGDB_CLIENT_SECRET || process.env.TWITCH_CLIENT_SECRET || '').trim();
+const DEFAULT_IGDB_CLIENT_ID = String(getPrivateServerValue('IGDB_CLIENT_ID') || getPrivateServerValue('TWITCH_CLIENT_ID') || '').trim();
+const DEFAULT_IGDB_CLIENT_SECRET = String(getPrivateServerValue('IGDB_CLIENT_SECRET') || getPrivateServerValue('TWITCH_CLIENT_SECRET') || '').trim();
 const METADATA_PROXY_TIMEOUT_MS = Math.max(2500, parseInt(process.env.METADATA_PROXY_TIMEOUT_MS || '8000', 10) || 8000);
 const METADATA_PROXY_CACHE_MS = Math.max(60000, parseInt(process.env.METADATA_PROXY_CACHE_MS || '1800000', 10) || 1800000);
 
@@ -1535,7 +1560,7 @@ const METADATA_PROXY_CACHE_MAX = METADATA_CACHE_MAX_ITEMS;
 let metadataSharedCachePrunedAt = 0;
 const METADATA_LIVE_SCHEMA_VERSION = 1;
 const METADATA_LIVE_PENDING_MAX = Math.max(2, Math.min(24, parseInt(process.env.METADATA_LIVE_PENDING_MAX || '8', 10) || 8));
-const RAWG_SERVER_KEYS = String(process.env.RAWG_KEYS || process.env.RAWG_API_KEYS || process.env.RAWG_KEY || '').split(/[\s,;]+/).map(value => value.trim()).filter(Boolean).slice(0, 16);
+const RAWG_SERVER_KEYS = String(getPrivateServerValue('RAWG_KEYS') || getPrivateServerValue('RAWG_API_KEYS') || getPrivateServerValue('RAWG_KEY') || '').split(/[\s,;]+/).map(value => value.trim()).filter(Boolean).slice(0, 16);
 const metadataProxyCache = new Map();
 const metadataLiveProviderPending = new Map();
 let igdbAccessToken = '';
@@ -1937,11 +1962,8 @@ function normalizeRawgLiveDetails(details = {}, screenshots = []) {
   };
 }
 
-function getRawgKeysForLiveRequest(req) {
-  const values = RAWG_SERVER_KEYS.slice();
-  const clientKey = String(req.get('x-rawg-key') || '').trim().slice(0, 128);
-  if (clientKey) values.push(clientKey);
-  return [...new Set(values)].slice(0, 4);
+function getRawgKeysForLiveRequest() {
+  return [...new Set(RAWG_SERVER_KEYS)].slice(0,4);
 }
 
 async function getOrLoadLiveMetadataProvider(cacheKey, loader) {
@@ -2184,7 +2206,7 @@ app.get('/api/metadata/live', async (req, res) => {
   }
   if (include === 'all' || include === 'rawg') {
     tasks.push((async () => {
-      const keys = getRawgKeysForLiveRequest(req);
+      const keys = getRawgKeysForLiveRequest();
       if (!keys.length || !name) {
         payload.providerStatus.rawg = !name ? 'not-requested' : 'unconfigured';
         return;
@@ -2201,10 +2223,10 @@ app.get('/api/metadata/live', async (req, res) => {
   return res.json(payload);
 });
 
-const SS_PREVIEW_DEVID = String(process.env.SCREENSCRAPER_DEV_ID || 'LuanTeles').trim();
-const SS_PREVIEW_DEVPASSWORD = String(process.env.SCREENSCRAPER_DEV_PASSWORD || '69bjUwTdqXA').trim();
-const SS_PREVIEW_USER = String(process.env.SCREENSCRAPER_USER || 'LuanTeles').trim();
-const SS_PREVIEW_PASSWORD = String(process.env.SCREENSCRAPER_PASSWORD || 'LuanTeles12').trim();
+const SS_PREVIEW_DEVID = getPrivateServerValue('SCREENSCRAPER_DEV_ID');
+const SS_PREVIEW_DEVPASSWORD = getPrivateServerValue('SCREENSCRAPER_DEV_PASSWORD');
+const SS_PREVIEW_USER = getPrivateServerValue('SCREENSCRAPER_USER');
+const SS_PREVIEW_PASSWORD = getPrivateServerValue('SCREENSCRAPER_PASSWORD');
 const SS_PREVIEW_ENABLED = process.env.SCREENSCRAPER_PREVIEWS_ENABLED !== '0' && !!SS_PREVIEW_DEVID && !!SS_PREVIEW_DEVPASSWORD;
 if (SS_PREVIEW_ENABLED && !(SS_PREVIEW_USER && SS_PREVIEW_PASSWORD))
   console.warn('[ScreenScraper] No member login configured; set SCREENSCRAPER_USER and SCREENSCRAPER_PASSWORD on Render to use member quota.');
@@ -2730,7 +2752,7 @@ function ssPreviewFindVideo(game, expectedSystem) {
 }
 
 const ssPreviewVideoSecret = crypto.createHmac('sha256',
-  String(process.env.SCREENSCRAPER_MEDIA_SIGNING_KEY || SS_PREVIEW_DEVPASSWORD))
+  String(getPrivateServerValue('SCREENSCRAPER_MEDIA_SIGNING_KEY') || SS_PREVIEW_DEVPASSWORD || crypto.randomBytes(32).toString('hex')))
   .update('PSN-Content ScreenScraper media links v1').digest();
 const { Transform: SsVideoTransform } = require('node:stream');
 const SS_PREVIEW_VIDEO_MAX_BYTES = 32 * 1024 * 1024;
@@ -5080,6 +5102,114 @@ app.get('/api/screenscraper-image',async(req,res)=>{
   return res.send(cached.body);
 });
 
+// Provider search proxies. Only search metadata travels through this server.
+const providerSearchKeys = {
+  rawg: [...new Set(RAWG_SERVER_KEYS)],
+  youtube: [...new Set(getPrivateServerValue('YOUTUBE_KEYS').split(/[\s,;]+/).filter(Boolean))].slice(0,16),
+  giphy: [getPrivateServerValue('GIPHY_API_KEY')].filter(Boolean)
+};
+const providerSearchPending = new Map();
+const providerSearchCache = new Map();
+const providerSearchBudget = new Map();
+const providerSearchLimits = {rawg:120,youtube:60,giphy:180};
+const providerSearchText = (value,max) => typeof value === 'string' ? value.trim().slice(0,max) : '';
+const providerSearchUrl = (value,domain) => {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && !url.username && !url.password && (url.hostname === domain || url.hostname.endsWith('.'+domain)) ? url.href : '';
+  } catch (_) { return ''; }
+};
+function compactProviderSearch(provider, kind, data) {
+  if (provider === 'youtube') return {
+    items:(Array.isArray(data.items) ? data.items : []).slice(0,50).map(item => ({videoId:providerSearchText(item?.id?.videoId,40),title:providerSearchText(item?.snippet?.title,300)})).filter(item=>item.videoId),
+    nextPageToken:providerSearchText(data.nextPageToken,512)
+  };
+  if (provider === 'giphy') return {data:(Array.isArray(data.data) ? data.data : []).slice(0,20).map(item=>{
+    const preview=providerSearchUrl(item?.images?.fixed_height_small?.url,'giphy.com');
+    const full=providerSearchUrl(item?.images?.downsized?.url,'giphy.com');
+    return {images:{fixed_height_small:{url:preview||full},downsized:{url:full||preview}}};
+  }).filter(item=>item.images.fixed_height_small.url)};
+  if (kind === 'search') return {results:(Array.isArray(data.results) ? data.results : []).slice(0,5).map(item=>({id:item.id,slug:item.slug,name:item.name,released:item.released,platforms:item.platforms}))};
+  if (kind === 'screenshots') return {results:(Array.isArray(data.results) ? data.results : []).slice(0,8).map(item=>({image:item.image}))};
+  const {id,slug,name,released,description_raw,description,metacritic,playtime,developers,publishers,genres,tags,platforms} = data;
+  return {id,slug,name,released,description_raw,description,metacritic,playtime,developers,publishers,genres,tags,platforms};
+}
+async function loadPrivateProviderSearch(provider, kind, q, limit, pageToken) {
+  const keys = providerSearchKeys[provider];
+  if (!keys.length) return {status:503,body:{error:'Provider not configured.'}};
+  const started = Date.now();
+  let lastStatus = 502;
+  for (const key of keys) {
+    const remaining = 6500-(Date.now()-started);
+    if (remaining < 200) break;
+    const now = Date.now();
+    let budget = providerSearchBudget.get(provider);
+    if (!budget || now-budget.at >= 60000) { budget={at:now,count:0}; providerSearchBudget.set(provider,budget); }
+    if (budget.count >= providerSearchLimits[provider]) return {status:429,body:{error:'Provider temporarily busy.'}};
+    budget.count++;
+    let url;
+    if (provider === 'giphy') {
+      url=new URL('https://api.giphy.com/v1/gifs/'+(q?'search':'trending'));
+      url.searchParams.set('api_key',key);url.searchParams.set('limit',String(limit));url.searchParams.set('rating','g');
+      if(q)url.searchParams.set('q',q);
+    } else if(provider==='youtube') {
+      url=new URL('https://www.googleapis.com/youtube/v3/search');
+      url.search=new URLSearchParams({part:'snippet',type:'video',maxResults:String(limit),q,key});
+      if(pageToken)url.searchParams.set('pageToken',pageToken);
+    } else {
+      url=new URL('https://api.rawg.io/api/games'+(kind==='search'?'':'/'+encodeURIComponent(q)+(kind==='screenshots'?'/screenshots':'')));
+      url.searchParams.set('key',key);
+      if(kind==='search'){url.searchParams.set('search',q);url.searchParams.set('page_size','5');}
+    }
+    try {
+      const response=await requestMetadataJson(url,{timeoutMs:Math.min(4000,remaining),hardDeadline:true,headers:{'User-Agent':'PSN-Content-Metadata/1.0'}});
+      lastStatus=response.status;
+      if(response.ok && response.data && !response.data.error) {
+        const body=compactProviderSearch(provider,kind,response.data);
+        // Never return upstream API keys, including keys echoed in URLs or fields.
+        const serialized=JSON.stringify(body);
+        if(keys.some(secret=>serialized.includes(secret))) return {status:502,body:{error:'Invalid provider response.'}};
+        return {status:200,body};
+      }
+      if (![401,403,429].includes(lastStatus)) break;
+    } catch (_) { lastStatus=502;break; }
+  }
+  return {status:lastStatus===404?404:lastStatus===429||lastStatus===403||lastStatus===401?429:502,body:{error:'Provider request failed.'}};
+}
+function registerPrivateProviderSearch(path,provider,kind) {
+  app.options(path,(req,res)=>{setMetadataCors(res);res.status(204).end();});
+  app.get(path,async(req,res)=>{
+    setMetadataCors(res);
+    const q=providerSearchText(req.query[kind==='details'||kind==='screenshots'?'slug':'q'],240);
+    const pageToken=provider==='youtube'?providerSearchText(req.query.pageToken,512):'';
+    const limit=provider==='giphy'?Math.min(20,Math.max(1,parseInt(req.query.limit,10)||20)):provider==='youtube'?Math.min(50,Math.max(1,parseInt(req.query.limit,10)||10)):5;
+    if((provider!=='giphy'&&!q)||((kind==='details'||kind==='screenshots')&&!/^[a-z0-9_-]{1,240}$/i.test(q)))return res.status(400).json({error:'Invalid search.'});
+    const id=JSON.stringify([provider,kind,q,limit,pageToken]);
+    const cached=providerSearchCache.get(id);
+    if(cached && Date.now()-cached.at<60000)return res.json(cached.body);
+    if(cached)providerSearchCache.delete(id);
+    let pending=providerSearchPending.get(id);
+    if(!pending){
+      if(providerSearchPending.size>=6)return res.status(503).json({error:'Provider temporarily busy.'});
+      pending=loadPrivateProviderSearch(provider,kind,q,limit,pageToken).then(result=>{
+        if(result.status===200 && Buffer.byteLength(JSON.stringify(result.body))<=65536){
+          providerSearchCache.set(id,{at:Date.now(),body:result.body});
+          while(providerSearchCache.size>64)providerSearchCache.delete(providerSearchCache.keys().next().value);
+        }
+        return result;
+      }).finally(()=>providerSearchPending.delete(id));
+      providerSearchPending.set(id,pending);
+    }
+    try{const result=await pending;return res.status(result.status).json(result.body);}
+    catch(_){return res.status(502).json({error:'Provider request failed.'});}
+  });
+}
+registerPrivateProviderSearch('/api/metadata/rawg-search','rawg','search');
+registerPrivateProviderSearch('/api/metadata/rawg-details','rawg','details');
+registerPrivateProviderSearch('/api/metadata/rawg-screenshots','rawg','screenshots');
+registerPrivateProviderSearch('/api/metadata/youtube-search','youtube','search');
+registerPrivateProviderSearch('/api/metadata/gifs','giphy','search');
+
 app.options('/api/metadata/igdb', (req, res) => { setMetadataCors(res); res.status(204).end(); });
 app.options('/api/metadata/steam/search', (req, res) => { setMetadataCors(res); res.status(204).end(); });
 app.options('/api/metadata/steam/details', (req, res) => { setMetadataCors(res); res.status(204).end(); });
@@ -5087,8 +5217,8 @@ app.options('/api/metadata/steam/details', (req, res) => { setMetadataCors(res);
 app.get('/api/metadata/igdb', async (req, res) => {
   setMetadataCors(res);
   const query = String(req.query && req.query.q || '').trim().slice(0, 180);
-  const clientId = String(req.get('x-igdb-client-id') || (req.query && req.query.client_id) || DEFAULT_IGDB_CLIENT_ID || '').trim().slice(0, 160);
-  const clientSecret = String(req.get('x-igdb-client-secret') || (req.query && req.query.client_secret) || DEFAULT_IGDB_CLIENT_SECRET || '').trim().slice(0, 300);
+  const clientId = DEFAULT_IGDB_CLIENT_ID;
+  const clientSecret = DEFAULT_IGDB_CLIENT_SECRET;
   if (!query) return res.status(400).json({ ok: false, provider: 'igdb', error: 'Missing q.' });
   if (!clientId || !clientSecret) return res.status(503).json({ ok: false, provider: 'igdb', configured: false, error: 'IGDB credentials are not configured.' });
   const cacheKey = `igdb:${query.toLowerCase()}`;
@@ -6162,6 +6292,15 @@ async function initDb() {
       user_name TEXT PRIMARY KEY,
       last_read_id BIGINT NOT NULL DEFAULT 0,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS patreon_account_links (
+      user_name TEXT PRIMARY KEY REFERENCES users(name) ON DELETE CASCADE,
+      patreon_id TEXT NOT NULL UNIQUE
+    );
+    CREATE TABLE IF NOT EXISTS patreon_auth_flows (
+      user_name TEXT PRIMARY KEY REFERENCES users(name) ON DELETE CASCADE,
+      state_hash TEXT NOT NULL UNIQUE,
+      expires_at TIMESTAMPTZ NOT NULL
     );
     CREATE TABLE IF NOT EXISTS user_reward_notices (
       user_name TEXT NOT NULL,
@@ -18809,11 +18948,181 @@ function readSocialUnseenStateShared(actor) {
 // ============================================================================
 // Client connection & event handlers
 // ============================================================================
+async function grantSupporterDonation(name, actor) {
+    try {
+      const stamp = Date.now();
+      const trophy = { unlocked:true, progress:1, isNew:true, unlockAt:stamp, unlockDate:new Date(stamp).toISOString() };
+      const { result, target, cachedDonationAt } = await runSerializedUserRowMutation(name, async () => {
+        const cachedDonationAt = Number(userDatabase[name]?.supporterDonationAt) || 0;
+        const result = await queryDbWithRetry(`
+        WITH granted AS (
+          UPDATE users SET data = COALESCE(data, '{}'::jsonb) || jsonb_build_object(
+            'supporterDonationAt', $2::bigint,
+            'supporterNoticePendingAt', $2::bigint,
+            'trophiesData', (CASE WHEN jsonb_typeof(data->'trophiesData')='object' THEN data->'trophiesData' ELSE '{}'::jsonb END) || jsonb_build_object('site_supporter', $3::jsonb),
+            'trophies', (SELECT count(*) FROM jsonb_each(CASE WHEN jsonb_typeof(data->'trophiesData')='object' THEN data->'trophiesData' ELSE '{}'::jsonb END) AS t(id, state) WHERE id <> 'site_supporter' AND lower(COALESCE(state->>'unlocked','false')) IN ('true','1','yes')) + 1,
+            'xp', (CASE WHEN data->>'xp' ~ '^[0-9]{1,9}$' THEN (data->>'xp')::integer ELSE 0 END) + 90,
+            'level', ((CASE WHEN data->>'xp' ~ '^[0-9]{1,9}$' THEN (data->>'xp')::integer ELSE 0 END) + 90) / 100 + 1,
+            'profileUpdatedAt', GREATEST($2::bigint, CASE WHEN data->>'profileUpdatedAt' ~ '^[0-9]{1,18}$' THEN (data->>'profileUpdatedAt')::bigint + 1 ELSE 0 END)
+          ) WHERE name=$1 AND data->'supporterDonationAt' IS NULL RETURNING name,data
+        ), notice AS (
+          INSERT INTO user_reward_notices (user_name,reward_id,trophy_id,title,kind,image_url,created_at,seen,visited)
+          SELECT name,'rew_theme_1','site_supporter','RGB Glass Theme','theme','',$2::bigint,FALSE,FALSE FROM granted
+          ON CONFLICT (user_name,reward_id) DO NOTHING RETURNING user_name
+        ) SELECT data FROM granted
+        `, [name, stamp, trophy], { attempts:2, label:'DONATION REWARD GRANT' });
+        const target = await refreshSingleUserCacheFromDb(name, { forceDuringWrite:true, savedData:result.rows[0]?.data });
+        return { result, target, cachedDonationAt };
+      });
+      if (!target) return { success:false, message:'User not found.' };
+      if (!(Number(target.supporterDonationAt) > 0)) return { success:false, message:'Donation could not be confirmed.' };
+      if (!result.rows.length && cachedDonationAt === Number(target.supporterDonationAt)) {
+        emitSupporterNotice(name, target);
+        deferServerTask('DONATION CACHE COMPACT', () => compactCachedUser(name), 250);
+        return { success:true, already:true };
+      }
+      const keys = ['trophiesData','trophies','xp','level','isSupporter'];
+      invalidatePublicProfileListReads(name, keys);
+      emitPublicProfileListChanged(name, keys, target.profileUpdatedAt);
+      emitProfileSyncPatchFromUser(name, target, keys);
+      emitProfileCountsUpdate(name, target);
+      emitPublicProfileBannerUpdate(name, target);
+      invalidateOnlineListCache('supporter-update');
+      emitPresenceUpdate(name, target);
+      emitRewardNoticeChange(name);
+      emitSupporterNotice(name, target);
+      if (result.rows.length) {
+        invalidateGlobalTrophyStatsCache();
+        scheduleTrophyStatsRefreshBroadcast(900);
+      }
+      deferServerTask('DONATION REWARD SYNC', () => notifyProfileSyncAcrossInstances(name, null, target.profileUpdatedAt, { keys, trophies:true, counts:true, publicProfile:true, supporterNoticeChanged:true }), 0);
+      deferServerTask('DONATION NOTICE SYNC', () => notifyRewardNoticeChange(name), 0);
+      deferServerTask('DONATION CACHE COMPACT', () => compactCachedUser(name), 250);
+      if (result.rows.length) await addModerationLog('donation', `Confirmed donation from ${name}`, { targetName:name }, actor);
+      return { success:true, already:!result.rows.length };
+    } catch (err) {
+      console.error('[DONATION REWARD ERROR]', err);
+      return { success:false, message:'Could not confirm donation.' };
+    }
+}
+
+const patreonConfig = (() => {
+  const clientId = getPrivateServerValue('PATREON_CLIENT_ID');
+  const clientSecret = getPrivateServerValue('PATREON_CLIENT_SECRET');
+  const campaign = getPrivateServerValue('PATREON_CAMPAIGN_ID');
+  const webhookSecret = getPrivateServerValue('PATREON_WEBHOOK_SECRET');
+  try {
+    const callback = new URL(getPrivateServerValue('PATREON_REDIRECT_URI') || 'https://patreon.ps3-pro.workers.dev/api/patreon/callback');
+    const checkout = new URL(getPrivateServerValue('PATREON_CHECKOUT_URL'));
+    if (!clientId || !clientSecret || !webhookSecret || !/^\d+$/.test(campaign) || callback.protocol !== 'https:' || callback.pathname !== '/api/patreon/callback' || callback.search || callback.hash || checkout.protocol !== 'https:' || !['www.patreon.com','patreon.com'].includes(checkout.hostname) || checkout.username || checkout.password) return null;
+    return {clientId,clientSecret,campaign,webhookSecret,callback:callback.href,checkout:checkout.href};
+  } catch (_) { return null; }
+})();
+const patreonStateHash = state => crypto.createHash('sha256').update(state).digest('hex');
+function patreonMemberPaid(member, campaignScoped = false) {
+  if (member?.type !== 'member') return false;
+  const campaign = member.relationships?.campaign?.data?.id;
+  const a = member.attributes || {};
+  return (campaign ? String(campaign) === patreonConfig.campaign : campaignScoped) && a.last_charge_status === 'Paid' && Number(a.campaign_lifetime_support_cents ?? a.lifetime_support_cents) > 0 && a.is_free_trial !== true && a.is_gifted !== true;
+}
+function patreonCallbackPage(res, message, status = 200) {
+  res.set({'Cache-Control':'no-store','Referrer-Policy':'no-referrer','Content-Security-Policy':"default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'"});
+  return res.status(status).type('html').send(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>NoPayStation Database</title><body style="background:#0f1521;color:white;font:16px system-ui;padding:32px;text-align:center"><h2>NoPayStation Database</h2><p>${message}</p><p>Return to the app to continue.</p></body>`);
+}
+app.get('/api/patreon/callback', async (req,res) => {
+  res.set({'Cache-Control':'no-store','Referrer-Policy':'no-referrer'});
+  if (!patreonConfig) return patreonCallbackPage(res,'Patreon is not configured.',503);
+  const state = typeof req.query.state === 'string' ? req.query.state : '';
+  if (!/^[a-f0-9]{64}$/.test(state)) return patreonCallbackPage(res,'Invalid authorization. Start again in the app.',400);
+  try {
+    const flow = await queryDbWithRetry(`DELETE FROM patreon_auth_flows WHERE state_hash=$1 AND expires_at>NOW() RETURNING user_name`,[patreonStateHash(state)],{attempts:1,label:'PATREON STATE'});
+    const name = flow.rows[0]?.user_name;
+    if (!name) return patreonCallbackPage(res,'Authorization expired. Start again in the app.',400);
+    if (req.query.error || typeof req.query.code !== 'string' || req.query.code.length>2048) return patreonCallbackPage(res,'Authorization was cancelled.',400);
+    const tokenRes = await fetch('https://www.patreon.com/api/oauth2/token',{method:'POST',body:new URLSearchParams({grant_type:'authorization_code',code:req.query.code,client_id:patreonConfig.clientId,client_secret:patreonConfig.clientSecret,redirect_uri:patreonConfig.callback}),signal:AbortSignal.timeout(15000)});
+    if (!tokenRes.ok) throw new Error('token request failed');
+    const token = (await tokenRes.json()).access_token;
+    if (typeof token !== 'string' || !token) throw new Error('token missing');
+    const params = new URLSearchParams({include:'memberships','fields[member]':'last_charge_status,campaign_lifetime_support_cents,is_free_trial,is_gifted'});
+    const identityRes = await fetch('https://www.patreon.com/api/oauth2/v2/identity?'+params,{headers:{Authorization:'Bearer '+token},signal:AbortSignal.timeout(15000)});
+    if (!identityRes.ok) throw new Error('identity request failed');
+    const identity = await identityRes.json();
+    const id = String(identity.data?.id || '');
+    if (identity.data?.type !== 'user' || !/^\d{1,32}$/.test(id)) throw new Error('invalid identity');
+    const link = await queryDbWithRetry(`INSERT INTO patreon_account_links(user_name,patreon_id) VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING user_name`,[name,id],{attempts:2,label:'PATREON LINK'});
+    if (!link.rows.length) {
+      const existing = await queryDbWithRetry('SELECT user_name FROM patreon_account_links WHERE user_name=$1 AND patreon_id=$2',[name,id],{attempts:2,label:'PATREON LINK CHECK'});
+      if (!existing.rows.length) return patreonCallbackPage(res,'This Patreon account or site account is already linked to a different account. Contact support.',409);
+    }
+    // With identity scope only, Patreon limits memberships to this OAuth client's creator campaign.
+    if (Array.isArray(identity.included) && identity.included.some(member => patreonMemberPaid(member,true))) {
+      const result = await grantSupporterDonation(name,'Patreon');
+      if (!result.success) throw new Error('reward grant failed');
+      return patreonCallbackPage(res,'Payment verified. Thank you for your support!');
+    }
+    return res.redirect(303,patreonConfig.checkout);
+  } catch (err) {
+    console.error('[PATREON CALLBACK]',err.message);
+    return patreonCallbackPage(res,'Could not verify your account. Please try again in the app.',502);
+  }
+});
+app.post('/api/patreon/webhook', express.raw({type:'application/json',limit:'256kb'}), async (req,res) => {
+  if (!patreonConfig) return res.sendStatus(503);
+  const signature = String(req.get('X-Patreon-Signature') || '');
+  if (!Buffer.isBuffer(req.body) || !/^[a-f0-9]{32}$/i.test(signature)) return res.sendStatus(401);
+  const expected = crypto.createHmac('md5',patreonConfig.webhookSecret).update(req.body).digest();
+  if (!crypto.timingSafeEqual(expected,Buffer.from(signature,'hex'))) return res.sendStatus(401);
+  if (!['members:create','members:update','members:pledge:create','members:pledge:update'].includes(req.get('X-Patreon-Event'))) return res.sendStatus(204);
+  try {
+    const member = JSON.parse(req.body.toString('utf8')).data;
+    // The webhook secret must belong exclusively to the configured campaign.
+    if (!patreonMemberPaid(member,true)) return res.sendStatus(204);
+    const id = String(member.relationships?.user?.data?.id || '');
+    if (!/^\d{1,32}$/.test(id)) return res.sendStatus(204);
+    const link = await queryDbWithRetry('SELECT user_name FROM patreon_account_links WHERE patreon_id=$1',[id],{attempts:2,label:'PATREON WEBHOOK LINK'});
+    if (!link.rows.length) return res.sendStatus(204);
+    const result = await grantSupporterDonation(link.rows[0].user_name,'Patreon');
+    return res.sendStatus(result.success ? 204 : 503);
+  } catch (err) {
+    console.error('[PATREON WEBHOOK]',err.message);
+    return res.sendStatus(503);
+  }
+});
+
 io.on('connection', (socket) => {
   console.log('[NETWORK] Socket connected. ID: ' + socket.id);
   socket.emit('content_limits', getClientContentLimits());
   socket.once('disconnecting', () => { unindexSocketUser(socket); adminSockets.delete(socket); });
   deferServerTask('CONNECTION INIT', () => emitAdminState(socket), 0);
+
+  socket.on('patreon_begin', async (_data, callback) => {
+    if (typeof callback !== 'function') return;
+    const name = socket.userName;
+    if (!name || !patreonConfig) return callback({success:false,message:'Patreon is not available yet.'});
+    if (socket.__patreonBeginAt && Date.now()-socket.__patreonBeginAt<3000) return callback({success:false,message:'Please wait a moment and retry.'});
+    socket.__patreonBeginAt = Date.now();
+    try {
+      const state = crypto.randomBytes(32).toString('hex');
+      await queryDbWithRetry(`INSERT INTO patreon_auth_flows(user_name,state_hash,expires_at) VALUES($1,$2,NOW()+INTERVAL '15 minutes') ON CONFLICT(user_name) DO UPDATE SET state_hash=EXCLUDED.state_hash,expires_at=EXCLUDED.expires_at`,[name,patreonStateHash(state)],{attempts:2,label:'PATREON BEGIN'});
+      if (socket.userName !== name) return callback({success:false});
+      const url = new URL('https://www.patreon.com/oauth2/authorize');
+      url.search = new URLSearchParams({response_type:'code',client_id:patreonConfig.clientId,redirect_uri:patreonConfig.callback,scope:'identity',state}).toString();
+      callback({success:true,url:url.href});
+    } catch (err) { console.error('[PATREON BEGIN]',err.message); callback({success:false,message:'Could not start authorization.'}); }
+  });
+  socket.on('patreon_status', async (_data, callback) => {
+    if (typeof callback !== 'function') return;
+    const name = socket.userName;
+    if (!name || !patreonConfig) return callback({success:false,message:'Patreon is not available yet.'});
+    if (socket.__patreonStatusAt && Date.now()-socket.__patreonStatusAt<2000) return callback({success:false});
+    socket.__patreonStatusAt = Date.now();
+    try {
+      const result = await queryDbWithRetry(`SELECT data->>'supporterDonationAt' AS paid, EXISTS(SELECT 1 FROM patreon_account_links WHERE user_name=$1) AS linked FROM users WHERE name=$1`,[name],{attempts:1,label:'PATREON STATUS'});
+      if (socket.userName !== name || !result.rows.length) return callback({success:false});
+      const row = result.rows[0];
+      callback({success:true,paid:Number(row.paid)>0,linked:row.linked===true});
+    } catch (_) { callback({success:false}); }
+  });
 
   socket.on('social_unseen_get', async (_data = {}, callback) => {
     const reply = typeof callback === 'function' ? callback : () => {};
@@ -22657,61 +22966,7 @@ io.on('connection', (socket) => {
     if (socket.isAdmin !== true || !socket.userName) return respond({ success:false, message:'Admin only.' });
     const name = normalizeText(data?.targetName, '').trim();
     if (!name || name.length > 120) return respond({ success:false, message:'User not found.' });
-    try {
-      const stamp = Date.now();
-      const trophy = { unlocked:true, progress:1, isNew:true, unlockAt:stamp, unlockDate:new Date(stamp).toISOString() };
-      const { result, target, cachedDonationAt } = await runSerializedUserRowMutation(name, async () => {
-        const cachedDonationAt = Number(userDatabase[name]?.supporterDonationAt) || 0;
-        const result = await queryDbWithRetry(`
-        WITH granted AS (
-          UPDATE users SET data = COALESCE(data, '{}'::jsonb) || jsonb_build_object(
-            'supporterDonationAt', $2::bigint,
-            'supporterNoticePendingAt', $2::bigint,
-            'trophiesData', (CASE WHEN jsonb_typeof(data->'trophiesData')='object' THEN data->'trophiesData' ELSE '{}'::jsonb END) || jsonb_build_object('site_supporter', $3::jsonb),
-            'trophies', (SELECT count(*) FROM jsonb_each(CASE WHEN jsonb_typeof(data->'trophiesData')='object' THEN data->'trophiesData' ELSE '{}'::jsonb END) AS t(id, state) WHERE id <> 'site_supporter' AND lower(COALESCE(state->>'unlocked','false')) IN ('true','1','yes')) + 1,
-            'xp', (CASE WHEN data->>'xp' ~ '^[0-9]{1,9}$' THEN (data->>'xp')::integer ELSE 0 END) + 90,
-            'level', ((CASE WHEN data->>'xp' ~ '^[0-9]{1,9}$' THEN (data->>'xp')::integer ELSE 0 END) + 90) / 100 + 1,
-            'profileUpdatedAt', GREATEST($2::bigint, CASE WHEN data->>'profileUpdatedAt' ~ '^[0-9]{1,18}$' THEN (data->>'profileUpdatedAt')::bigint + 1 ELSE 0 END)
-          ) WHERE name=$1 AND data->'supporterDonationAt' IS NULL RETURNING name,data
-        ), notice AS (
-          INSERT INTO user_reward_notices (user_name,reward_id,trophy_id,title,kind,image_url,created_at,seen,visited)
-          SELECT name,'rew_theme_1','site_supporter','RGB Glass Theme','theme','',$2::bigint,FALSE,FALSE FROM granted
-          ON CONFLICT (user_name,reward_id) DO NOTHING RETURNING user_name
-        ) SELECT data FROM granted
-        `, [name, stamp, trophy], { attempts:2, label:'DONATION REWARD GRANT' });
-        const target = await refreshSingleUserCacheFromDb(name, { forceDuringWrite:true, savedData:result.rows[0]?.data });
-        return { result, target, cachedDonationAt };
-      });
-      if (!target) return respond({ success:false, message:'User not found.' });
-      if (!(Number(target.supporterDonationAt) > 0)) return respond({ success:false, message:'Donation could not be confirmed.' });
-      if (!result.rows.length && cachedDonationAt === Number(target.supporterDonationAt)) {
-        emitSupporterNotice(name, target);
-        deferServerTask('DONATION CACHE COMPACT', () => compactCachedUser(name), 250);
-        return respond({ success:true, already:true });
-      }
-      const keys = ['trophiesData','trophies','xp','level','isSupporter'];
-      invalidatePublicProfileListReads(name, keys);
-      emitPublicProfileListChanged(name, keys, target.profileUpdatedAt);
-      emitProfileSyncPatchFromUser(name, target, keys);
-      emitProfileCountsUpdate(name, target);
-      emitPublicProfileBannerUpdate(name, target);
-      invalidateOnlineListCache('supporter-update');
-      emitPresenceUpdate(name, target);
-      emitRewardNoticeChange(name);
-      emitSupporterNotice(name, target);
-      if (result.rows.length) {
-        invalidateGlobalTrophyStatsCache();
-        scheduleTrophyStatsRefreshBroadcast(900);
-      }
-      deferServerTask('DONATION REWARD SYNC', () => notifyProfileSyncAcrossInstances(name, null, target.profileUpdatedAt, { keys, trophies:true, counts:true, publicProfile:true, supporterNoticeChanged:true }), 0);
-      deferServerTask('DONATION NOTICE SYNC', () => notifyRewardNoticeChange(name), 0);
-      deferServerTask('DONATION CACHE COMPACT', () => compactCachedUser(name), 250);
-      if (result.rows.length) await addModerationLog('donation', `Confirmed donation from ${name}`, { targetName:name }, socket.userName);
-      respond({ success:true, already:!result.rows.length });
-    } catch (err) {
-      console.error('[DONATION REWARD ERROR]', err);
-      respond({ success:false, message:'Could not confirm donation.' });
-    }
+    respond(await grantSupporterDonation(name, socket.userName));
   });
 
   socket.on('admin_set_role', async (data, callback) => {
