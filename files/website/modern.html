@@ -255,9 +255,13 @@
 		const android = /Android/i.test(navigator.userAgent || '') || navigator.userAgentData?.platform === 'Android';
 		const ios = document.documentElement.classList.contains('ios-webkit');
 		const mobile = android || ios;
+		const root = document.documentElement;
+		const mobileBar = mobile && !root.hasAttribute('data-psn-mobile-edge');
+		if (mobile) root.setAttribute('data-psn-rgb-mobile','');
+		if (mobileBar) root.setAttribute('data-psn-rgb-mobile-bar','');
 		function isDesktopOverlay() { return mode.matches && overlay?.visible !== false; }
 		const meta = document.querySelector('meta[name="theme-color"]');
-		let enabled = false, frameRequest = null, blend = null, background = null, glass = null, position = 9, lastDesktopUpdate = -Infinity;
+		let enabled = false, frameRequest = null, mobileTimer = null, blend = null, background = null, glass = null, mobileEdge = null, lastEdgeColor = null, position = 9, lastDesktopUpdate = -Infinity;
 		function clearIosFallback() {
 			if (!ios) return;
 			document.body?.style.removeProperty('background-color');
@@ -273,7 +277,8 @@
 		}
 		function stop() {
 			if (frameRequest !== null) cancelAnimationFrame(frameRequest);
-			frameRequest = null;
+			if (mobileTimer !== null) clearTimeout(mobileTimer);
+			frameRequest = mobileTimer = null;
 			blend = null;
 			lastDesktopUpdate = -Infinity;
 		}
@@ -295,7 +300,7 @@
 			return u*u*(3-2*u);
 		}
 		function tick(now = performance.now()) {
-			frameRequest = null;
+			frameRequest = mobileTimer = null;
 			const desktop = isDesktopOverlay();
 			if (!enabled || document.hidden || (!desktop && !mobile)) return;
 			// Pace desktop theme-color writes to the observed native repaint cadence.
@@ -313,22 +318,36 @@
 			const progress = timing?.progress ?? 0;
 			// Desktop lead calibrated from the recorded native title-bar repaint lag.
 			const lead = blend?.playState === 'running' && timing?.progress != null && Number(timing.duration) > 0
-				? (desktop ? 340 : 100) * blend.playbackRate / Number(timing.duration) : 0;
-			const phase = ((progress + lead) * colors.length % colors.length + colors.length) % colors.length;
-			const index = Math.floor(phase), mix = ease(phase-index);
+				? (desktop ? 340 : mobileBar ? 300 : 100) * blend.playbackRate / Number(timing.duration) : 0;
 			const left = Math.floor(position), right = Math.min(10,left+1), fraction = position-left;
-			const shade = Math.max(0,Math.min(1,Number(glass?.style.opacity)||0))*.48;
+			const shade = !desktop && mobileBar ? 0 : Math.max(0,Math.min(1,Number(glass?.style.opacity)||0))*.48;
 			const tint = [5,6,9];
 			// Compensate the small native desktop caption color offset measured at the seam.
 			const correction = desktop ? [-1,-1,0] : [0,0,0];
-			const rgb = colors[index][left].map((value,channel) => {
-				const a = value+(colors[index][right][channel]-value)*fraction;
+			function sample(offset) {
+				const phase = ((progress + offset) * colors.length % colors.length + colors.length) % colors.length;
+				const index = Math.floor(phase), mix = ease(phase-index);
 				const next = colors[(index+1)%colors.length];
-				const b = next[left][channel]+(next[right][channel]-next[left][channel])*fraction;
-				return Math.min(255,Math.max(0,Math.round((a+(b-a)*mix)*(1-shade)+tint[channel]*shade+correction[channel])));
-			});
-			write('#'+rgb.map(value=>value.toString(16).padStart(2,'0')).join(''));
-			if (!reduced.matches) frameRequest = requestAnimationFrame(tick);
+				const rgb = colors[index][left].map((value,channel) => {
+					const a = value+(colors[index][right][channel]-value)*fraction;
+					const b = next[left][channel]+(next[right][channel]-next[left][channel])*fraction;
+					return Math.min(255,Math.max(0,Math.round((a+(b-a)*mix)*(1-shade)+tint[channel]*shade+correction[channel])));
+				});
+				return '#'+rgb.map(value=>value.toString(16).padStart(2,'0')).join('');
+			}
+			if (!desktop && mobileBar) {
+				mobileEdge ||= document.querySelector('.psn-rgb-mobile-header-edge');
+				const edgeColor = sample(0);
+				if (mobileEdge && lastEdgeColor !== edgeColor) {
+					mobileEdge.style.backgroundColor = edgeColor;
+					lastEdgeColor = edgeColor;
+				}
+			}
+			write(sample(lead));
+			if (!reduced.matches) {
+				if (desktop) frameRequest = requestAnimationFrame(tick);
+				else mobileTimer = setTimeout(tick,200);
+			}
 		}
 		function sync() {
 			stop();
@@ -728,7 +747,8 @@ button:disabled, [disabled], [aria-disabled="true"], .chat-delete-action-disable
 body { --psn-entry-tint-top:rgb(var(--psn-tone-00367a,0,54,122)); --psn-entry-tint-mid:rgb(var(--psn-tone-081221,8,18,33)); --psn-entry-tint-end:rgb(var(--psn-tone-030509,3,5,9)); transition:--psn-entry-tint-top var(--psn-entry-theme-duration) ease-in-out,--psn-entry-tint-mid var(--psn-entry-theme-duration) ease-in-out,--psn-entry-tint-end var(--psn-entry-theme-duration) ease-in-out; margin: 0; font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; color: var(--text-main); height: 100dvh; min-height: -webkit-fill-available; overflow: hidden; background: radial-gradient(circle at top center,var(--psn-entry-tint-top) 0%,var(--psn-entry-tint-mid) 45%,var(--psn-entry-tint-end) 100%); display: flex; flex-direction: column; }
 /* RGB glass: animate only the ambient layer; fixed translucent surfaces reveal its colors. */
 :root[data-psn-rgb-theme] { --psn-rgb-cycle:84s; --psn-pad-modal-item-fill:var(--psn-panel-fill); --psn-rgb-title-divider:rgba(255,255,255,.36); --psn-panel-fill:rgba(18,24,36,.4); --psn-panel-hover:rgba(25,32,45,.6); --psn-rgb-modal-fill:rgba(4,5,8,.55); --psn-modal-overlay-blur:18px; --psn-modal-panel-blur:18px; --psn-rgb-modal-shade:rgba(0,0,0,.24); --psn-modal-glass-border:rgba(255,255,255,.2); --psn-modal-glass-shadow:0 10px 40px rgba(0,0,0,.8),0 0 20px rgba(255,255,255,.05),inset 0 1px 0 rgba(255,255,255,.025); --psn-rgb-header-fill:rgba(5,6,9,.48); --psn-rgb-control-hover:rgba(12,13,16,.36); --card-surface-bg:rgba(7,8,11,.43); --card-surface-hover-bg:rgba(12,13,16,.48); --card-state-fill:rgba(5,6,9,.45); --card-state-hover-fill:rgba(10,11,14,.50); }
-@media (display-mode:window-controls-overlay) { :root[data-psn-rgb-theme] { --psn-rgb-cycle:180s; } }
+:root[data-psn-rgb-theme][data-psn-rgb-mobile] { --psn-rgb-cycle:120s; }
+@media (display-mode:window-controls-overlay) { :root[data-psn-rgb-theme], :root[data-psn-rgb-theme][data-psn-rgb-mobile] { --psn-rgb-cycle:180s; } }
 html[data-psn-rgb-theme] body { --psn-entry-tint-top:#00367a; --psn-entry-tint-mid:#081221; --psn-entry-tint-end:#030509; }
 #psn-rgb-background { position:fixed; inset:0; z-index:-2; pointer-events:none; opacity:0; visibility:hidden; transition:opacity var(--psn-entry-theme-duration) ease-in-out; }
 html[data-psn-rgb-theme] #psn-rgb-background { opacity:1; visibility:visible; }
@@ -794,6 +814,8 @@ body:has(.global-main-header.psn-island-header) #psn-ambient-aurora { inset:0; }
 .global-main-header.psn-island-header:not(.psn-header-depth) #nav-magic-light { opacity:0 !important; visibility:hidden; }
 .global-main-header.psn-island-header { background-color:transparent; backdrop-filter:none; -webkit-backdrop-filter:none; box-shadow:none; border-bottom-color:transparent; isolation:isolate; transition:none; }
 .global-main-header.psn-island-header .psn-header-glass-layer { position:absolute; inset:0; z-index:-1; pointer-events:none; background:var(--psn-rgb-header-fill,rgba(var(--psn-tone-121824,18,24,36),.7)); backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(5px); border-bottom:1px solid rgba(var(--psn-tone-91c4ef,145,196,239),.105); box-shadow:0 5px 18px rgba(0,0,0,.42),inset 0 -1px 0 rgba(var(--psn-tone-64afee,100,175,238),.06); opacity:0; will-change:opacity; }
+.psn-rgb-mobile-header-edge { display:none; }
+html[data-psn-rgb-theme][data-psn-rgb-mobile-bar] .psn-rgb-mobile-header-edge { display:block; position:absolute; inset:0 0 auto; height:calc(100% + 20px); z-index:-1; pointer-events:none; background-color:transparent; -webkit-mask-image:linear-gradient(to bottom,#000 0 12px,transparent 100%); mask-image:linear-gradient(to bottom,#000 0 12px,transparent 100%); }
 .global-main-header.psn-island-header #psn-header-scroll-progress { opacity:0; transition:opacity .3s ease; }
 .global-main-header.psn-island-header.psn-header-depth #psn-header-scroll-progress { opacity:1; }
 .global-main-header.psn-island-header .top-nav { position:relative; isolation:isolate; }
@@ -9559,6 +9581,7 @@ html[data-psn-rgb-theme] .shared-content-link-modal .shared-content-link-card::b
 
 	<div class="global-main-header psn-island-header">
 		<div class="psn-header-glass-layer" aria-hidden="true"></div>
+		<div class="psn-rgb-mobile-header-edge" aria-hidden="true"></div>
 		<div class="pwa-controls-wrapper">
 			<button type="button" class="pwa-title-btn" onclick="location.reload()" title="Reload Page">
 				<i class="fas fa-sync-alt"></i>
