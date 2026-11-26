@@ -222,17 +222,111 @@
 		if (currentAt && (!incomingAt || incomingAt < currentAt)) return false;
 		return authoritative || !!incomingAt || (!currentAt && currentColor === '#0070cc');
 	}
+	const psnRgbWindowColor = (function () {
+		// Samples from the top edge of the existing RGB frames, in animation order.
+		const colors = [
+			[[5,70,132],[6,76,144],[8,74,141],[13,64,125],[23,50,104],[38,38,90],[57,29,85],[77,26,88],[91,25,93],[95,24,93],[88,21,85]],
+			[[46,33,23],[48,35,24],[46,37,27],[38,38,33],[27,43,44],[19,54,62],[12,71,85],[8,88,107],[6,98,121],[5,98,120],[5,88,108]],
+			[[117,29,63],[127,30,68],[124,30,69],[106,28,65],[83,24,63],[64,22,66],[52,21,76],[49,22,91],[49,23,101],[48,22,103],[44,20,96]],
+			[[7,19,44],[7,22,47],[7,24,46],[7,27,45],[8,36,45],[9,49,49],[10,68,58],[11,87,68],[12,98,75],[12,98,74],[11,87,66]],
+			[[135,55,35],[148,59,37],[145,57,38],[127,50,39],[105,40,40],[89,31,46],[86,26,55],[91,24,66],[98,24,74],[98,24,76],[90,21,70]],
+			[[14,38,36],[15,40,38],[14,41,41],[13,41,47],[11,44,58],[9,54,79],[7,69,107],[7,85,135],[6,95,152],[6,94,151],[5,84,136]],
+			[[110,23,47],[120,25,51],[118,26,50],[106,28,47],[92,32,41],[85,41,37],[89,55,36],[102,70,37],[113,82,37],[115,85,37],[105,78,35]],
+			[[6,32,44],[6,34,47],[8,33,48],[13,30,51],[22,27,59],[35,25,75],[51,26,97],[66,29,120],[76,31,135],[76,30,135],[68,27,121]],
+			[[17,61,131],[19,67,143],[20,67,139],[22,63,120],[28,60,94],[40,62,71],[58,72,55],[76,86,47],[90,97,44],[94,99,41],[87,91,37]],
+			[[44,25,21],[48,27,23],[49,26,26],[51,25,29],[58,24,37],[75,25,51],[100,29,69],[125,34,85],[142,37,96],[141,36,96],[125,32,86]],
+			[[5,75,102],[6,81,111],[7,79,110],[9,68,100],[13,54,88],[19,41,82],[27,34,86],[34,31,96],[39,30,105],[39,29,107],[36,27,99]],
+			[[38,15,40],[40,17,42],[38,19,42],[32,25,43],[24,34,45],[17,51,52],[12,72,63],[10,92,75],[8,105,83],[7,105,83],[5,93,75]]
+		];
+		const mode = window.matchMedia('(display-mode: window-controls-overlay)');
+		const reduced = window.matchMedia('(prefers-reduced-motion: reduce)');
+		const overlay = navigator.windowControlsOverlay;
+		const meta = document.querySelector('meta[name="theme-color"]');
+		let enabled = false, timer = null, blend = null, background = null, glass = null, position = 9;
+		function write(color) {
+			if (meta && meta.content !== color) meta.content = color;
+		}
+		function stop() {
+			if (timer !== null) clearTimeout(timer);
+			timer = null;
+			blend = null;
+		}
+		function updatePosition() {
+			const rect = overlay?.getTitlebarAreaRect?.();
+			const width = window.innerWidth || 1;
+			const seam = rect && rect.width > 0 ? (rect.x > width - rect.x - rect.width ? rect.x : rect.x + rect.width) / width : .9;
+			position = Math.max(0,Math.min(10,seam*10));
+		}
+		function ease(t) {
+			// Match the CSS ease-in-out cubic-bezier(.42,0,.58,1).
+			let low = 0, high = 1;
+			for (let i = 0; i < 12; i++) {
+				const u = (low+high)/2, v = 1-u;
+				if (3*v*v*u*.42+3*v*u*u*.58+u*u*u < t) low = u; else high = u;
+			}
+			const u = (low+high)/2;
+			return u*u*(3-2*u);
+		}
+		function tick() {
+			timer = null;
+			if (!enabled || document.hidden || !mode.matches || overlay?.visible === false) return;
+			background ||= document.getElementById('psn-rgb-background');
+			glass ||= document.querySelector('.psn-header-glass-layer');
+			if (!reduced.matches && (!blend || blend.playState === 'idle')) {
+				blend = background?.getAnimations?.({subtree:true}).find(animation => animation.animationName === 'psnRgbBlend') || null;
+			}
+			const progress = reduced.matches ? 0 : blend?.effect?.getComputedTiming().progress ?? 0;
+			const phase = (progress * colors.length) % colors.length;
+			const index = Math.floor(phase), mix = ease(phase-index);
+			const left = Math.floor(position), right = Math.min(10,left+1), fraction = position-left;
+			const shade = Math.max(0,Math.min(1,Number(glass?.style.opacity)||0))*.48;
+			const tint = [5,6,9];
+			const rgb = colors[index][left].map((value,channel) => {
+				const a = value+(colors[index][right][channel]-value)*fraction;
+				const next = colors[(index+1)%colors.length];
+				const b = next[left][channel]+(next[right][channel]-next[left][channel])*fraction;
+				return Math.round((a+(b-a)*mix)*(1-shade)+tint[channel]*shade);
+			});
+			write('#'+rgb.map(value=>value.toString(16).padStart(2,'0')).join(''));
+			if (!reduced.matches) timer = setTimeout(tick,200);
+		}
+		function sync() {
+			stop();
+			if (!enabled || document.hidden) return;
+			if (!mode.matches || overlay?.visible === false) {
+				const neutral = document.documentElement.style.getPropertyValue('--psn-tone-0f1521');
+				if (neutral) write('#'+neutral.split(',').map(v=>Number(v).toString(16).padStart(2,'0')).join(''));
+				return;
+			}
+			updatePosition();
+			tick();
+		}
+		function setEnabled(value) {
+			if (enabled !== value) {
+				enabled = value;
+				const method = value ? 'addEventListener' : 'removeEventListener';
+				mode[method]('change',sync);
+				reduced[method]('change',sync);
+				overlay?.[method]('geometrychange',sync);
+				window[method]('resize',sync);
+			}
+			if (enabled) sync(); else stop();
+		}
+		return {setEnabled,sync};
+	})();
 	function syncRgbThemeVisibility() {
 		document.documentElement.toggleAttribute('data-psn-rgb-paused', document.hidden);
+		psnRgbWindowColor.sync();
 	}
 	function setRgbThemeEnabled(enabled) {
 		document.removeEventListener('visibilitychange',syncRgbThemeVisibility);
 		if (enabled) {
 			document.addEventListener('visibilitychange',syncRgbThemeVisibility);
-			syncRgbThemeVisibility();
+			document.documentElement.toggleAttribute('data-psn-rgb-paused',document.hidden);
 		} else {
 			document.documentElement.removeAttribute('data-psn-rgb-paused');
 		}
+		psnRgbWindowColor.setEnabled(enabled);
 	}
 	function isLoginThemeWaitingForReveal() {
 		const boot = document.getElementById('ps5-boot-container');
@@ -285,8 +379,8 @@
 		}
 		root.toggleAttribute('data-psn-rgb-theme', rgb);
 		if (rgb) window.resetPsnAmbientCoverHover?.();
-		setRgbThemeEnabled(rgb);
 		applyThemePalette(rgb ? '#b0b0b0' : nextColor, rgb);
+		setRgbThemeEnabled(rgb);
 		return true;
 	}
 	function applyThemePalette(nextColor, glass = false) {
