@@ -201,6 +201,17 @@
 	</script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no">
+	<meta name="apple-mobile-web-app-capable" content="yes">
+	<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+	<script>(function(){
+		const root = document.documentElement;
+		const mobile = /Android/i.test(navigator.userAgent || '') || navigator.userAgentData?.platform === 'Android' || root.classList.contains('ios-webkit');
+		const installed = navigator.standalone === true || matchMedia('(display-mode: standalone)').matches || matchMedia('(display-mode: fullscreen)').matches;
+		if (!mobile || !installed) return;
+		const viewport = document.querySelector('meta[name="viewport"]');
+		viewport.content += ', viewport-fit=cover';
+		root.setAttribute('data-psn-mobile-edge','');
+	})();</script>
     <title>NoPayStation™ Network Database</title>
 	<link rel="icon" type="image/png" sizes="32x32" href="https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/favicon/favicon-32x32.png">
 	<link rel="icon" type="image/png" sizes="16x16" href="https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/interface/modern/images/favicon/favicon-16x16.png">
@@ -246,7 +257,20 @@
 		const mobile = android || ios;
 		function isDesktopOverlay() { return mode.matches && overlay?.visible !== false; }
 		const meta = document.querySelector('meta[name="theme-color"]');
-		let enabled = false, timer = null, blend = null, background = null, glass = null, position = 9;
+		let enabled = false, frameRequest = null, blend = null, background = null, glass = null, position = 9, mobileTopEdge = false;
+		function hasMobileTopEdge() {
+			const root = document.documentElement;
+			if (!mobile || !root.hasAttribute('data-psn-mobile-edge')) return false;
+			const inset = parseFloat(getComputedStyle(root).getPropertyValue('--psn-pwa-safe-top')) || 0;
+			// Insets alone do not prove that the native status bar overlaps the page.
+			const missing = Math.max(0, window.screen.height - window.innerHeight);
+			return inset > 0 && missing < inset - 2;
+		}
+		function clearIosFallback() {
+			if (!ios) return;
+			document.body?.style.removeProperty('background-color');
+			background?.style.removeProperty('background-color');
+		}
 		function write(color) {
 			if (meta && meta.content !== color) meta.content = color;
 			if (ios && enabled && document.body) {
@@ -256,8 +280,8 @@
 			}
 		}
 		function stop() {
-			if (timer !== null) clearTimeout(timer);
-			timer = null;
+			if (frameRequest !== null) cancelAnimationFrame(frameRequest);
+			frameRequest = null;
 			blend = null;
 		}
 		function updatePosition() {
@@ -278,8 +302,8 @@
 			return u*u*(3-2*u);
 		}
 		function tick() {
-			timer = null;
-			if (!enabled || document.hidden || (!isDesktopOverlay() && !mobile)) return;
+			frameRequest = null;
+			if (!enabled || document.hidden || mobileTopEdge || (!isDesktopOverlay() && !mobile)) return;
 			background ||= document.getElementById('psn-rgb-background');
 			glass ||= document.querySelector('.psn-header-glass-layer');
 			if (!reduced.matches && (!blend || blend.playState === 'idle')) {
@@ -289,7 +313,7 @@
 			const progress = timing?.progress ?? 0;
 			// Small lead compensates for native title-bar repaint latency.
 			const lead = blend?.playState === 'running' && timing?.progress != null && Number(timing.duration) > 0
-				? (isDesktopOverlay() ? 75 : 50) * blend.playbackRate / Number(timing.duration) : 0;
+				? (isDesktopOverlay() ? 125 : 100) * blend.playbackRate / Number(timing.duration) : 0;
 			const phase = ((progress + lead) * colors.length % colors.length + colors.length) % colors.length;
 			const index = Math.floor(phase), mix = ease(phase-index);
 			const left = Math.floor(position), right = Math.min(10,left+1), fraction = position-left;
@@ -302,11 +326,17 @@
 				return Math.round((a+(b-a)*mix)*(1-shade)+tint[channel]*shade);
 			});
 			write('#'+rgb.map(value=>value.toString(16).padStart(2,'0')).join(''));
-			if (!reduced.matches) timer = setTimeout(tick,50);
+			if (!reduced.matches) frameRequest = requestAnimationFrame(tick);
 		}
 		function sync() {
 			stop();
 			if (!enabled || document.hidden) return;
+			mobileTopEdge = hasMobileTopEdge();
+			if (mobileTopEdge) {
+				clearIosFallback();
+				if (meta && meta.content !== '#0f1521') meta.content = '#0f1521';
+				return;
+			}
 			if (!isDesktopOverlay() && !mobile) {
 				const neutral = document.documentElement.style.getPropertyValue('--psn-tone-0f1521');
 				if (neutral) write('#'+neutral.split(',').map(v=>Number(v).toString(16).padStart(2,'0')).join(''));
@@ -328,10 +358,8 @@
 			if (enabled) sync();
 			else {
 				stop();
-				if (changed && ios && document.body) {
-					document.body.style.removeProperty('background-color');
-					background?.style.removeProperty('background-color');
-				}
+				mobileTopEdge = false;
+				if (changed) clearIosFallback();
 			}
 		}
 		return {setEnabled,sync};
@@ -7873,6 +7901,10 @@ a:focus, button:focus, select:focus, input:focus, textarea:focus, [contenteditab
 :focus-visible { outline: none !important; }
 .chat-translate-btn, .direct-chat-translate-btn { opacity: .68; transform: none; }
 }
+/* Mobile installed web apps: keep controls inside the safe area while the background fills the viewport. */
+:root[data-psn-mobile-edge] { --psn-pwa-safe-top:env(safe-area-inset-top,0px); --header-height:calc(70px + var(--psn-pwa-safe-top)); }
+:root[data-psn-mobile-edge] .global-main-header { padding-top:var(--psn-pwa-safe-top) !important; }
+:root[data-psn-mobile-edge]:not([data-psn-rgb-theme])::before { content:""; position:fixed; inset:0 0 auto; height:var(--psn-pwa-safe-top); background:rgb(var(--psn-tone-0f1521,15,21,33)); z-index:10000000; pointer-events:none; }
 @media (display-mode: window-controls-overlay) {
 #view-chat { height: 100% !important; max-height: 100% !important; }
 #subview-chat .file-manager-container { min-height: 0 !important; }
