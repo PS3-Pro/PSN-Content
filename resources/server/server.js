@@ -482,7 +482,7 @@ const POST_AUTH_PROFILE_SYNC_DELAY_MS = Math.max(0, parseInt(process.env.POST_AU
 const USER_CACHE_REFRESH_INTERVAL_MS = 30000;
 const PASSWORD_RESET_WINDOW_MS = 10 * 60 * 1000;
 const DEFAULT_MAINTENANCE_MESSAGE = "The service is under maintenance. Please try again soon.";
-const VALID_USER_ROLES = new Set(["user", "trusted", "mod", "admin"]);
+const VALID_USER_ROLES = new Set(["user", "developer", "mod", "admin"]);
 const VALID_PROFILE_COUNTRY_CODES = new Set([
   'AD', 'AE', 'AF', 'AG', 'AI', 'AL', 'AM', 'AO', 'AQ', 'AR', 'AS', 'AT',
   'AU', 'AW', 'AX', 'AZ', 'BA', 'BB', 'BD', 'BE', 'BF', 'BG', 'BH', 'BI',
@@ -641,6 +641,7 @@ function buildOnlineListSignature(list = []) {
       user && user.joined || "",
       user && user.level || 1,
       user && user.role || "",
+      user && user.isSupporter === true ? "1" : "0",
       getUserCountryCode(user),
       user && user.banned ? "1" : "0",
       Math.max(0, Number(user && user.presenceRevision) || 0),
@@ -663,6 +664,28 @@ function setSocketAdminState(socket, isAdmin) {
   return nextAdmin;
 }
 
+function getPendingSupporterNoticeAt(user = null) {
+  const stamp = Number(user?.supporterNoticePendingAt) || 0;
+  return Number.isSafeInteger(stamp) && stamp > 0 && stamp === Number(user?.supporterDonationAt) ? stamp : 0;
+}
+
+function emitSupporterNotice(name, user, socket = null) {
+  const stamp = getPendingSupporterNoticeAt(user);
+  if (!stamp) return false;
+  const payload = { targetName:name, noticeId:`supporter:${stamp}` };
+  for (const client of socket ? [socket] : getSocketsByUserName(name)) {
+    if (client.connected && client.userName === name) client.emit('supporter_notice', payload);
+  }
+  return true;
+}
+
+function clearSupporterNoticeCache(name, stamp) {
+  if (Number(userDatabase[name]?.supporterNoticePendingAt) === stamp) delete userDatabase[name].supporterNoticePendingAt;
+  for (const client of getSocketsByUserName(name)) {
+    if (client.connected) client.emit('supporter_notice', { targetName:name, noticeId:`supporter:${stamp}`, clear:true });
+  }
+}
+
 function buildRealtimeRolePayload(name, user = null) {
   const targetName = normalizeText(name, '');
   const source = user || userDatabase[targetName] || {};
@@ -675,6 +698,7 @@ function buildRealtimeRolePayload(name, user = null) {
     role,
     isAdmin,
     isModerator: role === 'mod',
+    isSupporter: isUserSupporter(source),
     banned,
     isBanned: banned
   };
@@ -703,7 +727,7 @@ function applyRealtimeRoleState(name, user = null, options = {}) {
   return payload;
 }
 
-const ROLE_NOTICE_RANK = Object.freeze({ user: 0, trusted: 1, mod: 2, admin: 3 });
+const ROLE_NOTICE_RANK = Object.freeze({ user: 0, developer: 1, mod: 2, admin: 3 });
 
 function normalizeRoleNoticeRole(value, fallback = 'user') {
   const raw = normalizeText(value, fallback).toLowerCase();
@@ -725,9 +749,9 @@ function buildRoleChangeNotice(targetName, role, previousRole, changedBy, option
     : (nextRank > priorRank ? 'promotion' : 'demotion');
 
   if (kind === 'promotion') {
-    if (nextRank <= priorRank || !['admin', 'mod'].includes(nextRole)) return null;
+    if (nextRank <= priorRank || !['admin', 'mod', 'developer'].includes(nextRole)) return null;
   } else {
-    if (nextRank >= priorRank || !['admin', 'mod'].includes(priorRole)) return null;
+    if (nextRank >= priorRank || !['admin', 'mod', 'developer'].includes(priorRole)) return null;
   }
 
   return {
@@ -785,7 +809,7 @@ function buildRoleChangeNoticeForTransition(targetName, nextRole, immediatePrevi
   const baselineRank = ROLE_NOTICE_RANK[baselineRole] || 0;
   const nextRank = ROLE_NOTICE_RANK[normalizedNextRole] || 0;
 
-  if (nextRank > baselineRank && ['admin', 'mod'].includes(normalizedNextRole)) {
+  if (nextRank > baselineRank && ['admin', 'mod', 'developer'].includes(normalizedNextRole)) {
     return buildRoleChangeNotice(targetName, normalizedNextRole, baselineRole, changedBy, { kind: 'promotion' });
   }
 
@@ -793,7 +817,7 @@ function buildRoleChangeNoticeForTransition(targetName, nextRole, immediatePrevi
     nextRank < baselineRank &&
     acknowledgedRole &&
     acknowledgedRole === baselineRole &&
-    ['admin', 'mod'].includes(baselineRole)
+    ['admin', 'mod', 'developer'].includes(baselineRole)
   ) {
     return buildRoleChangeNotice(targetName, normalizedNextRole, baselineRole, changedBy, { kind: 'demotion' });
   }
@@ -6237,6 +6261,7 @@ function getSanitizedOnlineList() {
     avatar: u.avatar || DEFAULT_AVATAR,
     isAdmin: isUserAdmin(username, u),
     role: getUserRole(username, u),
+    isSupporter: isUserSupporter(u),
     banned: isUserBanned(u),
     level: u.level || 1,
     joined: u.joined || '2026',
@@ -7116,6 +7141,15 @@ function isUserAdmin(name, userData = null) {
   return ADMIN_USERS.includes(name) || getUserRole(name, userData) === "admin";
 }
 
+function isUserSupporter(user) {
+  return Number(user && user.supporterDonationAt) > 0;
+}
+
+function getPublicBadgeMetadata(name) {
+  const user = Object.prototype.hasOwnProperty.call(userDatabase, name) ? userDatabase[name] : null;
+  return user ? { role:getUserRole(name, user), isAdmin:isUserAdmin(name, user), isModerator:isUserModerator(name, user), isSupporter:isUserSupporter(user), profileUpdatedAt:normalizeTimestampValue(user.profileUpdatedAt) } : {};
+}
+
 function isUserModerator(name, userData = null) {
   return getUserRole(name, userData) === "mod";
 }
@@ -7833,6 +7867,7 @@ function emitPublicProfileBannerUpdate(name, user = null) {
     publicUser.avatar || DEFAULT_AVATAR,
     publicUser.joined || '2026',
     publicUser.role || 'user',
+    publicUser.isSupporter === true,
     publicUser.isAdmin === true,
     Number(publicUser.level || 1),
     publicUser.countryCode || '',
@@ -7849,6 +7884,7 @@ function emitPublicProfileBannerUpdate(name, user = null) {
     avatar: publicUser.avatar || DEFAULT_AVATAR,
     joined: publicUser.joined || '2026',
     role: publicUser.role || 'user',
+    isSupporter: publicUser.isSupporter === true,
     isAdmin: publicUser.isAdmin === true,
     level: Number(publicUser.level || 1),
     profileUpdatedAt: normalizeTimestampValue(user.profileUpdatedAt) || Date.now(),
@@ -8101,6 +8137,7 @@ function getPublicUserData(username, user = {}, includeAdminFields = false) {
     avatar: user.avatar || DEFAULT_AVATAR,
     isAdmin: isUserAdmin(username, user),
     role: getUserRole(username, user),
+    isSupporter: isUserSupporter(user),
     level: user.level || 1,
     joined: user.joined || "2026",
     countryCode: getUserCountryCode(user),
@@ -8244,6 +8281,7 @@ function buildCompactUserSummary(name, userData = {}) {
     ...(notificationState ? { notificationState } : {}),
     countersData: buildCompactCountersData(source.countersData),
     ...(Number(source.supporterDonationAt) > 0 ? { supporterDonationAt:Number(source.supporterDonationAt) } : {}),
+    ...(getPendingSupporterNoticeAt(source) ? { supporterNoticePendingAt:getPendingSupporterNoticeAt(source) } : {}),
     themeColor: getUserSystemTheme(source),
     themeColorUpdatedAt: getUserThemeColorUpdatedAt(source),
     profileCardStyle: getUserProfileCardStyle(source),
@@ -11491,6 +11529,7 @@ function hydrateGamePlayerEntry(row, titleId) {
     lastSeen: publicUser.lastSeen || null,
     level: Math.max(1, Number(publicUser.level) || 1),
     role: publicUser.role || 'user',
+    isSupporter: publicUser.isSupporter === true,
     isAdmin: publicUser.isAdmin === true,
     ps3Status,
     isFriend: row && row.is_friend === true,
@@ -11915,6 +11954,7 @@ function buildLightProfileUserData(name, user = {}) {
     joined: user.joined || '2026',
     countryCode: getUserCountryCode(user),
     role: getUserRole(name, user),
+    isSupporter: isUserSupporter(user),
     isAdmin: isUserAdmin(name, user),
     isModerator: isUserModerator(name, user),
     banned: isUserBanned(user),
@@ -12360,6 +12400,8 @@ async function patchUserData(name, patch = {}, label = 'USER DATA PATCH') {
   delete outgoing.passwordHash;
   delete outgoing.password;
   delete outgoing.supporterDonationAt;
+  delete outgoing.isSupporter;
+  delete outgoing.supporterNoticePendingAt;
   const keys = Object.keys(outgoing);
   if (!keys.length) return true;
   const writesTrophies = hasObjectPayload(outgoing.trophiesData);
@@ -12487,7 +12529,9 @@ function getPublicChatHistory() {
 }
 
 function getPublicChatMessageForUser(message, userName = '') {
-  return cleanChatMessage(message);
+  const clean = cleanChatMessage(message);
+  delete clean.isSupporter;
+  return { ...clean, ...getPublicBadgeMetadata(clean.user) };
 }
 
 function getPublicChatHistoryForUser(userName = '') {
@@ -13217,7 +13261,7 @@ async function syncChatAcrossInstances() {
         messageHistory.push(message);
         if (messageHistory.length > MAX_CHAT_HISTORY) messageHistory.shift();
         lastChatDbId = Math.max(lastChatDbId, dbId);
-        const publicSyncedMessage = cleanChatMessage(message);
+        const publicSyncedMessage = getPublicChatMessageForUser(message);
         io.sockets.sockets.forEach(client => {
           if (!client || !client.connected || client.__chatInitialFullSyncInFlight === true) return;
           client.emit('chat_message', publicSyncedMessage);
@@ -13236,7 +13280,7 @@ async function syncChatAcrossInstances() {
         const maxId = Number(meta.rows[0]?.max_id || 0);
         if (maxId < lastChatDbId) {
           await refreshChatHistoryFromDb();
-          const publicHistory = getPublicChatHistory();
+          const publicHistory = getPublicChatHistoryForUser();
           io.sockets.sockets.forEach(client => {
             if (!client || !client.connected || client.__chatInitialFullSyncInFlight === true) return;
             client.emit('chat_history', publicHistory);
@@ -13432,7 +13476,7 @@ function directGroupId(value) { const id = String(value || '').trim().toLowerCas
 function serializeDirectGroupMessage(row) {
   if (!row) return null;
   const type = row.message_type === 'playing' ? 'playing' : (row.message_type === 'poll' ? 'poll' : normalizeDirectMessageType(row.message_type, normalizeDirectMessageMedia(row.content)));
-  return { id:String(row.id), groupId:String(row.group_id), from:normalizeDirectMessageUser(row.sender_name), text:sanitizeGlobalChatMarkup(String(row.text || '').slice(0,DIRECT_MESSAGE_TEXT_MAX)), type, content:type === 'playing' ? normalizeSocialPlaying(row.content) : (type === 'poll' ? normalizeDirectGroupPoll(row.content,true) : normalizeDirectMessageMedia(row.content)), replyTo:normalizeDirectMessageReply(row.reply_to), reactions:normalizeDirectMessageReactions(row.reactions,DIRECT_GROUP_MAX_MEMBERS), pinnedAt:row.pinned_at ? new Date(row.pinned_at).toISOString():null, editedAt:row.edited_at ? new Date(row.edited_at).toISOString():null, createdAt:new Date(row.created_at).toISOString() };
+  return { id:String(row.id), groupId:String(row.group_id), from:normalizeDirectMessageUser(row.sender_name), ...getPublicBadgeMetadata(normalizeDirectMessageUser(row.sender_name)), text:sanitizeGlobalChatMarkup(String(row.text || '').slice(0,DIRECT_MESSAGE_TEXT_MAX)), type, content:type === 'playing' ? normalizeSocialPlaying(row.content) : (type === 'poll' ? normalizeDirectGroupPoll(row.content,true) : normalizeDirectMessageMedia(row.content)), replyTo:normalizeDirectMessageReply(row.reply_to), reactions:normalizeDirectMessageReactions(row.reactions,DIRECT_GROUP_MAX_MEMBERS), pinnedAt:row.pinned_at ? new Date(row.pinned_at).toISOString():null, editedAt:row.edited_at ? new Date(row.edited_at).toISOString():null, createdAt:new Date(row.created_at).toISOString() };
 }
 function normalizeDirectGroupPoll(value, allowVoters = false) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
@@ -13772,6 +13816,7 @@ function serializeDirectMessage(row) {
   return {
     id: String(row.id || ''),
     from: normalizeDirectMessageUser(row.sender_name || row.from),
+    ...getPublicBadgeMetadata(normalizeDirectMessageUser(row.sender_name || row.from)),
     to: normalizeDirectMessageUser(row.recipient_name || row.to),
     text: sanitizeGlobalChatMarkup(String(row.text == null ? '' : row.text).slice(0, DIRECT_MESSAGE_TEXT_MAX)),
     type,
@@ -14021,6 +14066,7 @@ async function queryDirectConversationPayload(userName) {
 
   const conversations = (result.rows || []).map(row => ({
     peer: row.peer_name,
+    ...getPublicBadgeMetadata(row.peer_name),
     avatar: row.peer_avatar || DEFAULT_AVATAR,
     online: row.peer_online === true,
     lastSeen: newestDirectActivityIso(row.peer_last_seen, row.peer_message_activity_at),
@@ -14524,6 +14570,7 @@ function buildFullProfileSyncPayload(name, user = {}, sourceSocketId = null, opt
       joined: safe.joined || '2026',
       countryCode: getUserCountryCode(safe),
       role: getUserRole(name, safe),
+      isSupporter: isUserSupporter(safe),
       isAdmin: isUserAdmin(name, safe),
       isModerator: isUserModerator(name, safe),
       banned: isUserBanned(safe),
@@ -14562,15 +14609,15 @@ function buildFullProfileSyncPayload(name, user = {}, sourceSocketId = null, opt
 }
 
 const PROFILE_SYNC_PATCH_KEYS = new Set([
-  'id', 'name', 'avatar', 'joined', 'countryCode', 'role', 'isAdmin', 'isModerator', 'banned',
+  'id', 'name', 'avatar', 'joined', 'countryCode', 'role', 'isAdmin', 'isModerator', 'isSupporter', 'banned',
   'lastSeen', 'ps3Status', 'level', 'xp',
   ...Object.entries(PROFILE_HEAVY_SECTION_META).flatMap(([dataKey, meta]) => [dataKey, meta.countKey, ...(meta.versionKeys || [])].filter(Boolean)),
   'recentlyVisited', 'recentlyVisitedData', 'recentlyVisitedUpdatedAt', 'notificationState',
   'countersData', 'themeColor', 'themeColorUpdatedAt', 'settingsData'
 ]);
 
-const PROFILE_ONLINE_LIST_KEYS = new Set(['id', 'avatar', 'joined', 'countryCode', 'role', 'isAdmin', 'banned', 'level', 'ps3Status']);
-const PROFILE_PUBLIC_META_KEYS = new Set(['avatar', 'joined', 'countryCode', 'role', 'isAdmin', 'isModerator', 'banned', 'level']);
+const PROFILE_ONLINE_LIST_KEYS = new Set(['id', 'avatar', 'joined', 'countryCode', 'role', 'isAdmin', 'isSupporter', 'banned', 'level', 'ps3Status']);
+const PROFILE_PUBLIC_META_KEYS = new Set(['avatar', 'joined', 'countryCode', 'role', 'isAdmin', 'isModerator', 'isSupporter', 'banned', 'level']);
 function profileChangedKeysTouchOnlineList(changedKeys = []) {
   return Array.isArray(changedKeys) && changedKeys.some(key => PROFILE_ONLINE_LIST_KEYS.has(key));
 }
@@ -14591,6 +14638,7 @@ function buildProfileSyncPatchPayload(name, user = {}, changedKeys = [], sourceS
   if (include('joined')) target.joined = user.joined || '2026';
   if (include('countryCode')) target.countryCode = getUserCountryCode(user);
   if (include('role')) target.role = getUserRole(name, user);
+  if (include('isSupporter')) target.isSupporter = isUserSupporter(user);
   if (include('isAdmin')) target.isAdmin = isUserAdmin(name, user);
   if (include('isModerator')) target.isModerator = isUserModerator(name, user);
   if (include('banned')) target.banned = isUserBanned(user);
@@ -14693,6 +14741,7 @@ function buildPresenceUpdatePayload(name, user = null) {
     joined: source.joined || '2026',
     countryCode: getUserCountryCode(source),
     role: getUserRole(name, source),
+    isSupporter: isUserSupporter(source),
     isAdmin: isUserAdmin(name, source),
     banned: isUserBanned(source),
     ps3Status: source.online === true ? (source.ps3Status || null) : null,
@@ -14845,6 +14894,8 @@ async function notifyProfileSyncAcrossInstances(name, sourceSocketId = null, pro
       ...(changes && changes.previousRole ? { previousRole: normalizeText(changes.previousRole, '').toLowerCase().slice(0, 24) } : {}),
       roleNoticeChanged: changes && changes.roleNoticeChanged === true,
       roleNoticeOnly: changes && changes.roleNoticeOnly === true,
+      ...(changes?.supporterNoticeChanged === true ? { supporterNoticeChanged:true } : {}),
+      ...(Number(changes?.supporterNoticeAckAt) > 0 ? { supporterNoticeAckAt:Number(changes.supporterNoticeAckAt) } : {}),
       ...(changes && changes.roleNoticeAckId ? { roleNoticeAckId: normalizeText(changes.roleNoticeAckId, '').slice(0, 96) } : {}),
       ...(changes && changes.roleChangeNotice && typeof changes.roleChangeNotice === 'object'
         ? { roleChangeNotice: normalizeStoredRoleChangeNotice(changes.roleChangeNotice, name) }
@@ -15254,7 +15305,8 @@ async function initProfileSyncNotifications() {
         emitPublicProfileListChanged(name, sectionKeys, data.profileUpdatedAt);
       }
       if (message.channel === 'profile_sync' && data.changes && data.changes.roleNoticeOnly === true) {
-        emitRoleChangeNoticeState(name, null, { noticeId: data.changes.roleNoticeAckId });
+        if (Number(data.changes.supporterNoticeAckAt) > 0) clearSupporterNoticeCache(name, Number(data.changes.supporterNoticeAckAt));
+        else emitRoleChangeNoticeState(name, null, { noticeId: data.changes.roleNoticeAckId });
         return;
       }
 
@@ -15376,6 +15428,7 @@ async function initProfileSyncNotifications() {
       if (legacyBroadProfileChange || changedKeys.some(key => key === 'libraryData' || key === 'downloadsData' || key === 'friendsData')) {
         clearGamePlayersSummaryCache();
       }
+      if (hasLocalSession && data.changes?.supporterNoticeChanged === true) emitSupporterNotice(name, refreshedUser);
       const syncChangedKeys = legacyBroadProfileChange ? null : changedKeys;
       if (hasLocalSession) {
         const localSockets = getSocketsByUserName(name).filter(client => !(data.sourceSocketId && client.id === data.sourceSocketId));
@@ -17402,7 +17455,7 @@ function packOnlineListForSocket(client, list) {
   return { onlineListCompactV1: 1, rows: list.map(user => [
     user.id, user.name, user.avatar, user.isAdmin, user.role, user.banned,
     user.level, user.joined, user.countryCode, user.online, user.lastSeen,
-    user.presenceRevision, user.ps3Status, ...(withSince ? [user.onlineSince] : [])
+    user.presenceRevision, user.ps3Status, ...(withSince ? [user.onlineSince, user.isSupporter === true] : [])
   ]) };
 }
 
@@ -17566,7 +17619,7 @@ async function setUserRole(targetName, role, adminName) {
 
   const normalizedRole = role === "moderator" ? "mod" : normalizeText(role, "user").toLowerCase();
   if (!VALID_USER_ROLES.has(normalizedRole)) {
-    return { success: false, message: "Invalid role. Use user, trusted, mod, or admin." };
+    return { success: false, message: "Invalid role. Use user, developer, mod, or admin." };
   }
 
   if (ADMIN_USERS.includes(targetName) && normalizedRole !== "admin") {
@@ -18038,6 +18091,7 @@ function buildContentShareSharerPayload(name, source = {}) {
     name,
     avatar: normalizeText(user.avatar, DEFAULT_AVATAR).slice(0, 4096),
     role: getUserRole(name, user),
+    isSupporter: isUserSupporter(user),
     isAdmin: isUserAdmin(name, user),
     isModerator: isUserModerator(name, user),
     level: Math.max(1, Number(user.level) || 1),
@@ -18200,7 +18254,7 @@ function socialPublicReactions(raw) {
 function serializeSocialPost(row) {
   if (!row) return null;
   return {
-    id: String(row.id), author: row.author_name, avatar: row.author_avatar || DEFAULT_AVATAR,
+    id: String(row.id), author: row.author_name, ...getPublicBadgeMetadata(row.author_name), avatar: row.author_avatar || DEFAULT_AVATAR,
     text: row.body || '', images: Array.isArray(row.images) ? row.images : [],
     playing: normalizeSocialPlaying(row.playing),
     createdAt: row.created_at, editedAt: row.edited_at || null, reactions: socialPublicReactions(row.reactions),
@@ -18211,7 +18265,7 @@ function serializeSocialPost(row) {
 function serializeSocialComment(row) {
   if (!row) return null;
   return {
-    id: String(row.id), postId: String(row.post_id), author: row.author_name,
+    id: String(row.id), postId: String(row.post_id), author: row.author_name, ...getPublicBadgeMetadata(row.author_name),
     avatar: row.author_avatar || DEFAULT_AVATAR, text: row.body || '',
     parentId: row.parent_id ? String(row.parent_id) : null,
     parentAuthor: row.parent_author || '', replyCount: Number(row.reply_count) || 0,
@@ -19418,6 +19472,8 @@ io.on('connection', (socket) => {
             });
           }
 
+          if (getPendingSupporterNoticeAt(dbUser)) emitSupporterNotice(name, dbUser, socket);
+
           if (pendingRoleChangeNoticeAtAuth) {
             deferServerTask('AUTH PENDING ROLE CHANGE NOTICE', () => {
               emitPendingRoleChangeNoticeToSocket(socket, { ...dbUser, pendingRoleChangeNotice: pendingRoleChangeNoticeAtAuth });
@@ -19850,6 +19906,8 @@ io.on('connection', (socket) => {
     userData = (userData && typeof userData === "object") ? { ...userData } : {};
     delete userData.notificationState;
     delete userData.supporterDonationAt;
+    delete userData.isSupporter;
+    delete userData.supporterNoticePendingAt;
     discardInvalidTrophySnapshot(userData);
     const syncRequestId = normalizeText(userData._syncRequestId, '');
     const syncReason = normalizeText(userData._syncReason, '');
@@ -21043,7 +21101,7 @@ io.on('connection', (socket) => {
           if (filter === 'offline') return user.online !== true;
           if (filter === 'admin') return isUserAdmin(username, user);
           if (filter === 'mod') return role === 'mod';
-          if (filter === 'trusted') return role === 'trusted';
+          if (filter === 'developer') return role === 'developer';
           if (filter === 'banned') return banned;
           if (filter === 'user') return !isUserAdmin(username, user) && !banned && role === 'user';
           return true;
@@ -21493,6 +21551,7 @@ io.on('connection', (socket) => {
       `, [viewer, pattern, DIRECT_MESSAGE_HISTORY_MAX, DEFAULT_AVATAR, DIRECT_MESSAGE_SEARCH_MAX], { attempts:2, label:'DIRECT MESSAGE GLOBAL SEARCH' });
       const results = (result.rows || []).map(row => ({
         peer: row.peer_name,
+        ...getPublicBadgeMetadata(row.peer_name),
         avatar: row.peer_avatar || DEFAULT_AVATAR,
         online: row.peer_online === true,
         lastSeen: newestDirectActivityIso(row.peer_last_seen, row.peer_message_activity_at),
@@ -22336,6 +22395,8 @@ io.on('connection', (socket) => {
       chatTrace.stage('sanitized', { storedPayload:sanitizedTraceStats.payload, storedType:sanitizedTraceStats.type, storedTextBytes:sanitizedTraceStats.textBytes, storedContentCount:sanitizedTraceStats.contentCount, storedContentBytes:sanitizedTraceStats.contentBytes });
     }
 
+    delete messageData.isSupporter;
+    delete messageData.supporterNoticePendingAt;
     messageData.isAdmin = isAdmin;
     messageData.role = actorRole;
     messageData.isModerator = actorRole === 'mod';
@@ -22353,7 +22414,7 @@ io.on('connection', (socket) => {
       if (messageHistory.length > MAX_CHAT_HISTORY) messageHistory.shift();
       chatTrace.stage('after_history_push', { historySize:messageHistory.length });
 
-      const publicMessage = cleanChatMessage(messageData);
+      const publicMessage = getPublicChatMessageForUser(messageData);
       deferServerTask('CHAT USER NOTIFICATIONS', () => recordChatUserNotifications(publicMessage), 0);
       const syncChange = saved.change;
       chatTrace.stage('after_sync_change', { revision:Number(syncChange && syncChange.revision)||0 });
@@ -22605,6 +22666,7 @@ io.on('connection', (socket) => {
         WITH granted AS (
           UPDATE users SET data = COALESCE(data, '{}'::jsonb) || jsonb_build_object(
             'supporterDonationAt', $2::bigint,
+            'supporterNoticePendingAt', $2::bigint,
             'trophiesData', (CASE WHEN jsonb_typeof(data->'trophiesData')='object' THEN data->'trophiesData' ELSE '{}'::jsonb END) || jsonb_build_object('site_supporter', $3::jsonb),
             'trophies', (SELECT count(*) FROM jsonb_each(CASE WHEN jsonb_typeof(data->'trophiesData')='object' THEN data->'trophiesData' ELSE '{}'::jsonb END) AS t(id, state) WHERE id <> 'site_supporter' AND lower(COALESCE(state->>'unlocked','false')) IN ('true','1','yes')) + 1,
             'xp', (CASE WHEN data->>'xp' ~ '^[0-9]{1,9}$' THEN (data->>'xp')::integer ELSE 0 END) + 90,
@@ -22623,20 +22685,25 @@ io.on('connection', (socket) => {
       if (!target) return respond({ success:false, message:'User not found.' });
       if (!(Number(target.supporterDonationAt) > 0)) return respond({ success:false, message:'Donation could not be confirmed.' });
       if (!result.rows.length && cachedDonationAt === Number(target.supporterDonationAt)) {
+        emitSupporterNotice(name, target);
         deferServerTask('DONATION CACHE COMPACT', () => compactCachedUser(name), 250);
         return respond({ success:true, already:true });
       }
-      const keys = ['trophiesData','trophies','xp','level'];
+      const keys = ['trophiesData','trophies','xp','level','isSupporter'];
       invalidatePublicProfileListReads(name, keys);
       emitPublicProfileListChanged(name, keys, target.profileUpdatedAt);
       emitProfileSyncPatchFromUser(name, target, keys);
       emitProfileCountsUpdate(name, target);
+      emitPublicProfileBannerUpdate(name, target);
+      invalidateOnlineListCache('supporter-update');
+      emitPresenceUpdate(name, target);
       emitRewardNoticeChange(name);
+      emitSupporterNotice(name, target);
       if (result.rows.length) {
         invalidateGlobalTrophyStatsCache();
         scheduleTrophyStatsRefreshBroadcast(900);
       }
-      deferServerTask('DONATION REWARD SYNC', () => notifyProfileSyncAcrossInstances(name, null, target.profileUpdatedAt, { keys, trophies:true, counts:true }), 0);
+      deferServerTask('DONATION REWARD SYNC', () => notifyProfileSyncAcrossInstances(name, null, target.profileUpdatedAt, { keys, trophies:true, counts:true, publicProfile:true, supporterNoticeChanged:true }), 0);
       deferServerTask('DONATION NOTICE SYNC', () => notifyRewardNoticeChange(name), 0);
       deferServerTask('DONATION CACHE COMPACT', () => compactCachedUser(name), 250);
       if (result.rows.length) await addModerationLog('donation', `Confirmed donation from ${name}`, { targetName:name }, socket.userName);
@@ -22664,6 +22731,27 @@ io.on('connection', (socket) => {
     } catch (err) {
       console.error('[ADMIN ROLE ERROR]:', err);
       respond({ success: false, message: "Server error while changing role." });
+    }
+  });
+
+  socket.on('ack_supporter_notice', async (data = {}, callback) => {
+    const respond = typeof callback === 'function' ? callback : () => {};
+    const name = socket.userName;
+    const match = /^supporter:(\d{1,16})$/.exec(String(data?.noticeId || ''));
+    const stamp = match ? Number(match[1]) : 0;
+    if (!name || !Number.isSafeInteger(stamp) || stamp <= 0) return respond({ success:false });
+    try {
+      const result = await runSerializedUserRowMutation(name, () => queryDbWithRetry(`
+        UPDATE users SET data = data - 'supporterNoticePendingAt'
+        WHERE name=$1 AND data->>'supporterNoticePendingAt'=$2::text
+          AND data->>'supporterDonationAt'=$2::text RETURNING name
+      `, [name, String(stamp)], { attempts:2, label:'SUPPORTER NOTICE ACK' }));
+      clearSupporterNoticeCache(name, stamp);
+      if (result.rows.length) deferServerTask('SUPPORTER NOTICE ACK SYNC', () => notifyProfileSyncAcrossInstances(name, socket.id, Date.now(), { roleNoticeOnly:true, supporterNoticeAckAt:stamp }), 0);
+      respond({ success:true });
+    } catch (err) {
+      console.error('[SUPPORTER NOTICE ACK ERROR]:', err);
+      respond({ success:false });
     }
   });
 
