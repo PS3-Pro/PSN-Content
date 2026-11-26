@@ -6209,7 +6209,7 @@ async function initDb() {
   await refreshChatHistoryFromDb();
 
   const pinnedRes = await pool.query('SELECT data FROM pinned_messages ORDER BY id ASC');
-  pinnedMessages = pinnedRes.rows.map(r => r.data);
+  pinnedMessages = pinnedRes.rows.map(r => sanitizeGlobalChatPayload(r.data));
 
   await refreshAdminStateFromDb();
   await loadChatSpamResetMarkersFromDb();
@@ -12413,12 +12413,62 @@ async function saveAdminState(key, data) {
 // ============================================================================
 // Chat history, seen state, sync & deletion
 // ============================================================================
+function sanitizeGlobalChatMarkup(value) {
+  if (typeof value !== 'string' || !/[<>]/.test(value)) return value;
+  // Legacy clients render chat HTML; only attribute-free formatting tags may cross this boundary.
+  return value.replace(/<\/?(?:b|strong|i|em|u|s|strike|del|ul|ol|li|br|div|p)[ \t]*\/?>|[<>]/gi, token => token === '<' ? '&lt;' : token === '>' ? '&gt;' : token);
+}
+
+function sanitizeGlobalChatPlainText(value) {
+  return typeof value === 'string' ? value.replace(/<(?=[a-z/!?])/gi, '&lt;') : value;
+}
+
+function isSafeChatMediaUrl(value) {
+  return typeof value === 'string' && value.length <= CHAT_MESSAGE_URL_MAX && /^https?:\/\//i.test(value) && !/[\s<>"'`\\\x00-\x1f\x7f]/.test(value);
+}
+
+function sanitizeGlobalChatPayload(message) {
+  if (!message || typeof message !== 'object') return message;
+  const text = sanitizeGlobalChatMarkup(typeof message.text === 'string' ? message.text : '');
+  if (typeof message.avatar === 'string' && /[<>"'`\\\x00-\x1f\x7f]/.test(message.avatar)) delete message.avatar;
+  if (message.type === 'image') {
+    const source = Array.isArray(message.content) ? message.content : [message.content];
+    if (!Array.isArray(message.content) || source.length > CHAT_MESSAGE_MEDIA_MAX || source.some(url => !isSafeChatMediaUrl(url))) {
+      message.content = source.slice(0, CHAT_MESSAGE_MEDIA_MAX).filter(isSafeChatMediaUrl);
+    }
+  }
+  if (text !== message.text) message.text = text;
+  if (message.replyTo && typeof message.replyTo === 'object') {
+    const reply = message.replyTo;
+    const replyText = sanitizeGlobalChatMarkup(reply.text);
+    const replyUser = sanitizeGlobalChatPlainText(reply.user);
+    const replyId = /^\d{1,16}$/.test(String(reply.id || '')) ? String(reply.id) : '';
+    if (replyText !== reply.text || replyUser !== reply.user || replyId !== reply.id) message.replyTo = { ...reply, text:replyText, user:replyUser, id:replyId };
+  }
+  if (message.type === 'poll' && message.content && typeof message.content === 'object' && Array.isArray(message.content.options)) {
+    const poll = message.content;
+    const question = sanitizeGlobalChatPlainText(poll.question);
+    let options = poll.options;
+    for (let i = 0; i < options.length; i++) {
+      const option = options[i];
+      if (!option || typeof option !== 'object') continue;
+      const safe = sanitizeGlobalChatPlainText(option.text);
+      if (safe !== option.text) {
+        if (options === poll.options) options = options.slice();
+        options[i] = { ...option, text:safe };
+      }
+    }
+    if (question !== poll.question || options !== poll.options) message.content = { ...poll, question, options };
+  }
+  return message;
+}
+
 function cleanChatMessage(message = {}) {
   const clean = { ...(message || {}) };
   delete clean._dbId;
   delete clean.seenBy;
   delete clean.seenAt;
-  return clean;
+  return sanitizeGlobalChatPayload(clean);
 }
 
 function attachChatDbId(message, dbId) {
@@ -12942,19 +12992,24 @@ async function deleteChatMessagesWithSyncBatch(entries = [], trace = null) {
 
 function emitChatSyncChange(change) {
   if (!change || !change.epoch || !change.revision) return;
+  let payload = null;
+  let recipients = 0;
   io.sockets.sockets.forEach(client => {
     if (!client || !client.connected || !client.userName) return;
-    const payload = {
-      syncV1: true,
-      epoch: change.epoch,
-      revision: change.revision,
-      type: change.type,
-      msgId: change.msgId,
-      message: change.message ? getPublicChatMessageForUser(change.message, client.userName) : null
-    };
-    trackBandwidthPayload('chat_sync_change', payload, 1);
+    if (!payload) {
+      payload = {
+        syncV1: true,
+        epoch: change.epoch,
+        revision: change.revision,
+        type: change.type,
+        msgId: change.msgId,
+        message: change.message ? getPublicChatMessageForUser(change.message) : null
+      };
+    }
+    recipients++;
     client.emit('chat_sync_change', payload);
   });
+  if (recipients) trackBandwidthPayload('chat_sync_change', payload, recipients);
 }
 
 function emitChatBatchDeleteRealtime(batch = {}) {
@@ -13109,7 +13164,7 @@ function sanitizeChatSyncChangeForUser(row, userName = '') {
 async function refreshChatHistoryFromDb() {
   const chatRes = await pool.query("SELECT id, message - 'seenBy' - 'seenAt' AS message FROM chat ORDER BY id DESC LIMIT $1", [MAX_CHAT_HISTORY]);
   const rows = chatRes.rows.reverse();
-  messageHistory = rows.map(row => attachChatDbId({ ...(row.message || {}) }, row.id));
+  messageHistory = rows.map(row => attachChatDbId(sanitizeGlobalChatPayload({ ...(row.message || {}) }), row.id));
   lastChatDbId = rows.length ? Math.max(...rows.map(row => Number(row.id) || 0)) : 0;
   return messageHistory;
 }
@@ -13156,7 +13211,7 @@ async function syncChatAcrossInstances() {
           lastChatDbId = Math.max(lastChatDbId, dbId);
           continue;
         }
-        const message = attachChatDbId({ ...(row.message || {}) }, dbId);
+        const message = attachChatDbId(sanitizeGlobalChatPayload({ ...(row.message || {}) }), dbId);
         if (dbId) existingDbIds.add(dbId);
         if (messageTime) existingMessageTimes.add(messageTime);
         messageHistory.push(message);
@@ -13368,7 +13423,7 @@ function normalizeDirectMessageText(value) {
       if (canonical === 'br') return '<br>';
       return closing ? `</${canonical}>` : `<${canonical}>`;
     });
-  return text.slice(0, DIRECT_MESSAGE_TEXT_MAX);
+  return sanitizeGlobalChatMarkup(text.slice(0, DIRECT_MESSAGE_TEXT_MAX));
 }
 
 const DIRECT_GROUP_MAX_MEMBERS = 16;
@@ -13377,7 +13432,7 @@ function directGroupId(value) { const id = String(value || '').trim().toLowerCas
 function serializeDirectGroupMessage(row) {
   if (!row) return null;
   const type = row.message_type === 'playing' ? 'playing' : (row.message_type === 'poll' ? 'poll' : normalizeDirectMessageType(row.message_type, normalizeDirectMessageMedia(row.content)));
-  return { id:String(row.id), groupId:String(row.group_id), from:normalizeDirectMessageUser(row.sender_name), text:String(row.text || '').slice(0,DIRECT_MESSAGE_TEXT_MAX), type, content:type === 'playing' ? normalizeSocialPlaying(row.content) : (type === 'poll' ? normalizeDirectGroupPoll(row.content,true) : normalizeDirectMessageMedia(row.content)), replyTo:normalizeDirectMessageReply(row.reply_to), reactions:normalizeDirectMessageReactions(row.reactions,DIRECT_GROUP_MAX_MEMBERS), pinnedAt:row.pinned_at ? new Date(row.pinned_at).toISOString():null, editedAt:row.edited_at ? new Date(row.edited_at).toISOString():null, createdAt:new Date(row.created_at).toISOString() };
+  return { id:String(row.id), groupId:String(row.group_id), from:normalizeDirectMessageUser(row.sender_name), text:sanitizeGlobalChatMarkup(String(row.text || '').slice(0,DIRECT_MESSAGE_TEXT_MAX)), type, content:type === 'playing' ? normalizeSocialPlaying(row.content) : (type === 'poll' ? normalizeDirectGroupPoll(row.content,true) : normalizeDirectMessageMedia(row.content)), replyTo:normalizeDirectMessageReply(row.reply_to), reactions:normalizeDirectMessageReactions(row.reactions,DIRECT_GROUP_MAX_MEMBERS), pinnedAt:row.pinned_at ? new Date(row.pinned_at).toISOString():null, editedAt:row.edited_at ? new Date(row.edited_at).toISOString():null, createdAt:new Date(row.created_at).toISOString() };
 }
 function normalizeDirectGroupPoll(value, allowVoters = false) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
@@ -13633,7 +13688,7 @@ function normalizeDirectMessageMedia(value) {
   return (Array.isArray(value) ? value : [])
     .slice(0, DIRECT_MESSAGE_MEDIA_MAX)
     .map(item => normalizeText(item, '').slice(0, DIRECT_MESSAGE_URL_MAX))
-    .filter(item => /^https?:\/\//i.test(item));
+    .filter(isSafeChatMediaUrl);
 }
 
 function normalizeDirectMessageType(value, media = []) {
@@ -13665,7 +13720,7 @@ function normalizeDirectMessageReply(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const id = String(value.id || '').slice(0, 40);
   const from = normalizeDirectMessageUser(value.from || value.user);
-  const text = String(value.text == null ? '' : value.text).slice(0, DIRECT_MESSAGE_REPLY_TEXT_MAX);
+  const text = sanitizeGlobalChatMarkup(String(value.text == null ? '' : value.text).slice(0, DIRECT_MESSAGE_REPLY_TEXT_MAX));
   const rawType = normalizeText(value.type, 'text').toLowerCase();
   const type = ['poll','gif','image','playing'].includes(rawType) ? rawType : 'text';
   if (!id || !from) return null;
@@ -13718,7 +13773,7 @@ function serializeDirectMessage(row) {
     id: String(row.id || ''),
     from: normalizeDirectMessageUser(row.sender_name || row.from),
     to: normalizeDirectMessageUser(row.recipient_name || row.to),
-    text: String(row.text == null ? '' : row.text).slice(0, DIRECT_MESSAGE_TEXT_MAX),
+    text: sanitizeGlobalChatMarkup(String(row.text == null ? '' : row.text).slice(0, DIRECT_MESSAGE_TEXT_MAX)),
     type,
     content: type === 'playing' || type === 'poll' ? content : (content.length ? content : null),
     replyTo: normalizeDirectMessageReply(row.reply_to || row.replyTo),
@@ -14960,7 +15015,7 @@ async function initProfileSyncNotifications() {
         if (data.reason === 'delete_batch') {
           deferServerTask('CHAT REMOTE PIN DELETE SYNC', async () => {
             const rows = await queryDbWithRetry('SELECT data FROM pinned_messages ORDER BY id ASC', [], { attempts: 2, label:'CHAT REMOTE PINS READ' });
-            const next = rows.rows.map(row => row.data);
+            const next = rows.rows.map(row => sanitizeGlobalChatPayload(row.data));
             if (stableStringifySmall(next) !== stableStringifySmall(pinnedMessages)) {
               pinnedMessages = next;
               io.emit('pinned_list', pinnedMessages);
@@ -22285,10 +22340,10 @@ io.on('connection', (socket) => {
     messageData.role = actorRole;
     messageData.isModerator = actorRole === 'mod';
     messageData.user = senderName;
+    sanitizeGlobalChatPayload(messageData);
 
     try {
-      const savedMessage = cleanChatMessage(messageData);
-      chatTrace.stage('before_db_insert', CHAT_MEMORY_TRACE_ENABLED ? { savedPayload:summarizeChatTracePayload(savedMessage).payload } : {});
+      chatTrace.stage('before_db_insert', CHAT_MEMORY_TRACE_ENABLED ? { savedPayload:summarizeChatTracePayload(cleanChatMessage(messageData)).payload } : {});
       const saved = await saveChatMessageWithSync(messageData);
       chatTrace.stage('after_db_insert');
       attachChatDbId(messageData, saved.dbId);
@@ -23710,15 +23765,15 @@ io.on('connection', (socket) => {
       if (canEditTarget) {
         const wasEditedByStaff = (!isOwner && canModerate);
         const wasEditedByAdmin = (!isOwner && isAdmin);
-        const nextText = String(data.newText == null ? '' : data.newText);
+        const nextText = sanitizeGlobalChatMarkup(String(data.newText == null ? '' : data.newText).slice(0, CHAT_MESSAGE_TEXT_MAX));
         const editingPlaying = data.type === 'playing' && msg.type === 'playing' ? normalizeSocialPlaying(data.content) : null;
-        const nextType = editingPlaying ? 'playing' : (data.content ? (data.type || 'image') : msg.type);
+        const nextType = editingPlaying ? 'playing' : (data.content && data.type !== 'playing' ? (data.type === 'poll' && msg.type === 'poll' ? 'poll' : 'image') : msg.type);
         const textUnchanged = String(msg.text == null ? '' : msg.text) === nextText;
         const contentUnchanged = !data.content || stableStringifySmall(msg.content || null) === stableStringifySmall(data.content || null);
         const typeUnchanged = !data.content || String(msg.type || '') === String(nextType || '');
         if (textUnchanged && contentUnchanged && typeUnchanged) return;
 
-        msg.text = data.newText;
+        msg.text = nextText;
         msg.edited = true;
         msg.editedByAdmin = wasEditedByAdmin;
         msg.editedByMod = wasEditedByStaff && !wasEditedByAdmin;
@@ -23731,16 +23786,17 @@ io.on('connection', (socket) => {
           msg.type = 'playing';
           msg.content = editingPlaying;
         } else if (data.content && data.type !== 'playing') {
-          msg.type = data.type || 'image';
+          msg.type = nextType;
           msg.content = data.content;
         }
 
+        sanitizeGlobalChatPayload(msg);
         try {
           await pool.query("UPDATE chat SET message = $1 WHERE message->>'time' = $2", [cleanChatMessage(msg), msg.time]);
           const syncChange = await recordChatSyncChangeSafe('upsert', String(data.msgId || new Date(msg.time).getTime()), msg);
           io.emit('message_edited', {
             msgId: data.msgId,
-            newText: data.newText,
+            newText: msg.text,
             type: msg.type,
             content: msg.content,
             editedByAdmin: wasEditedByAdmin,
@@ -23752,7 +23808,7 @@ io.on('connection', (socket) => {
 
           const pinned = pinnedMessages.find(p => p.id === data.msgId);
           if (pinned) {
-            pinned.text = data.newText;
+            pinned.text = msg.text;
             pinned.type = msg.type || 'text';
             pinned.content = msg.content || null;
 
