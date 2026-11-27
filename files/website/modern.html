@@ -2278,6 +2278,8 @@ html.ios-webkit #object-particles { contain:strict; }
 #psn-game-case .psn-case-page-arrow:focus-visible { outline:2px solid var(--psn-focus-ring,#8ac7ff); outline-offset:2px; }
 .psn-case-paper { width:100%; flex:1 1 0; min-height:0; overflow:auto; text-align:center; background:rgba(0,0,0,.22); border-radius:8px; }
 .psn-case-paper.is-flipping { overflow:hidden; }
+.psn-case-paper.is-flipping .psn-case-sheet { width:100%; height:100%; overflow:clip; }
+.psn-case-paper.is-flipping .psn-case-sheet > canvas { position:absolute; inset:0; margin:auto; }
 .psn-case-sheet { position:relative; display:flex; align-items:center; justify-content:center; box-sizing:border-box; min-width:100%; min-height:100%; width:max-content; height:max-content; padding:6px; }
 .psn-case-paper canvas { display:block; flex:none; background:#fff; box-shadow:0 3px 14px #0005; }
 .psn-case-paper .psn-case-page-flip { position:absolute; z-index:1; pointer-events:none; backface-visibility:hidden; }
@@ -122028,7 +122030,7 @@ function getVisibleChatStackEl(id) {
     let displayedPage=0,displayedZoom=1,pageFlip=null,readerObserver=null,readerResize=0,readerSize='',pageBusy=false,resizePending=false,viewTimer=0,closeTimer=0;
     const reducedMotion=()=>matchMedia('(prefers-reduced-motion: reduce)').matches;
     function updatePageArrows(){prevPage.disabled=!pdf||pageNumber<=1;nextPage.disabled=!pdf||pageNumber>=pdf.numPages;for(const button of [prevPage,nextPage])button.setAttribute('aria-disabled',String(button.disabled||pageBusy));}
-    function stopPageFlip(){if(pageFlip){const flip=pageFlip;pageFlip=null;flip.animation.cancel();flip.canvas.remove();}paper.classList.remove('is-flipping');}
+    function stopPageFlip(){if(pageFlip){const flip=pageFlip;pageFlip=null;flip.animation.cancel();flip.reveal?.cancel();flip.canvas.remove();}paper.classList.remove('is-flipping');}
     function stopReaderWork(){++renderGeneration;renderTask?.cancel();renderTask=null;stopPageFlip();pageBusy=false;resizePending=false;readerObserver?.disconnect();readerObserver=null;cancelAnimationFrame(readerResize);readerResize=0;readerSize='';updatePageArrows();}
     function finishPage(gen){if(gen!==renderGeneration)return;pageBusy=false;updatePageArrows();if(resizePending&&!reader.hidden&&current()){resizePending=false;showPage();}}
     async function showPage(direction=0){
@@ -122050,14 +122052,18 @@ function getVisibleChatStackEl(id) {
         const old=sheet.firstElementChild;
         const animate=direction&&old&&displayedPage!==requestedPage&&displayedZoom===1&&requestedZoom===1&&typeof old.animate==='function'&&!reducedMotion()&&!resizePending;
         if(animate){
-          const x=old.offsetLeft,y=old.offsetTop;
+          const oldWidth=parseFloat(old.style.width),oldHeight=parseFloat(old.style.height),newWidth=parseFloat(canvas.style.width),newHeight=parseFloat(canvas.style.height);
+          const differentSize=Math.abs(oldWidth-newWidth)>1||Math.abs(oldHeight-newHeight)>1;
           paper.classList.add('is-flipping');
-          old.classList.add('psn-case-page-flip');old.setAttribute('aria-hidden','true');old.style.left=x+'px';old.style.top=y+'px';old.style.transformOrigin=direction>0?'left center':'right center';
+          old.classList.add('psn-case-page-flip');old.setAttribute('aria-hidden','true');old.style.transformOrigin=direction>0?'left center':'right center';
           sheet.insertBefore(canvas,old);
           const angle=direction>0?-92:92;
-          const animation=old.animate([{transform:'perspective(1100px) rotateY(0deg)',opacity:1},{transform:`perspective(1100px) rotateY(${angle*.7}deg)`,opacity:1,offset:.7},{transform:`perspective(1100px) rotateY(${angle}deg)`,opacity:0}],{duration:390,easing:'cubic-bezier(.25,.65,.35,1)',fill:'forwards'});
-          const flip={canvas:old,animation};pageFlip=flip;
-          animation.finished.catch(()=>{}).finally(()=>{if(pageFlip===flip){pageFlip=null;old.remove();paper.classList.remove('is-flipping');finishPage(gen);}});
+          const timing={duration:390,easing:'cubic-bezier(.25,.65,.35,1)',fill:'both'};
+          // Keep both sheets independently centered; reveal a different page format without resizing either sheet.
+          const reveal=differentSize?canvas.animate([{opacity:0,clipPath:'inset(0 50% 0 50%)'},{opacity:1,clipPath:'inset(0 0 0 0)'}],timing):null;
+          const animation=old.animate([{transform:'perspective(1100px) rotateY(0deg)',opacity:1},{transform:`perspective(1100px) rotateY(${angle*.7}deg)`,opacity:1,offset:.7},{transform:`perspective(1100px) rotateY(${angle}deg)`,opacity:0}],timing);
+          const flip={canvas:old,animation,reveal};pageFlip=flip;
+          animation.finished.catch(()=>{}).finally(()=>{if(pageFlip===flip){pageFlip=null;old.remove();reveal?.cancel();paper.classList.remove('is-flipping');finishPage(gen);}});
         }else sheet.replaceChildren(canvas);
         displayedPage=requestedPage;displayedZoom=requestedZoom;
         paper.scrollLeft=Math.max(0,(paper.scrollWidth-paper.clientWidth)/2);paper.scrollTop=Math.max(0,(paper.scrollHeight-paper.clientHeight)/2);
