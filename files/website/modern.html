@@ -5853,6 +5853,7 @@ body.admin-maintenance-reveal-pending #user-select-screen, body.admin-maintenanc
 .admin-user-filters label:has(input[value="admin"]:checked), .admin-user-filters label:has(input[value="banned"]:checked) { background: rgba(255,68,68,0.15); color: #ff8585; border-color: rgba(255,68,68,0.45); text-shadow: 0 0 8px rgba(255,68,68,0.35); }
 .admin-user-filters label:has(input[value="mod"]:checked) { background: rgba(0,212,255,0.13); color: #8be8ff; border-color: rgba(0,212,255,0.38); text-shadow: 0 0 8px rgba(0,212,255,0.35); }
 .admin-user-filters label:has(input[value="developer"]:checked) { background: rgba(76,175,80,0.14); color: #a5ffb6; border-color: rgba(76,175,80,0.36); }
+.admin-user-filters label:has(input[value="supporter"]:checked) { background: rgba(245,195,91,0.15); color: #f5c35b; border-color: rgba(245,195,91,0.42); text-shadow: 0 0 8px rgba(245,195,91,0.30); }
 
 /* ========================================================================== PROFILE COUNTRY / REGION ========================================================================== */
 .profile-country-row { min-height: 22px; margin-top: 2px; display: flex; align-items: center; gap: 6px; color: var(--text-muted); font-size: 11px; line-height: 1.25; }
@@ -11788,6 +11789,7 @@ html[data-psn-rgb-theme] .shared-content-link-modal .shared-content-link-card::b
 									<label title="Show only administrators"><input type="radio" name="admin-user-filter" value="admin" onchange="adminSetUserFilter(this.value)"> Admin</label>
 									<label title="Show only moderators"><input type="radio" name="admin-user-filter" value="mod" onchange="adminSetUserFilter(this.value)"> Mod</label>
 									<label title="Show only developers"><input type="radio" name="admin-user-filter" value="developer" onchange="adminSetUserFilter(this.value)"> Developer</label>
+									<label title="Show only supporters"><input type="radio" name="admin-user-filter" value="supporter" onchange="adminSetUserFilter(this.value)"> Supporter</label>
 									<label title="Show only banned users"><input type="radio" name="admin-user-filter" value="banned" onchange="adminSetUserFilter(this.value)"> Banned</label>
 									<label title="Show only regular users"><input type="radio" name="admin-user-filter" value="user" onchange="adminSetUserFilter(this.value)"> User</label>
 								</div>
@@ -17938,6 +17940,7 @@ P
 		window.__profileNotificationStateNeedsMigration = fromLegacy || Number(state.version || 0) < Number(PROFILE_NOTIFICATION_STATE_VERSION);
 		const categories = ['downloads', 'wishlist', 'favorites', 'playtogether', 'trophies'];
 		const active = (localStorage.getItem('psn_username') || '') === name;
+		let trophyPendingChanged = false;
 		window.__applyingProfileNotificationState = true;
 		try {
 			categories.forEach(category => {
@@ -17979,6 +17982,7 @@ P
 					writeSyncedSettingForUser(name, 'psn_play_together_dot_items', JSON.stringify(pending));
 					writeSyncedSettingForUser(name, 'psn_play_together_dot', dot ? 'true' : 'false');
 				} else if (category === 'trophies') {
+					trophyPendingChanged = JSON.stringify(normalizeProfileNotificationPendingValue(loadState('psn_trophy_dot_items'))) !== JSON.stringify(pending);
 					writeSyncedSettingForUser(name, 'psn_trophy_dot_items', JSON.stringify(pending));
 					writeSyncedSettingForUser(name, 'psn_trophy_dot', dot ? 'true' : 'false');
 					writeSyncedSettingForUser(name, 'psn_last_trophy_color', String(incoming.color || ''));
@@ -18009,6 +18013,10 @@ P
 					if (trophyDotEl.style.display !== nextDisplay) trophyDotEl.style.display = nextDisplay;
 					const color = loadState('psn_last_trophy_color') || '';
 					if (trophyDotVisible && color && trophyDotEl.dataset.liveDotColor !== color) { trophyDotEl.dataset.liveDotColor = color; trophyDotEl.style.background = color; }
+				}
+				if (trophyPendingChanged && window.__trophiesHydrated === true) {
+					if (typeof psnMarkTrophyViewsDirty === 'function') psnMarkTrophyViewsDirty();
+					if (typeof window.refreshTrophiesWithMotion === 'function' && psnIsViewVisible('view-trophies')) window.refreshTrophiesWithMotion({ revealNew:false });
 				}
 			}
 		} finally {
@@ -48338,6 +48346,8 @@ P
 			online: isOnline,
 			onlineSince: isOnline ? (Number(record.onlineSince) || null) : null,
 			isAdmin: record.isAdmin === true || localStorage.getItem(`${name}_psn_isAdmin`) === 'true',
+			isSupporter: typeof record.isSupporter === 'boolean' ? record.isSupporter : null,
+			profileUpdatedAt: Number(record.profileUpdatedAt) || 0,
 			isBanned: typeof window.isPsnUserBanned === 'function' ? window.isPsnUserBanned(name, record) : (record.isBanned === true || record.banned === true || localStorage.getItem(`${name}_psn_isBanned`) === 'true'),
 			level: record.level || localStorage.getItem(`${name}_psn_level`) || 1,
 			lastSeen: record.lastSeen || record.last_seen || localStorage.getItem(`${name}_psn_lastSeen`) || '',
@@ -48362,6 +48372,8 @@ P
 			avatar: normalized.avatar || previous.avatar || '',
 			online: previous.online === true || normalized.online === true,
 			isAdmin: previous.isAdmin === true || normalized.isAdmin === true,
+			isSupporter: typeof normalized.isSupporter === 'boolean' && (typeof previous.isSupporter !== 'boolean' || normalized.profileUpdatedAt >= (previous.profileUpdatedAt || 0)) ? normalized.isSupporter : (previous.isSupporter ?? null),
+			profileUpdatedAt: Math.max(previous.profileUpdatedAt || 0, normalized.profileUpdatedAt),
 			isBanned: explicitBanState ? normalized.isBanned === true : (previous.isBanned === true || normalized.isBanned === true),
 			ps3Status: normalized.ps3Status || previous.ps3Status || null,
 			sessionCount: Math.max(Number(previous.sessionCount) || 0, Number(normalized.sessionCount) || 0),
@@ -48570,7 +48582,7 @@ P
 	}
 
 	function adminGetUserFilterMode() {
-		const allowed = ['all', 'online', 'offline', 'admin', 'mod', 'developer', 'banned', 'user'];
+		const allowed = ['all', 'online', 'offline', 'admin', 'mod', 'developer', 'supporter', 'banned', 'user'];
 		const mode = String(window.adminUserFilterMode || localStorage.getItem('psn_admin_user_filter') || 'all').toLowerCase();
 		return allowed.includes(mode) ? mode : 'all';
 	}
@@ -48590,6 +48602,7 @@ P
 		if (mode === 'online') return user.online === true;
 		if (mode === 'offline') return user.online !== true;
 		const name = String(user.name || '');
+		if (mode === 'supporter') return typeof user.isSupporter === 'boolean' ? user.isSupporter : (typeof window.isPsnSupporter === 'function' && window.isPsnSupporter(name, user));
 		if (mode === 'banned') return typeof window.isPsnUserBanned === 'function' ? window.isPsnUserBanned(name, user) : user.isBanned === true;
 		const role = adminGetUserRole(name, user);
 		const isAdminUser = user.isAdmin === true || role === 'admin';
@@ -48604,7 +48617,7 @@ P
 	}
 
 	window.adminSetUserFilter = function(mode) {
-		const allowed = ['all', 'online', 'offline', 'admin', 'mod', 'developer', 'banned', 'user'];
+		const allowed = ['all', 'online', 'offline', 'admin', 'mod', 'developer', 'supporter', 'banned', 'user'];
 		mode = String(mode || 'all').toLowerCase();
 		if (!allowed.includes(mode)) mode = 'all';
 		window.adminUserFilterMode = mode;
@@ -49071,11 +49084,12 @@ P
 				admin: { name: 'administrators', title: 'No administrators found', icon: 'fa-user-shield' },
 				mod: { name: 'moderators', title: 'No moderators found', icon: 'fa-user-gear' },
 				developer: { name: 'developers', title: 'No developers found', icon: 'fa-code' },
+				supporter: { name: 'supporters', title: 'No supporters found', icon: 'fa-heart' },
 				banned: { name: 'banned users', title: 'No banned users', icon: 'fa-user-slash' },
 				user: { name: 'regular users', title: 'No regular users found', icon: 'fa-user' }
 			};
 
-			if (allKnownUsers.length === 0) {
+			if (allKnownUsers.length === 0 && (userFilterMode === 'all' || window.adminUsersLoading)) {
 				renderAdminUsersHtml(buildAdminUsersEmpty('No users loaded yet', 'Use Refresh Users to request the complete registered list from the server.', 'fa-users-viewfinder'));
 			} else if (filteredUsers.length === 0) {
 				const emptyMeta = userFilterLabels[userFilterMode] || userFilterLabels.all;
@@ -49133,7 +49147,7 @@ P
 						? `<button class="btn-mini-round admin-unban-action" title="Unban user" ${isMe ? 'disabled' : ''} onclick="event.stopPropagation(); adminUnbanUser('${encodedName}', '${encodedSocketId}')"><i class="fas fa-unlock"></i></button>`
 						: `<button class="btn-mini-round admin-ban-action" title="Ban user" ${isProtected ? 'disabled' : ''} onclick="event.stopPropagation(); adminBanUser('${encodedName}', '${encodedSocketId}')"><i class="fas fa-ban"></i></button>`;
 					const adminUserLiveSignature = typeof window.getLiveRenderSignature === 'function'
-						? window.getLiveRenderSignature([name, avatar, socketId, isMe ? 1 : 0, isOnline ? 1 : 0, sessionCount, isTargetAdmin ? 1 : 0, isBanned ? 1 : 0, level, role, isFriend ? 1 : 0, statusText, onlineSinceText, avatarBorder, ps3 ? String(ps3.status || '') : '', ps3 ? String(ps3.title || '') : ''])
+						? window.getLiveRenderSignature([name, avatar, socketId, isMe ? 1 : 0, isOnline ? 1 : 0, sessionCount, isTargetAdmin ? 1 : 0, isBanned ? 1 : 0, level, role, roleTag, isFriend ? 1 : 0, statusText, onlineSinceText, avatarBorder, ps3 ? String(ps3.status || '') : '', ps3 ? String(ps3.title || '') : ''])
 						: '';
 
 					return `
@@ -94245,8 +94259,9 @@ function getVisibleChatStackEl(id) {
 				supporterNoticeTimer = setTimeout(tryShowSupporterNotice, 420);
 				return;
 			}
-			// The server has already granted the trophy and XP; reuse only its presentation.
+			// The server already persisted the trophy, XP and notification state.
 			const popup = showTrophyPopup(TROPHY_DATA.site_supporter, 'site_supporter', pending.session);
+			scheduleTrophyUnlockVisualRefresh();
 			supporterTrophyPresentation = { noticeId:pending.noticeId, session:pending.session, popup };
 			if (popup?.isConnected) {
 				supporterNoticeTimer = setTimeout(tryShowSupporterNotice, 420);
@@ -95722,6 +95737,7 @@ function getVisibleChatStackEl(id) {
 				exportWaiter.resolve(payload);
 				return;
 			}
+			if (payload && typeof payload.filter === 'string' && payload.filter !== adminGetUserFilterMode()) return;
 			clearTimeout(window.adminUsersRenderTimer);
 			window.adminUsersRenderTimer = null;
 			const wasAdminUsersLoading = window.adminUsersLoading === true;
@@ -97718,6 +97734,23 @@ function getVisibleChatStackEl(id) {
 				if (typeof window.cacheFreshPsnUserMeta === 'function') window.cacheFreshPsnUserMeta(data, Date.now());
 				if (typeof window.syncPsnUserMetaBatch === 'function') window.syncPsnUserMetaBatch([data], { forceAvatarDomSync:true });
 				else if (typeof window.syncPsnUserMeta === 'function') window.syncPsnUserMeta(data);
+				if (typeof data.isSupporter === 'boolean') {
+					const adminList = window.adminAllUsers;
+					const adminIndex = window.__adminAllUsersIndexByName;
+					const adminUser = Array.isArray(adminList) && adminIndex instanceof Map && window.__adminAllUsersIndexSource === adminList ? adminList[adminIndex.get(name.toLowerCase())] : null;
+					const onlineUser = window.__currentOnlineUserByName instanceof Map ? window.__currentOnlineUserByName.get(name) : null;
+					let adminSupporterChanged = false;
+					for (const user of [adminUser, onlineUser]) {
+						if (!user || user.isSupporter === data.isSupporter || (Number(data.profileUpdatedAt) || 0) < (Number(user.profileUpdatedAt) || 0)) continue;
+						user.isSupporter = data.isSupporter;
+						user.profileUpdatedAt = Number(data.profileUpdatedAt) || 0;
+						adminSupporterChanged = true;
+					}
+					if (adminSupporterChanged) {
+						window.adminInvalidateKnownUsersCache?.();
+						if (document.getElementById('view-admin')?.style.display === 'block') adminSchedulePanelRender();
+					}
+				}
 				if (typeof data.isSupporter === 'boolean' && previousSupporter !== data.isSupporter) {
 					window.patchVisibleSocialRoleBadges?.(name, data);
 					if (typeof scheduleChatHistorySoftRerender === 'function') scheduleChatHistorySoftRerender('supporter-updated', false);

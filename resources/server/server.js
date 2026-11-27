@@ -16014,6 +16014,15 @@ async function drainHistoryRetentionQueue() {
   }
 }
 
+function publishStoredFriendActivity(row) {
+  const event = serializeFriendActivityRow(row);
+  if (!event) return null;
+  scheduleFriendActivityRetention(event.actor);
+  emitFriendActivityToLocalSubscribers(event);
+  deferServerTask('FRIEND ACTIVITY NOTIFY', () => notifyFriendActivityAcrossInstances(event), 0);
+  return event;
+}
+
 async function recordFriendActivity(actorName, type, rawData = {}, options = {}) {
   const actor = normalizeSocialUserName(actorName);
   const eventType = normalizeText(type, '').toLowerCase();
@@ -16049,12 +16058,7 @@ async function recordFriendActivity(actorName, type, rawData = {}, options = {})
       { attempts: 2, label: 'FRIEND ACTIVITY INSERT' }
     );
     if (!result.rows[0]) return null;
-    const event = serializeFriendActivityRow(result.rows[0]);
-    if (!event) return null;
-    scheduleFriendActivityRetention(actor);
-    emitFriendActivityToLocalSubscribers(event);
-    deferServerTask('FRIEND ACTIVITY NOTIFY', () => notifyFriendActivityAcrossInstances(event), 0);
-    return event;
+    return publishStoredFriendActivity(result.rows[0]);
   } catch (err) {
     console.error('[FRIEND ACTIVITY INSERT ERROR]:', err && err.message ? err.message : err);
     return null;
@@ -18959,6 +18963,19 @@ async function grantSupporterDonation(name, actor) {
           UPDATE users SET data = COALESCE(data, '{}'::jsonb) || jsonb_build_object(
             'supporterDonationAt', $2::bigint,
             'supporterNoticePendingAt', $2::bigint,
+            'notificationState', jsonb_set(
+              CASE WHEN jsonb_typeof(data->'notificationState') = 'object' THEN data->'notificationState' ELSE '{}'::jsonb END,
+              '{trophies}',
+              (CASE WHEN jsonb_typeof(data#>'{notificationState,trophies}') = 'object' THEN data#>'{notificationState,trophies}' ELSE '{}'::jsonb END) || jsonb_build_object(
+                'pendingItems', CASE
+                  WHEN jsonb_typeof(data#>'{notificationState,trophies,pendingItems}') = 'array' THEN
+                    CASE WHEN (data#>'{notificationState,trophies,pendingItems}') ? 'site_supporter' THEN data#>'{notificationState,trophies,pendingItems}'
+                    ELSE jsonb_build_array('site_supporter') || (data#>'{notificationState,trophies,pendingItems}') END
+                  ELSE jsonb_build_array('site_supporter') END,
+                'dot', TRUE, 'color', '#ffcc00',
+                'updatedAt', GREATEST($2::bigint, CASE WHEN data#>>'{notificationState,trophies,updatedAt}' ~ '^[0-9]{1,18}$' THEN (data#>>'{notificationState,trophies,updatedAt}')::bigint + 1 ELSE 0 END)
+              ), true
+            ) || jsonb_build_object('version', $5::int),
             'trophiesData', (CASE WHEN jsonb_typeof(data->'trophiesData')='object' THEN data->'trophiesData' ELSE '{}'::jsonb END) || jsonb_build_object('site_supporter', $3::jsonb),
             'trophies', (SELECT count(*) FROM jsonb_each(CASE WHEN jsonb_typeof(data->'trophiesData')='object' THEN data->'trophiesData' ELSE '{}'::jsonb END) AS t(id, state) WHERE id <> 'site_supporter' AND lower(COALESCE(state->>'unlocked','false')) IN ('true','1','yes')) + 1,
             'xp', (CASE WHEN data->>'xp' ~ '^[0-9]{1,9}$' THEN (data->>'xp')::integer ELSE 0 END) + 90,
@@ -18969,8 +18986,23 @@ async function grantSupporterDonation(name, actor) {
           INSERT INTO user_reward_notices (user_name,reward_id,trophy_id,title,kind,image_url,created_at,seen,visited)
           SELECT name,'rew_theme_1','site_supporter','RGB Glass Theme','theme','',$2::bigint,FALSE,FALSE FROM granted
           ON CONFLICT (user_name,reward_id) DO NOTHING RETURNING user_name
-        ) SELECT data FROM granted
-        `, [name, stamp, trophy], { attempts:2, label:'DONATION REWARD GRANT' });
+        ), activity AS (
+          INSERT INTO friend_activity (actor_name,event_type,data,dedupe_key,created_at)
+          SELECT name,'trophy',$4::jsonb,$6::text,to_timestamp($2::double precision / 1000.0) FROM granted
+          ON CONFLICT (dedupe_key) DO NOTHING
+          RETURNING id,actor_name,event_type,data,created_at
+        ), notification AS (
+          INSERT INTO user_notifications (user_name,event_type,data,dedupe_key,created_at)
+          SELECT name,'trophy',$4::jsonb,$7::text,to_timestamp($2::double precision / 1000.0) FROM granted
+          ON CONFLICT (dedupe_key) DO NOTHING
+          RETURNING id,user_name,event_type,data,created_at
+        ) SELECT data,
+          (SELECT to_jsonb(activity) || jsonb_build_object('id', id::text, 'created_at', $2::bigint) FROM activity) AS trophy_activity,
+          (SELECT to_jsonb(notification) || jsonb_build_object('id', id::text, 'created_at', $2::bigint) FROM notification) AS trophy_notification
+        FROM granted
+        `, [name, stamp, trophy, { trophyId:'site_supporter', title:'A Brighter Future', trophyType:'gold' },
+          PROFILE_NOTIFICATION_STATE_VERSION, `${name.toLowerCase()}:trophy:site_supporter`,
+          `${name.toLowerCase()}:notification:trophy:site_supporter`], { attempts:2, label:'DONATION REWARD GRANT' });
         const target = await refreshSingleUserCacheFromDb(name, { forceDuringWrite:true, savedData:result.rows[0]?.data });
         return { result, target, cachedDonationAt };
       });
@@ -18981,7 +19013,7 @@ async function grantSupporterDonation(name, actor) {
         deferServerTask('DONATION CACHE COMPACT', () => compactCachedUser(name), 250);
         return { success:true, already:true };
       }
-      const keys = ['trophiesData','trophies','xp','level','isSupporter'];
+      const keys = ['trophiesData','trophies','xp','level','isSupporter','notificationState'];
       invalidatePublicProfileListReads(name, keys);
       emitPublicProfileListChanged(name, keys, target.profileUpdatedAt);
       emitProfileSyncPatchFromUser(name, target, keys);
@@ -18992,6 +19024,9 @@ async function grantSupporterDonation(name, actor) {
       emitRewardNoticeChange(name);
       emitSupporterNotice(name, target);
       if (result.rows.length) {
+        const granted = result.rows[0];
+        if (granted.trophy_activity) publishStoredFriendActivity(granted.trophy_activity);
+        if (granted.trophy_notification) await publishStoredUserNotification(granted.trophy_notification);
         invalidateGlobalTrophyStatsCache();
         scheduleTrophyStatsRefreshBroadcast(900);
       }
@@ -20949,7 +20984,7 @@ io.on('connection', (socket) => {
     const trophyId = normalizeText(data.trophyId, '').slice(0, 80);
     const title = normalizeText(data.title, 'Trophy').slice(0, 140);
     const trophyType = normalizeText(data.trophyType, '').toLowerCase();
-    if (!trophyId || !['bronze', 'silver', 'gold', 'platinum'].includes(trophyType)) return;
+    if (!trophyId || trophyId.toLowerCase() === 'site_supporter' || !['bronze', 'silver', 'gold', 'platinum'].includes(trophyType)) return;
     deferServerTask('TROPHY ACTIVITY AND NOTIFICATION', async () => {
       await Promise.all([
         recordFriendActivity(name, 'trophy', { trophyId, title, trophyType }, { dedupeKey: `${name.toLowerCase()}:trophy:${trophyId.toLowerCase()}` }),
@@ -21408,6 +21443,7 @@ io.on('connection', (socket) => {
           const banned = isUserBanned(user);
           if (filter === 'online') return user.online === true;
           if (filter === 'offline') return user.online !== true;
+          if (filter === 'supporter') return isUserSupporter(user);
           if (filter === 'admin') return isUserAdmin(username, user);
           if (filter === 'mod') return role === 'mod';
           if (filter === 'developer') return role === 'developer';
