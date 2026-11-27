@@ -47,7 +47,17 @@ export default {
         redirect: 'manual',
         cf: {cacheEverything:false,cacheTtl:0}
       });
-      if (response.status >= 300 && response.status < 400) return new Response('Unexpected upstream redirect', {status:502,headers:noCache});
+      if (response.status >= 300 && response.status < 400) {
+        if (callback && response.status === 303) {
+          try {
+            const location = new URL(response.headers.get('Location') || '');
+            if (location.protocol === 'https:' && ['www.patreon.com', 'patreon.com'].includes(location.hostname) && !location.username && !location.password && !location.port) {
+              return new Response(null, {status:303, headers:{...noCache, Location:location.href}});
+            }
+          } catch {}
+        }
+        return new Response('Unexpected upstream redirect', {status:502,headers:noCache});
+      }
       const outgoing = new Response(response.body, response);
       for (const [name, value] of Object.entries(noCache)) outgoing.headers.set(name, value);
       return outgoing;
