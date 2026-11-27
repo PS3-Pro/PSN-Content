@@ -645,7 +645,6 @@ html.cards-blur-on .game-card { --card-surface-bg: rgba(var(--psn-tone-1e232d,30
 
 /* ========================================================================== TOUCH TAP / FOCUS CLEANUP ========================================================================== */
 * { -webkit-tap-highlight-color: transparent; }
-body.psn-home-interactive.site-disclaimer-input-lock::after { display: none !important; pointer-events: none !important; touch-action: auto !important; }
 body.psn-home-interactive #ps5-boot-container { pointer-events: none !important; touch-action: none !important; }
 body.psn-home-interactive #ps5-boot-container.psn-boot-released { display: none !important; visibility: hidden !important; opacity: 0 !important; pointer-events: none !important; }
 body.psn-home-interactive .site-disclaimer-overlay:not(.show):not(.closing) { pointer-events: none !important; visibility: hidden !important; opacity: 0 !important; }
@@ -3025,7 +3024,7 @@ input:checked+.slider:before { transform: translateX(20px); }
 #view-settings #support-project-setting:is(:hover,.psn-hover-stable) { border-color:rgba(245,195,91,.55) !important; }
 #view-settings #support-project-setting.is-new { border:1px solid rgba(255,255,255,.6) !important; background:var(--psn-panel-fill) !important; }
 #view-settings #support-project-setting.is-new::before { animation:ps5Sweep 2s ease-out infinite; }
-.trophy-donation-link { color:#f5c35b; font-weight:700; text-decoration:none; cursor:pointer; }
+.trophy-donation-link { color:#f5c35b; font-weight:700; text-decoration:underline; text-underline-offset:2px; cursor:pointer; }
 .trophy-donation-link:is(:hover,:focus-visible) { text-shadow:0 0 8px #f5c35b; }
 @media (prefers-reduced-motion:reduce) { #view-settings #support-project-setting.is-new::before { animation:none; } }
 #view-settings .settings-section-label.settings-support-label { color:rgba(245,195,91,.78); }
@@ -14094,19 +14093,131 @@ P
 	};
 	
 	const psnDonation = {session:null,popup:null,busy:false,waiting:false,checking:false,refreshRequested:false,lastCheckAt:-Infinity,lastCheckedSocket:null,url:''};
+	let psnItemFocusCleanup = null;
+	window.clearPsnItemFocus = function() {
+		psnItemFocusCleanup?.();
+	};
+	window.lockPsnItemFocus = function(row, duration, onEnd) {
+		window.clearPsnItemFocus();
+		if (document.body?.classList.contains('site-disclaimer-input-lock') || !row?.isConnected || !row.getClientRects().length || row.closest('[inert],[hidden]')) { onEnd?.(); return false; }
+		const locked = new Set(), temporaryTab = new Set();
+		const controller = new AbortController();
+		const opts = {capture:true, passive:false, signal:controller.signal};
+		let timer, observer;
+		const cleanup = () => {
+			if (psnItemFocusCleanup !== cleanup) return;
+			psnItemFocusCleanup = null;
+			clearTimeout(timer);
+			observer?.disconnect();
+			controller.abort();
+			for (const sibling of locked) sibling.removeAttribute('inert');
+			for (const element of temporaryTab) if (element.getAttribute('tabindex') === '-1') element.removeAttribute('tabindex');
+			onEnd?.();
+		};
+		psnItemFocusCleanup = cleanup;
+		const sync = () => {
+			if (!row.isConnected || !row.getClientRects().length || row.closest('[hidden]') || getComputedStyle(row).visibility === 'hidden') { cleanup(); return; }
+			const next = new Set();
+			for (let node = row; node && node !== document.body; node = node.parentElement) {
+				const parent = node.parentElement;
+				if (!parent) break;
+				for (const sibling of parent.children) {
+					if (sibling === node || sibling.matches('script,style,link,template')) continue;
+					if (locked.has(sibling) || !sibling.hasAttribute('inert')) {
+						next.add(sibling);
+						if (!sibling.hasAttribute('inert')) sibling.setAttribute('inert', '');
+					}
+				}
+			}
+			for (const sibling of locked) if (!next.has(sibling)) sibling.removeAttribute('inert');
+			locked.clear(); for (const sibling of next) locked.add(sibling);
+		};
+		sync();
+		if (psnItemFocusCleanup !== cleanup) return false;
+		if (typeof clearPsnStableHover === 'function') clearPsnStableHover();
+		observer = new MutationObserver(sync);
+		for (let node = row; node && node !== document.documentElement; node = node.parentElement) {
+			observer.observe(node, {childList:true, attributes:true, attributeFilter:['hidden','style','class']});
+		}
+		const actionSelector = 'button,a[href],input,select,textarea,[contenteditable="true"],[role="button"],[onclick],[tabindex]:not([tabindex="-1"])';
+		const controls = () => [row, ...row.querySelectorAll(actionSelector)].filter(element => element.matches(actionSelector) && !element.matches(':disabled,[aria-disabled="true"],input[type="hidden"]') && !element.closest('[inert],[hidden]') && element.getClientRects().length && getComputedStyle(element).visibility !== 'hidden');
+		const focus = element => {
+			if (!element.hasAttribute('tabindex') && element.tabIndex < 0) { element.setAttribute('tabindex','-1'); temporaryTab.add(element); }
+			element.focus({preventScroll:true});
+		};
+		const block = event => {
+			if (event.target instanceof Node && row.contains(event.target)) return;
+			if (event.cancelable) event.preventDefault();
+			event.stopImmediatePropagation();
+		};
+		for (const type of ['pointerdown','pointerup','pointerover','mouseover','click','contextmenu','wheel','touchstart','touchmove']) window.addEventListener(type, block, opts);
+		window.addEventListener('click', event => {
+			const action = event.target?.closest?.(actionSelector);
+			if (action && row.contains(action) && !action.matches('input,textarea,select,[contenteditable="true"],:disabled,[aria-disabled="true"]')) cleanup();
+		}, opts);
+		window.addEventListener('keydown', event => {
+			const key = event.key;
+			const stop = () => { event.preventDefault(); event.stopImmediatePropagation(); };
+			if (key === 'Escape') { stop(); cleanup(); return; }
+			if (event.ctrlKey || event.metaKey || event.altKey) return;
+			const active = document.activeElement;
+			const inside = row.contains(active);
+			const editable = inside && active.matches('input,textarea,select,[contenteditable="true"]');
+			if (editable && key !== 'Tab') return;
+			if (key === 'Tab' || /^Arrow/.test(key)) {
+				stop();
+				const items = controls(); if (!items.length) return;
+				const index = items.indexOf(active), back = event.shiftKey || key === 'ArrowLeft' || key === 'ArrowUp';
+				focus(items[index < 0 ? (back ? items.length-1 : 0) : (index + (back ? -1 : 1) + items.length) % items.length]);
+				return;
+			}
+			if (key === 'Enter' || key === ' ') {
+				stop(); if (event.repeat) return;
+				const items = controls(), target = items.includes(active) ? active : items[0];
+				if (target) { focus(target); target.click(); }
+				return;
+			}
+			if (!inside) stop();
+		}, opts);
+		timer = setTimeout(cleanup, duration);
+		return true;
+	};
+	window.highlightPsnItem = function(row, className, duration) {
+		if (!row?.isConnected || !row.getClientRects().length) return false;
+		window.clearPsnItemFocus();
+		row.classList.remove(className);
+		void row.offsetWidth;
+		row.classList.add(className);
+		return window.lockPsnItemFocus(row, duration, () => row.classList.remove(className));
+	};
 	window.openSupportDonationSetting = function(event) {
 		if (event) { event.preventDefault(); event.stopPropagation(); }
 		if (typeof playUiClick === 'function') playUiClick();
 		const reveal = () => {
 			const epoch = window.getPsnNavigationEpoch();
-			requestAnimationFrame(() => {
-				if (!window.isPsnNavigationEpochCurrent(epoch) || !psnIsViewVisible('view-settings')) return;
+			const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+			const isCurrent = () => window.isPsnNavigationEpochCurrent(epoch) && psnIsViewVisible('view-settings');
+			const scrollToDonation = () => {
+				if (!isCurrent()) return;
 				const row = document.getElementById('support-project-setting');
+				const scroller = document.getElementById('scroll-area');
 				if (!row) return;
 				if (row.classList.contains('anim-reveal')) resetRevealTargetToStatic(row, 'anim-reveal');
-				const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-				if (reduced) row.scrollIntoView({ behavior:'auto', block:'center' });
-				window.focusPsnNotificationDestination(row, { duration:5000, scroll:!reduced });
+				const behavior = reduced ? 'instant' : 'smooth';
+				if (scroller && scroller.contains(row)) {
+					const area = scroller.getBoundingClientRect();
+					const item = row.getBoundingClientRect();
+					const top = scroller.scrollTop + item.top - area.top - scroller.clientTop - (scroller.clientHeight - item.height) / 2;
+					scroller.scrollTo({ top:Math.max(0, Math.min(top, scroller.scrollHeight - scroller.clientHeight)), behavior });
+				} else row.scrollIntoView({ behavior, block:'center' });
+				window.focusPsnNotificationDestination(row, { duration:5000, scroll:false });
+			};
+			requestAnimationFrame(() => {
+				if (!isCurrent()) return;
+				const view = document.getElementById('view-settings');
+				const entry = !reduced && view?.getAnimations?.().find(animation => animation.animationName === 'view-enter' && animation.playState === 'running');
+				if (entry) entry.finished.then(() => requestAnimationFrame(scrollToDonation), () => requestAnimationFrame(scrollToDonation));
+				else requestAnimationFrame(scrollToDonation);
 			});
 		};
 		if (psnIsViewVisible('view-settings')) reveal();
@@ -14166,6 +14277,7 @@ P
 	}
 	function resumeSupportDonation() { if(!document.hidden && psnDonation.waiting) checkSupportDonation(); }
 	function openSupportDonationModal() {
+		window.clearPsnItemFocus();
 		if(typeof socketChat==='undefined' || !socketChat?.connected || window.isProfileLoaded!==true) { if(typeof showToastNotification==='function') showToastNotification('Support the Project','Connect to the server first.'); return; }
 		const modal=supportDonationModal(); if(!modal || psnDonation.session) return;
 		psnDonation.session=capturePsnAccountSession();
@@ -21773,20 +21885,53 @@ P
 	const SITE_DISCLAIMER_DAILY_PREFIX = 'psn_site_disclaimer_skip_today_v1_';
 	const SITE_DISCLAIMER_HOME_DELAY_MS = 500;
 
+	let siteDisclaimerInputCleanup = null;
+	let siteDisclaimerTransition = 0;
 	function setSiteDisclaimerPadPending(active) {
-		try {
-			if (document.body) document.body.classList.toggle('ps3-pad-disclaimer-pending', !!active);
-		} catch(e) {}
+		document.body?.classList.toggle('ps3-pad-disclaimer-pending', !!active);
+		if (active) lockSiteDisclaimerInput();
+		else unlockSiteDisclaimerInput();
 	}
 	function lockSiteDisclaimerInput() {
-		try {
-			const modal = document.getElementById('site-disclaimer-modal');
-			if (!modal || (!modal.classList.contains('show') && !modal.classList.contains('closing') && !modal.classList.contains('is-visible') && !window.__siteDisclaimerOpening)) return;
-			if (document.body) document.body.classList.add('site-disclaimer-input-lock');
-		} catch(e) {}
+		const body = document.body, modal = document.getElementById('site-disclaimer-modal');
+		if (!body || !modal || siteDisclaimerInputCleanup) return;
+		window.clearPsnItemFocus?.();
+		const locked = new Set(), controller = new AbortController();
+		const opts = {capture:true, passive:false, signal:controller.signal};
+		const sync = () => {
+			for (const child of body.children) {
+				if (child === modal || child.matches('script,style,link,template,audio') || child.hasAttribute('inert')) continue;
+				child.setAttribute('inert', '');
+				locked.add(child);
+			}
+		};
+		const observer = new MutationObserver(sync);
+		siteDisclaimerInputCleanup = () => {
+			observer.disconnect();
+			controller.abort();
+			for (const child of locked) child.removeAttribute('inert');
+			body.classList.remove('site-disclaimer-input-lock');
+			siteDisclaimerInputCleanup = null;
+		};
+		body.classList.add('site-disclaimer-input-lock');
+		sync();
+		observer.observe(body, {childList:true});
+		if (typeof clearPsnStableHover === 'function') clearPsnStableHover();
+		if (document.activeElement !== body && !modal.contains(document.activeElement)) document.activeElement?.blur();
+		const block = event => {
+			if (event.cancelable) event.preventDefault();
+			event.stopImmediatePropagation();
+		};
+		const isReady = () => modal.classList.contains('show') && !window.__siteDisclaimerOpening;
+		const blockOutside = event => {
+			if (!isReady() || !modal.contains(event.target)) block(event);
+		};
+		for (const type of ['pointerdown','pointerup','pointerover','mouseover','click','dblclick','contextmenu','wheel','touchstart','touchmove','touchend']) window.addEventListener(type, blockOutside, opts);
+		for (const type of ['keydown','keyup','keypress']) window.addEventListener(type, event => { if (!isReady()) block(event); }, opts);
 	}
 	function unlockSiteDisclaimerInput() {
-		try { if (document.body) document.body.classList.remove('site-disclaimer-input-lock'); } catch(e) {}
+		siteDisclaimerInputCleanup?.();
+		document.body?.classList.remove('site-disclaimer-input-lock');
 	}
 	function getSiteDisclaimerTodayStamp() {
 		const d = new Date();
@@ -21817,9 +21962,9 @@ P
 	function hideSiteDisclaimerModalSilently() {
 		const modal = document.getElementById('site-disclaimer-modal');
 		if (modal && modal.contains(document.activeElement)) document.activeElement.blur();
+		++siteDisclaimerTransition;
 		clearTimeout(window.__siteDisclaimerOpenTimer);
 		window.__siteDisclaimerOpening = false;
-		unlockSiteDisclaimerInput();
 		if (modal) {
 			modal.classList.remove('show', 'is-visible', 'closing');
 			modal.setAttribute('aria-hidden', 'true');
@@ -21847,10 +21992,9 @@ P
 		const modal = document.getElementById('site-disclaimer-modal');
 		if (!modal) {
 			setSiteDisclaimerPadPending(false);
-			unlockSiteDisclaimerInput();
 			return;
 		}
-		if (isSiteDisclaimerOpenOrOpening()) {
+		if (isSiteDisclaimerOpenOrOpening() || modal.classList.contains('closing')) {
 			setSiteDisclaimerPadPending(true);
 			return;
 		}
@@ -21859,7 +22003,6 @@ P
 		const todayStamp = getSiteDisclaimerTodayStamp();
 		if (!shouldShowSiteDisclaimerForUser(safeName)) {
 			setSiteDisclaimerPadPending(false);
-			unlockSiteDisclaimerInput();
 			return;
 		}
 		setSiteDisclaimerPadPending(true);
@@ -21877,10 +22020,13 @@ P
 		lockSiteDisclaimerInput();
 		const skipTodayCheckbox = document.getElementById('site-disclaimer-skip-today');
 		if (skipTodayCheckbox) skipTodayCheckbox.checked = false;
+		const transition = ++siteDisclaimerTransition;
 		window.__siteDisclaimerOpenTimer = setTimeout(() => {
+			if (transition !== siteDisclaimerTransition || !window.__siteDisclaimerOpening) return;
 			modal.classList.remove('show', 'closing');
 			requestAnimationFrame(() => {
 				requestAnimationFrame(() => {
+					if (transition !== siteDisclaimerTransition || !window.__siteDisclaimerOpening) return;
 					modal.setAttribute('aria-hidden', 'false');
 					modal.classList.add('show');
 					lockSiteDisclaimerInput();
@@ -21892,7 +22038,8 @@ P
 	}
 	function closeSiteDisclaimerModal() {
 		const modal = document.getElementById('site-disclaimer-modal');
-		if (!modal) { unlockSiteDisclaimerInput(); return; }
+		if (!modal) { setSiteDisclaimerPadPending(false); return; }
+		if (!modal.classList.contains('show')) return;
 		lockSiteDisclaimerInput();
 		try { if (window.__pendingSiteDisclaimerKey) sessionStorage.setItem(window.__pendingSiteDisclaimerKey, '1'); } catch(e) {}
 		const skipTodayCheckbox = document.getElementById('site-disclaimer-skip-today');
@@ -21909,10 +22056,10 @@ P
 		modal.classList.remove('show');
 		modal.classList.add('closing');
 		modal.setAttribute('aria-hidden', 'true');
+		const transition = ++siteDisclaimerTransition;
 		setTimeout(() => {
-			if (!modal.classList.contains('show')) {
+			if (transition === siteDisclaimerTransition && !modal.classList.contains('show')) {
 				modal.classList.remove('is-visible', 'closing');
-				unlockSiteDisclaimerInput();
 				setSiteDisclaimerPadPending(false);
 			}
 		}, 320);
@@ -22016,13 +22163,11 @@ P
 			if (document.body) {
 				document.body.style.pointerEvents = 'auto';
 				document.body.style.touchAction = '';
-				document.body.classList.remove('site-disclaimer-input-lock');
 				document.body.classList.add('psn-home-interactive');
 				window.__psnWarmTrophyCatalog?.();
 				if (typeof window.__psnFlushHomeDeferredWork === 'function') window.__psnFlushHomeDeferredWork();
 			}
 			if (document.documentElement) document.documentElement.style.pointerEvents = 'auto';
-			if (typeof unlockSiteDisclaimerInput === 'function') unlockSiteDisclaimerInput();
 			const bootContainer = document.getElementById('ps5-boot-container');
 			if (bootContainer && !bootContainer.classList.contains('psn-login-revealing') && !bootContainer.classList.contains('psn-login-reveal-open')) {
 				bootContainer.classList.add('psn-boot-released');
@@ -23816,7 +23961,7 @@ P
                 requestAnimationFrame(() => {
                     const row = list.querySelector(`.license-pack-catalog-row[data-license-title-id="${CSS.escape(titleId)}"]`);
                     if (row && typeof window.focusPsnNotificationDestination === 'function') {
-                        window.focusPsnNotificationDestination(row, { duration:5000 });
+                        window.focusPsnNotificationDestination(row, { duration:5000, lock:false });
                     }
                 });
             });
@@ -41296,7 +41441,7 @@ P
             if (focusRow) {
                 const persistentPending = readPlayTogetherNewPending().includes(notificationFocusTitleId);
                 if (typeof window.focusPsnNotificationDestination === 'function') {
-                    window.focusPsnNotificationDestination(focusRow, { preserveExisting:persistentPending, duration:5000 });
+                    window.focusPsnNotificationDestination(focusRow, { preserveExisting:persistentPending, duration:5000, lock:false });
                 }
                 window.__pendingPlayTogetherNotificationFocus = '';
             }
@@ -48920,10 +49065,7 @@ P
 			const row = Array.from(list?.children || []).find(node => node.getAttribute(attr) === current.id);
 			if (row) {
 				row.scrollIntoView({behavior:window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block:'center'});
-				row.classList.remove('admin-pending-focus');
-				void row.offsetWidth;
-				row.classList.add('admin-pending-focus');
-				setTimeout(() => row.classList.remove('admin-pending-focus'), 4400);
+				window.highlightPsnItem(row, 'admin-pending-focus', 4400);
 			} else if (++attempts < 24) setTimeout(reveal, 250);
 		};
 		setTimeout(reveal, 330);
@@ -56209,6 +56351,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		if (currentViewId === 'view-explore' && viewId !== 'view-explore' && typeof window.resetExploreUpdateHighlights === 'function') {
 			window.resetExploreUpdateHighlights();
 		}
+		window.clearPsnItemFocus();
 		psnNavigationEpoch++;
 		cancelStaleViewOpenWork(viewId);
 
@@ -61630,7 +61773,8 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 	function prepareUserSelectReturn() {
 		try {
 			if (typeof resetPsnSessionEntryScroll === 'function') resetPsnSessionEntryScroll();
-			document.body.classList.remove('psn-home-interactive', 'psn-sidebar-tab-switched', 'site-disclaimer-input-lock');
+			if (typeof hideSiteDisclaimerModalSilently === 'function') hideSiteDisclaimerModalSilently();
+			document.body.classList.remove('psn-home-interactive', 'psn-sidebar-tab-switched');
 			document.body.style.pointerEvents = 'auto';
 			document.body.style.touchAction = '';
 			document.body.style.filter = '';
@@ -61662,7 +61806,6 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 				userSelect.style.transform = 'translateY(0) scale(1)';
 				userSelect.style.filter = 'none';
 			}
-			if (typeof unlockSiteDisclaimerInput === 'function') unlockSiteDisclaimerInput();
 		} catch (err) {
 			console.warn('[AUTH] Could not prepare user select return:', err);
 		}
@@ -68040,11 +68183,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 			target.style.setProperty('--console-temp-focus-text', visual.focus);
 
 			try { card.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (e) { try { card.scrollIntoView(false); } catch (ignore) {} }
-			target.classList.remove('console-temp-alert-focus');
-			void target.offsetWidth;
-			target.classList.add('console-temp-alert-focus');
-			clearTimeout(window.__consoleTempAlertFocusTimer);
-			window.__consoleTempAlertFocusTimer = setTimeout(() => target.classList.remove('console-temp-alert-focus'), 3600);
+			window.highlightPsnItem(target, 'console-temp-alert-focus', 3600);
 			return true;
 		};
 
@@ -75082,7 +75221,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 						<div class="trophy-reward-link" style="margin-top: 10px; color: #ccc; font-size: 11px; font-weight: bold; text-transform: uppercase; letter-spacing: 0.5px; display: flex; align-items: center; gap: 5px; cursor: pointer; transition: 0.2s;" 
 							onmouseenter="if(typeof playUiHover === 'function') playUiHover(); this.style.textShadow='0 0 8px var(--ps-blue)';" 
 							onmouseleave="this.style.textShadow='none';" 
-							onclick="playUiClick(); switchView('view-rewards'); setTimeout(() => { let grid = document.getElementById('rewards-grid-container'); if(grid) grid.style.pointerEvents = 'none'; let r = document.getElementById('reward-card-${associatedReward.id}'); if(r){ if(r.dataset.animTimer) clearTimeout(parseInt(r.dataset.animTimer)); r.classList.remove('anim-reveal'); r.classList.add('no-anim', 'is-new'); r.scrollIntoView({behavior: 'smooth', block: 'center'}); r.style.opacity = '1'; r.style.filter = 'grayscale(0)'; r.dataset.animTimer = setTimeout(() => { r.classList.remove('is-new'); r.style.opacity = ''; r.style.filter = ''; if(grid) grid.style.pointerEvents = ''; r.dataset.animTimer = ''; }, 3000); } else { if(grid) grid.style.pointerEvents = ''; } }, 350);">
+							onclick="playUiClick(); window.openPsnRewardFromNotification('${associatedReward.id}', 3000);">
 							<i class="fas fa-gift" style="color: ${isLocked ? '#888' : 'var(--ps-blue)'};"></i>
 							<span class="trophy-reward-label">REWARD:</span>
 							<span class="trophy-reward-state" style="color: ${isLocked ? '#ff4444' : '#4caf50'}; text-decoration: underline;">${isLocked ? 'LOCKED' : 'UNLOCKED'}</span>
@@ -75437,7 +75576,23 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		});
 	}
 
-	window.openPsnRewardFromNotification = function(rewardId) {
+	window.openPsnTrophyEvidence = function(trophyId, duration = 5000) {
+		const reveal = () => {
+			const epoch = window.getPsnNavigationEpoch();
+			let attempts = 0;
+			const focusCard = () => {
+				if (!window.isPsnNavigationEpochCurrent(epoch) || !psnIsViewVisible('view-trophies')) return;
+				const card = document.getElementById('trophy-card-' + String(trophyId || ''));
+				if (card?.getClientRects().length) window.focusPsnNotificationDestination(card, { duration, preserveExisting:!!window.userTrophies?.[trophyId]?.isNew });
+				else if (++attempts < 30) setTimeout(focusCard, 100);
+			};
+			setTimeout(focusCard, 380);
+		};
+		if (psnIsViewVisible('view-trophies')) reveal();
+		else window.switchView('view-trophies', false, false, reveal);
+	};
+
+	window.openPsnRewardFromNotification = function(rewardId, duration = 5000) {
 		const id = String(rewardId || '').trim();
 		if (!id || !(window.REWARDS_DATA || []).some(reward => String(reward.id) === id)) return;
 		markPsnRewardNotices({ seen:true, visited:true });
@@ -75446,7 +75601,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			if (!psnIsViewVisible('view-rewards')) return;
 			const card = document.getElementById('reward-card-' + id);
 			if (card && card.getClientRects().length) {
-				if (typeof window.focusPsnNotificationDestination === 'function') window.focusPsnNotificationDestination(card, { duration:5000 });
+				if (typeof window.focusPsnNotificationDestination === 'function') window.focusPsnNotificationDestination(card, { duration });
 				else card.scrollIntoView({behavior:'smooth', block:'center'});
 				return;
 			}
@@ -75584,7 +75739,7 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 			const progressPct = trophy ? Math.min((state.progress / trophy.max) * 100, 100) : 0;
 			const trophyColor = trophy ? (TROPHY_COLORS[trophy.type] || '#fff') : '#fff';
 			
-			const navToTrophyScript = `event.stopPropagation(); playUiClick(); switchTab('trophies'); setTimeout(() => { let grid = document.getElementById('trophy-grid-container'); if(grid) grid.style.pointerEvents = 'none'; let t = document.getElementById('trophy-card-${reward.req}'); if(t){ t.scrollIntoView({behavior: 'smooth', block: 'center'}); t.classList.add('is-new'); t.style.transition = 'opacity 0.3s ease'; t.style.opacity = '1'; setTimeout(() => { t.classList.remove('is-new'); t.style.opacity = ''; if(grid) grid.style.pointerEvents = ''; }, 3000); } else { if(grid) grid.style.pointerEvents = ''; } }, 350);`;
+			const navToTrophyScript = `event.stopPropagation(); playUiClick(); window.openPsnTrophyEvidence('${reward.req}', 3000);`;
 			
 			const reqText = isUnlocked 
 			? `<span class="reward-status-link" style="cursor: pointer; color: #4caf50; font-weight: bold; transition: 0.2s; display: flex; align-items: center; justify-content: center; gap: 4px;" onmouseenter="if(typeof playUiHover === 'function') playUiHover(); this.style.textShadow='0 0 8px #4caf50';" onmouseleave="this.style.textShadow='none';" onclick="${navToTrophyScript}"><i class="fas fa-unlock"></i> <span style="text-decoration: underline;">Unlocked</span></span>` 
@@ -82494,15 +82649,7 @@ function getVisibleChatStackEl(id) {
 		}
 	
 		setTimeout(() => {
-			target.classList.remove('msg-highlight-ps5');
-			void target.offsetWidth;
-			target.classList.add('msg-highlight-ps5');
-			
-			if (typeof playUiSuccess === 'function') playUiSuccess();
-	
-			setTimeout(() => {
-				if (target) target.classList.remove('msg-highlight-ps5');
-			}, 3000);
+			if (window.highlightPsnItem(target, 'msg-highlight-ps5', 3000) && typeof playUiSuccess === 'function') playUiSuccess();
 		}, 550);
 		return true;
 	}
@@ -89666,7 +89813,7 @@ function getVisibleChatStackEl(id) {
     if(priorVisible&&bar.firstElementChild){bar.firstElementChild.classList.remove('is-changing');void bar.firstElementChild.offsetWidth;bar.firstElementChild.classList.add('is-changing');}
   }
   window.stepDirectGroupPin=function(delta){const s=window.__directGroupState;if(!s.pins.length)return;s.pinIndex=(s.pinIndex+delta+s.pins.length)%s.pins.length;s.pinSignature='';renderDirectGroupPins();};
-  window.jumpDirectGroupMessage=function(id){const row=document.getElementById('direct-group-messages')?.querySelector(`[data-direct-group-message="${CSS.escape(String(id))}"]`);if(row){row.scrollIntoView({behavior:'smooth',block:'center'});row.classList.add('direct-message-highlight');setTimeout(()=>row.classList.remove('direct-message-highlight'),1800);}};
+  window.jumpDirectGroupMessage=function(id){const row=document.getElementById('direct-group-messages')?.querySelector(`[data-direct-group-message="${CSS.escape(String(id))}"]`);if(row){row.scrollIntoView({behavior:'smooth',block:'center'});window.highlightPsnItem(row,'direct-message-highlight',1800);}};
   function directGroupPollHtml(m){
     const poll=m.content||{},safe={question:directEscapeHtml(poll.question||''),totalVotes:Number(poll.totalVotes)||0,options:(poll.options||[]).map(o=>({text:directEscapeHtml(o.text||''),voters:(o.voters||[]).map(directEscapeHtml)}))};
     return typeof window.buildPollHtml==='function'?window.buildPollHtml(safe,'group-'+String(m.id),window.__directGroupState.pollViews?.[m.id]||'options'):'';
@@ -92477,8 +92624,7 @@ function getVisibleChatStackEl(id) {
 		}
 		if (!row) return false;
 		row.scrollIntoView({behavior:'smooth',block:'center'});
-		row.classList.remove('direct-message-highlight'); void row.offsetWidth; row.classList.add('direct-message-highlight');
-		setTimeout(() => row && row.classList.remove('direct-message-highlight'), 1800);
+		window.highlightPsnItem(row, 'direct-message-highlight', 1800);
 		if (typeof playUiClick === 'function') playUiClick();
 		return true;
 	};
@@ -98838,6 +98984,7 @@ function getVisibleChatStackEl(id) {
 	};
 
 	window.psnClearCurrentSession = function(username = '', options = {}) {
+		if (typeof hideSiteDisclaimerModalSilently === 'function') hideSiteDisclaimerModalSilently();
 		const name = username || localStorage.getItem('psn_username') || (typeof currentLoginUser !== 'undefined' ? currentLoginUser : '') || '';
 		if (window.__psnOfflineModeActive === true && typeof window.leavePsnOfflineMode === 'function') window.leavePsnOfflineMode(false);
 		try {
@@ -99982,13 +100129,10 @@ function getVisibleChatStackEl(id) {
         const targetTop = Math.max(0, target.offsetTop - Math.max(24, Math.floor(box.clientHeight * 0.35)));
         box.scrollTo({ top: targetTop, behavior: 'smooth' });
 
-        target.classList.remove('msg-highlight-ps5');
-        void target.offsetWidth;
-        target.classList.add('msg-highlight-ps5');
+        window.highlightPsnItem(target, 'msg-highlight-ps5', 3200);
 
         setTimeout(refreshMentionJumpButton, 120);
         setTimeout(refreshMentionJumpButton, 520);
-        setTimeout(() => target.classList.remove('msg-highlight-ps5'), 3200);
     }
 
     function getChatUnreadMessageCount() {
@@ -103384,6 +103528,7 @@ function getVisibleChatStackEl(id) {
 		if (!element || !element.classList) return false;
 
 		const duration = Math.max(1000, Number(options.duration) || 5000);
+		if (options.lock !== false) window.clearPsnItemFocus();
 		const preserveExisting = options.preserveExisting === true;
 		const scroll = options.scroll !== false;
 		const alreadyNew = element.classList.contains('is-new');
@@ -103394,6 +103539,14 @@ function getVisibleChatStackEl(id) {
 		if (scroll) {
 			try { element.scrollIntoView({ behavior:'smooth', block:'center' }); }
 			catch (e) { try { element.scrollIntoView(false); } catch (ignore) {} }
+		}
+
+		if (options.lock !== false) {
+			if (element.classList.contains('anim-reveal')) resetRevealTargetToStatic(element, 'anim-reveal');
+			const keep = alreadyNew && preserveExisting;
+			if (!keep) { clearTimeout(psnStandardIsNewTimers.get(element)); psnStandardIsNewTimers.delete(element); }
+			element.classList.add('is-new');
+			return window.lockPsnItemFocus(element, duration, () => { if (!keep) element.classList.remove('is-new'); });
 		}
 
 		if (alreadyNew) {
@@ -104100,14 +104253,7 @@ function getVisibleChatStackEl(id) {
 		}
 		if (item.type === 'trophy') {
 			if (typeof playUiClick === 'function') playUiClick();
-			if (typeof window.switchTab === 'function') window.switchTab('trophies');
-			setTimeout(function() {
-				const card = document.getElementById('trophy-card-' + String(data.trophyId || ''));
-				if (!card) return;
-				card.scrollIntoView({ behavior:'smooth', block:'center' });
-				card.classList.add('is-new');
-				setTimeout(function() { card.classList.remove('is-new'); }, 3200);
-			}, 380);
+			window.openPsnTrophyEvidence(data.trophyId, 3200);
 			return;
 		}
 		if (typeof playUiClick === 'function') playUiClick();
@@ -105659,7 +105805,7 @@ function getVisibleChatStackEl(id) {
 				const rows = Array.from(body.querySelectorAll('.download-item[data-shared-game-title-id]'));
 				rows.forEach(function(row, index) {
 					if (typeof window.focusPsnNotificationDestination === 'function') {
-						window.focusPsnNotificationDestination(row, { scroll:index === 0, duration:5000 });
+						window.focusPsnNotificationDestination(row, { scroll:index === 0, duration:5000, lock:false });
 					}
 				});
 			});
@@ -105711,17 +105857,7 @@ function getVisibleChatStackEl(id) {
 		}
 		if (item.type === 'trophy') {
 			const trophyId = String(data.trophyId || '');
-			if (typeof window.switchTab === 'function') window.switchTab('trophies');
-			setTimeout(function() {
-				const card = document.getElementById('trophy-card-' + trophyId);
-				if (!card) return;
-				const persistentIsNew = !!(window.userTrophies && window.userTrophies[trophyId] && window.userTrophies[trophyId].isNew);
-				if (typeof window.focusPsnNotificationDestination === 'function') {
-					window.focusPsnNotificationDestination(card, { preserveExisting:persistentIsNew, duration:5000 });
-				} else {
-					try { card.scrollIntoView({ behavior:'smooth', block:'center' }); } catch (e) {}
-				}
-			}, 380);
+			window.openPsnTrophyEvidence(trophyId);
 			return;
 		}
 		if (item.type === 'catalog') {
@@ -120690,12 +120826,10 @@ function getVisibleChatStackEl(id) {
         state.focusReportedCommentId=null;
         const row=list.querySelector(`[data-social-comment="${focusCommentId}"]`);
         if(row){
-          row.classList.add('is-report-target');
-          row.setAttribute('tabindex','-1');
+          window.highlightPsnItem(row,'is-report-target',3200);
           const offset=row.getBoundingClientRect().top-list.getBoundingClientRect().top+list.scrollTop-(list.clientHeight-row.offsetHeight)/2;
           list.scrollTo({top:Math.max(0,offset),behavior:'smooth'});
-          row.focus({preventScroll:true});
-          setTimeout(()=>{if(row.isConnected){row.classList.remove('is-report-target');row.removeAttribute('tabindex');}},3200);
+
         }else if(status)status.textContent='This comment is no longer available.';
       }
     })();
@@ -121434,11 +121568,14 @@ function getVisibleChatStackEl(id) {
       const card=document.querySelector(`[data-social-post="${target}"]`);
       if(card){
         card.scrollIntoView({behavior:'smooth',block:'center'});
-        card.style.borderColor='rgba(76,190,255,.8)';
-        setTimeout(()=>{if(card.isConnected)card.style.borderColor='';},2600);
         if(idOf(commentId)){
           state.focusReportedCommentId=idOf(commentId);
           openCommentModal(target,card.querySelector('[data-social-action="comments"]'));
+        }else{
+          window.clearPsnItemFocus();
+          const oldBorder=card.style.borderColor;
+          card.style.borderColor='rgba(76,190,255,.8)';
+          window.lockPsnItemFocus(card,2600,()=>{card.style.borderColor=oldBorder;});
         }
       }
     } else notify('This publication is no longer available.',true);
