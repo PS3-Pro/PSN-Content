@@ -1,4 +1,4 @@
-const ENDPOINTS_URL = 'https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/server/endpoints.json';
+const ENDPOINTS_URL = 'https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/server/endpoints.json';
 let cachedOrigin = '', cachedUntil = 0;
 function parsePsnServerEndpoints(data) {
   if (!Array.isArray(data?.servers) || !data.servers.length || data.servers.length > 16) throw new Error('Invalid server list');

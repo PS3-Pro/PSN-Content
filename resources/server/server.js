@@ -487,7 +487,7 @@ const DEBUG_BANDWIDTH_ENABLED = process.env.DEBUG_BANDWIDTH === "1";
 const CHAT_SYNC_INTERVAL_MS = 3000;
 const KEEP_ALIVE_INTERVAL_MS = Math.max(60000, parseInt(process.env.KEEP_ALIVE_INTERVAL_MS || "600000", 10) || 600000);
 const KEEP_ALIVE_TIMEOUT_MS = Math.max(1000, parseInt(process.env.KEEP_ALIVE_TIMEOUT_MS || "10000", 10) || 10000);
-const PSN_ENDPOINTS_URL = 'https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/server/endpoints.json';
+const PSN_ENDPOINTS_URL = 'https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/server/endpoints.json';
 const PROFILE_SYNC_INTERVAL_MS = Math.max(10000, parseInt(process.env.PROFILE_SYNC_INTERVAL_MS || "15000", 10) || 15000);
 const ENABLE_PROFILE_PERIODIC_SYNC = process.env.ENABLE_PROFILE_PERIODIC_SYNC === "1";
 const POST_AUTH_CHAT_HISTORY_DELAY_MS = Math.max(0, parseInt(process.env.POST_AUTH_CHAT_HISTORY_DELAY_MS || "180", 10) || 180);
