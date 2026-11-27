@@ -10,6 +10,10 @@ const bcrypt = require('bcrypt');
 const crypto = require('crypto');
 const { Worker } = require('node:worker_threads');
 const zlib = require('zlib');
+const manualFs = require('node:fs');
+const { pipeline: manualPipeline } = require('node:stream/promises');
+const { tmpdir: manualTmpdir } = require('node:os');
+const { join: manualJoin } = require('node:path');
 const { spawn } = require('child_process');
 const { isDeepStrictEqual } = require('node:util');
 const { monitorEventLoopDelay, performance } = require('node:perf_hooks');
@@ -2931,6 +2935,13 @@ let ssExtraImageActive = 0;
 let ssExtraImageBytes = 0;
 const SS_EXTRA_IMAGE_LIMIT = 16 * 1024 * 1024;
 const SS_EXTRA_IMAGE_TTL_MS = 60 * 60 * 1000;
+function ssPruneImageCache(now=Date.now()) {
+  for(const [key,value] of ssExtraImageCache) {
+    if(value.until>now)continue;
+    ssExtraImageCache.delete(key);ssExtraImageBytes-=value.body.length;
+  }
+}
+setInterval(ssPruneImageCache,5*60*1000).unref();
 function ssExtraImageToken(system, gameId, type, region) {
   const expires=(Math.floor(Date.now()/3600000)+2)*3600;
   const raw = Buffer.from(JSON.stringify({s:system,g:gameId,t:type,r:region || '',e:expires})).toString('base64url');
@@ -3113,16 +3124,22 @@ function ssPreviewSetCached(key, payload, ttl = null) {
 }
 
 const SS_PREVIEW_DB_NO_VIDEO_DAYS = 1;
+const SS_CASE_DB_DAYS = 30;
+function ssCaseMetadataComplete(extras) {
+  return extras?.caseArtworkChecked===true && extras.caseArtworkVersion===2 && extras.artworkChecked===true && !extras.inferredBase;
+}
 let ssPreviewDbPruneAfter = 0;
 async function ssPreviewLoadDatabase(key, systemId, legacyKey='', serial='', wanted='', refreshInitialsMiss=false, catalogBase=false, pendingWanted='') {
   try {
     const pendingKey=pendingWanted ? `pending1:${key}` : '';
     const keys=[...new Set([key,legacyKey,pendingKey].filter(Boolean))];
     const rows = (await pool.query({text:`
-      SELECT cache_key, game_id, media_type, api_host, extras, expires_at
+      SELECT cache_key, game_id, media_type, api_host, extras, expires_at, refreshed_at
       FROM screenscraper_game_cache
       WHERE cache_key = ANY($1::text[]) AND system_id = $2 AND expires_at > NOW()
-        AND (media_type IN ('video','video-normalized') OR refreshed_at > NOW() - INTERVAL '1 day')`,
+        AND (media_type IN ('video','video-normalized') OR refreshed_at > NOW() - INTERVAL '1 day'
+          OR (extras @> '{"caseArtworkChecked":true,"caseArtworkVersion":2,"artworkChecked":true}'::jsonb
+              AND NOT (extras @> '{"inferredBase":true}'::jsonb)))`,
       values:[keys,systemId],query_timeout:2500})).rows;
     const decode = row => {
       if (!row) return null;
@@ -3133,7 +3150,7 @@ async function ssPreviewLoadDatabase(key, systemId, legacyKey='', serial='', wan
         ssPreviewSetCached(row.cache_key,payload);
         return payload;
       }
-      const extras = row.extras && typeof row.extras === 'object' ? row.extras : null;
+      const extras = row.extras && typeof row.extras === 'object' ? {...row.extras} : null;
       if (extras?.inferredBase && !catalogBase) return null;
       const mediaSystem = systemId === 0 ? Number(extras?.system) : systemId;
       if (!ssPreviewValidMediaSystem(mediaSystem)) return null;
@@ -3146,12 +3163,17 @@ async function ssPreviewLoadDatabase(key, systemId, legacyKey='', serial='', wan
         url:`https://www.screenscraper.fr/medias/${mediaSystem}/${gameId}/${type}.mp4`
       } : null;
       if (!video && !extras) return null;
+      const checkedAgo=Date.now()-new Date(row.refreshed_at).getTime();
+      // Longer artwork retention must not suppress the daily recheck of missing gameplay.
+      const videoRecheckIn=SS_PREVIEW_DB_NO_VIDEO_DAYS*86400000-checkedAgo;
+      if(!video && ssCaseMetadataComplete(extras) && !(videoRecheckIn>0))extras.videoChecked=false;
       const payload = video
         ? {found:true, url:video.url, video, extras, provider:'screenscraper'}
         : {found:false, extras, provider:'screenscraper', reason:'no_video'};
       payload.lookupSource='postgresql';
       const remaining=Number(new Date(row.expires_at))-Date.now();
-      ssPreviewSetCached(row.cache_key, payload, (!video||extras?.inferredBase)&&Number.isFinite(remaining)?Math.max(0,Math.min(remaining,SS_PREVIEW_POSITIVE_MS)):null);
+      const ttl=(!video||extras?.inferredBase)&&Number.isFinite(remaining)?Math.max(0,Math.min(remaining,SS_PREVIEW_POSITIVE_MS)):null;
+      ssPreviewSetCached(row.cache_key,payload,!video&&ssCaseMetadataComplete(extras)&&videoRecheckIn>0?Math.min(ttl??SS_PREVIEW_POSITIVE_MS,videoRecheckIn):ttl);
       return payload;
     };
     const pending=rows.find(entry=>pendingKey && entry.cache_key===pendingKey && !entry.media_type && entry.extras?.pendingIdentityName===pendingWanted);
@@ -3199,7 +3221,7 @@ function ssPreviewPersistDatabase(key, systemId, result, aliases=[], protectPrim
       AND (screenscraper_game_cache.media_type NOT IN ('video','video-normalized')
         OR EXCLUDED.media_type IN ('video','video-normalized'))
       AND ((NOT $10::boolean AND screenscraper_game_cache.cache_key=$9) OR screenscraper_game_cache.game_id IN (0,EXCLUDED.game_id))`,
-    [[...new Set([key,...aliases])], systemId, gameId, type, host, JSON.stringify(metadata || null), persistent, SS_PREVIEW_DB_NO_VIDEO_DAYS,key,protectPrimary],
+    [[...new Set([key,...aliases])], systemId, gameId, type, host, JSON.stringify(metadata || null), persistent, ssCaseMetadataComplete(result.extras)?SS_CASE_DB_DAYS:SS_PREVIEW_DB_NO_VIDEO_DAYS,key,protectPrimary],
     { attempts:3, label:'SCREENSCRAPER CACHE WRITE', queryTimeoutMs:2500 }
   ).then(() => {
     const now = Date.now();
@@ -5083,7 +5105,8 @@ app.get('/api/screenscraper-extras', async (req,res) => {
   if ((!isPort && !SS_PREVIEW_SYSTEM_IDS.has(system)) || (isMinis && system !== 59) || name.length < 3 || !normalizeSsPreviewTitle(name)) return res.status(400).json({ok:false});
   try {
     const options={englishSummary:true,artwork:true,titleId:isPort?'':ssPreviewSerial(req.query?.titleId),catalogBase:req.query?.catalogBase==='1',caseArtwork:req.query?.case==='1'};
-    const result = await ssPreviewLookupCategory(name,system,isMinis,options);
+    // Physical artwork must match the displayed console; cross-console metadata is not useful here.
+    const result = await (options.caseArtwork&&!isPort&&!isMinis?ssPreviewLookup(name,system,options):ssPreviewLookupCategory(name,system,isMinis,options));
     const partial=result.partial || (options.caseArtwork && !!result.extras && result.extras.caseArtworkVersion!==2);
     if (partial) res.setHeader('Cache-Control','no-store');
     return res.json({ok:true,found:!!result.extras,extras:ssExtraPublic(result.extras),reason:result.reason,lookupSource:result.lookupSource,lookupTrace:result.lookupTrace,...(partial?{partial:true,retry:true}:{})});
@@ -5155,6 +5178,7 @@ async function ssVideoRequestImage(raw,signal,redirects=0,maxBytes=4*1024*1024) 
   return response;
 }
 const ssManualPending=new Map();
+const SS_MANUAL_MAX_BYTES=16*1024*1024;
 async function ssFetchManual(data) {
   const url=new URL('https://api.screenscraper.fr/api2/mediaManuelJeu.php');
   url.searchParams.set('devid',SS_PREVIEW_DEVID);
@@ -5164,26 +5188,35 @@ async function ssFetchManual(data) {
   url.searchParams.set('jeuid',String(data.g));
   url.searchParams.set('mediaformat','pdf');
   if(SS_PREVIEW_USER && SS_PREVIEW_PASSWORD){url.searchParams.set('ssid',SS_PREVIEW_USER);url.searchParams.set('sspassword',SS_PREVIEW_PASSWORD);}
-  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),22000),maxBytes=16*1024*1024;
+  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),22000);
+  let dir,keep=false;
   try {
     const release=await ssProviderAcquire('image',controller.signal);
     try {
+      dir=await manualFs.promises.mkdtemp(manualJoin(manualTmpdir(),'psn-manual-'));
+      const path=manualJoin(dir,'manual.pdf');
       for(const type of ['manuel','manual']){
         url.searchParams.set('media',type+(data.r?'('+data.r+')':''));
         ssPreviewQuotaReserve('image');
         let upstream;
-        try{upstream=await ssVideoRequestImage(url.href,controller.signal,0,maxBytes);}
+        try{upstream=await ssVideoRequestImage(url.href,controller.signal,0,SS_MANUAL_MAX_BYTES);}
         catch(error){if(error?.message==='image_upstream_404'&&type==='manuel')continue;throw error;}
-        let size=0;const parts=[];
-        for await(const chunk of upstream){size+=chunk.length;if(size>maxBytes){upstream.destroy();throw Error('pdf_too_large');}parts.push(chunk);}
-        const pdf=Buffer.concat(parts,size);
-        if(pdf.subarray(0,5).toString('ascii')==='%PDF-')return pdf;
-        if(size<1024 && /^NOMEDIA\s*$/i.test(pdf.toString('utf8').trim()))continue;
-        throw Error('not_pdf');
+        let size=0;
+        const file=await manualFs.promises.open(path,'w+',0o600).catch(error=>{upstream.destroy();throw error;});
+        try {
+          for await(const chunk of upstream){
+            size+=chunk.length;if(size>SS_MANUAL_MAX_BYTES){upstream.destroy();throw Error('pdf_too_large');}
+            await file.writeFile(chunk);
+          }
+          const head=Buffer.alloc(Math.min(size,1024));await file.read(head,0,head.length,0);
+          if(head.subarray(0,5).toString('ascii')==='%PDF-'){keep=true;return {dir,path,size};}
+          if(size<1024 && /^NOMEDIA\s*$/i.test(head.toString('utf8').trim()))continue;
+          throw Error('not_pdf');
+        } finally {await file.close();upstream.destroy();}
       }
       throw Error('manual_not_found');
     }finally{release();}
-  }finally{clearTimeout(timer);}
+  }finally{clearTimeout(timer);if(dir&&!keep)await manualFs.promises.rm(dir,{recursive:true,force:true}).catch(()=>{});}
 }
 app.options('/api/screenscraper-manual',(req,res)=>{setMetadataCors(res);res.status(204).end();});
 app.get('/api/screenscraper-manual',async(req,res)=>{
@@ -5191,22 +5224,34 @@ app.get('/api/screenscraper-manual',async(req,res)=>{
   const data=ssExtraVerifyToken(req.query?.token);
   if(!data||!['manual','manuel'].includes(data.t)||!SS_PREVIEW_ENABLED)return res.status(403).json({ok:false,reason:'invalid_manual_token'});
   const key=`${data.s}:${data.g}:${data.r}`;
+  let pending=ssManualPending.get(key),file,joined=false,sendTimer;
   try{
-    let pending=ssManualPending.get(key);
     if(!pending){
       if(ssManualPending.size>=1){res.setHeader('Retry-After','5');return res.status(503).json({ok:false,reason:'manual_busy'});}
-      pending=ssFetchManual(data).finally(()=>ssManualPending.delete(key));ssManualPending.set(key,pending);
+      pending={users:0,promise:ssFetchManual(data)};ssManualPending.set(key,pending);
     }
-    const pdf=await pending;if(res.destroyed||res.writableEnded)return;
-    res.setHeader('Content-Type','application/pdf');res.setHeader('Content-Disposition','inline; filename="screenscraper-manual.pdf"');res.setHeader('Cache-Control','private,max-age=900');res.setHeader('X-Content-Type-Options','nosniff');return res.send(pdf);
+    if(pending.users>=4){res.setHeader('Retry-After','5');return res.status(503).json({ok:false,reason:'manual_busy'});}
+    pending.users++;joined=true;
+    file=await pending.promise;if(res.destroyed||res.writableEnded)return;
+    res.setHeader('Content-Type','application/pdf');res.setHeader('Content-Length',String(file.size));res.setHeader('Content-Disposition','inline; filename="screenscraper-manual.pdf"');res.setHeader('Cache-Control','private,max-age=900');res.setHeader('X-Content-Type-Options','nosniff');
+    sendTimer=setTimeout(()=>res.destroy(),30000);
+    await manualPipeline(manualFs.createReadStream(file.path,{highWaterMark:64*1024}),res);
   }catch(error){
     if(res.destroyed||res.writableEnded)return;
+    if(res.headersSent){res.destroy();return;}
+    res.removeHeader('Content-Length');res.removeHeader('Content-Disposition');
     const message=String(error?.message||''),limited=error?.code==='provider_cooldown'||/^image_upstream_43[01]$|^image_upstream_429$/.test(message);
     const busy=error?.code==='provider_queue_full'||error?.code==='provider_queue_timeout';
     const absent=message==='manual_not_found'||message==='image_upstream_404';
     const large=message==='pdf_too_large'||message==='image_too_large';
     if(limited||busy)res.setHeader('Retry-After',String(busy?5:Math.min(3600,Math.max(2,Number(error.retryAfter)||60))));
     res.setHeader('Cache-Control','no-store');return res.status(limited?429:busy?503:absent?404:large?413:502).json({ok:false,reason:absent?'manual_not_found':large?'manual_too_large':limited?'provider_limited':busy?'manual_busy':'manual_unavailable'});
+  }finally{
+    clearTimeout(sendTimer);
+    if(joined&&--pending.users===0){
+      if(ssManualPending.get(key)===pending)ssManualPending.delete(key);
+      try{if(file)await manualFs.promises.rm(file.dir,{recursive:true,force:true});}catch(_){}
+    }
   }
 });
 app.options('/api/screenscraper-image',(req,res)=>{setMetadataCors(res);res.status(204).end();});
@@ -5216,8 +5261,8 @@ app.get('/api/screenscraper-image',async(req,res)=>{
   const data=ssExtraVerifyToken(req.query&&req.query.token);
   if (!data||!SS_PREVIEW_ENABLED||['manual','manuel'].includes(data.t)) return res.status(403).end();
   const key=`${data.s}:${data.g}:${data.t}:${data.r}`;
+  ssPruneImageCache();
   let cached=ssExtraImageCache.get(key);
-  if(cached&&cached.until<Date.now()) {ssExtraImageCache.delete(key);ssExtraImageBytes-=cached.body.length;cached=null;}
   if (cached) {
     cached.until = Date.now() + SS_EXTRA_IMAGE_TTL_MS;
     ssExtraImageCache.delete(key);
