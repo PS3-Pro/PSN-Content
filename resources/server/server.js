@@ -3628,7 +3628,7 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
     const video = validMatch ? (ssPreviewFindVideo(bestGame, systemId) ||
       (previousVideo?.gameId===Number(bestGame.id) && previousVideo?.system===mediaSystem ? previousVideo : null)) : null;
     const extras = validMatch ? ssPreviewExtractExtras(bestGame, mediaSystem) : null;
-    if (extras && confirmedDetailId===Number(bestGame.id)) extras.caseArtworkChecked=true;
+    if (extras && confirmedDetailId===Number(bestGame.id)) extras.caseArtworkChecked=true,extras.caseArtworkVersion=2;
     if (extras && !video && !detailedIds.has(Number(bestGame.id)) && !demand.wantsVideo) extras.videoChecked=false;
     if (extras && (retroConfirmed() || exactDetailsComplete())) {
       if (retroConfirmed()) extras.retroDetailsChecked=true;
@@ -3720,7 +3720,7 @@ function ssPreviewLookup(name, systemId, options = null) {
   const retro=options?.retro===true;
   const catalogBase=options?.catalogBase===true && !retro && systemId!==0;
   const ready = (result,video=wantsVideo,extras=wantsExtras,retroDetail=retro,caseDetail=caseArtwork) => !!result &&
-    (!caseDetail || (!result.extras && !result.found) || result.extras?.caseArtworkChecked===true) &&
+    (!caseDetail || (!result.extras && !result.found) || (result.extras?.caseArtworkChecked===true && result.extras?.caseArtworkVersion===2)) &&
     (!result.extras?.inferredBase || catalogBase) &&
     (!candidateId || Number(result.video?.gameId || result.extras?.gameId)===candidateId) &&
     (systemId!==0 || !result.extras || Array.isArray(result.extras.sourceCandidates) ||
@@ -3770,7 +3770,7 @@ function ssPreviewLookup(name, systemId, options = null) {
       primary?.extras?.artworkChecked===false || primary?.extras?.videoChecked===false,options?.lookupDeadline,primary?.video).catch(error=>{
       if (complete(primary)) return primary;
       if (complete(legacy)) return legacy;
-      if (demand.retro && demand.wantsExtras && primary?.extras) return {...primary,partial:true,partialReason:error?.code};
+      if ((demand.retro || demand.caseArtwork) && demand.wantsExtras && primary?.extras) return {...primary,partial:true,partialReason:error?.code};
       throw error;
     });
   });
@@ -5084,8 +5084,9 @@ app.get('/api/screenscraper-extras', async (req,res) => {
   try {
     const options={englishSummary:true,artwork:true,titleId:isPort?'':ssPreviewSerial(req.query?.titleId),catalogBase:req.query?.catalogBase==='1',caseArtwork:req.query?.case==='1'};
     const result = await ssPreviewLookupCategory(name,system,isMinis,options);
-    if (result.partial) res.setHeader('Cache-Control','no-store');
-    return res.json({ok:true,found:!!result.extras,extras:ssExtraPublic(result.extras),reason:result.reason,lookupSource:result.lookupSource,lookupTrace:result.lookupTrace,...(result.partial?{partial:true,retry:true}:{})});
+    const partial=result.partial || (options.caseArtwork && !!result.extras && result.extras.caseArtworkVersion!==2);
+    if (partial) res.setHeader('Cache-Control','no-store');
+    return res.json({ok:true,found:!!result.extras,extras:ssExtraPublic(result.extras),reason:result.reason,lookupSource:result.lookupSource,lookupTrace:result.lookupTrace,...(partial?{partial:true,retry:true}:{})});
   } catch (e) {res.setHeader('Cache-Control','no-store');if([429,503].includes(Number(e?.status)))res.setHeader('Retry-After',String(Math.min(3600,Math.max(2,Number(e.retryAfter)||5))));return res.status([429,503].includes(Number(e?.status)) ? e.status : 502).json({ok:false,retry:true,...ssPreviewPublicError(e)});}
 });
 
