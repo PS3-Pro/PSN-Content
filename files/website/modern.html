@@ -43375,6 +43375,7 @@ P
 			['--psn-ss-modal-bg','--psn-ss-fade-start','--psn-ss-fade-end'].forEach(prop=>scraperBackground.style.removeProperty(prop));
 		}
 		modal.__psnUseGalleryFanart = null;
+		modal.__psnGalleryMetadataPending = false;
 		modal.__psnScraperAppliedToken = null;
 		modal.__psnFanartGeneration = (Number(modal.__psnFanartGeneration)||0)+1;
 		const modalBody = modal.querySelector('.sys-modal-body');
@@ -43646,7 +43647,12 @@ P
 				}
 			} else {
 				primeGameModalMetadataLoadingUi(modal, { screenshots: true });
-				fetchGameSummary(game.cleanName, game.id || game.titleId || '', game.contentId || '', game.region || '', { prepared: true, requestToken: hydrationToken });
+				modal.__psnGalleryMetadataPending = true;
+				fetchGameSummary(game.cleanName, game.id || game.titleId || '', game.contentId || '', game.region || '', { prepared: true, requestToken: hydrationToken }).finally(() => {
+					if (modal.dataset.openHydrationToken !== hydrationToken) return;
+					modal.__psnGalleryMetadataPending = false;
+					modal.__psnUseGalleryFanart?.();
+				});
 			}
 		} else {
 			modalContent.style.maxWidth = '650px';
@@ -45581,6 +45587,7 @@ P
 				scrContainer.appendChild(tile);
 			});
 
+			modalRoot?.__psnUseGalleryFanart?.();
 			const gallerySnapshot = renderedScreenshotUrls.slice();
 			Array.from(scrContainer.querySelectorAll('.screenshot-item')).forEach((image, index) => {
 				image.onclick = () => openImageModal(index, gallerySnapshot, { gallery:true, sourceElement:image });
@@ -121741,7 +121748,7 @@ function getVisibleChatStackEl(id) {
     const previous=warmImages.get(key);
     if(previous && previous.until>now)return previous.promise;
     if(previous)warmImages.delete(key);
-    const entry={status:'pending',until:now+12*60*1000,url:'',image:null,promise:null};
+    const entry={status:'pending',until:now+12*60*1000,url:'',image:null,promise:null,screenshotUrls:[]};
     const load=(url,allowRenew)=>new Promise(resolve=>{
       const image=new Image();
       image.decoding='async';
@@ -121765,6 +121772,8 @@ function getVisibleChatStackEl(id) {
     });
     entry.promise=getAssets(name,system,isPort,false,isMinis,titleId).then(async data=>{
       const images=data?.extras?.images||[];
+      const shots=images.filter(item=>item.kind==='screenshot');
+      entry.screenshotUrls=[...shots.filter(item=>item.type==='ss'),...shots.filter(item=>item.type!=='ss')].map(item=>validImg(item.url)).filter(Boolean);
       const art=images.find(item=>item.kind==='background'&&validImg(item.url));
       const url=validImg(art?.url);
       if(url)return load(url,true);
@@ -121772,12 +121781,9 @@ function getVisibleChatStackEl(id) {
         (data.found===false||(data.extras?.artworkChecked===true&&Array.isArray(data.extras.images)&&!images.some(item=>item.kind==='background')));
       if(absent){
         entry.status='loading';
-        const shots=images.filter(item=>item.kind==='screenshot');
-        const screenshotUrls=[...shots.filter(item=>item.type==='ss'),...shots.filter(item=>item.type!=='ss')].map(item=>validImg(item.url));
         const bing=await warmBingFanart(name,system,isPort,isMinis);
-        const fallback=bing||await warmScreenshotFanart(screenshotUrls);
-        if(fallback){
-          entry.image=fallback.image;entry.url=fallback.url;entry.status='ready';entry.until=Date.now()+(bing?12*60*60*1000:15*60*1000);
+        if(bing){
+          entry.image=bing.image;entry.url=bing.url;entry.status='ready';entry.until=Date.now()+12*60*60*1000;
           return entry.url;
         }
       }
@@ -121948,10 +121954,12 @@ function getVisibleChatStackEl(id) {
       return;
     }
     const fanart=warmFanart(name,system,isPort,consoleTag==='minis',lookupTitleId);
-    let screenshotPending=false;
+    const fanartEntry=warmImages.get(identity);
+    let screenshotPending=false,galleryQueued=false;
     const triedScreenshots=new Set();
     const useGallery=async()=>{
-      if(!valid()||screenshotPending||content.classList.contains('psn-ss-fanart'))return;
+      if(!valid()||content.classList.contains('psn-ss-fanart'))return;
+      if(screenshotPending){galleryQueued=true;return;}
       screenshotPending=true;
       try{
         const url=await fanart;
@@ -121959,14 +121967,27 @@ function getVisibleChatStackEl(id) {
         if(!valid()||document.hidden||content.classList.contains('psn-ss-fanart'))return;
         const urls=Array.from(root.querySelectorAll('#modal-screenshots img.screenshot-item'),img=>{
           try{const u=new URL(img.currentSrc||img.src,document.baseURI);return u.protocol==='https:'?u.href:'';}catch(_){return '';}
-        }).filter(url=>url&&!triedScreenshots.has(url));
-        const candidates=[...new Set(urls)].slice(0,Math.max(0,2-triedScreenshots.size));
-        candidates.forEach(url=>triedScreenshots.add(url));
-        if(candidates.length){
-          const fallback=await warmScreenshotFanart(candidates);
+        }).filter(Boolean);
+        const candidates=[...new Set(urls)].filter(url=>!triedScreenshots.has(url)).slice(0,Math.max(0,4-triedScreenshots.size));
+        for(let index=0;index<candidates.length;index+=2){
+          if(!valid()||document.hidden)return;
+          const batch=candidates.slice(index,index+2);
+          batch.forEach(url=>triedScreenshots.add(url));
+          const fallback=await warmScreenshotFanart(batch);
+          if(fallback){apply(fallback.url);return;}
+        }
+        // RAWG and the other gallery providers must finish before the ScreenScraper fallback.
+        if(!valid()||document.hidden||root.__psnGalleryMetadataPending||galleryQueued)return;
+        const remaining=(fanartEntry?.screenshotUrls||[]).filter(url=>!triedScreenshots.has(url)).slice(0,2);
+        remaining.forEach(url=>triedScreenshots.add(url));
+        if(remaining.length){
+          const fallback=await warmScreenshotFanart(remaining);
           if(fallback)apply(fallback.url);
         }
-      }finally{screenshotPending=false;}
+      }finally{
+        screenshotPending=false;
+        if(galleryQueued){galleryQueued=false;if(valid())useGallery();}
+      }
     };
     root.__psnUseGalleryFanart=useGallery;
     fanart.then(url=>{if(url)apply(url);else useGallery();});
