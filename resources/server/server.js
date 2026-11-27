@@ -2921,7 +2921,8 @@ function ssPreviewVerifyVideoToken(token) {
   return parsed;
 }
 
-const SS_EXTRA_MEDIA_TYPES = new Set(['ss','sstitle','fanart','box-2D','box-3D','box-2D-back',
+const SS_CASE_ART_TYPES = new Set(['box-2D-back','box-2D-side','box-texture','support-2D','support-texture']);
+const SS_EXTRA_MEDIA_TYPES = new Set([...SS_CASE_ART_TYPES,'ss','sstitle','fanart','box-2D','box-3D','box-2D-back',
   'box-2D-front','wheel','wheel-hd','wheel-carbon','wheel-steel','steamgrid','screenmarquee','manuel','manual']);
 const ssExtraImageCache = new Map();
 const ssExtraImagePending = new Map();
@@ -2992,11 +2993,12 @@ function ssPreviewExtractExtras(game, system) {
     if (!SS_EXTRA_MEDIA_TYPES.has(type)) continue;
     const region = String(item.region || item.regionid || '').toLowerCase();
     const safeRegion = /^[a-z]{2,8}$/.test(region) ? region : '';
-    const kind = type === 'ss' || type === 'sstitle' ? 'screenshot' : type === 'fanart' ? 'background' : ['manuel','manual'].includes(type) ? 'manual' : 'artwork';
+    const kind = type === 'ss' || type === 'sstitle' ? 'screenshot' : type === 'fanart' ? 'background' : ['manuel','manual'].includes(type) ? 'manual' : SS_CASE_ART_TYPES.has(type) ? 'caseArtwork' : 'artwork';
     if (kind === 'screenshot' && images.filter(v=>v.kind==='screenshot').length>=3) continue;
     if (kind === 'artwork' && images.filter(v=>v.kind==='artwork').length>=5) continue;
     if (kind === 'background' && images.some(v=>v.kind==='background')) continue;
-    if (kind === 'manual' && images.some(v=>v.kind==='manual')) continue;
+    if (kind === 'manual' && images.filter(v=>v.kind==='manual').length>=4) continue;
+    if (kind === 'caseArtwork' && images.filter(v=>v.type===type).length>=4) continue;
     const key = type+':'+safeRegion;
     if (used.has(key)) continue;
     used.add(key);
@@ -3036,7 +3038,9 @@ function ssRetroMergeExtras(primary, incoming) {
     if (seen.has(key)) continue;
     const count=merged.images.filter(v=>v.kind===image.kind).length;
     if (image.kind==='screenshot' && count>=3) continue;
-    if (['background','manual'].includes(image.kind) && count) continue;
+    if (image.kind==='background' && count) continue;
+    if (image.kind==='manual' && count>=4) continue;
+    if (image.kind==='caseArtwork' && merged.images.filter(v=>v.type===image.type).length>=4) continue;
     if (image.kind==='artwork') {
       if ((ssRetroCover(image) && higherHasCover) || higherArtwork.has(image.type)) continue;
       if (count>=5) {
@@ -3527,7 +3531,7 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
     // Search results may omit media. Confirm an unambiguous match using the
     // ID supplied by the API, never a title-specific override.
     const confirmMedia = async () => {
-      if (!bestGame || (!((demand.wantsVideo && bestMediaRank<2) ||
+      if (!bestGame || (!((demand.caseArtwork && !detailedIds.has(Number(bestGame.id))) || (demand.wantsVideo && bestMediaRank<2) ||
           (demand.retro && demand.wantsExtras && !extrasSufficient()) ||
           (!demand.retro && demand.wantsExtras && (!ssPreviewExtractExtras(bestGame,ssPreviewGameSystem(bestGame))?.images.length || (directDigital() && uniqueExact() && !extrasSufficient()))))) ||
           (!bestSerialMatch && !inferredValid() && (bestScore !== 1 || (systemId===0 ? exactSources.get(ssPreviewGameSystem(bestGame))?.size!==1 : exactGameIds.size!==1)))) return;
@@ -3576,7 +3580,7 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
         incompleteSearch=error;
       }
       publishVideo();
-      if (!publishedVideo || (demand.retro && demand.wantsExtras)) await confirmMedia();
+      if (!publishedVideo || demand.caseArtwork || (demand.retro && demand.wantsExtras)) await confirmMedia();
     };
     let nextSearch = searches.length;
     if (!bestGame) {
@@ -3594,7 +3598,7 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
         }
       }
       publishVideo();
-      if (!publishedVideo || (demand.retro && demand.wantsExtras)) await confirmMedia();
+      if (!publishedVideo || demand.caseArtwork || (demand.retro && demand.wantsExtras)) await confirmMedia();
     } else if (resumeAlternates) {
       publishVideo();
       nextSearch = 1;
@@ -3615,7 +3619,7 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
       }
     }
     publishVideo();
-    if (!publishedVideo || (demand.retro && demand.wantsExtras)) await confirmMedia();
+    if (!publishedVideo || demand.caseArtwork || (demand.retro && demand.wantsExtras)) await confirmMedia();
     const minScore = systemId === 0 ? 0.95 : 0.78;
     const mediaSystem = Number(bestGame && (bestGame.systemeid || (bestGame.systeme && bestGame.systeme.id)));
     const validMatch = !!bestGame && bestScore >= minScore && ssPreviewValidMediaSystem(mediaSystem) &&
@@ -3624,6 +3628,7 @@ function ssPreviewFetchUpstream(name, systemId, key, serial='', knownGameId=0, l
     const video = validMatch ? (ssPreviewFindVideo(bestGame, systemId) ||
       (previousVideo?.gameId===Number(bestGame.id) && previousVideo?.system===mediaSystem ? previousVideo : null)) : null;
     const extras = validMatch ? ssPreviewExtractExtras(bestGame, mediaSystem) : null;
+    if (extras && confirmedDetailId===Number(bestGame.id)) extras.caseArtworkChecked=true;
     if (extras && !video && !detailedIds.has(Number(bestGame.id)) && !demand.wantsVideo) extras.videoChecked=false;
     if (extras && (retroConfirmed() || exactDetailsComplete())) {
       if (retroConfirmed()) extras.retroDetailsChecked=true;
@@ -3711,9 +3716,11 @@ function ssPreviewLookup(name, systemId, options = null) {
   const requireArtwork = options?.artwork === true;
   const wantsExtras = requireEnglish || requireArtwork;
   const wantsVideo = !wantsExtras;
+  const caseArtwork=options?.caseArtwork===true;
   const retro=options?.retro===true;
   const catalogBase=options?.catalogBase===true && !retro && systemId!==0;
-  const ready = (result,video=wantsVideo,extras=wantsExtras,retroDetail=retro) => !!result &&
+  const ready = (result,video=wantsVideo,extras=wantsExtras,retroDetail=retro,caseDetail=caseArtwork) => !!result &&
+    (!caseDetail || (!result.extras && !result.found) || result.extras?.caseArtworkChecked===true) &&
     (!result.extras?.inferredBase || catalogBase) &&
     (!candidateId || Number(result.video?.gameId || result.extras?.gameId)===candidateId) &&
     (systemId!==0 || !result.extras || Array.isArray(result.extras.sourceCandidates) ||
@@ -3730,12 +3737,13 @@ function ssPreviewLookup(name, systemId, options = null) {
     existing.wantsExtras ||= wantsExtras;
     existing.wantsVideo ||= wantsVideo;
     existing.retro ||= retro;
+    existing.caseArtwork ||= caseArtwork;
     existing.catalogBase ||= catalogBase;
     return wantsVideo ? existing.video : existing.full;
   }
   let publish;
   const earlyVideo = new Promise(resolve => {publish=resolve;});
-  const demand = {wantsExtras,wantsVideo,publish,retro,candidateGameId:candidateId,catalogBase,detailBudget:options?.detailBudget};
+  const demand = {wantsExtras,wantsVideo,publish,retro,caseArtwork,candidateGameId:candidateId,catalogBase,detailBudget:options?.detailBudget};
   const memoryLegacy=serial ? ssPreviewGetCached(legacyKey) : null;
   const refreshInitialsMiss = ssPreviewInitialsVariant(searchName) !== searchName;
   const pendingWanted=systemId && !retro && !candidateId && /^NP[A-Z]{2}\d{5}$/.test(serial) ? ssPreviewMatchTitle(name,refreshInitialsMiss) : '';
@@ -3744,7 +3752,7 @@ function ssPreviewLookup(name, systemId, options = null) {
     demand.pendingGameId=pendingId;
     // The previous lookup may have populated RAM while its asynchronous DB write is still pending.
     if (cached) primary={...cached,lookupSource:'memory'};
-    const complete = result => ready(result,demand.wantsVideo,demand.wantsExtras,demand.retro);
+    const complete = result => ready(result,demand.wantsVideo,demand.wantsExtras,demand.retro,demand.caseArtwork);
     if (primary?.found) demand.publish(primary);
     if (complete(primary) && (primary.extras || primary.found)) return primary;
     if (!legacy && memoryLegacy && ssPreviewLegacyCompatible(memoryLegacy.extras,serial,normalized)) legacy=memoryLegacy;
@@ -5074,7 +5082,7 @@ app.get('/api/screenscraper-extras', async (req,res) => {
   const system = isPort ? 0 : Number(req.query && req.query.system);
   if ((!isPort && !SS_PREVIEW_SYSTEM_IDS.has(system)) || (isMinis && system !== 59) || name.length < 3 || !normalizeSsPreviewTitle(name)) return res.status(400).json({ok:false});
   try {
-    const options={englishSummary:true,artwork:true,titleId:isPort?'':ssPreviewSerial(req.query?.titleId),catalogBase:req.query?.catalogBase==='1'};
+    const options={englishSummary:true,artwork:true,titleId:isPort?'':ssPreviewSerial(req.query?.titleId),catalogBase:req.query?.catalogBase==='1',caseArtwork:req.query?.case==='1'};
     const result = await ssPreviewLookupCategory(name,system,isMinis,options);
     if (result.partial) res.setHeader('Cache-Control','no-store');
     return res.json({ok:true,found:!!result.extras,extras:ssExtraPublic(result.extras),reason:result.reason,lookupSource:result.lookupSource,lookupTrace:result.lookupTrace,...(result.partial?{partial:true,retry:true}:{})});
@@ -5102,8 +5110,8 @@ async function ssExtraFetchImage(data) {
   url.searchParams.set('systemeid',String(data.s));
   url.searchParams.set('jeuid',String(data.g));
   url.searchParams.set('media',data.t+(data.r?'('+data.r+')':''));
-  url.searchParams.set('outputformat','jpg');
-  url.searchParams.set('maxwidth','1050');
+  url.searchParams.set('outputformat',data.t.startsWith('support-')?'png':'jpg');
+  url.searchParams.set('maxwidth',data.t==='box-texture'?'1800':'1050');
   url.searchParams.set('maxheight','720');
   if (SS_PREVIEW_USER && SS_PREVIEW_PASSWORD) {url.searchParams.set('ssid',SS_PREVIEW_USER);url.searchParams.set('sspassword',SS_PREVIEW_PASSWORD);}
   const controller=new AbortController();
@@ -5145,49 +5153,67 @@ async function ssVideoRequestImage(raw,signal,redirects=0,maxBytes=4*1024*1024) 
   if (Number(response.headers['content-length']||0)>maxBytes) {response.destroy();throw new Error('image_too_large');}
   return response;
 }
-app.options('/api/screenscraper-manual',(req,res)=>{setMetadataCors(res);res.status(204).end();});
-app.get('/api/screenscraper-manual',async(req,res)=>{
-  setMetadataCors(res);
-  const data=ssExtraVerifyToken(req.query&&req.query.token);
-  if(!data||!['manual','manuel'].includes(data.t)||!SS_PREVIEW_ENABLED)return res.status(403).end();
+const ssManualPending=new Map();
+async function ssFetchManual(data) {
   const url=new URL('https://api.screenscraper.fr/api2/mediaManuelJeu.php');
   url.searchParams.set('devid',SS_PREVIEW_DEVID);
   url.searchParams.set('devpassword',SS_PREVIEW_DEVPASSWORD);
   url.searchParams.set('softname','PSN-Content');
   url.searchParams.set('systemeid',String(data.s));
   url.searchParams.set('jeuid',String(data.g));
-  url.searchParams.set('media',data.t+(data.r?'('+data.r+')':''));
+  url.searchParams.set('mediaformat','pdf');
   if(SS_PREVIEW_USER && SS_PREVIEW_PASSWORD){url.searchParams.set('ssid',SS_PREVIEW_USER);url.searchParams.set('sspassword',SS_PREVIEW_PASSWORD);}
-  const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),18000);
+  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),22000),maxBytes=16*1024*1024;
   try {
     const release=await ssProviderAcquire('image',controller.signal);
-    let pdf;
     try {
-      ssPreviewQuotaReserve('image');
-      const upstream=await ssVideoRequestImage(url.href,controller.signal,0,9*1024*1024);
-      let size=0;const parts=[];
-      for await(const chunk of upstream){size+=chunk.length;if(size>9*1024*1024){upstream.destroy();throw Error('pdf_too_large');}parts.push(chunk);}
-      pdf=Buffer.concat(parts);
-    } finally {release();}
-    if(pdf.subarray(0,5).toString('ascii')!=='%PDF-')throw Error('not_pdf');
-    res.setHeader('Content-Type','application/pdf');
-    res.setHeader('Content-Disposition','inline; filename="screenscraper-manual.pdf"');
-    res.setHeader('Cache-Control','private,max-age=900');
-    res.setHeader('X-Content-Type-Options','nosniff');
-    return res.send(pdf);
+      for(const type of ['manuel','manual']){
+        url.searchParams.set('media',type+(data.r?'('+data.r+')':''));
+        ssPreviewQuotaReserve('image');
+        let upstream;
+        try{upstream=await ssVideoRequestImage(url.href,controller.signal,0,maxBytes);}
+        catch(error){if(error?.message==='image_upstream_404'&&type==='manuel')continue;throw error;}
+        let size=0;const parts=[];
+        for await(const chunk of upstream){size+=chunk.length;if(size>maxBytes){upstream.destroy();throw Error('pdf_too_large');}parts.push(chunk);}
+        const pdf=Buffer.concat(parts,size);
+        if(pdf.subarray(0,5).toString('ascii')==='%PDF-')return pdf;
+        if(size<1024 && /^NOMEDIA\s*$/i.test(pdf.toString('utf8').trim()))continue;
+        throw Error('not_pdf');
+      }
+      throw Error('manual_not_found');
+    }finally{release();}
+  }finally{clearTimeout(timer);}
+}
+app.options('/api/screenscraper-manual',(req,res)=>{setMetadataCors(res);res.status(204).end();});
+app.get('/api/screenscraper-manual',async(req,res)=>{
+  setMetadataCors(res);res.setHeader('Access-Control-Expose-Headers','Retry-After');
+  const data=ssExtraVerifyToken(req.query?.token);
+  if(!data||!['manual','manuel'].includes(data.t)||!SS_PREVIEW_ENABLED)return res.status(403).json({ok:false,reason:'invalid_manual_token'});
+  const key=`${data.s}:${data.g}:${data.r}`;
+  try{
+    let pending=ssManualPending.get(key);
+    if(!pending){
+      if(ssManualPending.size>=1){res.setHeader('Retry-After','5');return res.status(503).json({ok:false,reason:'manual_busy'});}
+      pending=ssFetchManual(data).finally(()=>ssManualPending.delete(key));ssManualPending.set(key,pending);
+    }
+    const pdf=await pending;if(res.destroyed||res.writableEnded)return;
+    res.setHeader('Content-Type','application/pdf');res.setHeader('Content-Disposition','inline; filename="screenscraper-manual.pdf"');res.setHeader('Cache-Control','private,max-age=900');res.setHeader('X-Content-Type-Options','nosniff');return res.send(pdf);
   }catch(error){
-    const limited=error?.code==='provider_cooldown'||/^image_upstream_43[01]$|^image_upstream_429$/.test(String(error?.message||''));
+    if(res.destroyed||res.writableEnded)return;
+    const message=String(error?.message||''),limited=error?.code==='provider_cooldown'||/^image_upstream_43[01]$|^image_upstream_429$/.test(message);
     const busy=error?.code==='provider_queue_full'||error?.code==='provider_queue_timeout';
+    const absent=message==='manual_not_found'||message==='image_upstream_404';
+    const large=message==='pdf_too_large'||message==='image_too_large';
     if(limited||busy)res.setHeader('Retry-After',String(busy?5:Math.min(3600,Math.max(2,Number(error.retryAfter)||60))));
-    return res.status(limited?429:busy?503:404).end();
-  } finally{clearTimeout(timer);}
+    res.setHeader('Cache-Control','no-store');return res.status(limited?429:busy?503:absent?404:large?413:502).json({ok:false,reason:absent?'manual_not_found':large?'manual_too_large':limited?'provider_limited':busy?'manual_busy':'manual_unavailable'});
+  }
 });
 app.options('/api/screenscraper-image',(req,res)=>{setMetadataCors(res);res.status(204).end();});
 app.get('/api/screenscraper-image',async(req,res)=>{
   setMetadataCors(res);
   res.setHeader('Access-Control-Expose-Headers','Retry-After');
   const data=ssExtraVerifyToken(req.query&&req.query.token);
-  if (!data||!SS_PREVIEW_ENABLED) return res.status(403).end();
+  if (!data||!SS_PREVIEW_ENABLED||['manual','manuel'].includes(data.t)) return res.status(403).end();
   const key=`${data.s}:${data.g}:${data.t}:${data.r}`;
   let cached=ssExtraImageCache.get(key);
   if(cached&&cached.until<Date.now()) {ssExtraImageCache.delete(key);ssExtraImageBytes-=cached.body.length;cached=null;}
