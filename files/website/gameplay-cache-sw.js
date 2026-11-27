@@ -9,7 +9,7 @@ const MAX_FILE = 32 * MIB, MAX_PART = 4 * MIB, MAX_PARTS_BYTES = 16 * MIB, MAX_P
 const LOCAL_PREFIX = new URL('./__psn_gameplay_cache__/',self.registration.scope).href;
 const INDEX_KEY = new URL('./__psn_gameplay_cache_index__', self.registration.scope).href;
 let indexPromise, indexQueue = Promise.resolve();
-const ENDPOINTS_URL = 'https://raw.githubusercontent.com/PS3-Pro/PSN-Content/master/resources/server/endpoints.json';
+const ENDPOINTS_URL = 'https://raw.githubusercontent.com/PS3-Pro/PSN-Content/refs/heads/main/resources/server/endpoints.json';
 let videoServerOrigins = new Set(), videoServerConfigRequest = null, videoServerConfigCheckedAt = 0;
 function parsePsnServerEndpoints(data) {
   if (!Array.isArray(data?.servers) || !data.servers.length || data.servers.length > 16) throw new Error('Invalid server list');
