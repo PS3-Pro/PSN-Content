@@ -5704,7 +5704,7 @@ body:not(.is-admin) #view-admin { display: none !important; }
 .admin-role-pill.role-developer { color: #4caf50; border-color: rgba(76,175,80,.35); background: rgba(76,175,80,.08); }
 .admin-role-pill.role-banned { color: #ff7777; border-color: rgba(255,68,68,.55); background: rgba(255,68,68,.12); }
 .admin-user-actions .btn-mini-round.admin-donation-action { color:#ffcc00; border-color:rgba(255,204,0,.55); }
-.admin-user-actions .btn-mini-round.admin-donation-action:hover { background:rgba(255,204,0,.16); color:#fff; border-color:#ffcc00; }
+.admin-user-actions .btn-mini-round.admin-donation-action:not(:disabled):hover { background:rgba(255,204,0,.16); color:#fff; border-color:#ffcc00; }
 .admin-user-actions .btn-mini-round.admin-role-action { border-color: rgba(156,39,176,0.7) !important; color: #ce93d8 !important; }
 .admin-user-actions .btn-mini-round.admin-role-action:hover { background: rgba(156,39,176,0.22) !important; border-color: #ce93d8 !important; color: #fff !important; box-shadow: 0 0 15px rgba(156,39,176,.5) !important; transform: scale(1.15); }
 .admin-status-strip { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
@@ -48618,6 +48618,8 @@ P
         }
 	}
 
+	const adminDonationPending = new Set();
+
 	function adminUserMatchesFilter(user, mode) {
 		if (!user) return false;
 		mode = mode || adminGetUserFilterMode();
@@ -49133,6 +49135,9 @@ P
 					const isOnline = u.online === true;
 					const sessionCount = isOnline ? Math.max(1, Number(u.sessionCount) || 1) : 0;
 					const isTargetAdmin = u.isAdmin === true;
+					const isSupporter = adminUserMatchesFilter(u, 'supporter');
+					const donationDisabled = isSupporter || adminDonationPending.has(name);
+					const donationTitle = isSupporter ? 'Donation already confirmed' : 'Confirm donation';
 					const isProtected = isMe || isTargetAdmin;
 					const isBanned = typeof window.isPsnUserBanned === 'function' ? window.isPsnUserBanned(name, u) : u.isBanned === true;
 					const level = parseInt(u.level, 10) || 1;
@@ -49170,7 +49175,7 @@ P
 						? `<button class="btn-mini-round admin-unban-action" title="Unban user" ${isMe ? 'disabled' : ''} onclick="event.stopPropagation(); adminUnbanUser('${encodedName}', '${encodedSocketId}')"><i class="fas fa-unlock"></i></button>`
 						: `<button class="btn-mini-round admin-ban-action" title="Ban user" ${isProtected ? 'disabled' : ''} onclick="event.stopPropagation(); adminBanUser('${encodedName}', '${encodedSocketId}')"><i class="fas fa-ban"></i></button>`;
 					const adminUserLiveSignature = typeof window.getLiveRenderSignature === 'function'
-						? window.getLiveRenderSignature([name, avatar, socketId, isMe ? 1 : 0, isOnline ? 1 : 0, sessionCount, isTargetAdmin ? 1 : 0, isBanned ? 1 : 0, level, role, roleTag, isFriend ? 1 : 0, statusText, onlineSinceText, avatarBorder, ps3 ? String(ps3.status || '') : '', ps3 ? String(ps3.title || '') : ''])
+						? window.getLiveRenderSignature([name, avatar, socketId, isMe ? 1 : 0, isOnline ? 1 : 0, sessionCount, isTargetAdmin ? 1 : 0, isBanned ? 1 : 0, level, role, roleTag, isSupporter ? 1 : 0, donationDisabled ? 1 : 0, isFriend ? 1 : 0, statusText, onlineSinceText, avatarBorder, ps3 ? String(ps3.status || '') : '', ps3 ? String(ps3.title || '') : ''])
 						: '';
 
 					return `
@@ -49195,7 +49200,7 @@ P
 								<button class="btn-mini-round ${isFriend ? 'btn-friend-remove' : 'btn-friend-add'}" title="${isFriend ? 'Remove friend' : 'Add friend'}" ${isMe ? 'disabled' : ''} onclick="event.stopPropagation(); adminToggleFriend('${encodedName}', '${encodedAvatar}')"><i class="fas ${isFriend ? 'fa-user-minus' : 'fa-user-plus'}"></i></button>
 								<button class="btn-mini-round admin-reset-action" title="Reset password" ${isMe ? 'disabled' : ''} onclick="event.stopPropagation(); adminResetUserPassword('${encodedName}')"><i class="fas fa-key"></i></button>
 								<button class="btn-mini-round admin-role-action" title="Change role" ${isMe ? 'disabled' : ''} onclick="event.stopPropagation(); adminSetUserRole('${encodedName}')"><i class="fas fa-user-tag"></i></button>
-								<button class="btn-mini-round admin-donation-action" title="Confirm donation" aria-label="Confirm donation" onclick="event.stopPropagation(); adminConfirmDonation('${encodedName}', this)"><i class="fas fa-hand-holding-heart"></i></button>
+								<button class="btn-mini-round admin-donation-action" title="${donationTitle}" aria-label="${donationTitle}" ${donationDisabled ? 'disabled' : ''} onclick="event.stopPropagation(); adminConfirmDonation('${encodedName}', this)"><i class="fas fa-hand-holding-heart"></i></button>
 								${(isOnline && !isMe && socketId) ? `<button class="btn-mini-round btn-kick-action" title="Kick from session" onclick="event.stopPropagation(); adminKickUser('${encodedSocketId}', '${encodedName}')"><i class="fas fa-user-slash"></i></button>` : ''}
 								${banActionButton}
 								<button class="btn-mini-round admin-delete-action" title="Delete account permanently" ${isProtected ? 'disabled' : ''} onclick="event.stopPropagation(); adminDeleteAccount('${encodedName}', '${encodedSocketId}')"><i class="fas fa-trash-alt"></i></button>
@@ -52856,11 +52861,30 @@ P
 	window.adminConfirmDonation = function(encodedName, button) {
 		if (!adminGuard()) return;
 		const name = decodeURIComponent(encodedName || '');
-		if (!name || !confirm(`Confirm a received donation from ${name} and unlock A Brighter Future?`)) return;
+		if (!name || button?.disabled || adminDonationPending.has(name) || adminUserMatchesFilter(adminGetAllKnownUsers().find(u => u.name === name), 'supporter')) return;
+		if (!confirm(`Confirm a received donation from ${name} and unlock A Brighter Future?`)) return;
 		if (typeof socketChat === 'undefined' || !socketChat?.connected) { adminToast('Offline', 'Connect to the server first.'); return; }
+		const requestSocket = socketChat;
+		const adminName = localStorage.getItem('psn_username');
+		adminDonationPending.add(name);
 		if (button) button.disabled = true;
-		socketChat.timeout(15000).emit('admin_confirm_donation', { targetName:name }, (error, result) => {
-			if (button) button.disabled = false;
+		requestSocket.timeout(15000).emit('admin_confirm_donation', { targetName:name }, (error, result) => {
+			adminDonationPending.delete(name);
+			if (socketChat !== requestSocket || localStorage.getItem('psn_username') !== adminName || !adminGuard(false)) return;
+			if (!error && result?.success) {
+				for (const list of [window.adminAllUsers, window.currentOnlineList]) {
+					const user = Array.isArray(list) ? list.find(u => u?.name === name) : null;
+					if (user) user.isSupporter = true;
+				}
+			}
+			adminInvalidateKnownUsersCache();
+			if (button) {
+				const confirmed = (!error && result?.success) || adminUserMatchesFilter(adminGetAllKnownUsers().find(u => u.name === name), 'supporter');
+				button.disabled = !!confirmed;
+				button.title = confirmed ? 'Donation already confirmed' : 'Confirm donation';
+				button.setAttribute('aria-label', button.title);
+			}
+			if (document.getElementById('view-admin')?.style.display === 'block') adminSchedulePanelRender();
 			if (error || !result?.success) { if (typeof playUiError === 'function') playUiError(); adminToast('Donation', result?.message || 'Confirmation failed. Try again.'); return; }
 			if (typeof playUiSuccess === 'function') playUiSuccess();
 			adminToast('Donation confirmed', result.already ? `${name} already has RGB Glass.` : `A Brighter Future unlocked for ${name}.`);
