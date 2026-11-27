@@ -1,0 +1,103 @@
+name: Update Artwork Indexes
+
+on:
+  workflow_run:
+    workflows: ['Update PSN™ Database']
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+
+concurrency:
+  group: update-artwork-indexes
+  cancel-in-progress: false
+
+jobs:
+  update-artwork:
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Download LaunchBox metadata
+        run: |
+          mkdir -p "$RUNNER_TEMP/artwork-indexes"
+          curl --fail --silent --show-error --location --retry 3 --retry-delay 5 \
+            --connect-timeout 30 --max-time 600 \
+            https://gamesdb.launchbox-app.com/Metadata.zip \
+            -o "$RUNNER_TEMP/Metadata.zip"
+
+      - name: Generate LaunchBox indexes
+        run: |
+          python .github/scripts/build-launchbox-index.py \
+            "$RUNNER_TEMP/Metadata.zip" "$RUNNER_TEMP/artwork-indexes/launchbox"
+
+      - name: Generate Libretro indexes
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python .github/scripts/build-libretro-index.py "$RUNNER_TEMP/artwork-indexes/libretro"
+
+      - name: Validate indexes
+        run: |
+          python .github/scripts/validate-artwork-indexes.py \
+            "$RUNNER_TEMP/artwork-indexes" resources/database
+
+      - name: Commit and Push changes
+        id: publish
+        env:
+          DATABASE_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          if [ -n "$DATABASE_HEAD_SHA" ] && [ "$(git rev-parse HEAD)" != "$DATABASE_HEAD_SHA" ]; then
+            echo 'database_changed=true' >> "$GITHUB_OUTPUT"
+          fi
+          git config user.name "PS3-Pro Bot"
+          git config user.email "bot@ps3pro.com"
+          for provider in launchbox libretro; do
+            mkdir -p "resources/database/$provider"
+            cp "$RUNNER_TEMP/artwork-indexes/$provider/"*.json "resources/database/$provider/"
+            git add -- "resources/database/$provider/"*.json
+          done
+          if git diff --cached --quiet; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            echo 'No changes to commit'
+            exit 0
+          fi
+          git commit -m "Auto-update: LaunchBox and Libretro artwork indexes"
+          for attempt in 1 2 3; do
+            git fetch origin main
+            git rebase origin/main
+            if git push origin HEAD:main; then
+              echo 'changed=true' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 5
+          done
+          exit 1
+
+      - name: Request GitHub Pages build
+        if: steps.publish.outputs.changed == 'true' || steps.publish.outputs.database_changed == 'true' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh api --method POST "repos/$GITHUB_REPOSITORY/pages/builds"; then
+            echo '::warning::Indexes are committed, but Pages build could not be requested. Check Pages settings or wait for the next normal deployment.'
+          fi

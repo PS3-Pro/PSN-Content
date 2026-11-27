@@ -2180,6 +2180,129 @@ function normalizeSteamDetails(appId, data = {}) {
   };
 }
 
+function registerArtworkFallback(app, setCors, pool) {
+  const apiKey = getPrivateServerValue('STEAMGRIDDB_API_KEY');
+  const gameTdbEnabled = getPrivateServerValue('GAMETDB_ARTWORK_ALLOWED') === '1';
+  const systems = new Set([31,57,58,59,60,61,62,142]);
+  const cache = new Map(), pending = new Map();
+  let active = 0, blockedUntil = 0, calls = 0, windowStart = Date.now();
+  const norm = s => String(s || '').replace(/[™®©]/g,' ').normalize('NFKD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+  const safeUrl = raw => {
+    try {
+      const u = new URL(raw);
+      return u.protocol === 'https:' && !u.username && !u.password && !u.port && /^(?:cdn\d*\.)steamgriddb\.com$/.test(u.hostname) && /\.(?:png|jpe?g|webp)$/i.test(u.pathname) ? u.href : '';
+    } catch (_) { return ''; }
+  };
+  let dbActive=0, dbBlockedUntil=0;
+  const persistent=pool&&typeof pool.query==='function';
+  async function dbQuery(sql,values=[]){
+    if(!persistent||dbActive>=1||pool.waitingCount>0||Date.now()<dbBlockedUntil)return null;
+    dbActive++;
+    try{return await pool.query({text:sql,values,query_timeout:1200});}
+    catch(_){dbBlockedUntil=Date.now()+60000;return null;}
+    finally{dbActive--;}
+  }
+  async function diskRead(key){
+    const result=await dbQuery('SELECT value, expires_at FROM artwork_fallback_cache WHERE cache_key=$1 AND expires_at>now()',[key]);
+    if(!result?.rows?.length)return {hit:false};
+    const value=result.rows[0].value;
+    const lifetime=Math.max(1,Math.min(6*60*60*1000,new Date(result.rows[0].expires_at).getTime()-Date.now()||60000));
+    if(key.startsWith('id:'))return {hit:value===null||Number.isSafeInteger(value)&&value>0,value,lifetime};
+    return {hit:Array.isArray(value)&&value.length<=2&&value.every(v=>safeUrl(v)===v),value,lifetime};
+  }
+  async function diskWrite(key,value,ttl){
+    if(!persistent)return;
+    await dbQuery('INSERT INTO artwork_fallback_cache(cache_key,value,expires_at) VALUES($1,$2::jsonb,now()+$3::bigint*interval \'1 millisecond\') ON CONFLICT(cache_key) DO UPDATE SET value=excluded.value,expires_at=excluded.expires_at',[key,JSON.stringify(value),ttl]);
+  }
+  function memo(key, ttl, job) {
+    const hit = cache.get(key);
+    if (hit && hit.until > Date.now()) { cache.delete(key); cache.set(key,hit); return Promise.resolve(hit.value); }
+    if (hit) cache.delete(key);
+    if (pending.has(key)) return pending.get(key);
+    if (pending.size >= 24) return Promise.reject(new Error('busy'));
+    const request = Promise.resolve().then(async()=>{
+      const stored=await diskRead(key);
+      if(stored.hit)return {value:stored.value,lifetime:stored.lifetime};
+      const value=await job();
+      const lifetime=value&&(!Array.isArray(value)||value.length)?ttl:30*60*1000;
+      void diskWrite(key,value,lifetime).catch(()=>{});
+      return {value,lifetime};
+    }).then(({value,lifetime}) => {
+      cache.set(key,{value,until:Date.now()+lifetime});
+      while (cache.size > 900) cache.delete(cache.keys().next().value);
+      return value;
+    }).finally(() => pending.delete(key));
+    pending.set(key,request);
+    return request;
+  }
+  async function api(path) {
+    const now=Date.now();
+    if(now-windowStart>=60000){windowStart=now;calls=0;}
+    if(!apiKey || now<blockedUntil || calls>=90 || active>=2) throw new Error('busy');
+    calls++;active++;
+    const controller=new AbortController();
+    const timeout=setTimeout(()=>controller.abort(),4000);
+    try {
+      const response=await fetch('https://www.steamgriddb.com/api/v2/'+path,{headers:{Authorization:'Bearer '+apiKey,Accept:'application/json'},redirect:'error',signal:controller.signal});
+      if(response.status===429){blockedUntil=Date.now()+Math.max(60000,Math.min(600000,(Number(response.headers.get('retry-after'))||60)*1000));throw new Error('rate_limit');}
+      if(response.status===401||response.status===403){blockedUntil=Date.now()+300000;throw new Error('auth');}
+      if(!response.ok)throw new Error('upstream');
+      const reader=response.body.getReader();let size=0;const chunks=[];
+      while(true){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>1024*1024){await reader.cancel();throw new Error('too_large');}chunks.push(Buffer.from(value));}
+      const data=JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      if(data.success!==true||!Array.isArray(data.data))throw new Error('upstream');
+      return data.data;
+    } finally {clearTimeout(timeout);active--;}
+  }
+  function gameId(name,key){
+    return memo('id:'+key,24*60*60*1000,async()=>{
+      const rows=await api('search/autocomplete/'+encodeURIComponent(name));
+      const ids=[...new Set(rows.filter(r=>norm(r.name)===key&&r.verified===true&&Number.isSafeInteger(r.id)&&r.id>0).map(r=>r.id))];
+      return ids.length===1?ids[0]:null;
+    });
+  }
+  async function assets(id,kind){
+    return memo(kind+':'+id,24*60*60*1000,async()=>{
+      const query=new URLSearchParams({types:'static',nsfw:'false',humor:'false',epilepsy:'false'});
+      if(kind==='cover')query.set('dimensions','600x900');
+      const rows=await api((kind==='cover'?'grids':'heroes')+'/game/'+id+'?'+query);
+      const candidates=rows.filter(r=>{
+        const w=Number(r.width),h=Number(r.height);
+        return safeUrl(r.url)&&Number.isFinite(w)&&Number.isFinite(h)&&r.nsfw!==true&&r.humor!==true&&r.epilepsy!==true&&(kind==='cover'?w>=300&&h>=450&&w/h>=.6&&w/h<=.8:w>=640&&h>=320&&w/h>=1.45&&w/h<=4);
+      });
+      candidates.sort((a,b)=>Number(b.score||0)-Number(a.score||0));
+      return [...new Set(candidates.map(r=>{
+        const pixels=Number(r.width)*Number(r.height);
+        // Avoid downloading large hero originals when a CDN thumbnail is available.
+        return kind==='hero'&&pixels>1920*1080?safeUrl(r.thumb):safeUrl(r.url);
+      }).filter(Boolean))].slice(0,2);
+    });
+  }
+  const cors=(req,res)=>{ if(typeof setCors==='function')setCors(res);else { const origin=req.headers.origin;if(origin==='https://ps3-pro.github.io'||origin==='null')res.setHeader('Access-Control-Allow-Origin',origin);res.setHeader('Vary','Origin');res.setHeader('Access-Control-Allow-Methods','GET, OPTIONS'); } };
+  app.get('/api/artwork-fallback/config',(req,res)=>{cors(req,res);res.setHeader('Cache-Control','no-store');res.json({ok:true,steamgriddb:!!apiKey,gametdb:gameTdbEnabled});});
+  app.options('/api/artwork-fallback',(req,res)=>{cors(req,res);res.status(204).end();});
+  app.get('/api/artwork-fallback',async(req,res)=>{
+    cors(req,res);res.setHeader('Cache-Control','no-store');
+    const name=String(req.query.name||'').trim(),key=norm(name),system=Number(req.query.system),kind=String(req.query.kind||'');
+    if(name.length>140||key.length<2||!systems.has(system)||!['cover','hero','gametdb'].includes(kind))return res.status(400).json({ok:false});
+    if(kind==='gametdb'){
+      const id=String(req.query.titleId||'').toUpperCase().replace(/[-_ .]/g,'');
+      const region=String(req.query.region||'').toLowerCase();
+      const territory=({usa:'US',us:'US',eur:'EN',eu:'EN',jpn:'JA',jp:'JA'})[region]||(/^B[LC]US/.test(id)?'US':/^B[LC]ES/.test(id)?'EN':/^B[LC]JS/.test(id)?'JA':'');
+      const urls=gameTdbEnabled&&system===59&&/^B[A-Z]{3}\d{5}$/.test(id)&&territory?[`https://art.gametdb.com/ps3/coverM/${territory}/${id}.jpg`]:[];
+      return res.json({ok:true,configured:gameTdbEnabled,urls});
+    }
+    if(!apiKey)return res.json({ok:true,configured:false,urls:[]});
+    try {
+      const id=await gameId(name,key);
+      const urls=id?await assets(id,kind):[];
+      return res.json({ok:true,configured:true,urls});
+    } catch (_) {return res.status(503).json({ok:false,retry:true});}
+  });
+}
+
+registerArtworkFallback(app, setMetadataCors, pool);
+
 app.options('/api/metadata/live', (req, res) => { setMetadataCors(res); res.status(204).end(); });
 app.get('/api/metadata/live', async (req, res) => {
   setMetadataCors(res);
@@ -6141,6 +6264,12 @@ async function initDb() {
       expires_at TIMESTAMPTZ NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_game_theme_cache_expires ON game_theme_cache(expires_at);
+    CREATE TABLE IF NOT EXISTS artwork_fallback_cache (
+      cache_key text PRIMARY KEY,
+      value jsonb NOT NULL,
+      expires_at timestamptz NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS artwork_fallback_cache_expiry_idx ON artwork_fallback_cache (expires_at);
     CREATE TABLE IF NOT EXISTS metadata_provider_cache (
       cache_key TEXT PRIMARY KEY,
       payload JSONB NOT NULL,
@@ -18161,6 +18290,9 @@ const storageMaintenanceTask = runNonOverlappingTask('STORAGE RETENTION', async 
   if (pool.waitingCount > 0) return;
   await pruneServerLog();
   if (pool.waitingCount === 0) await pruneChatSeenEvents();
+  if (pool.waitingCount === 0 && getPrivateServerValue('STEAMGRIDDB_API_KEY')) {
+    await pool.query("DELETE FROM artwork_fallback_cache WHERE cache_key IN (SELECT cache_key FROM artwork_fallback_cache WHERE expires_at<=now() ORDER BY expires_at LIMIT 1000) OR cache_key IN (SELECT cache_key FROM artwork_fallback_cache ORDER BY expires_at DESC,cache_key OFFSET 10000 LIMIT 1000)");
+  }
 });
 
 let backgroundTasksStarted = false;
