@@ -56740,24 +56740,11 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
    function syncScrollNavFloatingLayout() {
         const visible = scrollBtnsContainer.style.display !== 'none' &&
             (btnTop.classList.contains('scroll-nav-visible') || btnBottom.classList.contains('scroll-nav-visible'));
-        document.documentElement.classList.toggle('psn-scroll-nav-active', visible);
+        if (document.documentElement.classList.contains('psn-scroll-nav-active') !== visible) document.documentElement.classList.toggle('psn-scroll-nav-active', visible);
    }
 
-   function applyScrollButtonsVisibility() {
+   function applyScrollButtonsVisibility(isAllowedView = isScrollButtonRelevantViewVisible()) {
         if (!scrollArea || !scrollBtnsContainer || !btnTop || !btnBottom) return;
-
-        const isConnected = window._lastConnectionState === true;
-
-        const isBrowse = scrollButtonViews.browse?.style.display === 'block';
-        const isSocial = scrollButtonViews.social?.style.display === 'block';
-        const isWishlist = scrollButtonViews.wishlist?.style.display === 'block';
-        const isDownloads = scrollButtonViews.downloads?.style.display === 'block';
-
-        const isFavorites = scrollButtonViews.favorites?.style.display === 'flex' || scrollButtonViews.favorites?.style.display === 'block';
-        const isGames = scrollButtonViews.games?.style.display === 'flex' || scrollButtonViews.games?.style.display === 'block';
-        
-        const isLibraryAllowed = isConnected && (isFavorites || isGames);
-        const isAllowedView = isBrowse || isSocial || isWishlist || isDownloads || isLibraryAllowed;
 
         if (!isAllowedView) {
             setScrollNavigationButtonVisible(btnTop, false);
@@ -56854,6 +56841,9 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
     });
     const scrollButtonMainViewIds = new Set(['view-browse', 'view-social', 'view-wishlist', 'view-downloads', 'view-library']);
     const browseToolbarScrollState = new Map();
+    window.getPsnScrolledBrowseToolbars = function(main) {
+        return browseToolbars.filter(toolbar => toolbar.classList.contains('scrolled') && main.contains(toolbar));
+    };
 
     function getMainScrollActiveViewId() {
         const cached = psnCurrentViewCache;
@@ -56877,6 +56867,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 
     let scrollUiFrame = 0;
     scrollArea.addEventListener("scroll", () => {
+        if (scrollUiFrame) return;
         const activeViewId = getMainScrollActiveViewId();
         const hasToolbarWork = browseToolbarsByView.has(activeViewId);
         const canHaveScrollButtons = scrollButtonMainViewIds.has(activeViewId);
@@ -56885,7 +56876,6 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
             && typeof refreshExploreVirtualCarousels === 'function';
 
         if (!hasToolbarWork && !canHaveScrollButtons && !needsExploreFallback) return;
-        if (scrollUiFrame) return;
         scrollUiFrame = requestAnimationFrame(() => {
             scrollUiFrame = 0;
             const currentViewId = getMainScrollActiveViewId();
@@ -56896,7 +56886,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
                     cancelAnimationFrame(scrollButtonsVisibilityFrame);
                     scrollButtonsVisibilityFrame = 0;
                 }
-                applyScrollButtonsVisibility();
+                applyScrollButtonsVisibility(true);
             }
 
             if (currentViewId === 'view-explore'
@@ -57034,13 +57024,14 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
             if (!leftArrow && !rightArrow) return false;
 
             const maxScroll = window.getCarouselLogicalMaxScroll(container);
-            const currentLeft = Math.max(0, Math.min(maxScroll, Number(container.scrollLeft) || 0));
+            const scrollLeft = Number(container.scrollLeft) || 0;
+            const currentLeft = Math.max(0, Math.min(maxScroll, scrollLeft));
             const edgeThreshold = 2;
             let hasOverflow = maxScroll > edgeThreshold;
             let leftVisible = hasOverflow && currentLeft > edgeThreshold;
             let rightVisible = hasOverflow && currentLeft < (maxScroll - edgeThreshold);
 
-            if (container.id === 'recently-visited-grid' && (Number(container.scrollLeft) || 0) <= edgeThreshold) {
+            if (container.id === 'recently-visited-grid' && scrollLeft <= edgeThreshold) {
                 const parts = String(container.dataset.recentlyVisitedLayoutSignature || '').split('|');
                 const recentNeedsScroll = parts.length >= 4 && parts[parts.length - 1] === '1';
                 if (parts.length >= 4) {
@@ -62168,8 +62159,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		return targets;
 	}
 
-	function startLocalPs3PlayTimeTicker() {
-		const targets = getVisibleLocalPs3PlayTimeTargets();
+	function startLocalPs3PlayTimeTicker(targets = getVisibleLocalPs3PlayTimeTargets()) {
 		window.__localPs3PlayTimeTargets = targets;
 		if (!isLocalPs3PlayTimeTickerNeeded(targets)) {
 			stopLocalPs3PlayTimeTicker();
@@ -62202,9 +62192,9 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 			stopLocalPs3PlayTimeTicker();
 			return false;
 		}
+		if (!window.__localPs3PlayTimeTicker) return startLocalPs3PlayTimeTicker(targets);
 		refreshLocalPs3PlayTimeDisplays(targets);
-		if (window.__localPs3PlayTimeTicker) return true;
-		return startLocalPs3PlayTimeTicker();
+		return true;
 	}
 
 	function syncLocalPs3PlayTimeClock(playTime, updatedAt = Date.now(), titleId = '') {
@@ -62409,8 +62399,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		stopProfilePlayTimeTicker();
 		const el = document.getElementById('profile-playing-time');
 		if (el && el.dataset.playtimeLocal === '1') {
-			startLocalPs3PlayTimeTicker();
-			refreshLocalPs3PlayTimeDisplays();
+			if (!startLocalPs3PlayTimeTicker()) refreshLocalPs3PlayTimeDisplays();
 			return;
 		}
 		if (!refreshProfilePlayTimeTicker()) return;
@@ -70118,8 +70107,9 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 
 	function positionPs3ConsolePopover() {
 		const popover = document.getElementById('ps3-console-popover');
+		if (!popover || popover.hidden) return;
 		const anchor = document.querySelector('.ip-bar');
-		if (!popover || popover.hidden || !anchor) return;
+		if (!anchor) return;
 		const rect = anchor.getBoundingClientRect();
 		const width = Math.min(330, Math.max(240, window.innerWidth - 20));
 		const left = Math.max(8, Math.min(window.innerWidth - width - 8, rect.right - width));
@@ -70176,7 +70166,12 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		if (!popover || popover.hidden) return;
 		popover.classList.remove('show');
 		clearTimeout(popover._hideTimer);
-		popover._hideTimer = setTimeout(() => { if (!popover.classList.contains('show')) popover.hidden = true; }, 150);
+		popover._hideTimer = setTimeout(() => {
+			if (popover.classList.contains('show')) return;
+			popover.hidden = true;
+			window.removeEventListener('resize', positionPs3ConsolePopover);
+			window.removeEventListener('scroll', positionPs3ConsolePopover, true);
+		}, 150);
 	};
 
 	window.togglePs3ConsoleMenu = function(event) {
@@ -70188,6 +70183,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		renderPs3ConsolePopover();
 		popover.style.visibility = 'hidden';
 		popover.hidden = false;
+		window.addEventListener('resize', positionPs3ConsolePopover, { passive:true });
+		window.addEventListener('scroll', positionPs3ConsolePopover, { passive:true, capture:true });
 		positionPs3ConsolePopover();
 		requestAnimationFrame(() => {
 			popover.style.visibility = '';
@@ -70497,8 +70494,6 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 				closePs3ConsoleMenu();
 			}
 		}, true);
-		window.addEventListener('resize', positionPs3ConsolePopover, { passive:true });
-		window.addEventListener('scroll', positionPs3ConsolePopover, { passive:true, capture:true });
 	}
 	window.initializePs3ConsoleSelector = initializePs3ConsoleSelector;
 
@@ -71561,7 +71556,15 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		return menu;
 	}
 
+	function handleFileManagerContextScroll(event) {
+		const menu = document.getElementById('fm-context-menu');
+		if (!menu?.classList.contains('is-open') || event.target === menu) return;
+		closeFileManagerContextMenu();
+	}
+
 	function closeFileManagerContextMenu(options = {}) {
+		window.removeEventListener('scroll', handleFileManagerContextScroll, true);
+		window.removeEventListener('resize', closeFileManagerContextMenu);
 		const menu = document.getElementById('fm-context-menu');
 		if (fileManagerContextCloseTimer) {
 			clearTimeout(fileManagerContextCloseTimer);
@@ -71804,6 +71807,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 		menu.querySelectorAll('.fm-context-hidden').forEach(el => el.remove());
 		menu.classList.add('is-open');
 		menu.setAttribute('aria-hidden', 'false');
+		window.addEventListener('scroll', handleFileManagerContextScroll, { passive:true, capture:true });
+		window.addEventListener('resize', closeFileManagerContextMenu, { passive:true });
 		positionFileManagerContextMenu(menu, clientX, clientY);
 		if (typeof window.scheduleInterfaceTranslationScan === 'function') window.scheduleInterfaceTranslationScan(menu);
 	}
@@ -72299,12 +72304,6 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
 				closeFileManagerContextMenu();
 			}
 		}, true);
-		window.addEventListener('resize', closeFileManagerContextMenu, { passive: true });
-		window.addEventListener('scroll', event => {
-			const menu = document.getElementById('fm-context-menu');
-			if (menu && event.target === menu) return;
-			closeFileManagerContextMenu();
-		}, { passive: true, capture: true });
 	}
 
 	function getFileManagerDeviceRoot(path) {
@@ -76084,7 +76083,14 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
     window.updatePsnChatReactionPill = updatePsnChatReactionPill;
 
     let psnChatReactorsReturnFocus = null;
+    function handlePsnChatReactorsScroll(event) {
+        const popup = document.getElementById('psn-chat-reactors-popover');
+        if (popup && !popup.contains(event.target)) closePsnChatReactorsPopover();
+    }
+    function handlePsnChatReactorsResize() { closePsnChatReactorsPopover(); }
     function closePsnChatReactorsPopover(restoreFocus = false) {
+        document.removeEventListener('scroll', handlePsnChatReactorsScroll, true);
+        window.removeEventListener('resize', handlePsnChatReactorsResize);
         const popup = document.getElementById('psn-chat-reactors-popover');
         if (popup) popup.remove();
         const trigger = psnChatReactorsReturnFocus;
@@ -76178,6 +76184,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         popup.style.left = `${Math.round(left)}px`;
         popup.style.top = `${Math.round(top)}px`;
         psnChatReactorsReturnFocus = trigger;
+        document.addEventListener('scroll', handlePsnChatReactorsScroll, { passive:true, capture:true });
+        window.addEventListener('resize', handlePsnChatReactorsResize, { passive:true });
         trigger.setAttribute('aria-expanded', 'true');
         if (typeof playUiClick === 'function') playUiClick();
     }
@@ -76207,11 +76215,6 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
             event.preventDefault(); event.stopPropagation(); closePsnChatReactorsPopover(true);
         }
     }, true);
-    document.addEventListener('scroll', event => {
-        const popup = document.getElementById('psn-chat-reactors-popover');
-        if (popup && !popup.contains(event.target)) closePsnChatReactorsPopover();
-    }, true);
-    window.addEventListener('resize', () => closePsnChatReactorsPopover());
 
     function getChatReactionPresentation(msg = {}, msgId = '') {
         if (!msg || typeof msg !== 'object') return { html:'', totalCount:0 };
@@ -78205,7 +78208,8 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
         const rows = Array.from(box.querySelectorAll('[id^="msg-row-"]'));
         if (!rows.length) return null;
 
-        const indexes = [];
+        const indexes = new Set();
+        let start = Infinity, end = 0;
         rows.forEach(row => {
             const rowMsgId = String(row.getAttribute('data-chat-msg-id') || row.id || '').replace(/^msg-row-/, '');
             let index = parseInt(row.getAttribute('data-chat-index'), 10);
@@ -78218,20 +78222,21 @@ window.showLibrarySection = function(type, noScrollToTop = false, isSilent = fal
                 index = rowMsgId ? getChatMessageIndexById(rowMsgId) : -1;
                 if (index > -1) row.setAttribute('data-chat-index', String(index));
             }
-            if (Number.isFinite(index) && index >= 0 && index < history.length) indexes.push(index);
+            if (Number.isFinite(index) && index >= 0 && index < history.length) {
+                indexes.add(index);
+                if (index < start) start = index;
+                if (index >= end) end = index + 1;
+            }
         });
 
-        if (!indexes.length) return null;
-        const uniqueIndexes = Array.from(new Set(indexes)).sort((a, b) => a - b);
-        const start = uniqueIndexes[0];
-        const end = uniqueIndexes[uniqueIndexes.length - 1] + 1;
+        if (!indexes.size) return null;
         const span = Math.max(1, end - start);
         const maxAllowedGaps = Math.max(2, Math.floor(span * 0.04));
-        if (span - uniqueIndexes.length > maxAllowedGaps) return null;
+        if (span - indexes.size > maxAllowedGaps) return null;
 
         window.__chatVirtualStartIndex = start;
         window.__chatVirtualEndIndex = end;
-        return { start, end, count: uniqueIndexes.length };
+        return { start, end, count: indexes.size };
     }
     window.syncChatVirtualBoundsFromRendered = syncChatVirtualBoundsFromRendered;
 
@@ -91410,7 +91415,19 @@ function getVisibleChatStackEl(id) {
 		return menu;
 	}
 
+	function handleDirectContextViewportScroll(event) {
+		const menu = document.getElementById('direct-conversation-context-menu');
+		if (menu?.classList.contains('is-open') && !menu.contains(event.target)) closeDirectConversationContextMenu({ immediate:true });
+	}
+
+	function handleDirectContextViewportClose() {
+		closeDirectConversationContextMenu({ immediate:true });
+	}
+
 	function closeDirectConversationContextMenu(options = {}) {
+		document.removeEventListener('scroll', handleDirectContextViewportScroll, true);
+		window.removeEventListener('blur', handleDirectContextViewportClose);
+		window.removeEventListener('resize', handleDirectContextViewportClose);
 		const menu = document.getElementById('direct-conversation-context-menu');
 		clearTimeout(directConversationContextCloseTimer);
 		directConversationContextCloseTimer = 0;
@@ -91446,6 +91463,9 @@ function getVisibleChatStackEl(id) {
 		menu.style.top = '0px';
 		menu.classList.add('is-open');
 		menu.setAttribute('aria-hidden', 'false');
+		document.addEventListener('scroll', handleDirectContextViewportScroll, { passive:true, capture:true });
+		window.addEventListener('blur', handleDirectContextViewportClose);
+		window.addEventListener('resize', handleDirectContextViewportClose, { passive:true });
 		requestAnimationFrame(() => {
 			if (!menu.isConnected || !menu.classList.contains('is-open')) return;
 			const gap = 8;
@@ -91715,11 +91735,6 @@ function getVisibleChatStackEl(id) {
 				closeDirectConversationContextMenu();
 			}
 		});
-		window.addEventListener('blur', () => closeDirectConversationContextMenu({ immediate:true }));
-		window.addEventListener('resize', () => closeDirectConversationContextMenu({ immediate:true }));
-		document.addEventListener('scroll', event => {
-			if (document.getElementById('direct-conversation-context-menu')?.classList.contains('is-open') && !document.getElementById('direct-conversation-context-menu')?.contains(event.target)) closeDirectConversationContextMenu({ immediate:true });
-		}, true);
 	}
 
 	function directCommitConversationState(render = true) {
@@ -91790,7 +91805,7 @@ function getVisibleChatStackEl(id) {
 		state.peer = peerInfo;
 		const presenceEl = document.getElementById('direct-thread-presence');
 		const statusEl = document.getElementById('direct-thread-status');
-		if (presenceEl) { presenceEl.classList.toggle('online', peerInfo.online === true); presenceEl.classList.remove('connecting'); if (presenceEl.getAttribute('data-user') !== peerName) presenceEl.setAttribute('data-user', peerName); }
+		if (presenceEl) { const online = peerInfo.online === true; if (presenceEl.classList.contains('online') !== online) presenceEl.classList.toggle('online', online); if (presenceEl.classList.contains('connecting')) presenceEl.classList.remove('connecting'); if (presenceEl.getAttribute('data-user') !== peerName) presenceEl.setAttribute('data-user', peerName); }
 		if (statusEl) {
 			const activity = peerInfo.online === true ? getPsnPresenceActivity(peerInfo) : null;
 			const label = activity ? activity.text : (() => {
@@ -113181,13 +113196,22 @@ function getVisibleChatStackEl(id) {
             }
         } catch (err) {}
 
+        const scrollArrows = document.querySelector('.scroll-buttons');
+        const scrollArrowButtons = scrollArrows ? Array.from(scrollArrows.querySelectorAll('button')) : [];
+        function getScrollNavLayoutState() {
+            return [document.documentElement.classList.contains('psn-scroll-nav-active'), scrollArrows?.style.display, ...scrollArrowButtons.map(arrow => arrow.classList.contains('scroll-nav-visible'))].join('|');
+        }
+        let scrollNavLayoutState = getScrollNavLayoutState();
         const scrollNavObserver = new MutationObserver(function() {
+            const nextState = getScrollNavLayoutState();
+            if (nextState === scrollNavLayoutState) return;
+            scrollNavLayoutState = nextState;
             if (button.classList.contains('ps3-pad-dragging')) return;
             scheduleResponsiveReposition(true);
         });
         scrollNavObserver.observe(document.documentElement, {attributes:true, attributeFilter:['class']});
-        const scrollArrows = document.querySelector('.scroll-buttons');
-        if (scrollArrows) scrollNavObserver.observe(scrollArrows, {attributes:true, attributeFilter:['class','style'], subtree:true});
+        if (scrollArrows) scrollNavObserver.observe(scrollArrows, {attributes:true, attributeFilter:['style']});
+        scrollArrowButtons.forEach(arrow => scrollNavObserver.observe(arrow, {attributes:true, attributeFilter:['class']}));
         updateDefaultArrowPosition();
 
         window.addEventListener('resize', () => scheduleResponsiveReposition(true), { passive: true });
@@ -117537,9 +117561,9 @@ function getVisibleChatStackEl(id) {
 			animations.forEach(registerAnimation);
 		}
 
-		const finiteViewEntries = new Set(['view-enter','admin-view-enter','explore-view-enter','psn-heavy-view-enter','online-view-enter']);
+		const finiteAnimations = new Set(['view-enter','admin-view-enter','explore-view-enter','psn-heavy-view-enter','online-view-enter','tileReveal','trophyRevealLateral','friendPopReveal','fmFileRowReveal','settings-itemsReveal','guideRevealPop','msg-entry','psnPageScrollFadeIn','psnParticleOpacityRise','pulse-bright-anim']);
 		document.addEventListener('animationstart', event => {
-			if (finiteViewEntries.has(event.animationName) && !sourceAnimations.has(event.target)) return;
+			if (finiteAnimations.has(event.animationName) && !sourceAnimations.has(event.target)) return;
 			queueTargetSync(event.target);
 		}, true);
 		document.addEventListener('animationcancel', event => { if (sourceAnimations.has(event.target) || pendingSyncTargets.has(event.target)) queueTargetSync(event.target); }, true);
@@ -117547,6 +117571,8 @@ function getVisibleChatStackEl(id) {
 
 		let animationCleanupObserver = null;
 		let animationCleanupFrame = 0;
+		const removedAnimationHosts = new Set();
+		const animationHostSelector = `[${INFINITE_ANIMATION_HOST_ATTR}]`;
 		function syncAnimationCleanupObserverActivity() {
 			if (!animationCleanupObserver || !document.body) return;
 			try { animationCleanupObserver.disconnect(); } catch (e) {}
@@ -117554,18 +117580,21 @@ function getVisibleChatStackEl(id) {
 		}
 		if (document.body && typeof MutationObserver === 'function') {
 			animationCleanupObserver = new MutationObserver(mutations => {
-				if (!records.size || animationCleanupFrame) return;
-				let removed = false;
+				if (!records.size) return;
 				for (const mutation of mutations) {
 					for (const node of mutation.removedNodes) {
-						if (node.nodeType === 1 || node.nodeType === 11) { removed = true; break; }
+						if (node.nodeType !== 1 && node.nodeType !== 11) continue;
+						if (node.nodeType === 1 && records.has(node)) removedAnimationHosts.add(node);
+						if (node.firstElementChild) node.querySelectorAll(animationHostSelector).forEach(host => {
+							if (records.has(host)) removedAnimationHosts.add(host);
+						});
 					}
-					if (removed) break;
 				}
-				if (!removed) return;
+				if (!removedAnimationHosts.size || animationCleanupFrame) return;
 				animationCleanupFrame = requestAnimationFrame(() => {
 					animationCleanupFrame = 0;
-					for (const host of records.keys()) if (!host.isConnected) cleanupRecord(host);
+					for (const host of removedAnimationHosts) if (!host.isConnected) cleanupRecord(host);
+					removedAnimationHosts.clear();
 				});
 			});
 			syncAnimationCleanupObserverActivity();
@@ -117869,7 +117898,6 @@ function getVisibleChatStackEl(id) {
             '.ps3-pad-controller-info-card',
             '.ps3-pad-keyboard-settings-grid',
             '.ps3-console-popover-list',
-            '.artemis-cheats-list',
             '#direct-group-list',
             '#direct-mention-suggestions',
             '#avatar-selection-grid',
@@ -117897,6 +117925,8 @@ function getVisibleChatStackEl(id) {
         const pendingEdges = new Set();
         const edgesNeedingMeasure = new WeakSet();
         const edgeSizes = new WeakMap();
+        const appliedEdgeFlags = new WeakMap();
+        const edgeFlagClasses = ['psn-scroll-edge-polish','psn-scroll-edge-top','psn-scroll-edge-bottom','psn-scroll-edge-left','psn-scroll-edge-right','psn-scroll-fade-y','psn-scroll-fade-x'];
         let pendingEdgeFrame = 0;
         const observedEdges = new Set();
         let pageFadeTop = null;
@@ -117913,7 +117943,7 @@ function getVisibleChatStackEl(id) {
             const rect = main.getBoundingClientRect();
             let fadeTop = rect.top;
             if (showTop) {
-                const sticky = main.querySelectorAll('.browse-toolbar.scrolled');
+                const sticky = typeof window.getPsnScrolledBrowseToolbars === 'function' ? window.getPsnScrolledBrowseToolbars(main) : main.querySelectorAll('.browse-toolbar.scrolled');
                 for (const toolbar of sticky) {
                     const stickyRect = toolbar.getBoundingClientRect();
                     if (stickyRect.height && stickyRect.top <= rect.top + 5 && stickyRect.bottom > fadeTop && stickyRect.bottom < rect.bottom) fadeTop = stickyRect.bottom;
@@ -117945,8 +117975,10 @@ function getVisibleChatStackEl(id) {
                 pageFadeTop.style.top = g.top + 'px';
                 pageFadeBottom.style.top = Math.max(g.top, g.bottom - 22) + 'px';
             }
-            pageFadeTop.classList.toggle('is-visible', showTop && g.top + 22 < g.bottom);
-            pageFadeBottom.classList.toggle('is-visible', showBottom && g.height > 40);
+            const topVisible = showTop && g.top + 22 < g.bottom;
+            const bottomVisible = showBottom && g.height > 40;
+            if (pageFadeTop.classList.contains('is-visible') !== topVisible) pageFadeTop.classList.toggle('is-visible', topVisible);
+            if (pageFadeBottom.classList.contains('is-visible') !== bottomVisible) pageFadeBottom.classList.toggle('is-visible', bottomVisible);
         }
 
         function measureEdge(el, full) {
@@ -117954,7 +117986,8 @@ function getVisibleChatStackEl(id) {
             const directions = edgeDirections.get(el);
             let sizes = edgeSizes.get(el);
             const now = performance.now();
-            if (full || !sizes || now - sizes.at > 1500) {
+            const refreshSizes = full || !sizes || now - sizes.at > 1500;
+            if (refreshSizes) {
                 const vertical = directions ? directions.vertical : el.matches(edgeSelector);
                 const horizontal = directions ? directions.horizontal : el.matches(horizontalSelector);
                 const width = el.clientWidth;
@@ -117965,7 +117998,7 @@ function getVisibleChatStackEl(id) {
                 sizes = { hasY:maxY > 4, hasX:maxX > 4, maxY, maxX, at:now };
                 edgeSizes.set(el, sizes);
             }
-            const state = { ...sizes, scrollTop:el.scrollTop, scrollLeft:el.scrollLeft };
+            const state = { ...sizes, scrollTop:sizes.hasY ? el.scrollTop : 0, scrollLeft:sizes.hasX ? el.scrollLeft : 0, refreshSizes };
             if (directions ? directions.main : el.classList.contains('main-content')) state.pageFade = measurePageFade(el, state.hasY && state.scrollTop > 3);
             return state;
         }
@@ -117975,14 +118008,19 @@ function getVisibleChatStackEl(id) {
             const { hasY, hasX, scrollTop, scrollLeft, maxY, maxX } = state;
             const directions = edgeDirections.get(el);
             const isChatSuggestions = directions ? directions.chatSuggestions : el.matches('#mention-suggestions, #direct-mention-suggestions');
-            el.classList.toggle('psn-scroll-edge-polish', hasY && !isChatSuggestions);
-            el.classList.toggle('psn-scroll-edge-top', hasY && scrollTop > 3);
-            el.classList.toggle('psn-scroll-edge-bottom', hasY && scrollTop < maxY - 3);
-            el.classList.toggle('psn-scroll-edge-left', hasX && scrollLeft > 3);
-            el.classList.toggle('psn-scroll-edge-right', hasX && scrollLeft < maxX - 3);
-            el.classList.toggle('psn-scroll-fade-y', hasY && !isChatSuggestions && !el.classList.contains('main-content') && !el.classList.contains('sidebar'));
-            el.classList.toggle('psn-scroll-fade-x', hasX);
-            if (directions ? directions.main : el.classList.contains('main-content')) updatePageFade(el, hasY && scrollTop > 3, hasY && scrollTop < maxY - 3, state.pageFade);
+            const isMain = directions ? directions.main : el.classList.contains('main-content');
+            const top = hasY && scrollTop > 3;
+            const bottom = hasY && scrollTop < maxY - 3;
+            const flags = (hasY && !isChatSuggestions ? 1 : 0) | (top ? 2 : 0) | (bottom ? 4 : 0) | (hasX && scrollLeft > 3 ? 8 : 0) | (hasX && scrollLeft < maxX - 3 ? 16 : 0) | (hasY && !isChatSuggestions && !isMain && !el.classList.contains('sidebar') ? 32 : 0) | (hasX ? 64 : 0);
+            if (state.refreshSizes || appliedEdgeFlags.get(el) !== flags) {
+                appliedEdgeFlags.set(el, flags);
+                for (let i = 0; i < edgeFlagClasses.length; i++) {
+                    const className = edgeFlagClasses[i];
+                    const enabled = !!(flags & (1 << i));
+                    if (el.classList.contains(className) !== enabled) el.classList.toggle(className, enabled);
+                }
+            }
+            if (isMain) updatePageFade(el, top, bottom, state.pageFade);
         }
 
         function flushScheduledEdges() {
@@ -118068,6 +118106,7 @@ function getVisibleChatStackEl(id) {
             edgeDirections.delete(el);
             edgesNeedingMeasure.delete(el);
             edgeSizes.delete(el);
+            appliedEdgeFlags.delete(el);
             el.removeAttribute(edgeBoundAttribute);
             observedEdges.delete(el);
             pendingEdges.delete(el);
@@ -118146,7 +118185,7 @@ function getVisibleChatStackEl(id) {
             if (!root || (root.nodeType !== 1 && root.nodeType !== 11)) return;
             if (removed) {
                 if (!observedEdges.size) return;
-                if (root.nodeType === 1 && !root.hasAttribute(edgeBoundAttribute) && !root.querySelector(`[${edgeBoundAttribute}]`)) return;
+                if (root.nodeType === 1 && !root.hasAttribute(edgeBoundAttribute) && (!root.firstElementChild || !root.querySelector(`[${edgeBoundAttribute}]`))) return;
                 if (root.nodeType === 11 && !root.querySelector(`[${edgeBoundAttribute}]`)) return;
                 pendingEdgeRemoval = true;
             } else {
@@ -118171,8 +118210,8 @@ function getVisibleChatStackEl(id) {
             const refreshedAncestors = new Set();
             for (const record of records) {
                 refreshEdgeAncestors(record.target, refreshedAncestors);
-                record.addedNodes?.forEach(node => queueEdgeChange(node));
-                record.removedNodes?.forEach(node => queueEdgeChange(node, true));
+                for (const node of record.addedNodes) if (node.nodeType === 1 || node.nodeType === 11) queueEdgeChange(node);
+                for (const node of record.removedNodes) if (node.nodeType === 1 || node.nodeType === 11) queueEdgeChange(node, true);
             }
         });
         const observeRootWhenVisible = () => {
@@ -118254,6 +118293,7 @@ function getVisibleChatStackEl(id) {
                 restoreNativeTitle(tooltipTarget);
             }
             tooltipTarget = target;
+            window.addEventListener('scroll', hideTooltipOnScroll, { passive:true, capture:true });
             storeAndSuppressNativeTitle(target, text);
             const reveal = () => {
                 if (tooltipTarget !== target || !target.isConnected) return;
@@ -118266,9 +118306,14 @@ function getVisibleChatStackEl(id) {
             tooltipTimer = setTimeout(reveal, immediate ? 0 : 230);
         }
 
+        function hideTooltipOnScroll() {
+            hideTooltip(null, true);
+        }
+
         function hideTooltip(target = null, restore = true) {
             if (!tooltipTarget && !tooltipTimer) return;
             if (target && tooltipTarget && target !== tooltipTarget) return;
+            window.removeEventListener('scroll', hideTooltipOnScroll, true);
             clearTimeout(tooltipTimer);
             tooltipTimer = 0;
             const previous = tooltipTarget;
@@ -118308,7 +118353,6 @@ function getVisibleChatStackEl(id) {
             hideTooltip(target, true);
         });
 
-        window.addEventListener('scroll', () => hideTooltip(null, true), { passive:true, capture:true });
         let tooltipResizeFrame = 0;
         window.addEventListener('resize', () => {
             if (!tooltipTarget || !tooltip?.classList.contains('show') || tooltipResizeFrame) return;
