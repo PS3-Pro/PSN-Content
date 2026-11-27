@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Build per-system indices using only Libretro GitHub tree listings (no image downloads)."""
-import argparse, collections, json, os, re, unicodedata, urllib.request
+import argparse, collections, http.client, json, os, re, sys, time, unicodedata, urllib.error, urllib.request
 from pathlib import Path
 
 REPOS={'ps1':['Sony_-_PlayStation'],'ps2':['Sony_-_PlayStation_2'],'ps3':['Sony_-_PlayStation_3','Sony_-_PlayStation_3_Downloadable'],'ps4':['Sony_-_PlayStation_4'],'psp':['Sony_-_PlayStation_Portable'],'psvita':['Sony_-_PlayStation_Vita']}
@@ -40,13 +40,59 @@ def build_rows(repos,trees):
             if row not in rows and len(rows)<20:rows.append(row)
     return result
 
+ART_DIRS=('Named_Boxarts','Named_Snaps')
+RETRYABLE={408,429,500,502,503,504}
+
+def fetch_tree(repo,ref):
+    url=f'https://api.github.com/repos/libretro-thumbnails/{repo}/git/trees/{ref}'
+    headers={'User-Agent':'NPS-artwork-index-builder','Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'}
+    token=os.environ.get('GITHUB_TOKEN')
+    if token:headers['Authorization']='Bearer '+token
+    attempt=0
+    while True:
+        attempt+=1
+        try:
+            request=urllib.request.Request(url,headers=headers)
+            with urllib.request.urlopen(request,timeout=45) as response:data=json.load(response)
+            if data.get('truncated') or not isinstance(data.get('tree'),list):
+                raise RuntimeError(f'Incomplete tree: {repo}/{ref}')
+            return data['tree']
+        except urllib.error.HTTPError as error:
+            status=error.code
+            rate_limited=status==403 and (error.headers.get('Retry-After') or error.headers.get('X-RateLimit-Remaining')=='0')
+            if status in (401,403,404) and not rate_limited and 'Authorization' in headers:
+                headers.pop('Authorization');attempt-=1;error.close();continue
+            retryable=status in RETRYABLE or rate_limited
+            retry_after=error.headers.get('Retry-After','')
+            reset=error.headers.get('X-RateLimit-Reset','')
+            delay=max(2**attempt,int(retry_after) if retry_after.isdigit() else 0)
+            if rate_limited and reset.isdigit():delay=max(delay,int(reset)-int(time.time()))
+            error.close()
+            if not retryable or attempt>=5 or delay>120:
+                raise RuntimeError(f'GitHub HTTP {status}: {repo}/{ref}') from error
+            reason=f'HTTP {status}'
+        except (urllib.error.URLError,TimeoutError,http.client.HTTPException,OSError,json.JSONDecodeError) as error:
+            if attempt>=5:raise RuntimeError(f'GitHub request failed: {repo}/{ref}') from error
+            delay=2**attempt;reason=type(error).__name__
+        print(f'{repo}/{ref}: {reason}; retry {attempt+1}/5 in {delay}s',file=sys.stderr,flush=True)
+        time.sleep(delay)
+
 def download(repo):
-    headers={'User-Agent':'NPS-artwork-index-builder','Accept':'application/vnd.github+json'}
-    if os.environ.get('GITHUB_TOKEN'):headers['Authorization']='Bearer '+os.environ['GITHUB_TOKEN']
-    request=urllib.request.Request('https://api.github.com/repos/libretro-thumbnails/'+repo+'/git/trees/master?recursive=1',headers=headers)
-    with urllib.request.urlopen(request,timeout=45) as response:data=json.load(response)
-    if data.get('truncated') or not isinstance(data.get('tree'),list):raise RuntimeError('Incomplete tree: '+repo)
-    return data['tree']
+    print(f'Fetching {repo}',flush=True)
+    root=fetch_tree(repo,'master')
+    folders={item['path']:item['sha'] for item in root if item.get('type')=='tree' and item.get('path') in ART_DIRS and re.fullmatch(r'[0-9a-f]{40}',str(item.get('sha','')))}
+    if 'Named_Boxarts' not in folders:raise RuntimeError(f'Missing Named_Boxarts: {repo}')
+    result=[]
+    for folder in ART_DIRS:
+        if folder not in folders:continue
+        tree=fetch_tree(repo,folders[folder])
+        for item in tree:
+            path=item.get('path','')
+            if item.get('type')=='blob' and '/' not in path and path.lower().endswith('.png'):
+                result.append({'type':'blob','path':folder+'/'+path})
+    if not any(item['path'].startswith('Named_Boxarts/') for item in result):
+        raise RuntimeError(f'Empty Named_Boxarts: {repo}')
+    return sorted(result,key=lambda item:item['path'])
 
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('output_dir',type=Path);p.add_argument('--platform',choices=REPOS,action='append');a=p.parse_args();a.output_dir.mkdir(parents=True,exist_ok=True)
