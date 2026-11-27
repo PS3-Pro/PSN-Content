@@ -43374,6 +43374,7 @@ P
 			scraperBackground.classList.remove('psn-ss-fanart');
 			['--psn-ss-modal-bg','--psn-ss-fade-start','--psn-ss-fade-end'].forEach(prop=>scraperBackground.style.removeProperty(prop));
 		}
+		modal.__psnUseGalleryFanart = null;
 		modal.__psnScraperAppliedToken = null;
 		modal.__psnFanartGeneration = (Number(modal.__psnFanartGeneration)||0)+1;
 		const modalBody = modal.querySelector('.sys-modal-body');
@@ -43783,8 +43784,9 @@ P
 					scraperBackground.classList.remove('psn-ss-fanart');
 					['--psn-ss-modal-bg','--psn-ss-fade-start','--psn-ss-fade-end'].forEach(prop=>scraperBackground.style.removeProperty(prop));
 				}
+				modal.__psnUseGalleryFanart = null;
 				modal.__psnScraperAppliedToken = null;
-		modal.__psnFanartGeneration = (Number(modal.__psnFanartGeneration)||0)+1;
+				modal.__psnFanartGeneration = (Number(modal.__psnFanartGeneration)||0)+1;
 				window.dispatchEvent(new Event('psn-game-modal-closed'));
 				if (typeof window.resetGameModalCardMorphStyles === 'function') window.resetGameModalCardMorphStyles(modal);
 				modal.style.opacity = '';
@@ -121634,6 +121636,105 @@ function getVisibleChatStackEl(id) {
   };
   const warmImages = new Map();
   const imageKey = (name,system,isPort,isMinis=false,titleId='') => (isPort?'port':isMinis?'minis':system)+':'+(serialFor(titleId,isPort)||normalize(name));
+  const bingFanart = new Map();
+  const fanartPlatforms = {59:'PS3',58:'PS2',57:'PS1',61:'PSP',62:'PS Vita',60:'PS4',31:'PC Engine',142:'Neo Geo'};
+  function loadFanartCandidate(url,validate,readPixels=false) {
+    return new Promise(resolve=>{
+      const image=new Image();
+      image.decoding='async';
+      image.fetchPriority='low';
+      if(readPixels)image.crossOrigin='anonymous';
+      let settled=false;
+      const finish=ok=>{
+        if(settled)return;
+        settled=true;
+        clearTimeout(timeout);
+        image.onload=image.onerror=null;
+        if(!ok)image.removeAttribute('src');
+        resolve(ok?{url,image}:null);
+      };
+      const timeout=setTimeout(()=>finish(false),4500);
+      image.onload=()=>{try{finish(validate(image));}catch(_){finish(false);}};
+      image.onerror=()=>finish(false);
+      image.src=url;
+    });
+  }
+  function isUsableBingFanart(image) {
+    const w=image.naturalWidth,h=image.naturalHeight;
+    if(w<320||h<180||w/h<1.45||w/h>2.5||w*h>1920*1080)return false;
+    const canvas=document.createElement('canvas');
+    canvas.width=96;canvas.height=54;
+    const ctx=canvas.getContext('2d',{willReadFrequently:true});
+    if(!ctx)return false;
+    ctx.drawImage(image,0,0,96,54);
+    const pixels=ctx.getImageData(0,0,96,54).data;
+    // Reject broad uniform margins, including covers padded by the thumbnail service.
+    const margin=(vertical,reverse)=>{
+      const depth=vertical?96:54,length=vertical?54:96;
+      const offset=(line,point)=>{
+        const edge=reverse?depth-1-line:line;
+        return (vertical?point*96+edge:edge*96+point)*4;
+      };
+      const ref=offset(0,Math.floor(length/2));
+      let count=0;
+      for(let line=0;line<Math.ceil(depth*.45);line++){
+        let similar=0;
+        for(let point=0;point<length;point++){
+          const i=offset(line,point);
+          if(pixels[i+3]<24&&pixels[ref+3]<24||
+            Math.abs(pixels[i]-pixels[ref])<=18&&Math.abs(pixels[i+1]-pixels[ref+1])<=18&&
+            Math.abs(pixels[i+2]-pixels[ref+2])<=18&&Math.abs(pixels[i+3]-pixels[ref+3])<=24)similar++;
+        }
+        if(similar<length*.90)break;
+        count++;
+      }
+      return count/depth;
+    };
+    const left=margin(true,false),right=margin(true,true),top=margin(false,false),bottom=margin(false,true);
+    return Math.max(left,right,top,bottom)<.15&&!(left>=.08&&right>=.08)&&!(top>=.08&&bottom>=.08);
+  }
+  const isUsableScreenshot=image=>image.naturalWidth>=240&&image.naturalHeight>=160&&image.naturalWidth/image.naturalHeight>=1.15;
+  async function warmScreenshotFanart(urls) {
+    for(const url of [...new Set(urls.filter(Boolean))].slice(0,2)){
+      if(document.hidden)return null;
+      const result=await loadFanartCandidate(url,isUsableScreenshot);
+      if(result)return result;
+    }
+    return null;
+  }
+  function warmBingFanart(name,system,isPort,isMinis) {
+    if(document.hidden)return Promise.resolve(null);
+    const title=cleanName(name);
+    const platform=isMinis?'PlayStation Minis':isPort?'':fanartPlatforms[system]||'';
+    const key=JSON.stringify([normalize(title),platform]);
+    const now=Date.now();
+    const previous=bingFanart.get(key);
+    if(previous&&previous.until>now)return previous.promise;
+    if(previous)bingFanart.delete(key);
+    if(bingFanart.size>=12){
+      for(const [oldKey,oldEntry] of bingFanart){
+        if(!oldEntry.pending){bingFanart.delete(oldKey);break;}
+      }
+      if(bingFanart.size>=12)return Promise.resolve(null);
+    }
+    const query=[title,platform,'game wallpaper background'].filter(Boolean).join(' ');
+    const base='https://tse4.mm.bing.net/th?q='+encodeURIComponent(query);
+    const entry={pending:true,until:Infinity,promise:null};
+    entry.promise=(async()=>{
+      for(const size of ['960&h=540','640&h=360']){
+        if(document.hidden)break;
+        const result=await loadFanartCandidate(base+'&w='+size,isUsableBingFanart,true);
+        if(result)return result;
+      }
+      return null;
+    })().catch(()=>null).then(result=>{
+      entry.pending=false;
+      entry.until=Date.now()+(result?12*60*60*1000:60000);
+      return result;
+    });
+    bingFanart.set(key,entry);
+    return entry.promise;
+  }
   function warmFanart(name,system,isPort=false,isMinis=false,titleId='') {
     if(document.hidden)return Promise.resolve(null);
     const key=imageKey(name,system,isPort,isMinis,titleId), now=Date.now();
@@ -121662,11 +121763,25 @@ function getVisibleChatStackEl(id) {
       };
       image.src=url;
     });
-    entry.promise=getAssets(name,system,isPort,false,isMinis,titleId).then(data=>{
-      const art=(data?.extras?.images||[]).find(item=>item.kind==='background'&&validImg(item.url));
+    entry.promise=getAssets(name,system,isPort,false,isMinis,titleId).then(async data=>{
+      const images=data?.extras?.images||[];
+      const art=images.find(item=>item.kind==='background'&&validImg(item.url));
       const url=validImg(art?.url);
-      if(!url){entry.status=data?.ok&&!data.partial?'absent':'failed';entry.until=Date.now()+(data?.ok&&!data.partial?60000:15000);return null;}
-      return load(url,true);
+      if(url)return load(url,true);
+      const absent=data?.ok===true&&!data.partial&&!data.retry&&
+        (data.found===false||(data.extras?.artworkChecked===true&&Array.isArray(data.extras.images)&&!images.some(item=>item.kind==='background')));
+      if(absent){
+        entry.status='loading';
+        const shots=images.filter(item=>item.kind==='screenshot');
+        const screenshotUrls=[...shots.filter(item=>item.type==='ss'),...shots.filter(item=>item.type!=='ss')].map(item=>validImg(item.url));
+        const bing=await warmBingFanart(name,system,isPort,isMinis);
+        const fallback=bing||await warmScreenshotFanart(screenshotUrls);
+        if(fallback){
+          entry.image=fallback.image;entry.url=fallback.url;entry.status='ready';entry.until=Date.now()+(bing?12*60*60*1000:15*60*1000);
+          return entry.url;
+        }
+      }
+      entry.status=absent?'absent':'failed';entry.until=Date.now()+(absent?60000:15000);return null;
     }).catch(()=>{entry.status='failed';entry.until=Date.now()+15000;return null;});
     warmImages.set(key,entry);
     while(warmImages.size>6)warmImages.delete(warmImages.keys().next().value);
@@ -121830,9 +121945,31 @@ function getVisibleChatStackEl(id) {
     const warmed=warmImages.get(identity);
     if(warmed?.status==='ready'&&warmed.image?.naturalWidth&&warmed.until>Date.now()){
       apply(warmed.url);
-    }else{
-      warmFanart(name,system,isPort,consoleTag==='minis',lookupTitleId).then(apply);
+      return;
     }
+    const fanart=warmFanart(name,system,isPort,consoleTag==='minis',lookupTitleId);
+    let screenshotPending=false;
+    const triedScreenshots=new Set();
+    const useGallery=async()=>{
+      if(!valid()||screenshotPending||content.classList.contains('psn-ss-fanart'))return;
+      screenshotPending=true;
+      try{
+        const url=await fanart;
+        if(url){apply(url);return;}
+        if(!valid()||document.hidden||content.classList.contains('psn-ss-fanart'))return;
+        const urls=Array.from(root.querySelectorAll('#modal-screenshots img.screenshot-item'),img=>{
+          try{const u=new URL(img.currentSrc||img.src,document.baseURI);return u.protocol==='https:'?u.href:'';}catch(_){return '';}
+        }).filter(url=>url&&!triedScreenshots.has(url));
+        const candidates=[...new Set(urls)].slice(0,Math.max(0,2-triedScreenshots.size));
+        candidates.forEach(url=>triedScreenshots.add(url));
+        if(candidates.length){
+          const fallback=await warmScreenshotFanart(candidates);
+          if(fallback)apply(fallback.url);
+        }
+      }finally{screenshotPending=false;}
+    };
+    root.__psnUseGalleryFanart=useGallery;
+    fanart.then(url=>{if(url)apply(url);else useGallery();});
   };
   window.__psnGetScraperSummary = async function(name, consoleTag, titleId='') {
     const platform = String(consoleTag || '').toLowerCase().replace(/[^a-z0-9]/g,'');
@@ -121875,6 +122012,7 @@ function getVisibleChatStackEl(id) {
     const match=()=>root.isConnected&&root.classList.contains('show')&&String(root.dataset.titleId||'')===String(titleId||'')&&(!requestToken||String(root.dataset.openHydrationToken||'')===String(requestToken));
     const isMinis=consoleTag==='minis';
     window.__psnPrepareGameModalFanart?.(root,root.__psnLastOpenedGame||{cleanName:name,cTag:consoleTag},category,requestToken);
+    root.__psnUseGalleryFanart?.();
     const data=await getAssets(name,system,isPort,false,isMinis,titleId);
     if(!match()||!data?.found||!data.extras) return;
     const ext=data.extras;
@@ -121922,6 +122060,7 @@ function getVisibleChatStackEl(id) {
         }
       }
       root.__psnScraperAppliedToken=requestToken;
+      root.__psnUseGalleryFanart?.();
     }
   };
 })();
