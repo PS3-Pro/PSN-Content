@@ -11,8 +11,8 @@ function parsePsnServerEndpoints(data) {
 }
 async function getPatreonOrigin() {
   if (cachedOrigin && Date.now() < cachedUntil) return cachedOrigin;
-  const response = await fetch(ENDPOINTS_URL, {redirect:'error',cache:'no-store',signal:AbortSignal.timeout(7000),cf:{cacheEverything:false,cacheTtl:0}});
-  if (!response.ok) throw new Error('Configuration unavailable');
+  const response = await fetch(ENDPOINTS_URL, {redirect:'manual',headers:{'Cache-Control':'no-cache','Pragma':'no-cache'},signal:AbortSignal.timeout(10000),cf:{cacheEverything:false,cacheTtl:0}});
+  if (!response.ok) throw new Error(`Configuration HTTP ${response.status}`);
   const text = await response.text();
   if (text.length > 16384) throw new Error('Invalid configuration size');
   cachedOrigin = parsePsnServerEndpoints(JSON.parse(text))[0];
@@ -29,10 +29,12 @@ export default {
     if (!callback && !webhook) return new Response('Not found', { status: 404, headers: noCache });
     const method = callback ? 'GET' : 'POST';
     if (request.method !== method) return new Response('Method not allowed', { status: 405, headers: { ...noCache, Allow: method } });
+    let stage = 'configuration';
     try {
       const origin = new URL(await getPatreonOrigin());
+      stage = 'upstream';
       const target = new URL(incoming.pathname + incoming.search, origin);
-      const headers = new Headers();
+      const headers = new Headers({'Cache-Control':'no-cache, no-store','Pragma':'no-cache'});
       if (webhook) {
         for (const name of ['Content-Type', 'X-Patreon-Signature', 'X-Patreon-Event']) {
           const value = request.headers.get(name);
@@ -43,14 +45,15 @@ export default {
         method, headers,
         body: webhook ? request.body : undefined,
         redirect: 'manual',
-        cache: 'no-store'
+        cf: {cacheEverything:false,cacheTtl:0}
       });
       if (response.status >= 300 && response.status < 400) return new Response('Unexpected upstream redirect', {status:502,headers:noCache});
       const outgoing = new Response(response.body, response);
       for (const [name, value] of Object.entries(noCache)) outgoing.headers.set(name, value);
       return outgoing;
     } catch {
-      return new Response('Service temporarily unavailable', { status: 503, headers: noCache });
+      console.warn('[PATREON PROXY] failed:', stage);
+      return new Response(`Service temporarily unavailable (${stage})`, { status: 503, headers: {...noCache, 'X-Patreon-Proxy-Stage':stage} });
     }
   }
 };
