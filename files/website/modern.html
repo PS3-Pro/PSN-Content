@@ -34211,7 +34211,6 @@ P
 		const category = imgElement.getAttribute('data-cover-category') || card?.getAttribute?.('data-store-category') || '';
 		const webmanCover = normalizeCoverSrcForCache(imgElement.getAttribute('data-webman-cover') || '');
 		const isLibraryWebmanCover = String(category || '').toLowerCase() === 'library' && webmanCover && webmanCover === src;
-		if (getCoverCacheSource(src, imgElement) === 'bing' && !window.isContentMetadataOverrideCoverSrc(src)) window.checkBingCoverDisc?.(imgElement, src, key);
 		if (key && !isLibraryWebmanCover) window.rememberCardCoverSrc(key, src, category, imgElement);
 
 		const libPath = imgElement.getAttribute('data-lib-path') || '';
@@ -34875,127 +34874,19 @@ P
 		getOnlineCoverFallback(imgElement);
 	};
 	
-	window.getBingCoverFallbackUrl = function(gameName, consoleTag, titleId, category, region) {
-		gameName = String(gameName || '').trim().replace(/[™®©]/g, ' ').replace(/\s+/g, ' ').trim();
-		const rawConsole = String(consoleTag || 'ps3').trim().toLowerCase();
-		const cat = String(category || '').trim().toLowerCase();
-		const serial = String(titleId || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
-		const area = String(region || '').trim().toUpperCase();
-		const consoleMap = {
-			ps3: 'PS3', ps2: 'PS2', ps1: 'PS1', psx: 'PS1', psp: 'PSP', minis: 'PlayStation Minis',
-			vita: 'PS Vita', psv: 'PS Vita', psvita: 'PS Vita', ps4: 'PS4', pce: 'PC Engine', pcengine: 'PC Engine', neogeo: 'Neo Geo'
-		};
-		const searchConsole = consoleMap[rawConsole] || String(consoleTag || 'PS3').trim().toUpperCase();
-		const baseTitle = gameName || 'PlayStation game';
-		const quotedTitle = '"' + baseTitle.slice(0, 110) + '"';
-		const positive = [quotedTitle, searchConsole];
-		if (/^[A-Z]{4}\d{5}$/.test(serial)) positive.push(serial);
-		if (area && /^(US|EU|JP|AS|AU)$/.test(area)) positive.push(area);
-		positive.push('official front cover box art');
-		if (cat === 'prototypes') positive.push('prototype');
-		const negativeByConsole = {
-			'PS3': ['PS5','PS4','Xbox','Switch','Steam','PC','Master Collection','Remastered'],
-			'PS2': ['PS5','PS4','PS3','Xbox','Switch','Steam','PC','HD Collection','Remastered'],
-			'PS1': ['PS5','PS4','PS3','PS2','PSP','Xbox','Switch','Steam','PC','Remastered'],
-			'PSP': ['PS5','PS4','PS3','PS2','Xbox','Switch','Steam','PC','Remastered'],
-			'PS Vita': ['PS5','PS4','PS3','PS2','Xbox','Switch','Steam','PC','Remastered'],
-			'PlayStation Minis': ['PS5','PS4','Xbox','Switch','Steam','PC']
-		};
-		const negative = (negativeByConsole[searchConsole] || ['PS5','Xbox','Switch','Steam','PC']).concat(['disc','disk','disc label','disc art','CD-ROM','DVD-ROM','Blu-ray disc']).filter(value => !baseTitle.toLowerCase().includes(value.toLowerCase())).map(value => /\s/.test(value) ? '-"'+value+'"' : '-'+value);
-		const query = encodeURIComponent(positive.concat(negative).join(' '));
-		return `https://tse4.mm.bing.net/th?q=${query}&w=600&h=900`;
-	};
-
-	const bingCoverDiscChecks = new Map();
-	let bingCoverDiscActive = 0;
-	function looksLikeBingDisc(pixels, w, h) {
-		const at = (x,y) => (y*w+x)*4;
-		const corners = [at(0,0),at(w-1,0),at(0,h-1),at(w-1,h-1)];
-		const ref = corners[0];
-		const neutral = Math.max(pixels[ref],pixels[ref+1],pixels[ref+2])-Math.min(pixels[ref],pixels[ref+1],pixels[ref+2]) <= 20;
-		const same = i => pixels[i+3]<24 && pixels[ref+3]<24 || Math.abs(pixels[i+3]-pixels[ref+3])<24 && Math.abs(pixels[i]-pixels[ref])<25 && Math.abs(pixels[i+1]-pixels[ref+1])<25 && Math.abs(pixels[i+2]-pixels[ref+2])<25;
-		if ((!neutral && pixels[ref+3]>=24) || !corners.every(same)) return false;
-		let left=w,top=h,right=-1,bottom=-1;
-		for(let y=0;y<h;y++)for(let x=0;x<w;x++)if(!same(at(x,y))){left=Math.min(left,x);right=Math.max(right,x);top=Math.min(top,y);bottom=Math.max(bottom,y);}
-		const bw=right-left+1,bh=bottom-top+1;
-		if(bw<w*.52 || bh<h*.42 || bw/bh<.84 || bw/bh>1.19) return false;
-		const fraction=(x0,y0,x1,y1)=>{
-			let filled=0,total=0;
-			for(let y=Math.ceil(top+y0*bh);y<top+y1*bh && y<h;y++)for(let x=Math.ceil(left+x0*bw);x<left+x1*bw && x<w;x++){total++;if(!same(at(x,y)))filled++;}
-			return total?filled/total:0;
-		};
-		const emptyCorners=[fraction(0,0,.15,.15),fraction(.85,0,1,.15),fraction(0,.85,.15,1),fraction(.85,.85,1,1)];
-		const ring=[fraction(.4,.12,.6,.29),fraction(.4,.71,.6,.88),fraction(.12,.4,.29,.6),fraction(.71,.4,.88,.6)];
-		return emptyCorners.every(v=>v<.24) && ring.every(v=>v>.44);
-	}
-	window.checkBingCoverDisc = function(img, src, key) {
-		if (img.__psnBingDiscCheckedSrc===src) return;
-		let entry=bingCoverDiscChecks.get(src);
-		if (!entry) {
-			if (bingCoverDiscActive>=4) return;
-			if (bingCoverDiscChecks.size>=160) {
-				for(const [url,item] of bingCoverDiscChecks)if(!item.pending){bingCoverDiscChecks.delete(url);break;}
-				if(bingCoverDiscChecks.size>=160)return;
-			}
-			entry={pending:true,promise:null};
-			bingCoverDiscActive++;
-			entry.promise=new Promise(resolve=>{
-				const image=new Image();
-				image.crossOrigin='anonymous';image.decoding='async';image.fetchPriority='low';
-				let done=false;
-				const finish=result=>{if(done)return;done=true;clearTimeout(timer);image.onload=image.onerror=null;if(result===null)image.removeAttribute('src');resolve(result);};
-				const timer=setTimeout(()=>finish(null),4000);
-				image.onload=()=>{
-					try{
-						const scale=96/Math.max(image.naturalWidth,image.naturalHeight);
-						const w=Math.max(1,Math.round(image.naturalWidth*scale)),h=Math.max(1,Math.round(image.naturalHeight*scale));
-						const canvas=document.createElement('canvas');canvas.width=w;canvas.height=h;
-						const ctx=canvas.getContext('2d',{willReadFrequently:true});
-						ctx.drawImage(image,0,0,w,h);finish(looksLikeBingDisc(ctx.getImageData(0,0,w,h).data,w,h));
-					}catch(_){finish(null);}
-				};
-				image.onerror=()=>finish(null);image.src=src;
-			}).finally(()=>{entry.pending=false;bingCoverDiscActive--;});
-			bingCoverDiscChecks.set(src,entry);
-		}
-		img.__psnBingDiscCheckedSrc=src;
-		const identity=img.getAttribute('data-cover-key')||'';
-		entry.promise.then(isDisc=>{
-			if(isDisc!==true)return;
-			if(key)window.forgetCardCoverSrc(key,src);
-			if(!img.isConnected || normalizeCoverSrcForCache(img.getAttribute('src'))!==src || (img.getAttribute('data-cover-key')||'')!==identity || img.dataset.collectionImageRecycled==='1')return;
-			const path=img.getAttribute('data-lib-path')||'';
-			if(path && window.libCoverCache?.[path]?.resolvedCover===src)delete window.libCoverCache[path].resolvedCover;
-			const next=window.getBingCoverFallbackUrl(img.dataset.name,img.dataset.console,img.dataset.titleId,img.dataset.coverCategory,img.dataset.region);
-			if(next!==src && img.dataset.name){
-				img.removeAttribute('data-bing-tried');window.getOnlineCoverFallback(img);return;
-			}
-			img.onerror=null;img.src=FALLBACK_IMG;img.setAttribute('data-loaded','true');
-		});
+	window.getBingCoverFallbackUrl = function(gameName, consoleTag) {
+		gameName = String(gameName || '').trim();
+		let searchConsole = String(consoleTag || 'ps3').trim().toUpperCase();
+		if (searchConsole === 'PSX') searchConsole = 'PS1';
+		if (!gameName) gameName = 'PlayStation game';
+		const query = encodeURIComponent(`${gameName} ${searchConsole} high-quality official game front cover art`);
+		return `https://tse4.mm.bing.net/th?q=${query}`;
 	};
 
 	window.getOnlineCoverFallback = function(imgElement) {
 	    let gameName = imgElement.getAttribute('data-name') || '';
 	    let consoleTag = imgElement.getAttribute('data-console') || 'ps3';
-	    const category = imgElement.getAttribute('data-cover-category') || '';
-	    const titleId = imgElement.getAttribute('data-title-id') || '';
-	    const region = imgElement.getAttribute('data-region') || '';
-	    const cat = String(category || '').trim().toLowerCase();
-	    const consoleName = String(consoleTag || '').trim().toLowerCase();
-	    const hasSerial = /^[A-Z]{4}[-_ ]?\d{5}$/i.test(String(titleId || '').trim());
-	    if ((cat === 'prototypes' || cat === 'ports') && !hasSerial) {
-	        imgElement.onerror = null;
-	        imgElement.src = FALLBACK_IMG;
-	        imgElement.setAttribute('data-loaded', 'true');
-	        return;
-	    }
-	    if (consoleName && ['ps3','ps2','ps1','psx','psp','minis','psv','psvita','vita','ps4','pce','pcengine','neogeo'].indexOf(consoleName) === -1) {
-	        imgElement.onerror = null;
-	        imgElement.src = FALLBACK_IMG;
-	        imgElement.setAttribute('data-loaded', 'true');
-	        return;
-	    }
-	    const bingCover = window.getBingCoverFallbackUrl(gameName, consoleTag, titleId, category, region);
+	    const bingCover = window.getBingCoverFallbackUrl(gameName, consoleTag);
 	    const currentSrc = normalizeCoverSrcForCache(imgElement.currentSrc || imgElement.src);
 	    if (imgElement.getAttribute('data-bing-tried') === 'true' || currentSrc === normalizeCoverSrcForCache(bingCover)) {
 	        imgElement.onerror = null;
@@ -35005,7 +34896,6 @@ P
 	    }
 	
 	    imgElement.setAttribute('data-bing-tried', 'true');
-	    imgElement.setAttribute('data-cover-source', 'bing-cover');
 	    imgElement.src = bingCover;
 	};
 	
