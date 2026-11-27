@@ -122160,15 +122160,25 @@ function getVisibleChatStackEl(id) {
     let discFlight=null,discYaw=0,discPitch=0,discDrag=null,discSkipClick=false;
     inspect.classList.toggle('is-solid-media',solidMedia);
     function renderDisc(){mediaModel.style.transform=`rotateX(${discPitch}deg) rotateY(${discYaw}deg)`;mediaModel.style.setProperty('--disc-glint',`${Math.sin(discYaw*Math.PI/180)*65}%`);mediaModel.style.setProperty('--disc-hue',`${discYaw+discPitch}deg`);}
-    function flyDisc(seat,reverse,finish){
+    function flyDisc(seat,mode,finish){
       const target=mediaFlight.getBoundingClientRect(),dx=seat.left+seat.width/2-target.left-target.width/2,dy=seat.top+seat.height/2-target.top-target.height/2;
       if(reducedMotion()||typeof mediaFlight.animate!=='function'||!target.width||!seat.width){finish();return;}
-      const start=`translate3d(${dx}px,${dy}px,0) scale(${Math.max(.1,seat.width/target.width)}) rotateZ(-8deg)`;
-      const spin=solidMedia?0:360;
-      const frames=[{transform:start,opacity:.85},{transform:`translate3d(0,-12px,25px) scale(1.03) rotateZ(${spin*.72+8}deg)`,offset:.68},{transform:`translate3d(0,0,0) scale(1) rotateZ(${spin}deg)`,opacity:1}];
-      const animation=mediaFlight.animate(frames,{duration:650,direction:reverse?'reverse':'normal',easing:'cubic-bezier(.22,.75,.25,1)'});discFlight=animation;
-      animation.finished.catch(()=>{}).finally(()=>{if(discFlight===animation){discFlight=null;viewTimer=0;if(current())finish();}});
-      viewTimer=-1;
+      const tray=new DOMMatrixReadOnly(getComputedStyle(model).transform);
+      const size=Math.hypot(tray.m11,tray.m12,tray.m13)||1;
+      const pose=new DOMMatrix([tray.m11/size,tray.m12/size,tray.m13/size,0,tray.m21/size,tray.m22/size,tray.m23/size,0,tray.m31/size,tray.m32/size,tray.m33/size,0,0,0,0,1]);
+      const projectedX=Math.max(.1,Math.hypot(pose.m11,pose.m21)),projectedY=Math.max(.1,Math.hypot(pose.m12,pose.m22));
+      const seatScale=Math.max(.1,solidMedia?Math.min(seat.width/(target.width*projectedX),seat.height/(target.height*projectedY)):(seat.width/(target.width*projectedX)+seat.height/(target.height*projectedY))/2);
+      const seatTransform=`translate3d(${dx}px,${dy}px,0) scale(${seatScale}) rotateZ(0deg)`;
+      const centerTransform='translate3d(0,0,0) scale(1) rotateZ(0deg)';
+      const returning=mode==='back',spin=solidMedia?0:360;
+      const frames=returning
+        ? [{transform:centerTransform},{transform:`translate3d(${dx}px,${dy}px,0) scale(${seatScale}) rotateZ(${-spin}deg)`}]
+        : [{transform:seatTransform},{transform:`translate3d(0,0,0) scale(1) rotateZ(${spin}deg)`}];
+      const timing={duration:returning?540:650,easing:'cubic-bezier(.22,.75,.25,1)',fill:'both'};
+      const orientation=returning?getComputedStyle(mediaModel).transform:pose.toString();
+      const poseAnimation=mediaModel.animate([{transform:orientation},{transform:returning?pose.toString():'matrix3d(1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1)'}],timing);
+      const animation=mediaFlight.animate(frames,timing);discFlight=animation;viewTimer=-1;
+      animation.finished.then(()=>{if(discFlight===animation){discFlight=null;viewTimer=0;if(current())finish();}},()=>{if(discFlight===animation){discFlight=null;viewTimer=0;}}).finally(()=>{poseAnimation.cancel();animation.cancel();});
     }
     function showDisc(){
       if(!current()||viewTimer||!opened||!discUrl||!inspect.hidden)return;
@@ -122177,13 +122187,12 @@ function getVisibleChatStackEl(id) {
       try{canvas.getContext('2d').drawImage(source,0,0,canvas.width,canvas.height);}catch(_){return;}
       canvas.setAttribute('aria-label','Original game media');mediaFront.replaceChildren(canvas);
       discYaw=0;discPitch=0;renderDisc();stage.classList.remove('psn-case-view-enter');stage.classList.add('is-inspecting');stage.inert=true;inspect.hidden=false;inspect.focus({preventScroll:true});
-      note.textContent=solidMedia?'Tap to put it back':'Drag to rotate the disc · Tap to put it back';flyDisc(seat,false,()=>{});if(typeof playUiModal==='function')playUiModal();
+      note.textContent=solidMedia?'Tap to put it back':'Drag to rotate the disc · Tap to put it back';flyDisc(seat,'out',()=>{});if(typeof playUiModal==='function')playUiModal();
     }
     function returnDisc(){
       if(!current()||viewTimer||inspect.hidden)return;
-      discYaw=0;discPitch=0;renderDisc();
-      const finish=()=>{inspect.hidden=true;mediaFront.replaceChildren();stage.classList.remove('is-inspecting');stage.inert=false;stage.focus({preventScroll:true});status();};
-      if(typeof playUiBack==='function')playUiBack();flyDisc(disc.getBoundingClientRect(),true,finish);
+      const finish=()=>{discYaw=0;discPitch=0;renderDisc();inspect.hidden=true;mediaFront.replaceChildren();stage.classList.remove('is-inspecting');stage.inert=false;stage.focus({preventScroll:true});status();};
+      if(typeof playUiBack==='function')playUiBack();flyDisc(disc.getBoundingClientRect(),'back',finish);
     }
     book.addEventListener('click',showBook);disc.addEventListener('click',showDisc);
     inspect.tabIndex=0;inspect.setAttribute('aria-label','Inspect media. Drag or use arrow keys to rotate. Enter to return.');
