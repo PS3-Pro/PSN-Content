@@ -1,0 +1,55 @@
+name: Update Manual Indexes
+on:
+  schedule:
+    - cron: '30 5 * * 1'
+  workflow_dispatch:
+permissions:
+  contents: write
+  pages: write
+concurrency:
+  group: update-manual-indexes
+  cancel-in-progress: false
+jobs:
+  update-manuals:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Generate and validate public manual indexes
+        run: python .github/scripts/build-manual-index.py resources/database/manuals
+      - name: Commit and push indexes
+        id: publish
+        run: |
+          git config user.name 'PS3-Pro Bot'
+          git config user.email 'bot@ps3pro.com'
+          git add -- 'resources/database/manuals/*.json'
+          if git diff --cached --quiet; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git commit -m 'Auto-update: manual indexes'
+          for attempt in 1 2 3; do
+            git fetch origin main
+            git rebase origin/main
+            if git push origin HEAD:main; then
+              echo 'changed=true' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 5
+          done
+          exit 1
+      - name: Request GitHub Pages build
+        if: steps.publish.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh api --method POST "repos/$GITHUB_REPOSITORY/pages/builds"; then
+            echo '::warning::Indexes committed; Pages build could not be requested.'
+          fi

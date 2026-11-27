@@ -11,7 +11,7 @@ import zipfile
 from pathlib import Path
 
 PLATFORMS = {'Sony PlayStation':'ps1','Sony PlayStation 2':'ps2','Sony PlayStation 3':'ps3','Sony PlayStation 4':'ps4','Sony PSP':'psp','Sony PlayStation Portable':'psp','Sony PlayStation Vita':'psvita','NEC TurboGrafx-16':'pce','NEC PC Engine':'pce','SNK Neo Geo AES':'neogeo'}
-TYPES = {'Box - Front':'front','Box - Back':'back','Box - Spine':'spine','Box - 3D':'box3d','Disc':'disc','Disc - Front':'disc','Fanart - Background':'background'}
+TYPES = {'Box - Front':'front','Box - Back':'back','Box - Spine':'spine','Box - Full':'texture','Cart - Front':'cart','Box - 3D':'box3d','Disc':'disc','Disc - Front':'disc','Fanart - Background':'background'}
 FILE = re.compile(r'[A-Za-z0-9_-]{1,100}\.(?:png|jpe?g|webp)', re.I)
 
 def norm(value):
