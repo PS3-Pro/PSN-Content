@@ -308,7 +308,7 @@ def select_game_groups(game):
 def franchise_label_order(entry):
     key, name = entry
     qualified = bool(re.search(r'\s+(?:series|franchise)\s*$', name.strip(), re.I))
-    return qualified, key.startswith('f:'), name.casefold(), name, key
+    return qualified, name.islower(), key.startswith('f:'), name.casefold(), name, key
 
 
 def acronym(name):
@@ -365,36 +365,143 @@ def flatten_collection_parents(groups, relations):
     return result
 
 
-def flatten_named_subseries(components):
-    # Directional, whole-word names plus overlap of canonical games. Never
-    # connect unrelated series just because a crossover appears in both.
+def flatten_named_subseries(components, records=None):
+    records = records or {}
     words = [franchise_words(entry[1]) for entry, _ in components]
     signatures = [set(members.values()) for _, members in components]
-    prefixes = defaultdict(list)
-    for i, parts in enumerate(words):
-        prefixes[tuple(parts)].append(i)
+    by_game = defaultdict(list)
+    for i, signature in enumerate(signatures):
+        for gid in signature:
+            by_game[gid].append(i)
+    support = {}
+    def name_support(i, gid):
+        key = (i, gid)
+        if key not in support:
+            support[key] = any(label_in_name(components[i][0][1], title) for title in game_names(records.get(gid, {})))
+        return support[key]
     parents = {}
     for i, parts in enumerate(words):
-        candidates = set()
-        for n in range(1, len(parts)):
-            candidates.update(prefixes.get(tuple(parts[:n]), ()))
-        for n in range(2, len(parts)):
-            candidates.update(j for j in prefixes.get(tuple(parts[-n:]), ())
-                              if len(signatures[i] & signatures[j]) / len(signatures[i]) >= .75)
-        valid = [j for j in candidates if signatures[i] and
-                 len(signatures[i] & signatures[j]) / len(signatures[i]) >= .5]
-        if valid:
-            parents[i] = min(valid, key=lambda j: (len(words[j]), -len(signatures[j]), franchise_label_order(components[j][0])))
+        a = signatures[i]
+        if not a or not parts:
+            continue
+        overlaps = defaultdict(int)
+        for gid in a:
+            for j in by_game[gid]:
+                if j != i:
+                    overlaps[j] += 1
+        candidates = []
+        for j, count in overlaps.items():
+            b = signatures[j]
+            other = words[j]
+            if not other:
+                continue
+            coverage = count / len(a)
+            prefix = len(other) < len(parts) and parts[:len(other)] == other
+            suffix = len(other) < len(parts) and parts[-len(other):] == other
+            shared_start = len(parts[0]) >= 4 and parts[0] == other[0]
+            # Directional ranks prevent cycles, including equal-size aliases.
+            if len(b) <= len(a) and not (prefix or suffix):
+                continue
+            if prefix and coverage >= .5 or suffix and coverage >= .75:
+                strength = 4
+            elif shared_start and len(b) > len(a) and coverage >= .5 and (count >= 2 or len(a) == 2):
+                strength = 3
+            elif count >= 2 and coverage == 1 and len(b) <= 2 * len(a) and len(b) > len(a) and components[j][0][0].startswith('c:'):
+                # Exact canonical subset, not a coincidental single shared game.
+                strength = 2
+            elif records and count >= 2 and coverage >= 2/3 and len(b) > len(a) and components[i][0][0].startswith('c:') and all(not name_support(i,gid) for gid in a) and all(name_support(j,gid) for gid in a & b):
+                # An umbrella collection with a different label, backed by game titles.
+                strength = 1
+            else:
+                continue
+            candidates.append((strength, coverage, count, j))
+        if candidates:
+            candidates.sort(key=lambda item: (-item[0], -item[1], -item[2], len(words[item[3]]), -len(signatures[item[3]]), franchise_label_order(components[item[3]][0])))
+            best = candidates[0]
+            # Do not guess between unrelated, equally plausible parents.
+            if len(candidates) > 1 and best[:3] == candidates[1][:3] and best[0] <= 2:
+                continue
+            parents[i] = best[3]
     result = {}
     for i, (entry, members) in enumerate(components):
         target = i
-        while target in parents:
+        seen = set()
+        while target in parents and target not in seen:
+            seen.add(target)
             target = parents[target]
+        if target in seen:
+            target = i
         if target != i:
-            print(f'Merge named subseries: {entry[1]} -> {components[target][0][1]}')
+            print(f'Merge subseries/alias: {entry[1]} -> {components[target][0][1]}')
         result.setdefault(target, {}).update(members)
-    print(f'Subseries consolidation: {len(parents)} named groups absorbed')
+    print(f'Subseries consolidation: {len(parents)} candidate groups absorbed')
     return [(components[i][0], members) for i, members in sorted(result.items())]
+
+
+def prune_incidental_views(components, records):
+    if not records:
+        return components
+    by_game = defaultdict(list)
+    signatures = [set(members.values()) for _, members in components]
+    for i, signature in enumerate(signatures):
+        for gid in signature:
+            by_game[gid].append(i)
+    labels = {}
+    def supported(i, gid):
+        key = (i, gid)
+        if key not in labels:
+            labels[key] = any(label_in_name(components[i][0][1], title) for title in game_names(records.get(gid, {})))
+        return labels[key]
+    rejected = defaultdict(set)
+    # A game with a clear collection name should not be listed in a different
+    # series whose own name is absent. Keep valid multi-name crossovers.
+    for gid, indexes in by_game.items():
+        if len(indexes) < 2:
+            continue
+        anchors = [i for i in indexes if components[i][0][0].startswith('c:') and supported(i,gid)]
+        if not anchors:
+            continue
+        for i in indexes:
+            if i in anchors or supported(i,gid):
+                continue
+            if any(supported(i, other) for other in signatures[i] - {gid}):
+                rejected[i].add(gid)
+    # Brand/franchise-only views that merely repeat several independent named
+    # collections are redundant. Require strong coverage, not just a crossover.
+    for i, (entry, _) in enumerate(components):
+        if not entry[0].startswith('f:'):
+            continue
+        a = signatures[i]
+        coverage = defaultdict(set)
+        for gid in a:
+            for j in by_game[gid]:
+                if j != i and components[j][0][0].startswith('c:') and supported(j,gid):
+                    coverage[j].add(gid)
+        distinct = [ids for j, ids in coverage.items() if len(ids) >= 2 and len(ids) / len(signatures[j]) >= .75]
+        if len(distinct) >= 2:
+            combined = set().union(*distinct)
+            if len(combined) >= .85 * len(a) and sum(map(len, distinct)) <= 1.2 * len(combined):
+                rejected[i].update(combined)
+    cleaned = []
+    for i, (entry, members) in enumerate(components):
+        if rejected[i]:
+            print(f'Remove incidental/redundant game memberships: {entry[1]} ({len(rejected[i])})')
+            members = {tid:gid for tid,gid in members.items() if gid not in rejected[i]}
+        cleaned.append((entry,members))
+    # Pruning must not erase a title simply because its remaining group fell
+    # below the two-game threshold. Restore only affected groups if needed.
+    before = {tid for _, members in components if len(set(members.values())) >= 2 for tid in members}
+    covered = {tid for _, members in cleaned if len(set(members.values())) >= 2 for tid in members}
+    missing = before - covered
+    if missing:
+        for i, (entry, members) in enumerate(components):
+            if len(set(members.values())) >= 2 and missing.intersection(members):
+                cleaned[i] = (entry, members)
+                missing.difference_update(members)
+                print(f'Preserve unique catalog coverage: {entry[1]}')
+                if not missing:
+                    break
+    return cleaned
 
 
 def consolidate_groups(groups, records=None, relations=()):
@@ -485,7 +592,7 @@ def consolidate_groups(groups, records=None, relations=()):
         flattened.append((chosen, members))
     by_games = {}
     content_merges = 0
-    for chosen, members in flatten_named_subseries(flattened):
+    for chosen, members in prune_incidental_views(flatten_named_subseries(flattened, records), records):
         signature = frozenset(members.values())
         if len(signature) < 2:
             continue
@@ -500,7 +607,7 @@ def consolidate_groups(groups, records=None, relations=()):
             content_merges += 1
             print(f'Consolidate identical game view ({len(signature)}): {previous_entry!r}, {chosen!r} -> {winner!r}')
 
-    result = [{'id': key, 'name': name, 'titles': sorted(members)}
+    result = [{'id': key, 'name': name[:1].upper() + name[1:] if name.islower() else name, 'titles': sorted(members)}
               for (key, name), members in by_games.values()]
     result.sort(key=lambda g: (g['name'].casefold(), g['id']))
     print(f'Consolidation: {name_merges} name/source duplicates; {abbreviation_merges} abbreviations; {content_merges} identical-game views')

@@ -10069,7 +10069,7 @@ html[data-psn-rgb-theme] .shared-content-link-modal .shared-content-link-card::b
 			</ul>
 
 			<ul class="sidebar-menu menu-group-store" style="display: none;">
-				<li class="active" id="nav-browse" onmouseenter="playUiHover()" onclick="playUiClick(); switchView('view-browse'); toggleSidebar(true)">
+				<li class="active" id="nav-browse" onmouseenter="playUiHover()" onclick="playUiClick(); psnOpenStoreBrowse(); toggleSidebar(true)">
 					<i class="fas fa-search"></i> <span class="interface-compact-label sidebar-press-label" data-sidebar-press-label>Browse</span>
 					<span id="sidebar-count-browse" class="sidebar-count-pill is-empty" title="0 database items" style="display:none;">0</span>
 				</li>
@@ -26589,6 +26589,28 @@ P
     let psnFranchiseCountCache = null;
     let psnFranchiseBlocksRevision = -1, psnFranchiseCatalogRevision = -1, psnFranchiseCatalogLength = -1;
     let psnFranchiseRenderedGroups = null;
+    let psnFranchiseStoreMode = false, psnFranchiseStoreScroll = 0;
+    function psnOpenStoreBrowse() {
+        const current = getCurrentPsnViewElement()?.id;
+        switchView(psnFranchiseStoreMode && PSN_BROWSE_CONTEXT_VIEW_IDS.has(current) ? 'view-franchises' : 'view-browse');
+    }
+    function psnFranchiseResetStoreState() {
+        psnFranchiseStoreMode = false;
+        psnFranchiseStoreScroll = 0;
+        psnFranchiseSearch = '';
+        psnFranchiseLetter = psnFranchiseEffectiveLetter = 'ALL';
+        psnFranchiseSortMode = 'alpha';
+        psnFranchiseAlphaDesc = psnFranchiseCountDesc = false;
+        psnFranchiseLastSurprise = '';
+        psnFranchiseResults = [];
+        const scope = document.getElementById('franchise-scope-select');
+        const region = document.getElementById('franchise-region-select');
+        if (scope) scope.value = 'all';
+        if (region) region.value = 'ALL';
+        for (const input of document.querySelectorAll('#franchise-console-filters input')) input.checked = true;
+        resetLetterFilterScroll('psn-franchise-letter-filter');
+        psnFranchiseStopProgressive();
+    }
     let psnFranchiseSearch = '';
     let psnFranchiseLetter = 'ALL';
     let psnFranchiseEffectiveLetter = 'ALL';
@@ -27000,6 +27022,7 @@ P
     function psnFranchiseCategoryChanged() {
         if (psnFranchiseMainBrowse() && document.getElementById('cat-select')?.value !== 'games') {
             navHistory = null;
+            psnFranchiseStoreMode = false;
             psnFranchiseSyncBrowseMode();
         }
     }
@@ -32594,7 +32617,7 @@ P
     
 	const PSN_MAIN_VIEW_IDS = new Set(['view-explore', 'view-franchises', 'view-browse', 'view-wishlist', 'view-downloads', 'view-library', 'view-trending', 'view-online', 'view-social']);
 	const PSN_PROFILE_UTIL_VIEW_IDS = new Set(['view-chat', 'view-trophies', 'view-rewards']);
-	const PSN_BROWSE_CONTEXT_VIEW_IDS = new Set(['view-browse', 'view-wishlist', 'view-downloads']);
+	const PSN_BROWSE_CONTEXT_VIEW_IDS = new Set(['view-browse', 'view-franchises', 'view-wishlist', 'view-downloads']);
 	const PSN_CROSS_VIEW_HISTORY_NAMES = new Set([
 		'downloads', 'wishlist', 'library', 'trending', 'franchises', 'social',
 		'library_monitor', 'library_games', 'library_favs', 'library_files',
@@ -32801,7 +32824,7 @@ P
 		return match;
 	}
 	function getPsnSidebarItemByView(viewId) {
-        if (viewId === 'view-franchises') viewId = 'view-browse';
+        if (viewId === 'view-franchises' || viewId === 'view-browse') return document.getElementById('nav-browse');
 		if (psnSidebarItemByViewCache.has(viewId)) return psnSidebarItemByViewCache.get(viewId);
 		const match = PSN_STATIC_SIDEBAR_ITEMS.find(item => String(item.getAttribute('onclick') || '').includes(viewId)) || null;
 		psnSidebarItemByViewCache.set(viewId, match);
@@ -32850,7 +32873,7 @@ P
 		
 		let isPrimaryView = false;
 		if (tab === 'home' && currentView === 'view-explore') isPrimaryView = true;
-		if (tab === 'store' && currentView === 'view-browse') isPrimaryView = true;
+		if (tab === 'store' && (currentView === 'view-browse' || currentView === 'view-franchises')) isPrimaryView = true;
 		if (tab === 'online' && currentView === 'view-online') {
 			const feat = PSN_STATIC_NAV_DOM.onlineFeatured;
 			if (feat && (feat.style.display === 'block' || feat.style.display === 'flex' || feat.style.display === '')) {
@@ -32927,6 +32950,11 @@ P
 			navItem?.classList.add('active');
 			if(groups.store && groups.store.style.display !== 'block') groups.store.style.display = 'block';
 			
+            if (PSN_BROWSE_CONTEXT_VIEW_IDS.has(currentView)) {
+                psnOpenStoreBrowse();
+                return;
+            }
+            psnFranchiseResetStoreState();
 			window.__psnPendingStoreRootReset = true;
 			const showBrowseLoadingState = () => {
 				if (typeof showSkeletons === 'function') {
@@ -57214,8 +57242,17 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 			return;
 		}
 
-		if (currentViewId !== viewId) {
-            if(currentViewId==='view-franchises')psnFranchiseStopProgressive();
+        const returningToFranchisePicker = viewId === 'view-franchises' &&
+            (currentViewId === 'view-wishlist' || currentViewId === 'view-downloads') && psnFranchiseStoreMode && !window.isRestoringHistory;
+        if (currentViewId !== viewId) {
+            if (currentViewId === 'view-franchises') {
+                if (movingWithinBrowseContext && !window.isRestoringHistory) psnFranchiseStoreScroll = document.getElementById('scroll-area')?.scrollTop || 0;
+                psnFranchiseStopProgressive();
+            }
+            if (leavingBrowseContext && !window.isRestoringHistory) psnFranchiseResetStoreState();
+            else if (viewId === 'view-franchises') psnFranchiseStoreMode = true;
+            else if (viewId === 'view-browse' && !window.isRestoringHistory && !(currentViewId === 'view-franchises' && preventAutoLoad && onShown && !forceReset)) psnFranchiseStoreMode = false;
+            else if (viewId === 'view-browse' && window.isRestoringHistory) psnFranchiseStoreMode = psnFranchiseActiveIndex() >= 0;
 			if (currentViewId === 'view-browse') resetLetterFilterScroll('letter-filter');
 			else if (currentViewId === 'view-wishlist') resetLetterFilterScroll('wish-letter-filter');
 			else if (currentViewId === 'view-library') {
@@ -57224,6 +57261,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 			}
 		}
 
+        if (viewId === 'view-browse' && forceReset && !window.isRestoringHistory) psnFranchiseStoreMode = false;
 		const preparedNavigation = window.__psnPreparedNavigation;
 		const navigationPrepared = !!(preparedNavigation && preparedNavigation.viewId === viewId);
 		window.__psnPreparedNavigation = null;
@@ -57464,7 +57502,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 			}
             if (viewId === 'view-browse' || viewId === 'view-franchises') psnBrowseModeHeader(target);
 			target.style.display = 'block';
-            if (viewId === 'view-franchises') psnFranchiseSyncBrowseMode();
+            if (viewId === 'view-franchises' || viewId === 'view-browse') psnFranchiseSyncBrowseMode();
 			if (viewId === 'view-chat' || viewId === 'view-social') window.scheduleEmojiPickerPrebuild?.(true);
 			if (viewId === 'view-explore' && typeof window.renderRecentlyVisited === 'function') window.renderRecentlyVisited();
             psnCurrentViewCache = target;
@@ -57746,6 +57784,15 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 			else if (viewId === 'view-franchises') {
                 syncBrowseContextualSearchState(viewId);
                 psnFranchiseFilter(psnFranchiseSearch,true);
+                if (returningToFranchisePicker && psnFranchiseStoreScroll > 0) {
+                    const area = document.getElementById('scroll-area');
+                    if (area) {
+                        const behavior = area.style.scrollBehavior;
+                        area.style.scrollBehavior = 'auto';
+                        area.scrollTop = psnFranchiseStoreScroll;
+                        area.style.scrollBehavior = behavior;
+                    }
+                }
                 window.refreshPsnPageEmptyStates?.();
                 if (!preventAutoLoad) runViewOpenWork('view-franchises', psnFranchisePopulate);
             }
@@ -99814,6 +99861,7 @@ function getVisibleChatStackEl(id) {
 	};
 
 	window.resetPsnSessionRuntimeState = function(options = {}) {
+        psnFranchiseResetStoreState();
 		if (typeof window.invalidatePsnAccountSessionCallbacks === 'function') window.invalidatePsnAccountSessionCallbacks();
 		window.resetSupporterNoticeRuntime?.();
 		const runtimeName = String(options.username || localStorage.getItem('psn_username') || (typeof currentLoginUser !== 'undefined' ? currentLoginUser : '') || '').trim();
