@@ -626,8 +626,62 @@ def validate_coverage(previous, result, catalog):
         raise RuntimeError('Unexpected index coverage loss; previous index preserved')
 
 
+def is_game_record(game):
+    kind = game.get('game_type') or {}
+    return isinstance(kind, dict) and str(kind.get('type', '')).lower().replace('_', ' ') in ALLOWED_TYPES
+
+
+def resolve_catalog_game(tid, variants, primary, aliases, ext):
+    direct, exact, alternate = set(), set(), set()
+    for tag, keys in variants:
+        direct.update(ext.get((tag, tid), ()))
+        for key in keys:
+            found = primary.get((tag, key), ())
+            if found:
+                exact.update(found)
+                break
+        for key in keys:
+            found = aliases.get((tag, key), ())
+            if found:
+                alternate.update(found)
+                break
+    if direct:
+        # A platform-specific external ID is stronger than an alternate name.
+        # Explicitly conflicting evidence is not guessed away.
+        for evidence in (exact, alternate):
+            if evidence:
+                common = direct & evidence
+                if common:
+                    direct = common
+                elif len(direct) > 1 or evidence is exact:
+                    return direct | evidence
+        return direct
+    return exact or alternate
+
+
+def attach_exact_series_roots(groups, pending, records):
+    # An unclassified, matched game can be the original of an established
+    # series. Only exact official names and established series qualify.
+    by_name = defaultdict(list)
+    for entry, members in groups.items():
+        if len(set(members.values())) >= 2:
+            by_name[franchise_name_key(entry[1])].append(entry)
+    recovered = 0
+    for gid, tids in sorted(pending.items()):
+        name = records[gid].get('name', '')
+        entries = by_name.get(franchise_name_key(name), ())
+        if not entries:
+            continue
+        # All candidates share the same normalized label and will be merged.
+        entry = min(entries, key=franchise_label_order)
+        groups[entry].update((tid, gid) for tid in tids)
+        recovered += len(tids)
+        print(f'Recover exact series root: {name} -> {entry[1]} ({len(tids)} catalog IDs)')
+    return recovered
+
+
 def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=()):
-    aliases=defaultdict(set); ext=defaultdict(set); records={}
+    primary=defaultdict(set); aliases=defaultdict(set); ext=defaultdict(set); records={}
     requested_names=defaultdict(set); requested_ids=defaultdict(set)
     catalog_keys={}
     for tid, variants in catalog.items():
@@ -646,14 +700,18 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
     metadata_count=0
     for game in games:
         metadata_count+=1
+        if not is_game_record(game): continue
         gid=game['id']
         tags=set()
         for platform_id in game.get('platforms') or []:
             tags.update(tags_by_platform.get(platform_id, ()))
         if not tags: continue
+        official_keys=set(names(game.get('name', ''))) if game.get('name') else set()
         keys={key for name in game_names(game) for key in names(name)}
         relevant=False
         for tag in tags:
+            for key in official_keys & requested_names[tag]:
+                primary[tag,key].add(gid)
             for key in keys & requested_names[tag]:
                 aliases[tag,key].add(gid)
                 relevant=True
@@ -669,23 +727,14 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
             records[gid]=game
     print(f'IGDB metadata rows: {metadata_count}; relevant records indexed: {len(records)}')
     groups=defaultdict(dict); matched=0; ambiguous=0; canonical={}; memberships={}; rejected_games=set(); rejected_links=0
+    pending=defaultdict(list); unresolved=[]
     for tid, variants in sorted(catalog_keys.items()):
-        candidates=set()
-        for tag,keys in variants:
-            direct=ext.get((tag,tid),set())
-            found=set()
-            for key in keys:
-                found=aliases.get((tag,key),set())
-                if found: break
-            if direct and found:
-                candidates.update(direct & found or direct | found)
-            else:
-                candidates.update(direct or found)
+        candidates=resolve_catalog_game(tid, variants, primary, aliases, ext)
         if len(candidates)!=1:
-            ambiguous+=bool(candidates);continue
+            ambiguous+=bool(candidates)
+            unresolved.append((tid, variants, candidates))
+            continue
         gid=next(iter(candidates));game=records[gid]
-        kind=game.get('game_type') or {}
-        if not isinstance(kind,dict) or str(kind.get('type','')).lower().replace('_',' ') not in ALLOWED_TYPES: continue
         matched+=1
         canonical[tid]=gid
         if gid not in memberships:
@@ -695,8 +744,16 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
                 rejected_games.add(gid)
                 rejected_links += len(rejected)
                 print(f'Ignore incidental IP associations: {game.get("name", gid)} ({gid}): {", ".join(sorted(name for _,name in rejected))}')
+        if not memberships[gid]:
+            pending[gid].append(tid)
         for entry in memberships[gid]:
             groups[entry][tid]=gid
+    recovered=attach_exact_series_roots(groups, pending, records)
+    series_keys={franchise_name_key(entry[1]) for entry in groups}
+    for tid, variants, candidates in unresolved:
+        if any(key in series_keys for _, keys in variants for key in keys):
+            print(f'Unresolved exact series-title candidate: {tid}; IGDB candidates: {sorted(candidates)}')
+    print(f'Exact series-root recovery: {recovered} catalog IDs')
     print(f'Incidental IP associations: {rejected_links} removed across {len(rejected_games)} games')
     output = consolidate_groups(groups, records, relations)
     print(f'Catalog: {len(catalog)} IDs | matched: {matched} | ambiguous: {ambiguous} | franchises: {len(output)}')
