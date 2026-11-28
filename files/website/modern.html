@@ -6770,6 +6770,20 @@ body.ps3-pad-user-logged.ps3-pad-console-connected:not(.ps3-pad-page-active):not
 .rawg-chip-store { background: rgba(0,112,204,.12); border: 1px solid rgba(0,112,204,.35); color: #9fd4ff; }
 .rawg-chip-score { background: rgba(0,0,0,.38); }
 .rawg-chip-genre { background: rgba(0,112,204,.13); border: 1px solid rgba(0,174,255,.28); color: #aee7ff; }
+#game-modal [data-psn-meta-kind] { cursor:pointer; }
+#game-modal [data-psn-meta-kind]:hover { color:var(--ps-blue); text-decoration:underline; }
+#game-modal [data-psn-meta-kind]:focus-visible { outline:1px solid var(--psn-focus-ring); outline-offset:1px; }
+#psn-metadata-picker { padding:0; border:0; background:transparent; color:var(--text-main); width:min(480px,calc(100vw - 28px)); max-height:80dvh; overflow:visible; }
+#psn-metadata-picker::backdrop { background:var(--psn-rgb-modal-shade,rgba(0,0,0,.4)); backdrop-filter:blur(var(--psn-modal-overlay-blur,8px)); }
+#psn-metadata-picker .sys-modal-content { width:100%!important; max-width:none; transform:none; }
+#psn-metadata-picker .sys-modal-body { padding:16px; }
+.psn-metadata-picker-controls { display:flex; gap:8px; margin-bottom:12px; }
+.psn-metadata-picker-controls :is(input,select) { min-width:0; padding:8px; background:var(--psn-panel-fill); border:1px solid var(--psn-surface-border); border-radius:var(--psn-radius-control); color:inherit; font:inherit; }
+.psn-metadata-picker-controls input { flex:1; }
+.psn-metadata-picker-results { display:flex; flex-wrap:wrap; align-content:flex-start; gap:8px; max-height:48dvh; overflow:auto; scrollbar-width:none; }
+.psn-metadata-choice { max-width:100%; white-space:normal; text-align:left; }
+.psn-metadata-picker-note { width:100%; color:var(--text-muted); font-size:12px; }
+#browse-metadata-filter-btn[hidden] { display:none!important; }
 .rawg-chip-mode { background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.16); color: #fff; }
 .rawg-chip-playtime { background: rgba(255,176,0,.10); border: 1px solid rgba(255,176,0,.32); color: #ffd07a; }
 .rawg-alt2-panel { width: 100%; margin: -2px 0 10px 0; padding: 9px 10px; border-radius: 10px; background: linear-gradient(135deg,rgba(255,255,255,.075),rgba(var(--psn-tone-0070cc,0,112,204),.055)); border: 1px solid rgba(255,255,255,.11); box-shadow: inset 0 1px 0 rgba(255,255,255,.08); overflow: hidden; }
@@ -10590,6 +10604,7 @@ html[data-psn-rgb-theme] .shared-content-link-modal .shared-content-link-card::b
 							<i class="fas fa-sort-amount-up-alt"></i>
 						</button>
 						<button id="browse-surprise-btn" type="button" disabled aria-disabled="true" title="Surprise Me" aria-label="Surprise Me" onmouseenter="if(typeof playUiHover === 'function') playUiHover();" onclick="surpriseMeBrowse(this)"><i class="fas fa-dice"></i></button>
+                        <button id="browse-metadata-filter-btn" type="button" class="ps5-pill-btn ps5-pill-compact" title="Discover by genre, developer or publisher" aria-label="Discover by genre, developer or publisher" onclick="psnMetadataDiscovery.showPicker()" onmouseenter="playUiHover()"><i class="fas fa-sliders-h" aria-hidden="true"></i></button>
 					</div>
 					<div class="toolbar-group">
 						<div class="filter-checkboxes" id="console-filters">
@@ -27025,6 +27040,105 @@ P
         template.innerHTML = buildExploreCardHTML(game,'games',0,false,false,true);
         return template.content.firstElementChild;
     }
+    const psnMetadataDiscovery = (()=>{
+        const labels={developer:'Developer',publisher:'Publisher',genre:'Genre / Theme'};
+        const positions={developer:2,publisher:3,genre:4};
+        const normalize=value=>String(value||'').normalize('NFKC').trim().toLowerCase().replace(/\s+/g,' ');
+        const facetName=(kind,name)=>{const value=normalize(name);return kind==='genre'?({'rpg':'role-playing (rpg)','role-playing':'role-playing (rpg)','platformer':'platform','platformers':'platform','fighting games':'fighting'}[value]||value):value;};
+        let rows=null, facets=null, request=null, retryAt=0;
+        function ensure(){
+            if(rows)return Promise.resolve(true);
+            if(request)return request;
+            if(Date.now()<retryAt)return Promise.resolve(false);
+            request=(async()=>{
+                const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),8000);
+                try{
+                    const response=await fetch('https://raw.githubusercontent.com/PS3-Pro/PSN-Content/main/resources/database/helpers/game-metadata.json',{cache:'no-cache',signal:controller.signal});
+                    if(!response.ok)throw new Error('Index unavailable');
+                    const raw=await response.text();if(raw.length>8*1024*1024)throw new Error('Index too large');
+                    const payload=JSON.parse(raw);if(payload?.version!==1||!payload.games||Array.isArray(payload.games))throw new Error('Invalid index');
+                    const next=new Map(), groups=new Map();
+                    for(const [id,row] of Object.entries(payload.games)){
+                        if(!/^[A-Z]{4}\d{5}$/.test(id)||!Array.isArray(row)||row.length!==7||!Number.isSafeInteger(row[0])||row[0]<=0||!['ps3','ps2','psx','psp','minis','pce','neogeo'].includes(row[1])||![2,3,4,6].every(i=>Array.isArray(row[i])&&row[i].length<=100&&row[i].every(v=>typeof v==='string'&&v.length<=250&&v.trim()))||typeof row[5]!=='string'||(row[5]&&!/^\d{4}(?:-\d{2}-\d{2})?$/.test(row[5])))continue;
+                        next.set(id,row);
+                        for(const kind of Object.keys(positions))for(const name of (kind==='genre'?[...row[4],...row[6]]:row[positions[kind]])){
+                            const key=kind+':'+facetName(kind,name);let group=groups.get(key);
+                            if(!group){group={key,kind,name,ids:new Set()};groups.set(key,group);}group.ids.add(id);
+                        }
+                    }
+                    if(!next.size)throw new Error('Empty index');rows=next;facets=groups;return true;
+                }catch(_){retryAt=Date.now()+30000;return false;}
+                finally{clearTimeout(timeout);request=null;}
+            })();return request;
+        }
+        function row(id){return rows?.get(String(id||'').toUpperCase())||null;}
+        function group(kind,name){return facets?.get(kind+':'+facetName(kind,name))||null;}
+        function context(){const history=navHistory?.contextualType==='regions'?navHistory.parentHistory:navHistory;return history?.contextualType==='metadata'?facets?.get(history.metadataFacetKey)||null:null;}
+        function notify(message){window.showToastNotification?.('Discover Games',message);}
+        function capture(){return {fromExplore:'browse',parentHistory:navHistory,category:document.getElementById('cat-select').value,search:document.getElementById('search-input').value,letter:activeLetter,region:document.getElementById('region-select').value,consoles:getBrowseCheckedValueList(PSN_BROWSE_CONSOLE_FILTER_INPUTS),appsFilters:getBrowseCheckedValueList(PSN_BROWSE_APP_FILTER_INPUTS),showMissingRap:!!document.getElementById('show-missing-rap-toggle')?.checked,scroll:document.getElementById('scroll-area')?.scrollTop||0,limit:renderLimit};}
+        function open(facet,modal=null){
+            if(!facet?.ids.size||window.__viewExitTransitionActive||window.__browseContextTransitionActive)return;
+            if(context()?.key===facet.key){if(modal)window.closeModal(null,{silent:true});return;}
+            const history=modal?psnFranchiseCaptureModalHistory(modal):capture();
+            if(modal)window.closeModal(null,{silent:true,skipCardMorph:true});
+            const show=()=>{
+                resetBrowseToGamesMainScreen({deferUi:true});psnFranchiseStoreMode=false;
+                for(const input of PSN_BROWSE_CONSOLE_FILTER_INPUTS)input.checked=true;
+                navHistory={...history,lockSearch:true,contextualType:'metadata',contextualCategory:'games',contextualGameTitle:facet.name,metadataFacetKey:facet.key};
+                window.__browseForceTopOnNextFilter=true;updateBrowseContextualCategoryTitle(0);fetchDatabase({skipMotionCapture:true,reuseLoadedCovers:true});
+            };
+            if(getCurrentPsnViewElement()?.id==='view-browse')runBrowseContextTransition(show);else switchView('view-browse',false,true,show);
+        }
+        let picker=null;
+        async function showPicker(){
+            if(picker||isBrowseContextualNavigationActive()||document.getElementById('cat-select')?.value!=='games')return;
+            const dialog=document.createElement('dialog');picker=dialog;dialog.id='psn-metadata-picker';dialog.className='psn-metadata-picker';
+            dialog.innerHTML='<div class="sys-modal-content"><div class="sys-modal-header"><h2>Discover Games</h2><button type="button" class="sys-modal-close" aria-label="Close"><i class="fas fa-times"></i></button></div><div class="sys-modal-body"><div class="psn-metadata-picker-controls"><select aria-label="Filter type"><option value="genre">Genre / Theme</option><option value="developer">Developer</option><option value="publisher">Publisher</option></select><input type="search" placeholder="Search…" aria-label="Search filters"></div><div class="psn-metadata-picker-results" aria-live="polite">Loading…</div><div class="psn-metadata-picker-note">Metadata: IGDB</div></div></div>';
+            const close=()=>{if(picker!==dialog)return;picker=null;dialog.close();dialog.remove();};
+            dialog.__psnRequestClose=close;dialog.addEventListener('cancel',e=>{e.preventDefault();close();});dialog.querySelector('.sys-modal-close').onclick=close;dialog.addEventListener('click',e=>{if(e.target===dialog)close();});
+            const select=dialog.querySelector('select'),input=dialog.querySelector('input'),results=dialog.querySelector('.psn-metadata-picker-results');
+            const render=()=>{
+                if(picker!==dialog||!facets)return;
+                const term=normalize(input.value),matches=[...facets.values()].filter(f=>f.kind===select.value&&normalize(f.name).includes(term)).sort((a,b)=>a.name.localeCompare(b.name));
+                const fragment=document.createDocumentFragment();
+                for(const facet of matches.slice(0,80)){const button=document.createElement('button');button.type='button';button.className='ps5-pill-btn psn-metadata-choice';button.textContent=facet.name;button.addEventListener('mouseenter',()=>window.playUiHover?.());button.onclick=()=>{window.playUiClick?.();close();open(facet);};fragment.append(button);}
+                if(!matches.length)fragment.append(document.createTextNode('No matching filters.'));
+                else if(matches.length>80){const note=document.createElement('div');note.className='psn-metadata-picker-note';note.textContent='Refine your search to see more results.';fragment.append(note);}
+                results.replaceChildren(fragment);
+            };
+            select.onchange=render;input.oninput=render;document.body.append(dialog);dialog.showModal();
+            if(await ensure()){if(picker===dialog)render();}else if(picker===dialog)results.textContent='Metadata index unavailable. Run Update Game Metadata Index and try again.';
+        }
+        async function follow(element){
+            const modal=element.closest('#game-modal');if(!modal||element.dataset.psnMetaBusy==='1')return;
+            const token=modal.dataset.openHydrationToken,kind=element.dataset.psnMetaKind,name=element.dataset.psnMetaName;
+            element.dataset.psnMetaBusy='1';window.playUiClick?.();
+            try{if(!await ensure()){notify('Metadata index unavailable.');return;}if(!element.isConnected||modal.dataset.openHydrationToken!==token)return;const facet=group(kind,name);if(!facet){notify('No indexed games for this filter yet.');return;}open(facet,modal);}
+            finally{delete element.dataset.psnMetaBusy;}
+        }
+        function decorate(modal,tid,token){
+            if(!modal||modal.dataset.storeCategory!=='games')return;
+            const apply=()=>{
+                if(!modal.isConnected||modal.dataset.openHydrationToken!==token||String(modal.dataset.titleId).toUpperCase()!==String(tid).toUpperCase())return;
+                const data=row(tid);if(!data)return;
+                const studio=modal.querySelector('.rawg-alt2-studio:not(.rawg-alt2-placeholder)');
+                if(studio&&!studio.querySelector('[data-psn-meta-kind]')){
+                    const text=studio.textContent.trim();const candidates=[...data[2].map(name=>['developer',name]),...data[3].map(name=>['publisher',name])];
+                    const match=candidates.find(([,name])=>normalize(name)===normalize(text));
+                    if(match){const icon=studio.querySelector('i');const link=document.createElement('span');link.textContent=text;link.dataset.psnMetaKind=match[0];link.dataset.psnMetaName=match[1];link.setAttribute('role','button');link.tabIndex=0;studio.replaceChildren(...(icon?[icon]:[]),link);}
+                    else if(text){const parts=text.split(/\s*·\s*|,\s+/);const resolved=parts.map(part=>candidates.find(([,name])=>normalize(name)===normalize(part)));if(resolved.every(Boolean)){const icon=studio.querySelector('i');const fragment=document.createDocumentFragment();if(icon)fragment.append(icon);resolved.forEach(([kind,name],i)=>{if(i)fragment.append(document.createTextNode(' · '));const link=document.createElement('span');link.textContent=parts[i];link.dataset.psnMetaKind=kind;link.dataset.psnMetaName=name;link.setAttribute('role','button');link.tabIndex=0;fragment.append(link);});studio.replaceChildren(fragment);}}
+                }
+                for(const chip of modal.querySelectorAll('.rawg-chip-genre')){
+                    if(chip.dataset.psnMetaKind)continue;
+                    const name=chip.textContent.trim();if(group('genre',name)){chip.dataset.psnMetaKind='genre';chip.dataset.psnMetaName=name;chip.setAttribute('role','button');chip.tabIndex=0;}
+                }
+            };
+            if(rows)apply();else ensure().then(ok=>{if(ok)apply();});
+        }
+        document.addEventListener('click',e=>{const link=e.target.closest?.('#game-modal [data-psn-meta-kind]');if(link){e.preventDefault();e.stopPropagation();follow(link);}},true);
+        document.addEventListener('keydown',e=>{const link=e.target.closest?.('#game-modal [data-psn-meta-kind]');if(link&&(e.key==='Enter'||e.key===' ')){e.preventDefault();e.stopPropagation();follow(link);}},true);
+        return {ensure,row,group,context,showPicker,decorate,labels};
+    })();
     function psnFranchiseActiveIndex() {
         let history = navHistory;
         if (history?.contextualType === 'regions') history = history.parentHistory;
@@ -36811,6 +36925,8 @@ P
 		const regionFilter = context.regionFilter || 'ALL';
 		const activeConsoles = Array.isArray(context.activeConsoles) ? context.activeConsoles : [];
 		const currentCat = context.currentCat || '';
+        const metadataFacet=psnMetadataDiscovery.context();
+        if(metadataFacet&&(currentCat!=='games'||!metadataFacet.ids.has(String(game.id||game.titleId||'').toUpperCase())||game.__storeUnavailable||isDemoLikeTitle(game.cleanName)))return false;
         const franchise = context.franchiseIndex ?? psnFranchiseActiveIndex();
         if (franchise >= 0 && (currentCat !== 'games' || !psnFranchiseIndexes(game).includes(franchise) || game.__storeUnavailable || isDemoLikeTitle(game.cleanName) || (window.hasStoreContentBlocks?.() && window.isStoreContentBlocked(game,'games')))) return false;
         if(franchise>=0){
@@ -37025,6 +37141,7 @@ P
 		if (!titleEl || !categoryEl) return;
 
 		if (browseExpandedGroupTitle) {
+            const metadataButton=document.getElementById('browse-metadata-filter-btn');if(metadataButton)metadataButton.hidden=true;
 			const title = typeof getBrowseRegionsViewLabel === 'function' ? getBrowseRegionsViewLabel() : 'Regions';
 			if (titleEl.childElementCount || titleEl.textContent !== title) titleEl.textContent = title;
 			return;
@@ -37033,6 +37150,14 @@ P
 		const category = String(categoryEl.value || '');
 		const categoryOption = categoryEl.options[categoryEl.selectedIndex];
 		const defaultTitle = categoryOption ? categoryOption.text : 'Browse Database';
+        const metadataButton=document.getElementById('browse-metadata-filter-btn');
+        if(metadataButton)metadataButton.hidden=category!=='games'||isBrowseContextualNavigationActive();
+        const metadataFacet=psnMetadataDiscovery.context();
+        if(metadataFacet&&category==='games'){
+            const title=psnMetadataDiscovery.labels[metadataFacet.kind]+': '+metadataFacet.name;
+            if(titleEl.textContent!==title)titleEl.textContent=title;
+            return;
+        }
         if (psnFranchiseMainBrowse() && category === 'games') {
             const title = psnFranchiseDefinitions[psnFranchiseActiveIndex()]?.[0] || defaultTitle;
             if (titleEl.textContent !== title) titleEl.textContent = title;
@@ -38442,6 +38567,7 @@ P
 			ctx && ctx.isExactTitleIdSearch ? 'id:1' : 'id:0', activeConsoles,
 			ctx && ctx.showFirstPlay ? 'fp:1' : 'fp:0', ctx && ctx.showQore ? 'q:1' : 'q:0', ctx && ctx.showMedia ? 'm:1' : 'm:0',
 			`blocks:${Number(window.__contentBlocksRevision || 0)}`,
+            `metadata:${psnMetadataDiscovery.context()?.key||''}`,
             `franchise:${franchise}:${psnFranchisePersonalToken(personalSet)}:${franchise>=0?Number(window.__psnStoreCacheRevision||0)+':'+psnFranchiseIndexRevision:0}`
 		].join('|');
 	}
@@ -38454,6 +38580,14 @@ P
 		if (term && ctx && ctx.isExactTitleIdSearch && ctx.normalizedTermId) {
 			return index.byIdNormalized.get(ctx.normalizedTermId) || [];
 		}
+        const metadataFacet=psnMetadataDiscovery.context();
+        if(metadataFacet){
+            if(!index.metadataPool||index.metadataPool.key!==metadataFacet.key){
+                const pool=[];for(const id of metadataFacet.ids){const items=index.byIdNormalized.get(id);if(items)pool.push(...items);}
+                index.metadataPool={key:metadataFacet.key,pool};
+            }
+            consider(index.metadataPool.pool);
+        }
         const franchise=ctx?.franchiseIndex ?? psnFranchiseActiveIndex();
         if(franchise>=0){
             if(!index.byFranchise||index.franchiseRevision!==psnFranchiseIndexRevision){
@@ -38600,7 +38734,8 @@ P
 			window.sortOrders && window.sortOrders.browse ? window.sortOrders.browse : 'asc',
 			window.contentSizeSortOrders?.browse || 'off',
 			browseExpandedGroupTitle && browseExpandedGroupTitle.key ? `groupkey:${browseExpandedGroupTitle.key}` : '',
-			navHistory && navHistory.lockSearch ? `nav:${String(navHistory.contextualGameTitle || navHistory.fromExplore || 'locked')}` : ''
+			navHistory && navHistory.lockSearch ? `nav:${String(navHistory.contextualGameTitle || navHistory.fromExplore || 'locked')}` : '',
+            `metadata:${psnMetadataDiscovery.context()?.key||''}`
 		].join('|');
 	}
 
@@ -46444,6 +46579,7 @@ P
 		if (metadataCategory === 'updates') gameName = window.psnUpdateMediaGame({cleanName:gameName,id:gameId},metadataCategory).cleanName;
 		const contentMetadataOverride = typeof window.getContentMetadataOverride === 'function' ? window.getContentMetadataOverride({ titleId: gameId, contentId }, metadataCategory) : null;
 		const metadataSourceTracking = options && options.trackSources === true && !!modalRoot;
+        if(metadataCategory==='games')psnMetadataDiscovery.ensure();
 		const collectSummaryCandidates = metadataSourceTracking && options && options.collectSummaryCandidates === true;
 		const metadataProviderSources = { summary:[], details:[], score:[], year:[], genres:[], tags:[], screenshots:[] };
 		const metadataSummaryCandidates = [];
@@ -46529,7 +46665,7 @@ P
 		};
 		const getRawgExtraData = (detailsData = {}) => {
 			const developers = getRawgNames(detailsData.developers || [], 2);
-			const publishers = developers.length ? [] : getRawgNames(detailsData.publishers || [], 1);
+			const publishers = getRawgNames(detailsData.publishers || [], 1);
 			const genres = getRawgNames(detailsData.genres || [], 1);
 			const rawModes = getImportantModeTags(detailsData);
 			let modeChip = null;
@@ -46551,17 +46687,18 @@ P
 			if (!badgesContainer) return;
 			const extra = getRawgExtraData(detailsData);
 			const studioParts = [];
-			if (extra.developers.length) studioParts.push(extra.developers.join(', '));
-			if (extra.publishers.length) studioParts.push(extra.publishers.join(', '));
+            const studioLink=(kind,name)=>metadataCategory==='games'?`<span role="button" tabindex="0" data-psn-meta-kind="${kind}" data-psn-meta-name="${modalSafeText(name)}" title="${modalSafeText(name)}">${modalSafeText(name)}</span>`:modalSafeText(name);
+            if(extra.developers.length)studioParts.push(extra.developers.map(name=>studioLink('developer',name)).join(', '));
+            if(extra.publishers.length)studioParts.push(extra.publishers.filter(name=>!extra.developers.includes(name)).map(name=>studioLink('publisher',name)).join(', '));
 			const chips = [];
-			extra.genres.forEach(genre => chips.push(buildRawgChip(genre, 'fa-tag', 'rawg-chip-genre')));
+			extra.genres.forEach(genre=>chips.push(metadataCategory==='games'?`<span class="rawg-chip rawg-chip-genre" role="button" tabindex="0" data-psn-meta-kind="genre" data-psn-meta-name="${modalSafeText(genre)}"><i class="fas fa-tag"></i>${modalSafeText(genre)}</span>`:buildRawgChip(genre,'fa-tag','rawg-chip-genre')));
 			extra.modes.forEach(mode => chips.push(buildRawgChip(mode.label, mode.icon, 'rawg-chip-mode')));
 			const stats = [];
 			if (badgeHtml) stats.push(badgeHtml);
 			if (extra.playtime) stats.push(buildRawgChip(`${extra.playtime}h Avg`, 'fa-clock', 'rawg-chip-playtime'));
 			if (!studioParts.length && !stats.length && !chips.length) { badgesContainer.innerHTML = ''; badgesContainer.classList.remove('rawg-badge-row'); return; }
 			const studioHtml = studioParts.length
-				? `<div class="rawg-alt2-studio" data-no-translate="true" translate="no"><i class="fas fa-code"></i>${modalSafeText(studioParts.join(' · '))}</div>`
+				? `<div class="rawg-alt2-studio" data-no-translate="true" translate="no"><i class="fas fa-code"></i>${studioParts.filter(Boolean).join(' · ')}</div>`
 				: '<div class="rawg-alt2-studio rawg-alt2-placeholder" data-no-translate="true" translate="no" aria-hidden="true">&nbsp;</div>';
 			const tagLineHtml = [...stats, ...chips].length
 				? `<div class="rawg-alt2-tagline">${[...stats, ...chips].join('')}</div>`
@@ -46601,6 +46738,7 @@ P
 			await Promise.resolve();
 			if (!isCurrentRequest()) return;
 			applyGameModalResolvedMetadataSnapshot(modalRoot, resolvedMetadataSnapshot);
+            psnMetadataDiscovery.decorate(modalRoot,gameId,requestToken);
 			if (!collectSummaryCandidates && typeof window.__psnApplyScraperSupplement === 'function')
 				window.__psnApplyScraperSupplement(modalRoot, gameName, gameId, requestToken);
 			if (typeof window.scheduleInterfaceTranslationAfterUiChange === 'function') window.scheduleInterfaceTranslationAfterUiChange(modalRoot);
@@ -46681,7 +46819,7 @@ P
 			tags: Array.isArray(contentMetadataOverride?.tags) ? contentMetadataOverride.tags.map(name => ({ name })) : [],
 			playtime: 0,
 			metacritic: contentMetadataOverride?.score !== null && contentMetadataOverride?.score !== undefined ? Number(contentMetadataOverride.score) : 0,
-			released: window.psnPreferReleaseDate(contentMetadataOverride?.year, psnStoreMeta.releaseDate || psnStoreMeta.releaseYear)
+			released: window.psnNormalizeReleaseDate(contentMetadataOverride?.year) || window.psnNormalizeReleaseDate(psnStoreMeta.releaseDate || psnStoreMeta.releaseYear)
 		};
 		const syncResolvedProviderMetadata = () => {
 			if (!modalRoot || !isCurrentRequest()) return;
@@ -46696,6 +46834,7 @@ P
 			};
 		};
 		syncResolvedProviderMetadata();
+		let indexedReleaseLocked=false;
 		const mergeMetadataDetails = (detailsData = {}, sourceName = '') => {
 			let detailsChanged = false;
 			let scoreChanged = false;
@@ -46704,10 +46843,8 @@ P
 			let tagsChanged = false;
 			const sourceDevelopers = getRawgNames(detailsData.developers || [], 2);
 			const sourcePublishers = getRawgNames(detailsData.publishers || [], 1);
-			if (!mergedMetadata.developers.length && !mergedMetadata.publishers.length) {
-				if (sourceDevelopers.length) { mergedMetadata.developers = sourceDevelopers.map(name => ({ name })); detailsChanged = true; }
-				else if (sourcePublishers.length) { mergedMetadata.publishers = sourcePublishers.map(name => ({ name })); detailsChanged = true; }
-			}
+            if(!mergedMetadata.developers.length&&sourceDevelopers.length){mergedMetadata.developers=sourceDevelopers.map(name=>({name}));detailsChanged=true;}
+            if(!mergedMetadata.publishers.length&&sourcePublishers.length){mergedMetadata.publishers=sourcePublishers.map(name=>({name}));detailsChanged=true;}
 			if (!mergedMetadata.genres.length) {
 				const sourceGenres = getRawgNames(detailsData.genres || [], 1);
 				if (sourceGenres.length) { mergedMetadata.genres = sourceGenres.map(name => ({ name })); genresChanged = true; }
@@ -46719,7 +46856,7 @@ P
 			});
 			if (!(Number(mergedMetadata.playtime) > 0) && Number(detailsData.playtime) > 0) { mergedMetadata.playtime = Number(detailsData.playtime); detailsChanged = true; }
 			if (!(Number(mergedMetadata.metacritic) > 0) && Number(detailsData.metacritic) > 0) { mergedMetadata.metacritic = Number(detailsData.metacritic); detailsChanged = true; scoreChanged = true; }
-			const preferredRelease = window.psnPreferReleaseDate(mergedMetadata.released, detailsData.released);
+			const preferredRelease = (contentMetadataOverride?.year || (metadataCategory==='games'&&(psnStoreMeta.releaseDate||psnStoreMeta.releaseYear||indexedReleaseLocked))) ? mergedMetadata.released : window.psnPreferReleaseDate(mergedMetadata.released, detailsData.released);
 			if (preferredRelease !== mergedMetadata.released) { mergedMetadata.released = preferredRelease; detailsChanged = true; yearChanged = true; }
 			if (sourceName) {
 				if (detailsChanged) addMetadataProviderSource('details', sourceName);
@@ -46756,7 +46893,19 @@ P
 			extraMetaContainer.classList.toggle('metadata-people-visible', people.length > 0);
 		};
 		const renderMergedMetadata = () => { syncResolvedProviderMetadata(); renderRawgExtraMeta(mergedMetadata, buildMergedBadgeHtml()); renderMetadataPeopleOverride(); };
-		if (contentMetadataOverride) renderMergedMetadata();
+		let indexedMetadataApplied=false;
+        const applyIndexedMetadata=()=>{
+            if(indexedMetadataApplied||metadataCategory!=='games'||!isCurrentRequest())return;
+            const indexed=psnMetadataDiscovery.row(gameId);if(!indexed)return;indexedMetadataApplied=true;
+            if(indexed[5]&&!contentMetadataOverride?.year&&!psnStoreMeta.releaseDate&&!psnStoreMeta.releaseYear){
+                mergedMetadata.released=indexed[5];indexedReleaseLocked=true;addMetadataProviderSource('year','IGDB');
+            }
+            const asNames=values=>values.map(name=>({name}));
+            const changed=mergeMetadataDetails({developers:asNames(indexed[2]),publishers:asNames(indexed[3]),genres:asNames(indexed[4])},'IGDB');
+            if(changed||indexedReleaseLocked)renderMergedMetadata();
+        };
+        applyIndexedMetadata();
+        if (contentMetadataOverride) renderMergedMetadata();
 		let renderedScreenshotUrls = [];
 		const renderExternalScreenshots = (imageUrls = [], force = false, sourceName = '') => {
 			if (!isCurrentRequest()) return false;
@@ -46814,6 +46963,7 @@ P
 		const renderExternalMetadata = (detailsData = {}, imageUrls = [], options = {}) => {
 			if (!isCurrentRequest()) return false;
 			const sourceName = normalizeMetadataProviderSource(options.source || detailsData.source || '');
+            applyIndexedMetadata();
 			const renderedScreenshots = renderExternalScreenshots(imageUrls, false, sourceName);
 			if (options.metadata === false) return renderedScreenshots;
 			const metadataChanged = mergeMetadataDetails(detailsData, sourceName);
@@ -101598,6 +101748,8 @@ function getVisibleChatStackEl(id) {
 	}
 
 	function closePsnTopStackModalFromEscape(event) {
+        const metadataPicker=document.getElementById('psn-metadata-picker');
+        if(metadataPicker?.open){event.preventDefault();event.stopImmediatePropagation();metadataPicker.__psnRequestClose?.();return true;}
 		const caseDialog=document.getElementById('psn-game-case');
 		if(caseDialog?.open){event.preventDefault();event.stopImmediatePropagation();if(caseDialog.__psnRequestClose)caseDialog.__psnRequestClose();else caseDialog.close();return true;}
 		const closers = [

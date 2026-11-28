@@ -1,0 +1,63 @@
+name: Update Game Metadata Index
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ['Update PSN™ Database']
+    types: [completed]
+    branches: [main]
+permissions:
+  contents: write
+concurrency:
+  group: game-metadata-index
+  cancel-in-progress: false
+jobs:
+  index:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check cadence
+        id: cadence
+        run: |
+          if [ '${{ github.event_name }}' = 'workflow_dispatch' ] || [ "$(date -u +%u)" = '7' ]; then
+            echo 'run=true' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.cadence.outputs.run == 'true'
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        if: steps.cadence.outputs.run == 'true'
+        with:
+          python-version: '3.12'
+      - uses: actions/cache/restore@v4
+        if: steps.cadence.outputs.run == 'true'
+        with:
+          path: .cache/game-metadata/igdb.json.gz
+          key: game-metadata-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: game-metadata-v1-
+      - name: Build catalog metadata and coverage report
+        if: steps.cadence.outputs.run == 'true'
+        env:
+          IGDB_CLIENT_ID: ${{ secrets.IGDB_CLIENT_ID }}
+          IGDB_CLIENT_SECRET: ${{ secrets.IGDB_CLIENT_SECRET }}
+        run: python .github/scripts/update_game_metadata.py
+      - uses: actions/cache/save@v4
+        if: steps.cadence.outputs.run == 'true'
+        with:
+          path: .cache/game-metadata/igdb.json.gz
+          key: game-metadata-v1-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Publish index only
+        if: steps.cadence.outputs.run == 'true'
+        run: |
+          git add resources/database/helpers/game-metadata.json
+          if git diff --cached --quiet; then exit 0; fi
+          git config user.name 'PS3-Pro Bot'
+          git config user.email 'bot@ps3pro.com'
+          git commit -m 'Auto-update: game metadata index'
+          git pull --rebase origin main
+          git push origin HEAD:main
