@@ -2778,7 +2778,7 @@ html.ios-webkit #object-particles { contain:strict; }
 #view-explore .horizontal-scroll .game-title { font-weight: 600; line-height: 1.4; }
 }
 .explore-section { padding: 0; }
-#psn-franchise-status[hidden], #psn-franchise-empty[hidden], .psn-franchise-tile[hidden] { display:none !important; }
+#psn-franchise-empty[hidden], .psn-franchise-tile[hidden] { display:none !important; }
 #psn-franchise-grid { grid-template-columns:repeat(3,minmax(0,1fr)) !important; }
 .psn-franchise-tile { position:relative; min-width:0; min-height:114px; overflow:hidden; isolation:isolate; text-align:left; border:1px solid rgba(255,255,255,.12); border-radius:12px; background:var(--psn-panel-fill); color:#fff; padding:14px; display:flex; flex-direction:column; justify-content:flex-end; gap:5px; cursor:var(--psn-hand-cursor),pointer !important; transition:border-color .2s,box-shadow .2s,transform .2s; }
 .psn-franchise-tile:before { content:""; position:absolute; inset:0; z-index:-1; background:linear-gradient(90deg,rgba(10,15,24,.98) 0%,rgba(10,15,24,.82) 38%,rgba(10,15,24,.12) 100%); }
@@ -2803,7 +2803,10 @@ html.ios-webkit #object-particles { contain:strict; }
 #view-franchises .toolbar-group:first-child > :is(select,.psn-animated-select) { flex-basis:calc(50% - 4px); }
 }
 @media (hover:hover) { .psn-franchise-tile:hover img { transform:scale(1.06); } }
-#psn-franchise-status { font-size:12px; color:var(--text-muted); margin:0 0 12px; }
+#psn-franchise-grid > .psn-franchise-skeleton { width:100%; height:114px; min-width:0; border-radius:12px; padding:14px; justify-content:flex-end; gap:5px; pointer-events:none; animation:none; }
+#psn-franchise-grid > .psn-franchise-skeleton .skeleton-text { margin:0; width:48%; height:14px; }
+#psn-franchise-grid > .psn-franchise-skeleton .skeleton-text.short { width:22%; height:11px; }
+@media (max-width:768px) { #psn-franchise-grid > .psn-franchise-skeleton { height:96px; padding:10px; } #psn-franchise-grid > .psn-franchise-skeleton .skeleton-text:not(.short) { height:12px; } }
 #psn-franchise-empty button[hidden] { display:none !important; }
 #game-modal .psn-franchise-modal-btn { flex:0 0 24px; min-width:24px; }
 #game-modal .psn-franchise-modal-btn:disabled { cursor:default; }
@@ -10535,7 +10538,6 @@ html[data-psn-rgb-theme] .shared-content-link-modal .shared-content-link-card::b
                 <div class="content-area">
                     <h2 class="section-title"><span id="psn-franchise-title">Franchises</span><span id="psn-franchise-count">(0 franchises • 0 titles)</span></h2>
                     <div class="letter-filter" id="psn-franchise-letter-filter" aria-label="Filter franchises by letter"></div>
-                    <div id="psn-franchise-status" role="status">Loading franchises…</div>
                     <div id="psn-franchise-grid" class="games-grid">
                         <div id="psn-franchise-empty" class="psn-page-empty-state" role="status" hidden style="grid-column: 1/-1; text-align: center; color: #888; padding: 60px; background: rgba(0,0,0,0.2); border-radius: 12px; border: 1px dashed rgba(255,255,255,0.05); backdrop-filter: blur(5px);">
                             <i class="fas fa-search" data-empty-icon aria-hidden="true" style="font-size: 50px; margin-bottom: 20px; opacity: 0.2;"></i>
@@ -27272,24 +27274,47 @@ P
         if (fromModal && getCurrentPsnViewElement()?.id==='view-browse') runBrowseContextTransition(openFranchise);
         else switchView('view-browse', false, true, openFranchise);
     }
+    function psnFranchiseShowSkeletons(host=document.getElementById('psn-franchise-grid')) {
+        if(!host||psnFranchiseRenderedGroups)return;
+        const empty=document.getElementById('psn-franchise-empty');
+        if(!empty)return;
+        empty.hidden=true;
+        host.classList.remove('psn-page-empty-host');
+        if(!host.querySelector(':scope > .psn-franchise-skeleton')){
+            const compact=getBrowseIsCompact(), columns=compact?2:3;
+            const height=Math.max(0,getBrowseViewportRect().bottom-host.getBoundingClientRect().top);
+            const count=columns*Math.min(8,Math.max(2,Math.ceil(height/(compact?114:132))+1));
+            const fragment=document.createDocumentFragment();
+            for(let i=0;i<count;i++){
+                const card=document.createElement('div');
+                card.className='skeleton-card psn-franchise-skeleton';
+                card.setAttribute('aria-hidden','true');
+                card.innerHTML='<div class="skeleton-text"></div><div class="skeleton-text short"></div>';
+                fragment.append(card);
+            }
+            host.insertBefore(fragment,empty);
+            host.setAttribute('aria-busy','true');
+            window.refreshPsnPageEmptyStates?.();
+        }
+        window.setupSkeletonAnimations?.(host);
+    }
+    function psnFranchiseClearSkeletons(host) {
+        for(const card of host.querySelectorAll(':scope > .psn-franchise-skeleton'))card.remove();
+        host.removeAttribute('aria-busy');
+    }
     async function psnFranchisePopulate() {
-        const host=document.getElementById('psn-franchise-grid'),status=document.getElementById('psn-franchise-status');
+        const host=document.getElementById('psn-franchise-grid');
         if (!host || host.dataset.loading==='1') return;
         host.dataset.loading='1';
         psnFranchiseBindGrid(host);
         psnFranchiseLoadError=false;
-        if (!psnFranchiseRenderedGroups) {
-            const empty=document.getElementById('psn-franchise-empty');
-            if(empty)empty.hidden=true;
-            status.hidden=false;status.textContent='Loading franchises…';
-            window.refreshPsnPageEmptyStates?.();
-        }
+        psnFranchiseShowSkeletons(host);
         try {
             const [data,indexReady]=await Promise.all([window.psnStoreRenderCache?.games || window.psnStoreCache?.games || loadStoreCategoryData('games','low'),psnFranchiseEnsureIndex()]);
             if (!indexReady) throw new Error('Franchise index unavailable');
             const groups=psnFranchiseGetGroups(data);
             if (!groups || !data.length) throw new Error('Empty catalog');
-            if (groups === psnFranchiseRenderedGroups) { status.hidden=true; psnFranchiseFilter(); return; }
+            if (groups === psnFranchiseRenderedGroups) { psnFranchiseClearSkeletons(host); psnFranchiseFilter(); return; }
             psnFranchiseStopProgressive(host);
             psnFranchiseClearRevealState();
             psnFranchiseResults=[];
@@ -27299,11 +27324,11 @@ P
                 const name=psnFranchiseDefinitions[index][0], normalized=psnFranchiseName(name);
                 psnFranchiseEntries.push({index,name,search:normalized.replace(/ /g,''),searchTerms:psnFranchiseSearchTerms(name,psnFranchiseVariants[index]),letter:window.getPsnAlphabetBucket(normalized),titles:items.length,representative:items.find(game=>String(game.cTag).toLowerCase()==='ps3')||items[0]});
             });
-            host.replaceChildren(document.getElementById('psn-franchise-empty'));status.hidden=true;
+            host.replaceChildren(document.getElementById('psn-franchise-empty'));host.removeAttribute('aria-busy');
             psnFranchiseRenderedGroups=groups;
             psnFranchiseFilter();
         } catch (error) {
-            status.hidden=true;
+            psnFranchiseClearSkeletons(host);
             psnFranchiseLoadError=!psnFranchiseRenderedGroups;
             if(psnFranchiseLoadError){
                 psnFranchiseUpdateEmpty(document.getElementById('psn-franchise-empty'),0,'',psnFranchiseFilterSettings());
@@ -58068,7 +58093,10 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
                     }
                 }
                 window.refreshPsnPageEmptyStates?.();
-                if (!preventAutoLoad) runViewOpenWork('view-franchises', psnFranchisePopulate);
+                if (!preventAutoLoad) {
+                    if(!psnFranchiseLoadError)psnFranchiseShowSkeletons();
+                    runViewOpenWork('view-franchises', psnFranchisePopulate);
+                }
             }
             else if (viewId === 'view-online') {
 				if (!preventAutoLoad && typeof showOnlineSection === 'function') runViewOpenWork('view-online', () => showOnlineSection('featured', true));
@@ -59671,7 +59699,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
         psnFranchiseEntries=[];
         psnFranchiseResults=[];
         const franchiseGrid=document.getElementById('psn-franchise-grid');
-        if(franchiseGrid)franchiseGrid.replaceChildren(document.getElementById('psn-franchise-empty'));
+        if(franchiseGrid){franchiseGrid.replaceChildren(document.getElementById('psn-franchise-empty'));franchiseGrid.removeAttribute('aria-busy');}
         psnFranchiseSource=null;
         psnFranchiseGroups=null;
         psnFranchiseRenderedGroups=null;
