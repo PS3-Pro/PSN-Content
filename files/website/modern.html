@@ -2801,16 +2801,9 @@ html.ios-webkit #object-particles { contain:strict; }
 @media (hover:hover) { .psn-franchise-tile:hover img { transform:scale(1.06); } }
 #psn-franchise-status { font-size:12px; color:var(--text-muted); margin:0 0 12px; }
 #psn-franchise-empty button[hidden] { display:none !important; }
-.psn-franchise-related { min-width:0; margin-top:14px; }
-.psn-franchise-related-heading { font-size:10px; font-weight:bold; text-transform:uppercase; letter-spacing:1px; color:color-mix(in srgb,var(--text-muted) 82%,#fff 18%); margin:0 0 8px; }
-.psn-franchise-related-list { display:flex; overflow-x:auto; gap:9px; padding:3px 2px 6px; scrollbar-width:none; scroll-snap-type:x proximity; }
-.psn-franchise-related-list::-webkit-scrollbar { display:none; }
-.psn-franchise-related-card { flex:0 0 92px; min-width:0; padding:0; border:0; background:transparent; color:#fff; text-align:left; cursor:var(--psn-hand-cursor),pointer !important; scroll-snap-align:start; }
-.psn-franchise-related-card img { width:100%; height:112px; object-fit:cover; display:block; border:1px solid rgba(255,255,255,.12); border-radius:8px; transition:border-color .2s,filter .2s; }
-.psn-franchise-related-card:is(:hover,:focus-visible) img { border-color:var(--ps-blue); filter:brightness(1.12); }
-.psn-franchise-related-card span { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin-top:5px; font-size:10px; }
-.psn-franchise-related-card small { display:block; font-size:9px; color:var(--text-muted); margin-top:3px; }
-@media (max-width:768px) { #psn-franchise-grid { grid-template-columns:repeat(2,minmax(0,1fr)) !important; } .psn-franchise-tile { min-height:96px; padding:10px; } .psn-franchise-tile strong { font-size:12px; } .psn-franchise-related-card { flex-basis:72px; } .psn-franchise-related-card img { height:88px; } }
+#game-modal .psn-franchise-modal-btn { flex:0 0 24px; min-width:24px; }
+#game-modal .psn-franchise-modal-btn:disabled { cursor:default; }
+@media (max-width:768px) { #psn-franchise-grid { grid-template-columns:repeat(2,minmax(0,1fr)) !important; } .psn-franchise-tile { min-height:96px; padding:10px; } .psn-franchise-tile strong { font-size:12px; } }
 
 .section-header { display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 15px; }
 .section-header h2 { font-size: 16px; font-weight: 500; color: #fff; margin: 0; text-transform: uppercase; letter-spacing: 0.5px; }
@@ -26832,6 +26825,17 @@ P
     function psnFranchiseName(value) {
         return String(value || '').normalize('NFKD').replace(/[™®©]/g,'').replace(/[\u0300-\u036f]/g,'').replace(/['’]/g,'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
     }
+    function psnFranchiseSearchTerms(name, items) {
+        const terms=new Set();
+        for(const value of [name,...items.flatMap(game=>[game.cleanName,game.title,game.name,game.id,game.titleId])]) {
+            const key=psnFranchiseName(value).replace(/ /g,'');
+            if(key)terms.add(key);
+        }
+        return Array.from(terms);
+    }
+    function psnFranchiseMatches(entry,term) {
+        return entry.search.includes(term)||entry.searchTerms.some(key=>key.includes(term));
+    }
     function psnFranchiseFilterSettings() {
         return {
             scope:document.getElementById('franchise-scope-select')?.value || 'all',
@@ -26948,7 +26952,7 @@ P
         psnFranchiseRefreshCounts(psnFranchiseEntries,settings);
         for(const entry of psnFranchiseEntries)if(entry.titles>0)available.add(entry.letter);
         if(psnFranchiseEntries.length&&psnFranchiseLetter!=='ALL'&&!available.has(psnFranchiseLetter))psnFranchiseLetter='ALL';
-        const results=psnFranchiseEntries.filter(entry=>entry.titles>0&&(term?entry.search.includes(term):psnFranchiseLetter==='ALL'||entry.letter===psnFranchiseLetter));
+        const results=psnFranchiseEntries.filter(entry=>entry.titles>0&&(term?psnFranchiseMatches(entry,term):psnFranchiseLetter==='ALL'||entry.letter===psnFranchiseLetter));
         psnFranchiseSortEntries(results);
         for(const entry of results){titles+=entry.titles;matchedLetters.add(entry.letter);}
         const visible=results.length;
@@ -27077,15 +27081,39 @@ P
             setPsnAttributeIfChanged(button,'aria-pressed',String(selected));
         }
     }
-    function psnFranchiseSelect(index) {
+    function psnFranchiseCaptureModalHistory(modal) {
+        const bgView = getGameModalNavigationOriginView();
+        const modalReturnState = captureGameModalReturnState(modal);
+        const fromExplore = `gamemodal|${modalReturnState.titleId}|${bgView}|${encodeURIComponent(modalReturnState.contentId)}`;
+        const originState = window.captureNavigationReturnState(fromExplore);
+        const fastNavState = window.getPsnFastNavigationUiState?.();
+        return {
+            fromExplore, originState, modalReturnState, parentHistory:navHistory,
+            category:document.getElementById('cat-select').value,
+            search:document.getElementById('search-input').value, letter:activeLetter,
+            region:document.getElementById('region-select').value,
+            consoles:getBrowseCheckedValueList(PSN_BROWSE_CONSOLE_FILTER_INPUTS),
+            appsFilters:getBrowseCheckedValueList(PSN_BROWSE_APP_FILTER_INPUTS),
+            showMissingRap:!!document.getElementById('show-missing-rap-toggle')?.checked,
+            expandedGroupTitleKey:browseExpandedGroupTitle?.key || '',
+            scroll:originState.scroll, limit:renderLimit,
+            savedTopNav:fastNavState?.activeTopNav, savedSideGroup:fastNavState?.activeSideGroup,
+            franchiseModalOrigin:{storeMode:psnFranchiseStoreMode,storeScroll:psnFranchiseStoreScroll,
+                sort:window.sortOrders?.browse,sizeSort:window.contentSizeSortOrders?.browse,
+                groupTitles:getBrowseGroupTitleToggle()?.checked}
+        };
+    }
+    function psnFranchiseSelect(index, modalHistory=null) {
+        const fromModal = !!modalHistory;
         if (!psnFranchiseDefinitions[index] || !psnFranchiseGroups?.[index]?.length) return;
-        const settings=psnFranchiseFilterSettings();
+        const settings=fromModal?{scope:'all',region:'ALL',consoles:Array.from(document.querySelectorAll('#franchise-console-filters input'),input=>input.value)}:psnFranchiseFilterSettings();
         const keys=psnFranchiseFilteredKeys[index];
-        if(!keys?.size)return;
+        if(!fromModal&&!keys?.size)return;
         const personalKeys=settings.scope==='all'?null:Array.from(keys).sort();
-        const scroll = document.getElementById('scroll-area')?.scrollTop || 0;
-        switchView('view-browse', false, true, () => {
+        const scroll = fromModal && getCurrentPsnViewElement()?.id!=='view-franchises'?psnFranchiseStoreScroll:(document.getElementById('scroll-area')?.scrollTop || 0);
+        const openFranchise = () => {
             resetBrowseToGamesMainScreen({ deferUi:true });
+            psnFranchiseStoreMode = true;
             document.getElementById('region-select').value=settings.region;
             for(const input of PSN_BROWSE_CONSOLE_FILTER_INPUTS)input.checked=settings.consoles.includes(input.value);
             navHistory = {
@@ -27096,12 +27124,15 @@ P
                 consoles:getBrowseCheckedValueList(PSN_BROWSE_CONSOLE_FILTER_INPUTS),
                 appsFilters:getBrowseCheckedValueList(PSN_BROWSE_APP_FILTER_INPUTS),
                 scroll, limit:renderLimit, parentHistory:null,
-                originState:{viewKey:'franchises',returnKey:'franchises',scrollTarget:'main',scroll}
+                originState:{viewKey:'franchises',returnKey:'franchises',scrollTarget:'main',scroll},
+                ...modalHistory
             };
             window.__browseForceTopOnNextFilter = true;
             updateBrowseContextualCategoryTitle(0);
             fetchDatabase({skipMotionCapture:true,reuseLoadedCovers:true});
-        });
+        };
+        if (fromModal && getCurrentPsnViewElement()?.id==='view-browse') runBrowseContextTransition(openFranchise);
+        else switchView('view-browse', false, true, openFranchise);
     }
     async function psnFranchisePopulate() {
         const host=document.getElementById('psn-franchise-grid'),status=document.getElementById('psn-franchise-status');
@@ -27122,7 +27153,7 @@ P
             groups.forEach((items,index)=>{
                 if(items.length<2)return;
                 const name=psnFranchiseDefinitions[index][0], normalized=psnFranchiseName(name);
-                psnFranchiseEntries.push({index,name,search:normalized.replace(/ /g,''),letter:window.getPsnAlphabetBucket(normalized),titles:items.length,representative:items.find(game=>String(game.cTag).toLowerCase()==='ps3')||items[0]});
+                psnFranchiseEntries.push({index,name,search:normalized.replace(/ /g,''),searchTerms:psnFranchiseSearchTerms(name,psnFranchiseVariants[index]),letter:window.getPsnAlphabetBucket(normalized),titles:items.length,representative:items.find(game=>String(game.cTag).toLowerCase()==='ps3')||items[0]});
             });
             host.replaceChildren(document.getElementById('psn-franchise-empty'));status.hidden=true;
             psnFranchiseRenderedGroups=groups;
@@ -27132,34 +27163,42 @@ P
             const retry=document.createElement('button');retry.type='button';retry.className='btn-mini';retry.textContent='Retry';retry.onclick=()=>{psnFranchiseIndexRetryAt=0;psnFranchisePopulate();};status.append(retry);
         } finally { delete host.dataset.loading; }
     }
-    function psnFranchiseAddRelated(body,game,category) {
-        if (category!=='games' || !body) return;
-        const memberships=psnFranchiseIndexes(game), active=psnFranchiseActiveIndex();
-        const index=memberships.includes(active)?active:(memberships[0]??-1);
-        if(index<0)return;
-        const source=window.psnStoreRenderCache?.games || window.psnStoreCache?.games;
-        if (!Array.isArray(source)) return;
-        const groups=psnFranchiseGetGroups(source), currentKey=psnFranchiseGroupKey(game);
-        const items=[];
-        for(const item of groups?.[index]||[]) {
-            if(psnFranchiseGroupKey(item)!==currentKey)items.push(item);
-            if(items.length===12)break;
-        }
-        if (!items.length) return;
-        const section=document.createElement('section');section.className='psn-franchise-related';
-        const divider=document.createElement('div');divider.className='modal-divider';divider.style.margin='0 0 12px';
-        const title=document.createElement('h3');title.className='psn-franchise-related-heading';title.textContent='More from this franchise';
-        const list=document.createElement('div');list.className='psn-franchise-related-list';
-        for (const item of items) {
-            const button=document.createElement('button');button.type='button';button.className='psn-franchise-related-card';button.title=item.cleanName;
-            const name=document.createElement('span');name.textContent=item.cleanName;name.setAttribute('translate','no');
-            const consoleLabel=document.createElement('small');consoleLabel.textContent=String(item.cTag||'').toUpperCase();
-            button.append(psnFranchiseCover(item),name,consoleLabel);
+    function psnFranchiseBindModalButton(modal,game,category,hydrationToken) {
+        if(category!=='games'||!modal)return;
+        const actions=modal.querySelector('.modal-title-action-group');
+        if(!actions)return;
+        const isCurrent=()=>actions.isConnected&&modal.dataset.openHydrationToken===hydrationToken;
+        const attach=()=>{
+            if(!isCurrent()||actions.querySelector('.psn-franchise-modal-btn'))return;
+            const memberships=psnFranchiseIndexes(game), active=psnFranchiseActiveIndex();
+            const index=memberships.includes(active)?active:(memberships[0]??-1);
+            const name=psnFranchiseDefinitions[index]?.[0];
+            if(!name)return;
+            const button=document.createElement('button');
+            button.type='button';button.className='modal-title-game-theme-btn psn-franchise-modal-btn';
+            button.title='View franchise: '+name;button.setAttribute('aria-label',button.title);
+            button.innerHTML='<i class="fas fa-layer-group" aria-hidden="true"></i>';
             button.addEventListener('mouseenter',()=>playUiHover());
-            button.addEventListener('click',()=>{playUiClick();window.switchAndSearch('games',item.id,true,item.contentId||'');});
-            list.append(button);
-        }
-        section.append(divider,title,list);body.append(section);
+            button.addEventListener('click',async()=>{
+                if(button.disabled||!isCurrent()||window.__viewExitTransitionActive||window.__browseContextTransitionActive)return;
+                playUiClick();
+                if(psnFranchiseMainBrowse()&&psnFranchiseActiveIndex()===index){window.closeModal(null,{silent:true});return;}
+                button.disabled=true;
+                try {
+                    const data=await (window.psnStoreRenderCache?.games||window.psnStoreCache?.games||loadStoreCategoryData('games','high'));
+                    if(!isCurrent())return;
+                    const groups=psnFranchiseGetGroups(data);
+                    if(!groups?.[index]?.length||window.__viewExitTransitionActive||window.__browseContextTransitionActive){playUiError();return;}
+                    const history=psnFranchiseCaptureModalHistory(modal);
+                    window.closeModal(null,{silent:true,skipCardMorph:true});
+                    psnFranchiseSelect(index,history);
+                } catch (_) {if(isCurrent())playUiError();}
+                finally {if(isCurrent())button.disabled=false;}
+            });
+            actions.insertBefore(button,actions.querySelector('.modal-title-share-btn'));
+        };
+        if(psnFranchiseMembership)attach();
+        else psnFranchiseEnsureIndex().then(ready=>{if(ready)attach();});
     }
 
     async function populateExploreTab(options = {}) {
@@ -32433,6 +32472,44 @@ P
 		target.style.scrollBehavior = previousBehavior;
 	};
 
+	function getGameModalNavigationOriginView() {
+		const activeViewEl = (typeof getCurrentPsnViewElement === 'function')
+			? getCurrentPsnViewElement()
+			: null;
+		let bgView = String(activeViewEl && activeViewEl.id || '').replace(/^view-/, '') || 'explore';
+
+		if (bgView === 'chat') {
+			bgView = document.getElementById('subview-play-together')?.style.display === 'flex'
+				? 'playTogether'
+				: (document.getElementById('subview-activity')?.style.display === 'flex'
+					? 'activity'
+					: (document.getElementById('subview-friends')?.style.display === 'flex'
+						? 'friends'
+						: (document.getElementById('subview-messages')?.style.display === 'flex' ? 'messages' : 'chat')));
+		}
+
+		if (bgView === 'library') {
+			if (document.getElementById('subview-monitor')?.style.display !== 'none') bgView = 'library_monitor';
+			else if (document.getElementById('subview-favs')?.style.display !== 'none') bgView = 'library_favs';
+			else if (document.getElementById('subview-files')?.style.display !== 'none') bgView = 'library_files';
+			else bgView = 'library_games';
+		}
+	
+		return bgView;
+	}
+
+	function captureGameModalReturnState(gameModal) {
+		return {
+			gameModal: true,
+			game: gameModal.__psnLastOpenedGame || null,
+			category: gameModal.dataset.storeCategory || '',
+			titleId: gameModal.dataset.titleId || '',
+			contentId: gameModal.dataset.contentId || '',
+			index: Number(gameModal.dataset.modalIndex || 0),
+			originCard: gameModal.__psnCardMorphOriginCard || null
+		};
+	}
+
 	window.switchAndSearch = function(category, titleId, fromWhere = false, focusContentId = '', originCard = null, navigationContext = null) {
 		window.g_animCutoffFound = false;
 
@@ -32489,33 +32566,13 @@ P
 		}
 	
 		const safeLimit = typeof renderLimit !== 'undefined' ? renderLimit : DEFAULT_RENDER_LIMIT;
-		const activeViewEl = (typeof getCurrentPsnViewElement === 'function')
-			? getCurrentPsnViewElement()
-			: null;
-		let bgView = String(activeViewEl && activeViewEl.id || '').replace(/^view-/, '') || 'explore';
+		const bgView = getGameModalNavigationOriginView();
 
 		const scrollEl = bgView === 'downloads'
 			? document.getElementById('downloads-list')
 			: (document.getElementById('scroll-area') || document.querySelector('.content'));
 		
 		const safeScroll = scrollEl ? scrollEl.scrollTop : 0;
-	
-		if (bgView === 'chat') {
-			bgView = document.getElementById('subview-play-together')?.style.display === 'flex'
-				? 'playTogether'
-				: (document.getElementById('subview-activity')?.style.display === 'flex'
-					? 'activity'
-					: (document.getElementById('subview-friends')?.style.display === 'flex'
-						? 'friends'
-						: (document.getElementById('subview-messages')?.style.display === 'flex' ? 'messages' : 'chat')));
-		}
-
-		if (bgView === 'library') {
-			if (document.getElementById('subview-monitor')?.style.display !== 'none') bgView = 'library_monitor';
-			else if (document.getElementById('subview-favs')?.style.display !== 'none') bgView = 'library_favs';
-			else if (document.getElementById('subview-files')?.style.display !== 'none') bgView = 'library_files';
-			else bgView = 'library_games';
-		}
 	
 		let finalFromWhere = fromWhere;
 		if (!finalFromWhere && bgView === 'browse' && typeof browseExpandedGroupTitle !== 'undefined' && browseExpandedGroupTitle && browseExpandedGroupTitle.key) {
@@ -32524,15 +32581,7 @@ P
 	
 		const gameModal = document.getElementById('game-modal');
 		const fromOpenGameModal = !!(gameModal && (gameModal.style.display === 'flex' || gameModal.classList.contains('show')));
-		const gameModalReturnState = fromOpenGameModal ? {
-			gameModal: true,
-			game: gameModal.__psnLastOpenedGame || null,
-			category: gameModal.dataset.storeCategory || '',
-			titleId: gameModal.dataset.titleId || '',
-			contentId: gameModal.dataset.contentId || '',
-			index: Number(gameModal.dataset.modalIndex || 0),
-			originCard: gameModal.__psnCardMorphOriginCard || null
-		} : null;
+		const gameModalReturnState = fromOpenGameModal ? captureGameModalReturnState(gameModal) : null;
 		let modalCloseBeforeNavigation = null;
 		if (fromOpenGameModal) {
 			finalFromWhere = `gamemodal|${gameModalReturnState.titleId || titleId}|${bgView}|${encodeURIComponent(gameModalReturnState.contentId)}`;
@@ -33698,6 +33747,7 @@ P
 			const expectedView = getHistoryReturnViewId(history);
 			requestAnimationFrame(() => requestAnimationFrame(() => {
 				if (getCurrentPsnViewElement()?.id !== expectedView || navHistory !== currentParent) return;
+                if (history.franchiseModalOrigin) restoreOriginScroll();
 				const root = document.getElementById(expectedView);
 				const wantedId = String(state.titleId || '').toUpperCase();
 				const wantedContentId = String(state.contentId || '').toUpperCase();
@@ -33729,6 +33779,16 @@ P
 			const modalContentId = parts.length > 3 ? decodeURIComponent(parts.slice(3).join('|') || '') : '';
 			const savedScroll = oldHistory.scroll;
 			navHistory = currentParent;
+            const franchiseOrigin = oldHistory.franchiseModalOrigin;
+            if (franchiseOrigin) {
+                psnFranchiseStoreMode = franchiseOrigin.storeMode;
+                psnFranchiseStoreScroll = franchiseOrigin.storeScroll;
+                if (window.sortOrders && franchiseOrigin.sort) window.sortOrders.browse = franchiseOrigin.sort;
+                if (window.contentSizeSortOrders && franchiseOrigin.sizeSort) window.contentSizeSortOrders.browse = franchiseOrigin.sizeSort;
+                const groupToggle = getBrowseGroupTitleToggle();
+                if (groupToggle && typeof franchiseOrigin.groupTitles === 'boolean') groupToggle.checked = franchiseOrigin.groupTitles;
+                syncPsnContentSortControls('browse');
+            }
 	
 			const actualView = bgView.startsWith('library_') ? 'library' : (bgView.startsWith('online_') ? 'online' : ((bgView === 'chat' || bgView === 'messages' || bgView === 'friends' || bgView === 'activity' || bgView === 'playTogether') ? 'chat' : bgView));
 			
@@ -33737,8 +33797,9 @@ P
 			} else {
 				switchView('view-' + actualView);
 				autoSyncUI(bgView);
-				if (bgView === 'chat' || bgView === 'messages' || bgView === 'friends' || bgView === 'activity' || bgView === 'playTogether') if (typeof showSocialSection === 'function') showSocialSection(bgView);
-				else if (bgView === 'online_revived' && typeof showOnlineSection === 'function') showOnlineSection('revived', true);
+				if (bgView === 'chat' || bgView === 'messages' || bgView === 'friends' || bgView === 'activity' || bgView === 'playTogether') {
+                    if (typeof showSocialSection === 'function') showSocialSection(bgView);
+                } else if (bgView === 'online_revived' && typeof showOnlineSection === 'function') showOnlineSection('revived', true);
 				else if (bgView === 'online_featured' && typeof showOnlineSection === 'function') showOnlineSection('featured', true);
 				if (bgView === 'library_monitor' && typeof showLibrarySection === 'function') showLibrarySection('monitor', true);
 				else if (bgView === 'library_games' && typeof showLibrarySection === 'function') showLibrarySection('games', true);
@@ -39056,7 +39117,8 @@ P
 				else if (from === 'downloads') prevLabel = 'Downloads';
 				else if (from === 'wishlist') prevLabel = 'Wishlist';
 				else if (from === 'playTogether') prevLabel = 'Play Together';
-				else if (from === 'franchises') prevLabel = 'Franchises';
+				else if (navHistory.franchiseModalOrigin && typeof from === 'string' && from.startsWith('gamemodal|')) prevLabel = 'Game Details';
+                else if (from === 'franchises') prevLabel = 'Franchises';
                 else if (from === 'trending') prevLabel = 'Trending';
 				else if (from === 'library_monitor') prevLabel = 'System Monitor';
 				else if (from === 'library_games') prevLabel = 'My Games';
@@ -44841,7 +44903,7 @@ P
 			}
 		}
 	
-		if (!modalInfoOnly) psnFranchiseAddRelated(modalBody,game,currentCat);
+		if (!modalInfoOnly) psnFranchiseBindModalButton(modal,game,currentCat,hydrationToken);
 		if (typeof window.loadGamePlayers === 'function') window.loadGamePlayers(game.id || game.titleId || '', modalDisplayName || game.cleanName || '', currentCat, modal);
 		const shouldRecordRecentlyVisited = !modalInfoOnly && game && typeof window.recordRecentlyVisitedGame === 'function';
 		modal.style.display = 'flex';
@@ -57431,7 +57493,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 				if (searchInput.placeholder !== nextPlaceholder) searchInput.placeholder = nextPlaceholder;
 				setPsnAttributeIfChanged(searchInput, 'autocomplete', 'off');
 			} else {
-                const placeholder = viewId === 'view-franchises' ? 'Search franchises' : 'Search Title or ID';
+                const placeholder = viewId === 'view-franchises' ? 'Search franchises or games' : 'Search Title or ID';
                 if (searchInput.placeholder !== placeholder) searchInput.placeholder = placeholder;
 				setPsnAttributeIfChanged(searchInput, 'autocomplete', 'on');
 			}
