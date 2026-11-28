@@ -29,15 +29,18 @@ PLATFORMS = {
 PLATFORM_NAMES = {'pce': {'turbografx16pcengine', 'turbografx16pcenginecd', 'pcenginesupergrafx'}, 'neogeo': {'neogeoaes', 'neogeomvs', 'neogeocd'}}
 ALLOWED_TYPES = {'main game', 'remake', 'remaster', 'port', 'bundle', 'standalone expansion', 'expanded game'}
 ID = re.compile(r'^[A-Z0-9]{9}$')
+TITLE_ID_SUFFIX = re.compile(r'\s*\(\s*([A-Z0-9]{9})\s*\)\s*$', re.I)
+NON_ALNUM = re.compile(r'[\W_]+')
+WORD_PATTERN = re.compile(r'[^\W_]+')
+MARKS = str.maketrans('', '', '™®©')
 TRIAL = re.compile(r'\btrial\s+to\s+full\b', re.I)
-EXCLUDED = re.compile(r'\b(?:demo|trial|beta|prototype|network\s+test|test\s+version|soundtrack|guidebook|playview|avatar|dlc)\b|体験版|체험판', re.I)
 TECH = re.compile(r'\s*[\[(]\s*(?:PS[123XP]|PS[12]\s*classics?|minis?|PC\s*Engine|TurboGrafx(?:-16)?|Neo\s*Geo(?:\s*Station)?|Nostalgia Vault|(?:English|French|German|Spanish|Italian|Japanese)(?:\s+Version)?|digital version|trial to full|part\s*\d+|disc\s*\d+)\s*[\])]\s*', re.I)
 
 
 @lru_cache(maxsize=4096)
 def norm(value):
-    value = unicodedata.normalize('NFKD', str(value).replace('™', '').replace('®', '').replace('©', '')).casefold()
-    return ''.join(c for c in value if c.isalnum())
+    value = unicodedata.normalize('NFKD', str(value).translate(MARKS)).casefold()
+    return NON_ALNUM.sub('', value)
 
 
 @lru_cache(maxsize=4096)
@@ -63,16 +66,21 @@ DIGITAL_SUFFIX = re.compile(r'\s*\(\s*(?:digital|downloadable ver(?:sion)?\.?)\s
 
 def catalog_match_name(name, tid):
     # Some regional catalog names repeat their own Title ID as a suffix.
-    return re.sub(r'\s*\(\s*' + re.escape(tid) + r'\s*\)\s*$', '', name, flags=re.I)
+    match = TITLE_ID_SUFFIX.search(name)
+    return name[:match.start()] if match and match[1].upper() == tid else name
+
+
+@lru_cache(maxsize=4096)
+def recovery_base(value, catalog):
+    raw = unicodedata.normalize('NFKC', str(value).translate(MARKS)).strip()
+    if catalog and VAULT.search(raw):
+        raw = VAULT_PART.sub('', VAULT.sub('', raw))
+    return TRIAL.sub(' ', TECH.sub(' ', raw)).strip()
 
 
 @lru_cache(maxsize=4096)
 def recovery_keys(value, catalog=False):
-    raw = unicodedata.normalize('NFKC', str(value).replace('™', '').replace('®', '').replace('©', '')).strip()
-    if catalog and VAULT.search(raw):
-        raw = VAULT_PART.sub('', VAULT.sub('', raw))
-    raw = TECH.sub(' ', raw)
-    raw = TRIAL.sub(' ', raw).strip()
+    raw = recovery_base(value, catalog)
     if catalog:
         raw = REGIONAL_SUFFIX.sub('', raw).strip()
         raw = re.sub(r'\s*[\[(](?:ENG|FRA|FRE|GER|DEU|ITA|SPA|ESP|JPN|KOR|POR)[\])]\s*$', '', raw, flags=re.I).strip()
@@ -101,6 +109,52 @@ def recovery_keys(value, catalog=False):
     return frozenset(strong), frozenset(weak - strong)
 
 
+
+REISSUE_SUFFIX = re.compile(r'\s*(?:PlayStation\s*3|PS3)\s+the\s+Best\s*$', re.I)
+LANG_DASH_SUFFIX = re.compile(r'\s+[-–—]\s+(?:EN|ENG|DE|GER|FR|FRA|IT|ITA|ES|SPA|JP|JPN|KR|KOR|RU|RUS|PT|POR)\s*$', re.I)
+HD_EDITION = re.compile(r'\s*(?:[-:–—]\s*)?HD\s+Edition\s*$', re.I)
+NUMBER_PAIR = re.compile(r'(?<!\w)([IVXLCDM]+|\d+)\s+(?:and|&)\s+(?=(?:[IVXLCDM]+|\d+)(?:\b|[-/]))', re.I)
+NON_GAME_SUFFIX = re.compile(r'(?:\s+(?:Official|Gameplay|Launch)\s+Trailer|\s*[-–—]\s*Console Application)\s*$', re.I)
+MANUAL_SUFFIX = re.compile(r'(?:\b(?:DigiManual|Digital Manual|Manual)\b)(?:\s*\(Digital\))?\s*$', re.I)
+
+
+def is_explicit_non_game(title, tid):
+    title = unicodedata.normalize('NFKC', title).replace('™', '').replace('®', '').strip()
+    return bool(NON_GAME_SUFFIX.search(title) or (tid.startswith('NPUO') and MANUAL_SUFFIX.search(title)))
+
+
+@lru_cache(maxsize=4096)
+def late_recovery_keys(value, catalog=False):
+    raw = recovery_base(value, catalog)
+    if catalog:
+        raw = PLATFORM_PREFIX.sub('', raw).strip()
+        raw = REGIONAL_SUFFIX.sub('', raw).strip()
+        raw = DIGITAL_SUFFIX.sub('', raw).strip()
+    keys = set()
+    clean = REISSUE_SUFFIX.sub('', raw).strip()
+    if catalog:
+        clean = LANG_DASH_SUFFIX.sub('', clean).strip()
+    if clean != raw:
+        keys.update(recovery_keys(clean, catalog)[0])
+    # Compare only explicit pairs of installment numbers, not arbitrary conjunctions.
+    paired = NUMBER_PAIR.sub(r'\1/', clean)
+    if paired != clean:
+        keys.update(recovery_keys(paired, catalog)[0])
+    # An official numbered HD edition may include a subtitle omitted by PSN.
+    # Keep both the installment number and the explicit HD edition marker.
+    if not catalog and HD_EDITION.search(clean):
+        prefix = re.split(r'[:–—]|\s-\s', clean, maxsplit=1)[0].strip()
+        words = franchise_words(prefix)
+        if len(words) >= 3 and ROMAN.get(words[-1], words[-1]).isdigit():
+            keys.update(recovery_keys(prefix + ' HD Edition')[0])
+    # Also support a one-word base only for the explicit GOTY designation.
+    if catalog:
+        base = re.sub(r'\s+(?:GOTY(?: Edition)?|Game of the Year(?: Edition)?)\s*$', '', clean, flags=re.I).strip()
+        if base != clean and len(franchise_words(base)) == 1 and len(base) >= 5:
+            keys.update(recovery_keys(base)[0])
+    return frozenset(keys - {''})
+
+
 def platform(title, tid, cid):
     if 'NEOGEOSTATION' in cid.upper(): return 'neogeo'
     for regex, tag in [(r'\(\s*PS2[^)]*\)|\bPS2\s*CLASSICS?\b','ps2'), (r'\(\s*PS[1X]\s*\)|\bPSONE\b|\bPS1\s*CLASSICS?\b','psx'), (r'\(\s*MINIS?\s*\)','minis'), (r'\(\s*PSP\s*\)','psp'), (r'\(\s*(?:PC\s*ENGINE|TURBO\s*GRAFX(?:\s*-\s*16)?)\s*\)','pce'), (r'\bNEO\s*GEO(?:\s*STATION)?\b','neogeo')]:
@@ -117,14 +171,83 @@ def platform(title, tid, cid):
     return 'ps3'
 
 
+def compile_browse_regex(pattern):
+    # JavaScript's non-Unicode \b is based on ASCII word characters.
+    boundary = r'(?-i:(?:(?<![A-Za-z0-9_])(?=[A-Za-z0-9_])|(?<=[A-Za-z0-9_])(?![A-Za-z0-9_])))'
+    return re.compile(pattern.replace(r'\b', boundary), re.I)
+
+
+class BrowseContentFilter:
+    def __init__(self, modern):
+        source = modern.read_text(encoding='utf-8-sig')
+        block = re.search(r'const DICT_APPS_FILTER\s*=\s*\{(.*?)\};', source, re.S)
+        if not block:
+            raise RuntimeError('Missing Browse DICT_APPS_FILTER; previous index preserved')
+        self.apps = set(re.findall(r'"([A-Z0-9]{9})"\s*:\s*1\b', block[1]))
+        if not self.apps:
+            raise RuntimeError('Empty Browse app filter; previous index preserved')
+        rules = {}
+        for match in re.finditer(r'const\s+(PSN_(?:SOUNDTRACK|VIDEO)_[A-Z_]+_REGEX)\s*=\s*/((?:\\.|[^/\n])+)/i\s*;', source):
+            rules.setdefault(match[1], match[2])
+        def regex(name):
+            if name not in rules:
+                raise RuntimeError(f'Missing Browse rule {name}; previous index preserved')
+            return compile_browse_regex(rules[name])
+        self.soundtrack = regex('PSN_SOUNDTRACK_TITLE_SIGNAL_REGEX')
+        self.video_name = regex('PSN_VIDEO_NAME_SIGNAL_REGEX')
+        self.video_cid = regex('PSN_VIDEO_CONTENT_ID_SIGNAL_REGEX')
+        self.video_cid_exclusion = regex('PSN_VIDEO_CONTENT_ID_EXCLUSION_REGEX')
+        self.video_name_exclusion = regex('PSN_VIDEO_NAME_EXCLUSION_REGEX')
+        self.video_test = regex('PSN_VIDEO_TEST_VERSION_REGEX')
+        analysis = re.search(r'function buildStoreRowAnalysis\(.*?\n\s*function getStoreRowAnalysis\(', source, re.S)
+        guide = re.search(r'const isGuide\s*=\s*/((?:\\.|[^/\n])+)/i\.test\(rawName\);', analysis[0] if analysis else '')
+        if not guide:
+            raise RuntimeError('Missing Browse guide rule; previous index preserved')
+        self.guide = compile_browse_regex(guide[1])
+        # Read the same literal demo rules as isDemoLikeTitle, in source order.
+        demo = re.search(r'function isDemoLikeTitle\(value\)\s*\{(.*?)\n\s*\}', source, re.S)
+        rules = re.findall(r'if\s*\(/((?:\\.|[^/\n])+)/i\.test\(text\)\)\s*return true;', demo[1] if demo else '')
+        if not demo or not rules or 'isKnownNonDemoTitle(text)' not in demo[1] or 'isTrialToFullTitle(text)' not in demo[1]:
+            raise RuntimeError('Missing Browse demo rules; previous index preserved')
+        self.demo_rules = tuple(compile_browse_regex(rule) for rule in rules)
+        known = re.search(r'function isKnownNonDemoTitle\(value\).*?return /((?:\\.|[^/\n])+)/i\.test\(text\);', source, re.S)
+        if not known:
+            raise RuntimeError('Missing Browse non-demo exception; previous index preserved')
+        self.non_demo = compile_browse_regex(known[1])
+
+    def category(self, title, tid, cid, explicit_demo=False):
+        title = VAULT.sub('', title).strip()
+        if tid in self.apps:
+            return 'app'
+        if self.guide.search(title):
+            return 'guide'
+        if self.soundtrack.search(title):
+            return 'soundtrack'
+        if not (self.video_test.search(title) or self.video_name_exclusion.search(title) or self.video_cid_exclusion.search(cid)):
+            if self.video_name.search(title) or self.video_cid.search(cid):
+                return 'video'
+        normalized = unicodedata.normalize('NFKC', title).strip()
+        if explicit_demo:
+            if not TRIAL.search(title):
+                return 'demo'
+        elif normalized and not TRIAL.search(normalized) and not self.non_demo.search(normalized):
+            if any(rule.search(normalized) for rule in self.demo_rules):
+                return 'demo'
+        upper = title.upper()
+        if 'FIRSTPLAY' in upper or 'FIRST PLAY' in upper or 'QORE' in upper:
+            return 'app'
+        if is_explicit_non_game(title, tid):
+            return 'explicit_non_game'
+        return 'eligible_rows'
+
+
 def read_catalog(root, diagnostic=None):
     base = root / 'resources/database/content'
     if not (base / FILES[0]).is_file(): raise RuntimeError('Missing official games.tsv')
     modern = root / 'files/website/modern.html'
-    apps = set()
-    if modern.is_file():
-        block = re.search(r'const DICT_APPS_FILTER\s*=\s*\{(.*?)\};', modern.read_text(encoding='utf-8'), re.S)
-        if block: apps = set(re.findall(r'"([A-Z0-9]{9})"\s*:\s*1', block[1]))
+    if not modern.is_file():
+        raise RuntimeError(f'Missing Browse source at {modern}; previous index preserved')
+    browse_filter = BrowseContentFilter(modern)
     result = defaultdict(set)
     sources = {}
     for file in FILES:
@@ -134,6 +257,7 @@ def read_catalog(root, diagnostic=None):
             continue
         counts = Counter()
         sources[file] = counts
+        explicit_demo = file.endswith('demos.tsv')
         with path.open(encoding='utf-8-sig', newline='') as handle:
             for row in csv.reader(handle, delimiter='\t', quoting=csv.QUOTE_NONE):
                 counts['rows'] += 1
@@ -143,18 +267,17 @@ def read_catalog(root, diagnostic=None):
                 tid, _, title, url, _, cid = (x.strip() for x in row[:6])
                 tid = tid.upper()
                 if not ID.fullmatch(tid): reason = 'invalid_id_or_header'
-                elif tid in apps: reason = 'app'
-                elif not title or title.upper() == 'MISSING': reason = 'missing_title'
-                elif not url.startswith(('http://','https://')): reason = 'missing_download_url'
-                elif file.endswith('demos.tsv') and not TRIAL.search(title): reason = 'demo'
-                elif EXCLUDED.search(TRIAL.sub('',title)): reason = 'excluded_content'
+                elif len(title) < 2 or title.upper() == 'MISSING': reason = 'missing_title'
+                elif not url.lower().startswith(('http://','https://')): reason = 'missing_download_url'
                 else:
-                    reason = 'eligible_rows'
-                    result[tid].add((title, platform(title,tid,cid)))
+                    reason = browse_filter.category(title, tid, cid, explicit_demo)
+                    if reason == 'eligible_rows':
+                        result[tid].add((title, platform(title,tid,cid)))
                 counts[reason] += 1
     if diagnostic is not None:
         diagnostic['catalog_sources'] = sources
-        diagnostic['apps_filter_available'] = bool(apps)
+        diagnostic['apps_filter_available'] = True
+        diagnostic['browse_filter_app_ids'] = len(browse_filter.apps)
     if not result: raise RuntimeError('Catalog is empty')
     return result
 
@@ -325,9 +448,10 @@ def metadata(api, cache_path, force_full=False):
 
 @lru_cache(maxsize=4096)
 def franchise_words(value):
-    value = unicodedata.normalize('NFKD', str(value).replace('™', '').replace('®', '').replace('©', '')).casefold()
-    value = ''.join(c for c in value if not unicodedata.combining(c))
-    return tuple(re.findall(r'[^\W_]+', value, re.UNICODE))
+    value = unicodedata.normalize('NFKD', str(value).translate(MARKS)).casefold()
+    if not value.isascii():
+        value = ''.join(c for c in value if not unicodedata.combining(c))
+    return tuple(WORD_PATTERN.findall(value))
 
 
 @lru_cache(maxsize=2048)
@@ -828,17 +952,27 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
     primary=defaultdict(set); aliases=defaultdict(set); ext=defaultdict(set); records={}
     requested_names=defaultdict(set); requested_ids=defaultdict(set)
     catalog_keys={}; recovery_catalog={}; recovery_requested=defaultdict(set); recovery_index=defaultdict(set)
+    late_catalog={}; late_requested=defaultdict(set); late_extra_requested=defaultdict(set); late_index=defaultdict(set)
     for tid, variants in catalog.items():
-        prepared=[]
-        for name, tag in variants:
+        prepared=[]; recovery=[]; late_prepared=[]
+        for name, tag in sorted(variants):
             keys=names(name)
             prepared.append((tag,keys))
             requested_names[tag].update(keys)
             requested_ids[tag].add(tid)
+            match_name=catalog_match_name(name, tid)
+            strong,weak=recovery_keys(match_name, True)
+            extra=late_recovery_keys(match_name, True)
+            recovery.append((tag,strong,weak))
+            late_prepared.append((tag,extra,strong))
+            recovery_requested[tag].update(strong)
+            recovery_requested[tag].update(weak)
+            late_requested[tag].update(extra)
+            late_requested[tag].update(strong)
+            late_extra_requested[tag].update(extra)
         catalog_keys[tid]=prepared
-        recovery_catalog[tid]=[(tag, *recovery_keys(catalog_match_name(name, tid), True)) for name,tag in sorted(variants)]
-        for tag,strong,weak in recovery_catalog[tid]:
-            recovery_requested[tag].update(strong | weak)
+        recovery_catalog[tid]=recovery
+        late_catalog[tid]=late_prepared
     tags_by_platform=defaultdict(set)
     for tag, platforms in platform_map.items():
         if requested_ids.get(tag):
@@ -857,13 +991,17 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
         titles = game_names(game)
         official_keys = set(names(official)) if official else set()
         keys = official_keys.copy()
-        secondary = set()
+        secondary = set(); late = set()
         for title in titles:
             if title != official:
                 keys.update(names(title))
             secondary.update(recovery_keys(title)[0])
+            late.update(late_recovery_keys(title))
         relevant=False
         for tag in tags:
+            for key in (late & late_requested[tag]) | (secondary & late_extra_requested[tag]):
+                late_index[tag,key].add(gid)
+                relevant=True
             for key in secondary & recovery_requested[tag]:
                 recovery_index[tag,key].add(gid)
                 relevant=True
@@ -905,6 +1043,15 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
             candidates=possible
             if len(possible)==1:
                 recovered_matches['edition' if used_edition else 'normalized'] += 1
+        if not candidates:
+            # Do not override any existing match or resolve existing ambiguity by guessing.
+            possible=set()
+            for tag,extra,original in late_catalog[tid]:
+                for key in extra | original:
+                    possible.update(late_index.get((tag,key), ()))
+            if len(possible)==1:
+                recovered_matches['reissue_or_edition'] += 1
+            candidates=possible
         if len(candidates)>1:
             refined=resolve_plus_variant(tid, candidates, catalog[tid], records, ext)
             if len(refined)==1:
@@ -947,7 +1094,7 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
         collect_diagnostics(diagnostic, catalog, records, canonical, unresolved, groups,
                             memberships, rejected_memberships, output, metadata_count, recovered)
     result = {'version':1,'franchises':output,'games':{tid:canonical[tid] for tid in sorted(used)}}
-    for cached in (norm, names, recovery_keys, franchise_words, franchise_name_key, label_in_name):
+    for cached in (norm, names, recovery_base, recovery_keys, late_recovery_keys, franchise_words, franchise_name_key, label_in_name):
         cached.cache_clear()
     return result
 
@@ -1054,6 +1201,13 @@ def write_diagnostics(report, directory):
         else: lines.append(f"| {file} | {counts.get('rows',0)} | {counts.get('eligible_rows',0)} | {counts.get('rows',0)-counts.get('eligible_rows',0)} |")
     lines += ['', 'Rows include headers, duplicates and regional releases. See coverage.json for exclusions by reason.',
               '', 'Download the franchise-diagnostics artifact for all Title IDs, candidate names, accepted/rejected memberships and discarded groups. No credentials or download URLs are included.', '']
+    excluded = Counter()
+    for counts in report.get('catalog_sources', {}).values():
+        excluded.update({key: count for key, count in counts.items() if key in ('app', 'guide', 'soundtrack', 'video', 'demo', 'explicit_non_game')})
+    lines += ['### Content excluded before matching', '', '| Category | TSV rows |', '|---|---:|']
+    for key, label in (('app', 'Apps'), ('guide', 'Guides'), ('soundtrack', 'Soundtracks'), ('video', 'Videos / movies'), ('demo', 'Demos'), ('explicit_non_game', 'Explicit non-game content')):
+        lines.append(f'| {label} | {excluded[key]} |')
+    lines += ['', 'Counts are source rows, not unique Title IDs.', '']
     recoveries = report.get('secondary_match_recoveries', {})
     lines += ['### Secondary recovery', '', f"Normalized names: **{recoveries.get('normalized', 0)}** | Edition fallback: **{recoveries.get('edition', 0)}** | Explicit plus variants: **{recoveries.get('explicit_plus', 0)}** | Numbered series memberships: **{report.get('numbered_series_recoveries', 0)}**.", '']
     summary = '\n'.join(lines)
