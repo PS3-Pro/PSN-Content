@@ -8,7 +8,7 @@ import os
 import re
 import time
 import unicodedata
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -61,7 +61,7 @@ def platform(title, tid, cid):
     return 'ps3'
 
 
-def read_catalog(root):
+def read_catalog(root, diagnostic=None):
     base = root / 'resources/database/content'
     if not (base / FILES[0]).is_file(): raise RuntimeError('Missing official games.tsv')
     modern = root / 'files/website/modern.html'
@@ -70,18 +70,35 @@ def read_catalog(root):
         block = re.search(r'const DICT_APPS_FILTER\s*=\s*\{(.*?)\};', modern.read_text(encoding='utf-8'), re.S)
         if block: apps = set(re.findall(r'"([A-Z0-9]{9})"\s*:\s*1', block[1]))
     result = defaultdict(set)
+    sources = {}
     for file in FILES:
         path = base / file
-        if not path.is_file(): continue
+        if not path.is_file():
+            sources[file] = {'missing': True}
+            continue
+        counts = Counter()
+        sources[file] = counts
         with path.open(encoding='utf-8-sig', newline='') as handle:
             for row in csv.reader(handle, delimiter='\t', quoting=csv.QUOTE_NONE):
-                if len(row) < 6: continue
+                counts['rows'] += 1
+                if len(row) < 6:
+                    counts['invalid_row'] += 1
+                    continue
                 tid, _, title, url, _, cid = (x.strip() for x in row[:6])
                 tid = tid.upper()
-                if not ID.fullmatch(tid) or tid in apps or not title or title.upper() == 'MISSING' or not url.startswith(('http://','https://')): continue
-                if file.endswith('demos.tsv') and not TRIAL.search(title): continue
-                if EXCLUDED.search(TRIAL.sub('',title)): continue
-                result[tid].add((title, platform(title,tid,cid)))
+                if not ID.fullmatch(tid): reason = 'invalid_id_or_header'
+                elif tid in apps: reason = 'app'
+                elif not title or title.upper() == 'MISSING': reason = 'missing_title'
+                elif not url.startswith(('http://','https://')): reason = 'missing_download_url'
+                elif file.endswith('demos.tsv') and not TRIAL.search(title): reason = 'demo'
+                elif EXCLUDED.search(TRIAL.sub('',title)): reason = 'excluded_content'
+                else:
+                    reason = 'eligible_rows'
+                    result[tid].add((title, platform(title,tid,cid)))
+                counts[reason] += 1
+    if diagnostic is not None:
+        diagnostic['catalog_sources'] = sources
+        diagnostic['apps_filter_available'] = bool(apps)
     if not result: raise RuntimeError('Catalog is empty')
     return result
 
@@ -504,7 +521,7 @@ def prune_incidental_views(components, records):
     return cleaned
 
 
-def consolidate_groups(groups, records=None, relations=()):
+def consolidate_groups(groups, records=None, relations=(), diagnostic=None):
     groups = flatten_collection_parents(groups, relations)
     records = records or {}
     entries = sorted(groups, key=franchise_label_order)
@@ -595,6 +612,10 @@ def consolidate_groups(groups, records=None, relations=()):
     for chosen, members in prune_incidental_views(flatten_named_subseries(flattened, records), records):
         signature = frozenset(members.values())
         if len(signature) < 2:
+            if diagnostic is not None:
+                diagnostic.setdefault('discarded_groups', []).append({
+                    'id': chosen[0], 'name': chosen[1], 'distinct_igdb_games': len(signature),
+                    'titles': sorted(members), 'igdb_ids': sorted(signature)})
             continue
         previous = by_games.get(signature)
         if previous is None:
@@ -680,7 +701,7 @@ def attach_exact_series_roots(groups, pending, records):
     return recovered
 
 
-def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=()):
+def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(), diagnostic=None):
     primary=defaultdict(set); aliases=defaultdict(set); ext=defaultdict(set); records={}
     requested_names=defaultdict(set); requested_ids=defaultdict(set)
     catalog_keys={}
@@ -728,6 +749,7 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
     print(f'IGDB metadata rows: {metadata_count}; relevant records indexed: {len(records)}')
     groups=defaultdict(dict); matched=0; ambiguous=0; canonical={}; memberships={}; rejected_games=set(); rejected_links=0
     pending=defaultdict(list); unresolved=[]
+    rejected_memberships = {}
     for tid, variants in sorted(catalog_keys.items()):
         candidates=resolve_catalog_game(tid, variants, primary, aliases, ext)
         if len(candidates)!=1:
@@ -741,6 +763,7 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
             accepted, rejected = select_game_groups(game)
             memberships[gid] = accepted
             if rejected:
+                if diagnostic is not None: rejected_memberships[gid] = rejected
                 rejected_games.add(gid)
                 rejected_links += len(rejected)
                 print(f'Ignore incidental IP associations: {game.get("name", gid)} ({gid}): {", ".join(sorted(name for _,name in rejected))}')
@@ -755,21 +778,134 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
             print(f'Unresolved exact series-title candidate: {tid}; IGDB candidates: {sorted(candidates)}')
     print(f'Exact series-root recovery: {recovered} catalog IDs')
     print(f'Incidental IP associations: {rejected_links} removed across {len(rejected_games)} games')
-    output = consolidate_groups(groups, records, relations)
+    output = consolidate_groups(groups, records, relations, diagnostic)
     print(f'Catalog: {len(catalog)} IDs | matched: {matched} | ambiguous: {ambiguous} | franchises: {len(output)}')
     used={tid for group in output for tid in group['titles']}
+    if diagnostic is not None:
+        collect_diagnostics(diagnostic, catalog, records, canonical, unresolved, groups,
+                            memberships, rejected_memberships, output, metadata_count, recovered)
     return {'version':1,'franchises':output,'games':{tid:canonical[tid] for tid in sorted(used)}}
 
 
+STATUS_LABELS = {
+    'indexed': 'Indexed in a franchise',
+    'no_match': 'No eligible IGDB match',
+    'ambiguous': 'Multiple IGDB candidates',
+    'no_franchise_metadata': 'Matched; no franchise or collection metadata',
+    'incidental_only': 'Matched; only incidental IP associations',
+    'single_game_franchise': 'Matched; final group has fewer than two distinct games',
+    'excluded_during_consolidation': 'Matched; not retained during consolidation',
+}
+
+
+def collect_diagnostics(report, catalog, records, canonical, unresolved, groups,
+                        memberships, rejected, output, metadata_count, recovered):
+    final = defaultdict(list)
+    assigned = defaultdict(list)
+    discarded = defaultdict(list)
+    for group in output:
+        for tid in group['titles']:
+            final[tid].append(group['name'])
+    for (_, name), members in groups.items():
+        for tid in members:
+            assigned[tid].append(name)
+    for group in report.get('discarded_groups', []):
+        for tid in group['titles']:
+            discarded[tid].append(group['name'])
+    candidates_by_tid = {tid: candidates for tid, _, candidates in unresolved}
+    counts = Counter()
+    distinct = defaultdict(set)
+    by_platform = defaultdict(Counter)
+    rows = []
+    for tid, variants in sorted(catalog.items()):
+        gid = canonical.get(tid)
+        candidates = candidates_by_tid.get(tid, ())
+        if tid in final: status = 'indexed'
+        elif gid is None: status = 'ambiguous' if candidates else 'no_match'
+        elif tid in discarded: status = 'single_game_franchise'
+        elif tid in assigned: status = 'excluded_during_consolidation'
+        elif rejected.get(gid): status = 'incidental_only'
+        else: status = 'no_franchise_metadata'
+        counts[status] += 1
+        if gid is not None: distinct[status].add(gid)
+        tags = sorted({tag for _, tag in variants})
+        for tag in tags: by_platform[tag][status] += 1
+        rows.append({
+            'title_id': tid, 'catalog_names': sorted({name for name, _ in variants}),
+            'platforms': tags, 'status': status, 'igdb_id': gid,
+            'igdb_name': records[gid].get('name', '') if gid is not None else '',
+            'candidates': [{'id': candidate, 'name': records.get(candidate, {}).get('name', '')}
+                           for candidate in sorted(candidates)],
+            'accepted_groups': sorted({name for _, name in memberships.get(gid, ())}),
+            'rejected_groups': sorted({name for _, name in rejected.get(gid, ())}),
+            'assigned_groups': sorted(set(assigned.get(tid, ()))),
+            'discarded_groups': sorted(set(discarded.get(tid, ()))),
+            'final_groups': sorted(set(final.get(tid, ()))),
+        })
+    report.update({
+        'schema_version': 1, 'catalog_title_ids': len(catalog),
+        'matched_title_ids': len(canonical), 'distinct_matched_igdb_games': len(set(canonical.values())),
+        'indexed_title_ids': len(final),
+        'distinct_indexed_igdb_games': len({canonical[tid] for tid in final}),
+        'unindexed_title_ids': len(catalog) - len(final),
+        'franchises': len(output), 'metadata_rows': metadata_count,
+        'recovered_series_root_title_ids': recovered,
+        'status_counts': {key: counts[key] for key in STATUS_LABELS},
+        'distinct_matched_games_by_status': {key: len(distinct[key]) for key in STATUS_LABELS},
+        'platform_status_counts': {tag: dict(counter) for tag, counter in sorted(by_platform.items())},
+        'titles': rows,
+    })
+    if sum(counts.values()) != len(catalog) or counts['indexed'] != len(final):
+        raise RuntimeError('Diagnostic counts inconsistent')
+
+
+def write_diagnostics(report, directory):
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / 'coverage.json').write_text(json.dumps(report, ensure_ascii=False, indent=2)+'\n', encoding='utf-8')
+    fields = ('title_id', 'catalog_names', 'platforms', 'status', 'igdb_id', 'igdb_name',
+              'candidates', 'accepted_groups', 'rejected_groups', 'assigned_groups', 'discarded_groups', 'final_groups')
+    with (directory / 'titles.tsv').open('w', encoding='utf-8', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, delimiter='\t')
+        writer.writeheader()
+        for row in report['titles']:
+            writer.writerow({key: json.dumps(value, ensure_ascii=False, separators=(',', ':')) if isinstance(value, list) else value
+                             for key, value in row.items()})
+    lines = ['## Franchise coverage', '',
+             f"Eligible catalog Title IDs: **{report['catalog_title_ids']}** | Indexed: **{report['indexed_title_ids']}** | Not indexed: **{report['unindexed_title_ids']}**",
+             '', f"Distinct IGDB games: **{report['distinct_matched_igdb_games']} matched / {report['distinct_indexed_igdb_games']} indexed** | Franchise cards: **{report['franchises']}**",
+             '', '| Result | Title IDs | Distinct matched IGDB games |', '|---|---:|---:|']
+    for key, label in STATUS_LABELS.items():
+        lines.append(f"| {label} | {report['status_counts'][key]} | {report['distinct_matched_games_by_status'][key]} |")
+    lines += ['', f"Groups discarded below minimum: **{len(report.get('discarded_groups', []))}**. Exact series-root recoveries: **{report['recovered_series_root_title_ids']}**.",
+              '', 'Title ID statuses are mutually exclusive. Distinct IGDB counts by status may overlap; unmatched records have no confirmed IGDB ID. The website may count regional groups differently.',
+              '', '### By platform', '', '| Platform | Eligible IDs | Indexed IDs | No match | Ambiguous | Other unindexed |', '|---|---:|---:|---:|---:|---:|']
+    for tag, counter in report['platform_status_counts'].items():
+        total = sum(counter.values()); indexed = counter.get('indexed', 0); missing = counter.get('no_match', 0); ambiguous = counter.get('ambiguous', 0)
+        lines.append(f'| {tag} | {total} | {indexed} | {missing} | {ambiguous} | {total-indexed-missing-ambiguous} |')
+    lines += ['', 'Platform counts may overlap when a Title ID has multiple catalog classifications.', '',
+              '### TSV input', '', '| Source | Rows | Eligible rows | Excluded rows |', '|---|---:|---:|---:|']
+    for file, counts in report.get('catalog_sources', {}).items():
+        if counts.get('missing'): lines.append(f'| {file} | missing | — | — |')
+        else: lines.append(f"| {file} | {counts.get('rows',0)} | {counts.get('eligible_rows',0)} | {counts.get('rows',0)-counts.get('eligible_rows',0)} |")
+    lines += ['', 'Rows include headers, duplicates and regional releases. See coverage.json for exclusions by reason.',
+              '', 'Download the franchise-diagnostics artifact for all Title IDs, candidate names, accepted/rejected memberships and discarded groups. No credentials or download URLs are included.', '']
+    summary = '\n'.join(lines)
+    (directory / 'summary.md').write_text(summary, encoding='utf-8')
+    print(summary)
+
+
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--root',type=Path,default=ROOT);p.add_argument('--metadata',type=Path,help='Offline JSON fixture for testing');p.add_argument('--secrets-file', type=Path, default=os.environ.get('PSN_SECRETS_FILE') or None, help='Path to private JSON credentials');p.add_argument('--full-refresh', action='store_true', help='Ignore previous IGDB metadata cache');args=p.parse_args()
-    catalog=read_catalog(args.root)
+    p=argparse.ArgumentParser();p.add_argument('--root',type=Path,default=ROOT);p.add_argument('--metadata',type=Path,help='Offline JSON fixture for testing');p.add_argument('--secrets-file', type=Path, default=os.environ.get('PSN_SECRETS_FILE') or None, help='Path to private JSON credentials');p.add_argument('--full-refresh', action='store_true', help='Ignore previous IGDB metadata cache');p.add_argument('--diagnostics', type=Path, help='Write coverage reports to this directory');args=p.parse_args()
+    diagnostic = {} if args.diagnostics else None
+    catalog=read_catalog(args.root, diagnostic)
     if args.metadata:
         fixture=json.loads(args.metadata.read_text()); platforms=PLATFORMS; sources={36}
         games,relations=(fixture['games'],fixture.get('relations',[])) if isinstance(fixture,dict) else (fixture,[])
     else:
         api=IGDB(args.root,args.secrets_file);games,platforms,sources,relations=metadata(api, args.root/CACHE_FILE, args.full_refresh)
-    result=build(catalog,games,platforms,sources,relations)
+    result=build(catalog,games,platforms,sources,relations,diagnostic)
+    if diagnostic is not None:
+        write_diagnostics(diagnostic, args.diagnostics)
     if not args.metadata: print(f'IGDB requests: {api.requests}')
     if not result['franchises']:raise RuntimeError('No franchises matched; previous index preserved')
     path=args.root/OUTPUT

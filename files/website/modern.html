@@ -24518,6 +24518,31 @@ P
         xvi: '16', xvii: '17', xviii: '18', xix: '19', xx: '20'
     });
 
+    const PSN_TITLE_SORT_COLLATOR = new Intl.Collator(undefined, { sensitivity: 'base', numeric: true });
+
+    function getPsnTitleSortKey(value) {
+        const title = String(value || '').replace(/[™®©]/g, '').normalize('NFKC')
+            .replace(/[’‘'`´]/g, '')
+            .replace(/[:;,.!?…·•\-‐‑‒–—_\/\\|()[\]{}]/g, ' ')
+            .replace(/\s+/g, ' ').trim();
+        return title.split(' ').map((token, index) => {
+            if (index && /^[IVX]+$/.test(token) && Object.prototype.hasOwnProperty.call(BROWSE_GROUP_TITLE_NUMBER_ALIASES, token.toLowerCase())) {
+                return BROWSE_GROUP_TITLE_NUMBER_ALIASES[token.toLowerCase()];
+            }
+            return token;
+        }).join(' ');
+    }
+
+    function createPsnTitleSortComparator(getTitle, direction = 1) {
+        const keys = new Map();
+        const keyFor = item => {
+            const title = String(getTitle(item) || '');
+            if (!keys.has(title)) keys.set(title, getPsnTitleSortKey(title));
+            return keys.get(title);
+        };
+        return (a, b) => direction * PSN_TITLE_SORT_COLLATOR.compare(keyFor(a), keyFor(b));
+    }
+
     const BROWSE_GROUP_TITLE_NUMBER_CONTEXTS = new Set([
         'episode', 'ep', 'chapter', 'season', 'part', 'book', 'volume', 'vol'
     ]);
@@ -25769,6 +25794,10 @@ P
             return group;
         });
 
+        const sizeSortMode = window.contentSizeSortOrders?.browse || 'off';
+        if (sizeSortMode !== 'asc' && sizeSortMode !== 'desc') {
+            groupedItems.sort(createPsnTitleSortComparator(group => group.displayTitle, window.sortOrders?.browse === 'desc' ? -1 : 1));
+        }
         browseGroupedItemsIndex = groupedIndex;
         browseGroupedTitleChildCounts.set(groupedItems, groupedChildCount);
         return groupedItems;
@@ -26675,13 +26704,10 @@ P
             psnFranchiseSelect(Number(tile.dataset.franchise));
         });
     }
-    let psnFranchiseCollator;
-    function psnFranchiseCompare(a,b) {
-        return (psnFranchiseCollator ||= new Intl.Collator(undefined,{numeric:true})).compare(a,b);
-    }
     function psnFranchiseSortEntries(entries) {
+        const compare = createPsnTitleSortComparator(entry => entry.name);
         return entries.sort((a,b)=>{
-            const alpha=psnFranchiseCompare(a.search,b.search);
+            const alpha=compare(a,b);
             if(psnFranchiseSortMode==='count')return (a.titles-b.titles)*(psnFranchiseCountDesc?-1:1)||alpha;
             return alpha*(psnFranchiseAlphaDesc?-1:1);
         });
@@ -26983,7 +27009,7 @@ P
         psnFranchiseBlocksRevision = revision;
         psnFranchiseCatalogRevision = catalogRevision;
         psnFranchiseCatalogLength = data.length;
-        psnFranchiseGroups = groups.map(group=>Array.from(group.values()).sort((a,b)=>psnFranchiseCompare(String(a.cleanName),String(b.cleanName))));
+        psnFranchiseGroups = groups.map(group=>Array.from(group.values()).sort(createPsnTitleSortComparator(game => game.cleanName)));
         return psnFranchiseGroups;
     }
     function psnFranchiseCover(game) {
@@ -36004,12 +36030,13 @@ P
 			size:getPsnContentSortSizeBytes(item),
 			name:String(getName(item) || '')
 		}));
+		const compareNames = createPsnTitleSortComparator(entry => entry.name);
 		entries.sort((a, b) => {
 			const aKnown = a.size > 0;
 			const bKnown = b.size > 0;
 			if (aKnown !== bKnown) return aKnown ? -1 : 1;
 			if (aKnown && a.size !== b.size) return direction === 'desc' ? b.size - a.size : a.size - b.size;
-			return a.name.localeCompare(b.name);
+			return compareNames(a, b);
 		});
 		for (let i = 0; i < entries.length; i++) items[i] = entries[i].item;
 		return items;
@@ -36477,7 +36504,7 @@ P
 			game.size = formatSizeFromBytes(game.sizeBytes);
 			if (typeof window.applyContentMetadataOverrideToItem === 'function') window.applyContentMetadataOverrideToItem(game, cat);
 		}
-		data.sort((a, b) => a.cleanName.localeCompare(b.cleanName));
+		data.sort(createPsnTitleSortComparator(game => game.cleanName));
 
 		if (typeof sysData !== 'undefined') {
 			if (cat === 'dlcs' && sysData.dlcs) await addCacheIdsToSetSmooth(data, sysData.dlcs, highPriority ? 'high' : 'low');
@@ -60769,7 +60796,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		if (wishlistSizeSortMode === 'asc' || wishlistSizeSortMode === 'desc') {
 			sortPsnContentBySize(filteredWishlist, wishlistSizeSortMode, item => item && item.cleanName);
 		} else {
-			filteredWishlist.sort((a, b) => (a.cleanName || '').localeCompare(b.cleanName || ''));
+			filteredWishlist.sort(createPsnTitleSortComparator(game => game.cleanName));
 			if (wishlistSortMode === 'desc') filteredWishlist.reverse();
 		}
 
@@ -66408,7 +66435,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 		const effectiveTitle = (typeof window.getEffectiveContentTitle === 'function')
 			? (window.getEffectiveContentTitle(identity, targetCategory, fallbackTitle) || fallbackTitle)
 			: fallbackTitle;
-		const normalized = normalizeLibraryAlphabeticalTitle(effectiveTitle);
+		const normalized = getPsnTitleSortKey(normalizeLibraryAlphabeticalTitle(effectiveTitle));
 		libraryAlphabeticalTitleFastCache.set(game, normalized);
 		return normalized;
 	}
@@ -67223,7 +67250,7 @@ function formatLibraryLastPlayedBadge(game = {}) {
 
 		if (typeof window.syncAlphabeticalSortButtonState === 'function') window.syncAlphabeticalSortButtonState('fav', filteredFavs.length);
 
-		filteredFavs.sort((a, b) => a.title.localeCompare(b.title));
+		filteredFavs.sort(createPsnTitleSortComparator(game => game.title));
 		
 		if (window.sortOrders && window.sortOrders.fav === 'desc') {
 			filteredFavs.reverse();
