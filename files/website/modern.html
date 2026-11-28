@@ -26578,12 +26578,12 @@ P
     let psnFranchiseDefinitions = [];
     const psnFranchiseNoMembership = Object.freeze([]);
     let psnFranchiseMembership = null, psnFranchiseGameIds = null, psnFranchiseIndexRevision = 0;
-    let psnFranchiseIndexRequest = null, psnFranchiseIndexRetryAt = 0;
+    let psnFranchiseIndexRequest = null, psnFranchiseIndexRetryAt = 0, psnFranchiseLoadError = false;
     function psnFranchiseInstallIndex(payload) {
         if(payload?.version!==1 || !Array.isArray(payload.franchises) || !payload.franchises.length || payload.franchises.length>20000) throw new Error('Invalid franchise index');
         const definitions=[], memberships=new Map(), gameIds=new Map(), groupIds=new Set();
         for(const group of payload.franchises){
-            if(typeof group?.id!=='string'||!(/^[cf]:[1-9]\d*$/.test(group.id))||groupIds.has(group.id)||typeof group.name!=='string'||!group.name.trim()||group.name.length>250||!Array.isArray(group.titles)||group.titles.length<2)throw new Error('Invalid franchise group');
+            if(typeof group?.id!=='string'||!(/^[cfs]:[1-9]\d*$/.test(group.id))||groupIds.has(group.id)||typeof group.name!=='string'||!group.name.trim()||group.name.length>250||!Array.isArray(group.titles)||group.titles.length<2)throw new Error('Invalid franchise group');
             const titles=new Set(group.titles), index=definitions.length;
             if(titles.size<2||titles.size!==group.titles.length)throw new Error('Invalid franchise titles');
             for(const id of titles){
@@ -26612,7 +26612,7 @@ P
                 const text=await response.text();if(text.length>8*1024*1024)throw new Error('Index too large');
                 if(psnFranchiseActiveIndex()>=0)return false;
                 psnFranchiseInstallIndex(JSON.parse(text));return true;
-            }catch(_){psnFranchiseIndexRetryAt=Date.now()+30000;return false;}
+            }catch(error){psnFranchiseIndexRetryAt=Date.now()+30000;console.warn('[FRANCHISES] Index unavailable:',error.message);return false;}
             finally{clearTimeout(timeout);psnFranchiseIndexRequest=null;}
         })();
         return psnFranchiseIndexRequest;
@@ -26906,12 +26906,14 @@ P
     }
     window.psnFranchiseChangeFilters=function(){ psnFranchiseFilter(); };
     function psnFranchiseUpdateEmpty(empty, visible, term, settings) {
-        const show = !!psnFranchiseRenderedGroups && visible === 0;
+        const show = psnFranchiseLoadError || (!!psnFranchiseRenderedGroups && visible === 0);
         const changed = empty.hidden === show;
         if (show) {
             const {scope,region,consoles} = settings;
             let title='No Franchises Found', desc='No franchises match your selected filters.', icon='fa-search', action='reset', label='Reset Filters', actionIcon='fa-check-double';
-            if (!consoles.length) {
+            if (psnFranchiseLoadError) {
+                title='Franchises Unavailable';desc='Could not load franchises. Please try again.';icon='fa-exclamation-circle';action='retry';label='Retry';actionIcon='fa-redo';
+            } else if (!consoles.length) {
                 title='All Consoles Disabled';desc='Select at least one console filter to view franchises.';icon='fa-gamepad';action='consoles';label='Enable All Consoles';
             } else if (term) {
                 title='No Results Found';desc=`We couldn't find any franchises matching "${psnFranchiseSearch.trim()}". Try checking for typos.`;action='search';label='Clear Search';actionIcon='fa-times';
@@ -26946,6 +26948,7 @@ P
     window.psnFranchiseEmptyAction=function(action){
         if(getCurrentPsnViewElement()?.id!=='view-franchises')return;
         if(action==='search'){window.clearGlobalSearch();return;}
+        if(action==='retry'){playUiClick();psnFranchiseIndexRetryAt=0;psnFranchisePopulate();return;}
         if(!['consoles','region','scope','letter','reset'].includes(action))return;
         playUiClick();
         if(action==='consoles'||action==='reset')document.querySelectorAll('#franchise-console-filters input').forEach(input=>input.checked=true);
@@ -27274,7 +27277,13 @@ P
         if (!host || host.dataset.loading==='1') return;
         host.dataset.loading='1';
         psnFranchiseBindGrid(host);
-        if (!psnFranchiseRenderedGroups) {status.hidden=false;status.textContent='Loading franchises…';}
+        psnFranchiseLoadError=false;
+        if (!psnFranchiseRenderedGroups) {
+            const empty=document.getElementById('psn-franchise-empty');
+            if(empty)empty.hidden=true;
+            status.hidden=false;status.textContent='Loading franchises…';
+            window.refreshPsnPageEmptyStates?.();
+        }
         try {
             const [data,indexReady]=await Promise.all([window.psnStoreRenderCache?.games || window.psnStoreCache?.games || loadStoreCategoryData('games','low'),psnFranchiseEnsureIndex()]);
             if (!indexReady) throw new Error('Franchise index unavailable');
@@ -27293,9 +27302,14 @@ P
             host.replaceChildren(document.getElementById('psn-franchise-empty'));status.hidden=true;
             psnFranchiseRenderedGroups=groups;
             psnFranchiseFilter();
-        } catch (_) {
-            status.hidden=false;status.textContent=psnFranchiseMembership?'Franchises unavailable. ':'Franchise index unavailable. ';
-            const retry=document.createElement('button');retry.type='button';retry.className='btn-mini';retry.textContent='Retry';retry.onclick=()=>{psnFranchiseIndexRetryAt=0;psnFranchisePopulate();};status.append(retry);
+        } catch (error) {
+            status.hidden=true;
+            psnFranchiseLoadError=!psnFranchiseRenderedGroups;
+            if(psnFranchiseLoadError){
+                psnFranchiseUpdateEmpty(document.getElementById('psn-franchise-empty'),0,'',psnFranchiseFilterSettings());
+                psnFranchiseSyncControls(0);
+            }
+            if(psnFranchiseMembership)console.warn('[FRANCHISES] Catalog unavailable:',error.message);
         } finally { delete host.dataset.loading; }
     }
     function psnFranchiseBindModalButton(modal,game,category,hydrationToken) {
@@ -59661,6 +59675,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
         psnFranchiseSource=null;
         psnFranchiseGroups=null;
         psnFranchiseRenderedGroups=null;
+        psnFranchiseLoadError=false;
         psnFranchiseVariants=[];
         psnFranchiseFilteredKeys=[];
         psnFranchiseCountCache=null;
