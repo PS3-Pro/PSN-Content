@@ -1,10 +1,24 @@
 name: Update Theme Previews
 
 on:
-  workflow_run:
-    workflows: ['Update PSN™ Database']
-    types: [completed]
-    branches: [main]
+  workflow_call:
+    inputs:
+      database_update:
+        type: boolean
+        default: false
+      source:
+        type: string
+        default: "all"
+      title_id:
+        type: string
+      content_id:
+        type: string
+      overwrite:
+        type: boolean
+        default: false
+      keep_extracted:
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       source:
@@ -37,6 +51,7 @@ on:
 
 permissions:
   contents: write
+  pages: write
   actions: write
 
 concurrency:
@@ -45,29 +60,25 @@ concurrency:
 
 jobs:
   generate-theme-previews:
-    if: >-
-      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
-      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_branch == 'main' &&
-      github.event.workflow_run.head_repository.full_name == github.repository)
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && 360 || 45 }}
+    timeout-minutes: ${{ !inputs.database_update && github.event_name == 'workflow_dispatch' && 360 || 45 }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: main
           fetch-depth: 1
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.x"
 
       - name: Check for missing theme previews
         id: missing
         env:
-          EVENT_NAME: ${{ github.event_name }}
+          EVENT_NAME: ${{ inputs.database_update && 'database_update' || github.event_name }}
         run: |
           if [ "$EVENT_NAME" = workflow_dispatch ]; then
             echo 'run=true' >> "$GITHUB_OUTPUT"
@@ -95,17 +106,17 @@ jobs:
       - name: Generate theme previews
         if: steps.missing.outputs.run == 'true'
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          SOURCE_TO_PROCESS: ${{ github.event.inputs.source }}
-          TITLE_ID: ${{ github.event.inputs.title_id }}
-          CONTENT_ID: ${{ github.event.inputs.content_id }}
-          OVERWRITE: ${{ github.event.inputs.overwrite }}
-          KEEP_EXTRACTED: ${{ github.event.inputs.keep_extracted }}
+          EVENT_NAME: ${{ inputs.database_update && 'database_update' || github.event_name }}
+          SOURCE_TO_PROCESS: ${{ inputs.source }}
+          TITLE_ID: ${{ inputs.title_id }}
+          CONTENT_ID: ${{ inputs.content_id }}
+          OVERWRITE: ${{ inputs.overwrite }}
+          KEEP_EXTRACTED: ${{ inputs.keep_extracted }}
         shell: bash
         run: |
           args=(--repo . --source "${SOURCE_TO_PROCESS:-all}" --download-dir "$RUNNER_TEMP/theme_pkgs")
 
-          if [[ "$EVENT_NAME" == workflow_run ]]; then
+          if [[ "$EVENT_NAME" == database_update ]]; then
             args+=(--auto-batch 8)
           fi
 
@@ -137,11 +148,12 @@ jobs:
         run: |
           rm -rf "$RUNNER_TEMP/theme_pkgs" || true
           rm -rf .cache/ps3theme-p3t-extract .cache/run_p3t_extract.php || true
-          if [[ "${{ github.event.inputs.keep_extracted }}" != "true" ]]; then
+          if [[ "${{ inputs.keep_extracted }}" != "true" ]]; then
             rm -rf .cache/theme_extract || true
           fi
 
       - name: Commit generated theme PNGs only
+        id: publish
         if: steps.missing.outputs.run == 'true'
         shell: bash
         run: |
@@ -173,4 +185,14 @@ jobs:
               fi
             done
             if [ "$published" != true ]; then exit 1; fi
+            echo 'changed=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Request GitHub Pages build
+        if: ${{ !inputs.database_update && steps.publish.outputs.changed == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh api --method POST "repos/$GITHUB_REPOSITORY/pages/builds"; then
+            echo '::warning::Changes committed; Pages build could not be requested.'
           fi

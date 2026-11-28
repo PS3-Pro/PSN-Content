@@ -1,8 +1,21 @@
 name: Update Avatar Covers
 
 on:
-  schedule:
-    - cron: "30 3 * * *"
+  workflow_call:
+    inputs:
+      database_update:
+        type: boolean
+        default: false
+      source:
+        type: string
+        default: "all"
+      title_id:
+        type: string
+      content_id:
+        type: string
+      overwrite:
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       source:
@@ -30,6 +43,7 @@ on:
 
 permissions:
   contents: write
+  pages: write
   actions: write
 
 concurrency:
@@ -42,31 +56,54 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: main
           fetch-depth: 1
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.x"
 
+      - name: Check for missing avatar covers
+        id: missing
+        env:
+          DATABASE_UPDATE: ${{ inputs.database_update }}
+        run: |
+          if [ "$DATABASE_UPDATE" != true ]; then
+            echo 'run=true' >> "$GITHUB_OUTPUT"
+          else
+            missing=$(python .github/scripts/generate_avatar_covers.py --repo . --source all --check-missing)
+            case "$missing" in
+              yes) echo 'run=true' >> "$GITHUB_OUTPUT" ;;
+              no) echo 'run=false' >> "$GITHUB_OUTPUT" ;;
+              *) echo 'Unexpected avatar preflight response' >&2; exit 1 ;;
+            esac
+          fi
+
       - name: Install dependencies
+        if: steps.missing.outputs.run == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install pycryptodomex pillow
 
       - name: Generate avatar covers
+        if: steps.missing.outputs.run == 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          SOURCE_TO_PROCESS: ${{ github.event.inputs.source }}
-          TITLE_ID: ${{ github.event.inputs.title_id }}
-          CONTENT_ID: ${{ github.event.inputs.content_id }}
-          OVERWRITE: ${{ github.event.inputs.overwrite }}
+          SOURCE_TO_PROCESS: ${{ inputs.source }}
+          TITLE_ID: ${{ inputs.title_id }}
+          CONTENT_ID: ${{ inputs.content_id }}
+          OVERWRITE: ${{ inputs.overwrite }}
+          DATABASE_UPDATE: ${{ inputs.database_update }}
         shell: bash
         run: |
           args=(--repo . --source "${SOURCE_TO_PROCESS:-all}" --download-dir "$RUNNER_TEMP/avatar_pkgs")
+
+          if [[ "$DATABASE_UPDATE" == "true" && "${OVERWRITE:-false}" != "true" ]]; then
+            args+=(--missing-only)
+          fi
 
           if [[ "${OVERWRITE:-false}" == "true" ]]; then
             args+=(--overwrite)
@@ -93,12 +130,16 @@ jobs:
           rm -rf "$RUNNER_TEMP/avatar_pkgs" "$RUNNER_TEMP/avatar_extract" || true
 
       - name: Commit generated avatar PNGs only
+        id: publish
+        if: steps.missing.outputs.run == 'true'
         shell: bash
         run: |
           git config --global user.name "PS3-Pro Bot"
           git config --global user.email "bot@ps3pro.com"
 
-          git add resources/database/avatars
+          pathspec=':(glob)resources/database/avatars/**/*.png'
+          if [ -z "$(git ls-files --cached --others --exclude-standard -- "$pathspec")" ]; then exit 0; fi
+          git add -- "$pathspec"
 
           if git diff --cached --quiet; then
             echo "No new avatar PNGs to commit."
@@ -121,4 +162,14 @@ jobs:
               fi
             done
             if [ "$published" != true ]; then exit 1; fi
+            echo 'changed=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Request GitHub Pages build
+        if: ${{ !inputs.database_update && steps.publish.outputs.changed == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh api --method POST "repos/$GITHUB_REPOSITORY/pages/builds"; then
+            echo '::warning::Changes committed; Pages build could not be requested.'
           fi

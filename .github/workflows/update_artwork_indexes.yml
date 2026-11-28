@@ -1,10 +1,11 @@
 name: Update Artwork Indexes
 
 on:
-  workflow_run:
-    workflows: ['Update PSN™ Database']
-    types: [completed]
-    branches: [main]
+  workflow_call:
+    inputs:
+      database_update:
+        type: boolean
+        default: false
   workflow_dispatch:
 
 permissions:
@@ -17,28 +18,23 @@ concurrency:
 
 jobs:
   update-artwork:
-    if: >-
-      github.ref == 'refs/heads/main' &&
-      (github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'workflow_run' &&
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_repository.full_name == github.repository))
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: main
           fetch-depth: 1
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
       - name: Restore artwork caches
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         continue-on-error: true
         with:
           path: |
@@ -102,7 +98,7 @@ jobs:
 
       - name: Save artwork caches
         if: ${{ !cancelled() && steps.cache_after.outputs.changed == 'true' }}
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         continue-on-error: true
         with:
           path: |
@@ -112,12 +108,7 @@ jobs:
 
       - name: Commit and Push changes
         id: publish
-        env:
-          DATABASE_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
-          if [ -n "$DATABASE_HEAD_SHA" ] && [ "$(git rev-parse HEAD)" != "$DATABASE_HEAD_SHA" ]; then
-            echo 'database_changed=true' >> "$GITHUB_OUTPUT"
-          fi
           git config user.name "PS3-Pro Bot"
           git config user.email "bot@ps3pro.com"
           for provider in launchbox libretro; do
@@ -154,7 +145,7 @@ jobs:
           exit 1
 
       - name: Request GitHub Pages build
-        if: steps.publish.outputs.changed == 'true' || steps.publish.outputs.database_changed == 'true' || github.event_name == 'workflow_dispatch'
+        if: ${{ !inputs.database_update && (steps.publish.outputs.changed == 'true' || github.event_name == 'workflow_dispatch') }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

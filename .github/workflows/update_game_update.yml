@@ -1,12 +1,16 @@
 name: Update Game Updates Database
 
 on:
-  schedule:
-    - cron: '0 3 * * *'
+  workflow_call:
+    inputs:
+      database_update:
+        type: boolean
+        default: false
   workflow_dispatch:
 
 permissions:
   contents: write
+  pages: write
 concurrency:
   group: game-updates-index
   cancel-in-progress: false
@@ -16,12 +20,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
+          ref: main
           fetch-depth: 1
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
@@ -29,7 +34,7 @@ jobs:
         run: pip install requests
 
       - name: Restore update XML cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         continue-on-error: true
         with:
           path: .cache/game-updates/
@@ -63,17 +68,21 @@ jobs:
 
       - name: Save update XML cache
         if: ${{ !cancelled() && steps.cache_after.outputs.changed == 'true' }}
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         continue-on-error: true
         with:
           path: .cache/game-updates/
           key: game-updates-v1-${{ github.run_id }}-${{ github.run_attempt }}
 
+      - name: Refresh base-game helper with updated game updates
+        run: python .github/scripts/generate_base_game_index.py
+
       - name: Commit Changes
+        id: publish
         run: |
           git config --global user.name "PS3-Pro Bot"
           git config --global user.email "bot@ps3pro.com"
-          git add resources/database/content/official/game_updates.tsv
+          git add resources/database/content/official/game_updates.tsv resources/database/helpers/base_game_index.tsv
           if git diff --cached --quiet; then
             exit 0
           fi
@@ -95,3 +104,13 @@ jobs:
             fi
           done
           if [ "$published" != true ]; then exit 1; fi
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+
+      - name: Request GitHub Pages build
+        if: ${{ !inputs.database_update && steps.publish.outputs.changed == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh api --method POST "repos/$GITHUB_REPOSITORY/pages/builds"; then
+            echo '::warning::Changes committed; Pages build could not be requested.'
+          fi

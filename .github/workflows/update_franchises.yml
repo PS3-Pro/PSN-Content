@@ -1,35 +1,40 @@
 name: Update Franchises
 on:
+  workflow_call:
+    inputs:
+      database_update:
+        type: boolean
+        default: false
+      full_refresh:
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       full_refresh:
         description: Rebuild all IGDB metadata (ignore cache)
         type: boolean
         default: false
-  workflow_run:
-    workflows: ['Update PSN™ Database']
-    types: [completed]
-    branches: [main]
 permissions:
   contents: write
+  pages: write
 concurrency:
   group: update-franchises-main
   cancel-in-progress: false
 jobs:
   update:
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository))
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: main
           fetch-depth: 1
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - name: Restore IGDB metadata cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         continue-on-error: true
         with:
           path: |
@@ -57,7 +62,7 @@ jobs:
       - name: Upload franchise diagnostics
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: franchise-diagnostics
           path: ${{ runner.temp }}/franchise-diagnostics/
@@ -65,7 +70,7 @@ jobs:
           retention-days: 14
       - name: Save IGDB metadata cache
         if: ${{ !cancelled() && hashFiles('.cache/franchises-igdb-v1/games.json.gz') != '' }}
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         continue-on-error: true
         with:
           path: |
@@ -73,6 +78,7 @@ jobs:
             .cache/franchises-igdb-v1/games.checkpoint.json.gz
           key: ${{ runner.os }}-franchises-igdb-v1-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Commit index only if changed
+        id: publish
         run: |
           git config user.name 'PS3-Pro Bot'
           git config user.email 'bot@ps3pro.com'
@@ -96,3 +102,13 @@ jobs:
             fi
           done
           if [ "$published" != true ]; then exit 1; fi
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+
+      - name: Request GitHub Pages build
+        if: ${{ !inputs.database_update && steps.publish.outputs.changed == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh api --method POST "repos/$GITHUB_REPOSITORY/pages/builds"; then
+            echo '::warning::Changes committed; Pages build could not be requested.'
+          fi

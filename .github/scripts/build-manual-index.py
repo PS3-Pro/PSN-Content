@@ -707,6 +707,9 @@ def build(output, cache_path=CACHE_PATH, platforms=None, root=Path('.'), max_ite
             rows=collection_rows(ident,archive.pdfs(ident,collection=True)) if ident else discovery_rows(platform,archive)
             data=payload(platform,rows); previous=read_index(path,platform)
             count=len(data['titles']); old=len(previous['titles'])
+            if not count and not old and platform in ('ps4','psvita'):
+                print(f'{platform}: 0 titles; no verified public manuals found; index preserved',flush=True)
+                continue
             if not count or count<old*.85: raise ValueError(f'empty or reduced index ({count}, previous {old})')
             if sum(map(len,data['titles'].values()))<.85*sum(map(len,previous['titles'].values())):
                 raise ValueError('reduced manual coverage')

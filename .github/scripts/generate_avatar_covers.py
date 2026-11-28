@@ -37,8 +37,11 @@ try:
     from Cryptodome.Cipher import AES
     from Cryptodome.Util import Counter
 except ImportError:  # Allows running with pycryptodome too.
-    from Crypto.Cipher import AES
-    from Crypto.Util import Counter
+    try:
+        from Crypto.Cipher import AES
+        from Crypto.Util import Counter
+    except ImportError:
+        AES = Counter = None
 
 
 # -----------------------------------------------------------------------------
@@ -1311,6 +1314,10 @@ def find_external_avatar_cover(
     return False
 
 
+def expected_avatar_path(entry: AvatarEntry, output_root: Path) -> Path:
+    return output_root / safe_filename(entry.title_id) / f"{safe_filename(entry.content_id or entry.name)}.png"
+
+
 def process_entry(
     entry: AvatarEntry,
     download_dir: Path,
@@ -1328,7 +1335,7 @@ def process_entry(
     pkg_name = safe_filename(entry.content_id or Path(entry.pkg_url).name, fallback="avatar") + ".pkg"
     pkg_path = download_dir / pkg_name
 
-    expected_output = title_folder / f"{safe_filename(entry.content_id or entry.name)}.png"
+    expected_output = expected_avatar_path(entry, output_root)
     if expected_output.exists() and not overwrite:
         log(f"[SKIP] {entry.title_id} / {entry.content_id}: PNG already exists")
         return 0, 0
@@ -1452,6 +1459,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--title-id", action="append", help="Only process this Title ID/game ID. Can be used more than once.")
     parser.add_argument("--content-id", action="append", help="Only process this Content ID. Can be used more than once.")
     parser.add_argument("--limit", type=int, default=0, help="Limit how many entries are processed. 0 means no limit.")
+    parser.add_argument("--missing-only", action="store_true", help="Process only entries without an existing PNG.")
+    parser.add_argument("--check-missing", action="store_true", help="Print yes/no without downloads or third-party dependencies.")
     parser.add_argument("--start", type=int, default=0, help="Skip the first N matching entries.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing PNG files.")
     parser.add_argument("--redownload", action="store_true", help="Download PKGs again even when they already exist in cache.")
@@ -1482,13 +1491,6 @@ def main() -> int:
     output_root = (args.output or repo / "resources/database/avatars").resolve()
     download_dir = (args.download_dir or repo / ".cache/avatar_pkgs").resolve()
 
-    print(f"Repo: {repo}")
-    print(f"Output: {output_root}")
-    print(f"Temporary PKG folder: {download_dir}")
-    print("TSV:")
-    for path in tsv_paths:
-        print(f"  - {path}")
-
     entries = read_all_entries(tsv_paths)
 
     title_filter = {x.upper() for x in args.title_id or []}
@@ -1498,10 +1500,28 @@ def main() -> int:
         entries = [e for e in entries if e.title_id.upper() in title_filter]
     if content_filter:
         entries = [e for e in entries if e.content_id.upper() in content_filter]
+    if args.missing_only and not args.overwrite:
+        entries = [entry for entry in entries if not expected_avatar_path(entry, output_root).exists()]
     if args.start > 0:
         entries = entries[args.start :]
     if args.limit > 0:
         entries = entries[: args.limit]
+
+    if args.check_missing:
+        if not any(path.is_file() for path in tsv_paths):
+            raise FileNotFoundError("No avatar TSV sources found")
+        print("yes" if any(not expected_avatar_path(entry, output_root).exists() for entry in entries) else "no")
+        return 0
+
+    if entries and AES is None:
+        raise RuntimeError("Install pycryptodomex or pycryptodome before generating avatar covers")
+
+    print(f"Repo: {repo}")
+    print(f"Output: {output_root}")
+    print(f"Temporary PKG folder: {download_dir}")
+    print("TSV:")
+    for path in tsv_paths:
+        print(f"  - {path}")
 
     print(f"Entries to process: {len(entries)}")
     if not entries:

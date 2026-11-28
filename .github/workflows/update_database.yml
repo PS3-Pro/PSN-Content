@@ -16,14 +16,17 @@ jobs:
   update-database:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pages: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: main
           fetch-depth: 1
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v6
         with:
           python-version: '3.x'
       - name: Sync NPS and Detect Changes
@@ -210,110 +213,10 @@ jobs:
           )
           PY
 
-          echo "Generating compact PS3 Classic base-game helper..."
-
-          python - <<'PY'
-          import csv
-          from pathlib import Path
-
-          base_dir = Path("resources/database/content/official")
-          output = Path("resources/database/helpers/base_game_index.tsv")
-
-          def clean_field(value):
-              return str(value or "").replace("\t", " ").replace("\r", " ").replace("\n", " ").strip()
-
-          def valid_title_id(value):
-              value = clean_field(value).upper()
-              return value if len(value) == 9 and value.isalnum() else ""
-
-          def read_rows(path):
-              if not path.exists():
-                  return
-              with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
-                  for row in csv.reader(handle, delimiter="\t"):
-                      yield row
-
-          child_ids = set()
-          child_sources = [
-              base_dir / "dlcs.tsv",
-              base_dir / "pending" / "dlcs.tsv",
-              base_dir / "avatars.tsv",
-              base_dir / "pending" / "avatars.tsv",
-              base_dir / "themes.tsv",
-              base_dir / "pending" / "themes.tsv",
-              base_dir / "game_updates.tsv",
-          ]
-
-          for path in child_sources:
-              for row in read_rows(path) or ():
-                  if not row:
-                      continue
-                  title_id = valid_title_id(row[0])
-                  if title_id:
-                      child_ids.add(title_id)
-
-          records = []
-          seen = set()
-
-          # Keep name/content ID for Games so the Classic can apply its exact
-          # existing Guide/Soundtrack/Video exclusions on the PS3.
-          for path in (base_dir / "games.tsv", base_dir / "pending" / "games.tsv"):
-              for row in read_rows(path) or ():
-                  if not row:
-                      continue
-                  title_id = valid_title_id(row[0])
-                  if not title_id or title_id not in child_ids:
-                      continue
-                  name = clean_field(row[2] if len(row) > 2 else "")
-                  content_id = clean_field(row[5] if len(row) > 5 else "")
-                  key = ("G", title_id, name, content_id)
-                  if key not in seen:
-                      seen.add(key)
-                      records.append(key)
-
-          # Preserve optional apps.tsv support from the legacy loader if those
-          # files are ever present; absent files are simply ignored.
-          for path in (base_dir / "apps.tsv", base_dir / "pending" / "apps.tsv"):
-              for row in read_rows(path) or ():
-                  if not row:
-                      continue
-                  title_id = valid_title_id(row[0])
-                  if not title_id or title_id not in child_ids:
-                      continue
-                  key = ("A", title_id)
-                  if key not in seen:
-                      seen.add(key)
-                      records.append(key)
-
-          for path in (base_dir / "demos.tsv", base_dir / "pending" / "demos.tsv"):
-              for row in read_rows(path) or ():
-                  if not row:
-                      continue
-                  title_id = valid_title_id(row[0])
-                  if not title_id or title_id not in child_ids:
-                      continue
-                  key = ("D", title_id)
-                  if key not in seen:
-                      seen.add(key)
-                      records.append(key)
-
-          output.parent.mkdir(parents=True, exist_ok=True)
-          with output.open("w", encoding="utf-8", newline="\n") as handle:
-              handle.write("# PS3 Classic base game index v1\n")
-              handle.write("# G\\tTITLE_ID\\tNAME\\tCONTENT_ID\n")
-              handle.write("# A\\tTITLE_ID\n")
-              handle.write("# D\\tTITLE_ID\n")
-              for record in records:
-                  handle.write("\t".join(record) + "\n")
-
-          print(
-              "Generated {} | Child IDs: {} | Parent records: {}".format(
-                  output, len(child_ids), len(records)
-              )
-          )
-          PY
+          python .github/scripts/generate_base_game_index.py
 
       - name: Commit and Push changes
+        id: publish
         run: |
           git config --global user.name "PS3-Pro Bot"
           git config --global user.email "bot@ps3pro.com"
@@ -324,7 +227,10 @@ jobs:
           git add resources/database/helpers/child_content_index.tsv
           git add resources/database/helpers/base_game_index.tsv
 
-          if git diff --cached --quiet; then exit 0; fi
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           git commit -m "Auto-update: Synchronized with NoPayStation (Official & Pending)"
           published=false
           for attempt in 1 2 3; do
@@ -343,3 +249,112 @@ jobs:
             fi
           done
           if [ "$published" != true ]; then exit 1; fi
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+
+      - name: Publish updated catalog without waiting for indexers
+        if: steps.publish.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh api --method POST "repos/$GITHUB_REPOSITORY/pages/builds"; then
+            echo '::warning::Catalog committed; Pages build could not be requested.'
+          fi
+
+  refresh-game-updates:
+    needs: update-database
+    if: ${{ !cancelled() && needs.update-database.result == 'success' }}
+    uses: ./.github/workflows/update_game_update.yml
+    with:
+      database_update: true
+    permissions:
+      contents: write
+      pages: write
+
+  refresh-covers:
+    needs: [update-database, refresh-game-updates]
+    if: ${{ !cancelled() && needs.update-database.result == 'success' }}
+    uses: ./.github/workflows/update_covers_index.yml
+    with:
+      database_update: true
+    permissions:
+      contents: write
+      pages: write
+
+  refresh-artwork:
+    needs: [update-database, refresh-covers]
+    if: ${{ !cancelled() && needs.update-database.result == 'success' }}
+    uses: ./.github/workflows/update_artwork_indexes.yml
+    with:
+      database_update: true
+    permissions:
+      contents: write
+      pages: write
+
+  refresh-franchises:
+    needs: [update-database, refresh-artwork]
+    if: ${{ !cancelled() && needs.update-database.result == 'success' }}
+    uses: ./.github/workflows/update_franchises.yml
+    with:
+      database_update: true
+    permissions:
+      contents: write
+      pages: write
+    secrets: inherit
+
+  refresh-metadata:
+    needs: [update-database, refresh-franchises]
+    if: ${{ !cancelled() && needs.update-database.result == 'success' }}
+    uses: ./.github/workflows/update_game_metadata.yml
+    with:
+      database_update: true
+    permissions:
+      contents: write
+      pages: write
+
+  refresh-manuals:
+    needs: [update-database, refresh-metadata]
+    if: ${{ !cancelled() && needs.update-database.result == 'success' }}
+    uses: ./.github/workflows/update_manual_indexes.yml
+    with:
+      database_update: true
+    permissions:
+      contents: write
+      pages: write
+
+  refresh-avatars:
+    needs: [update-database, refresh-manuals]
+    if: ${{ !cancelled() && needs.update-database.result == 'success' }}
+    uses: ./.github/workflows/update_avatar_covers.yml
+    with:
+      database_update: true
+    permissions:
+      contents: write
+      pages: write
+      actions: write
+
+  refresh-themes:
+    needs: [update-database, refresh-avatars]
+    if: ${{ !cancelled() && needs.update-database.result == 'success' }}
+    uses: ./.github/workflows/update_theme_previews.yml
+    with:
+      database_update: true
+    permissions:
+      contents: write
+      pages: write
+      actions: write
+
+  publish-pages:
+    needs: [update-database, refresh-themes]
+    if: ${{ !cancelled() && needs.update-database.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+    steps:
+      - name: Request GitHub Pages build after all updates
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh api --method POST "repos/$GITHUB_REPOSITORY/pages/builds"; then
+            echo '::warning::Updates finished; Pages build could not be requested.'
+          fi

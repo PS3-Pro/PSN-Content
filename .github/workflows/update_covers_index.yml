@@ -1,11 +1,11 @@
 name: Update Covers & Blacklist Index
 
 on:
-  workflow_run:
-    workflows: ["Update PSN™ Database"]
-    types:
-      - completed
-    branches: [main]
+  workflow_call:
+    inputs:
+      database_update:
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths:
@@ -15,6 +15,7 @@ on:
 
 permissions:
   contents: write
+  pages: write
 
 concurrency:
   group: update-covers-index-main
@@ -23,37 +24,44 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    if: >-
-      github.ref == 'refs/heads/main' &&
-      (github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_repository.full_name == github.repository && github.event.workflow_run.head_branch == 'main'))
+    if: github.ref == 'refs/heads/main'
     steps:
       - name: Checkout PSN-Content
-        uses: actions/checkout@v3
+        uses: actions/checkout@v6
         with:
           path: PSN-Content
           ref: main
           fetch-depth: 1
 
       - name: Checkout Recently-Played-Games (Repositório de Hashes)
-        uses: actions/checkout@v3
+        uses: actions/checkout@v6
         with:
           repository: PS3-Pro/Recently-Played-Games
           path: Recently-Played-Games
 
       - name: Setup Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v6
         with:
-          node-version: '18'
+          node-version: '24'
 
       - name: Generate Indexes & Blacklist
+        shell: bash
         run: |
           cd PSN-Content
-          ls -1 resources/database/covers/compressed/*.JPG | awk -F'/' '{print $NF}' | sed 's/\.JPG//g' > resources/database/covers/index.tsv
+          covers=resources/database/covers
+          tmp=$(mktemp "$covers/index.tsv.XXXXXX")
+          trap 'rm -f "$tmp"' EXIT
+          find "$covers/compressed" -maxdepth 1 -type f -name '*.JPG' -printf '%f\n' | sed 's/\.JPG$//g' | LC_ALL=C sort > "$tmp"
+          if [ ! -s "$tmp" ]; then
+            echo '::error::No compressed covers found; previous index preserved.'
+            exit 1
+          fi
+          if ! cmp -s "$tmp" "$covers/index.tsv"; then mv "$tmp" "$covers/index.tsv"; fi
           
           node .github/scripts/generate_blacklist.js
 
       - name: Commit and Push
+        id: publish
         run: |
           cd PSN-Content
           git config --global user.name "PS3-Pro Bot"
@@ -78,3 +86,13 @@ jobs:
             fi
           done
           if [ "$published" != true ]; then exit 1; fi
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+
+      - name: Request GitHub Pages build
+        if: ${{ !inputs.database_update && steps.publish.outputs.changed == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh api --method POST "repos/$GITHUB_REPOSITORY/pages/builds"; then
+            echo '::warning::Changes committed; Pages build could not be requested.'
+          fi

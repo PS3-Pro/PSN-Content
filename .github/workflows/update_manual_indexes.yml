@@ -1,11 +1,12 @@
 name: Update Manual Indexes
 
 on:
+  workflow_call:
+    inputs:
+      database_update:
+        type: boolean
+        default: false
   workflow_dispatch:
-  workflow_run:
-    workflows: ['Update PSN™ Database']
-    types: [completed]
-    branches: [main]
 
 permissions:
   contents: write
@@ -17,22 +18,22 @@ concurrency:
 
 jobs:
   update-manuals:
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository))
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 55
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: main
           fetch-depth: 1
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - name: Restore unified manual cache
         id: restore
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         continue-on-error: true
         with:
           path: .cache/manual-index/
@@ -40,16 +41,36 @@ jobs:
           restore-keys: manuals-unified-v2-
       - name: Restore legacy PS3 scan state
         if: steps.restore.outputs.cache-matched-key == ''
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         continue-on-error: true
         with:
           path: .cache/ps3-manual-index/state.json
           key: ps3-manuals-v2-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: ps3-manuals-v2-
+      - name: Record restored manual cache state
+        id: cache_before
+        run: |
+          cache=.cache/manual-index/metadata.json.gz
+          if [ -f "$cache" ]; then
+            echo "digest=$(sha256sum "$cache" | cut -d ' ' -f1)" >> "$GITHUB_OUTPUT"
+          fi
       - name: Index public game manuals
         id: index
-        continue-on-error: true
-        run: python .github/scripts/build-manual-index.py resources/database/manuals
+        shell: bash
+        run: |
+          set +e
+          python -u .github/scripts/build-manual-index.py resources/database/manuals 2>&1 | tee "$RUNNER_TEMP/manual-refresh.log"
+          status=("${PIPESTATUS[@]}")
+          set -e
+          if [ "${status[1]}" != 0 ]; then exit "${status[1]}"; fi
+          echo "exit_code=${status[0]}" >> "$GITHUB_OUTPUT"
+      - name: Summarize manual refresh
+        if: ${{ !cancelled() && steps.index.outcome != 'skipped' }}
+        run: |
+          echo '## Manual refresh' >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$RUNNER_TEMP/manual-refresh.log" ]; then
+            sed -nE '/^::warning::|^Manual refresh|^Incomplete manual refresh|^Metadata cache:|^PS3:|^ps[[:alnum:]]+: [0-9]+ titles/p' "$RUNNER_TEMP/manual-refresh.log" | sed 's/^::warning::/Warning: /' >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Commit and push validated indexes
         id: publish
         run: |
@@ -82,15 +103,25 @@ jobs:
           done
           if [ "$published" != true ]; then exit 1; fi
           echo 'changed=true' >> "$GITHUB_OUTPUT"
+      - name: Detect manual cache changes
+        id: cache_after
+        if: ${{ !cancelled() && steps.cache_before.outcome == 'success' }}
+        env:
+          PREVIOUS: ${{ steps.cache_before.outputs.digest }}
+        run: |
+          cache=.cache/manual-index/metadata.json.gz
+          if [ -f "$cache" ] && [ "$(sha256sum "$cache" | cut -d ' ' -f1)" != "$PREVIOUS" ]; then
+            echo 'changed=true' >> "$GITHUB_OUTPUT"
+          fi
       - name: Save unified manual cache
-        if: ${{ !cancelled() && steps.publish.outcome == 'success' }}
-        uses: actions/cache/save@v4
+        if: ${{ !cancelled() && steps.cache_after.outputs.changed == 'true' }}
+        uses: actions/cache/save@v5
         continue-on-error: true
         with:
           path: .cache/manual-index/
           key: manuals-unified-v2-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Request GitHub Pages build
-        if: steps.publish.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        if: ${{ !inputs.database_update && (steps.publish.outputs.changed == 'true' || github.event_name == 'workflow_dispatch') }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -98,5 +129,7 @@ jobs:
             echo '::warning::Indexes committed; Pages build could not be requested.'
           fi
       - name: Report incomplete refresh
-        if: steps.index.outcome == 'failure'
-        run: exit 1
+        if: ${{ !cancelled() && steps.index.outputs.exit_code != '' && steps.index.outputs.exit_code != '0' }}
+        run: |
+          echo '::error::Manual refresh failed for one or more platforms. See Index public game manuals and the job summary for the original error; validated indexes and cache were preserved where possible.'
+          exit 1

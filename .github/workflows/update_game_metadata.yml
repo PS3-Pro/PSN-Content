@@ -1,31 +1,28 @@
 name: Update Game Metadata Index
 on:
+  workflow_call:
+    inputs:
+      database_update:
+        type: boolean
+        default: false
   workflow_dispatch:
-  schedule:
-    - cron: '40 8 * * 0'
-  workflow_run:
-    workflows: ['Update PSN™ Database']
-    types: [completed]
-    branches: [main]
 permissions:
   contents: write
+  pages: write
 concurrency:
   group: game-metadata-index
   cancel-in-progress: false
 jobs:
   index:
-    if: >-
-      ((github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && github.ref == 'refs/heads/main') ||
-      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_repository.full_name == github.repository)
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: main
           fetch-depth: 1
-      - uses: actions/cache/restore@v4
+      - uses: actions/cache/restore@v5
         continue-on-error: true
         with:
           path: |
@@ -39,7 +36,7 @@ jobs:
       - name: Check catalog changes or weekly refresh
         id: cadence
         env:
-          EVENT_NAME: ${{ github.event_name }}
+          EVENT_NAME: ${{ inputs.database_update && 'database_update' || github.event_name }}
         run: |
           fingerprint=$(git ls-tree -r HEAD -- resources/database/content/official/games.tsv resources/database/content/official/pending/games.tsv resources/database/content/official/demos.tsv resources/database/content/official/pending/demos.tsv resources/database/content/external/nostalgia_vault.tsv resources/database/launchbox files/website/modern.html .github/scripts/update_game_metadata.py .github/scripts/generate_franchises.py | sha256sum | cut -d ' ' -f1)
           echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
@@ -63,7 +60,7 @@ jobs:
             echo 'run=false' >> "$GITHUB_OUTPUT"
             echo 'Catalog and published index unchanged; next weekly refresh remains scheduled.'
           fi
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         if: steps.cadence.outputs.run == 'true'
         with:
           python-version: '3.12'
@@ -77,7 +74,7 @@ jobs:
           mkdir -p .cache/game-metadata
           printf '%s %s %s\n' "$CATALOG_FINGERPRINT" "$index_hash" "$(date -u +%F)" > .cache/game-metadata/cadence.tmp
           mv .cache/game-metadata/cadence.tmp .cache/game-metadata/cadence.txt
-      - uses: actions/cache/save@v4
+      - uses: actions/cache/save@v5
         continue-on-error: true
         if: always() && steps.cadence.outputs.run == 'true' && hashFiles('.cache/game-metadata/*.json.gz') != ''
         with:
@@ -86,6 +83,7 @@ jobs:
             .cache/game-metadata/cadence.txt
           key: game-metadata-v3-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Publish index only
+        id: publish
         if: steps.cadence.outputs.run == 'true'
         run: |
           git add resources/database/helpers/game-metadata.json
@@ -110,3 +108,13 @@ jobs:
             fi
           done
           if [ "$published" != true ]; then exit 1; fi
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+
+      - name: Request GitHub Pages build
+        if: ${{ !inputs.database_update && steps.publish.outputs.changed == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh api --method POST "repos/$GITHUB_REPOSITORY/pages/builds"; then
+            echo '::warning::Changes committed; Pages build could not be requested.'
+          fi
