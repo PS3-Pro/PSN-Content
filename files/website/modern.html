@@ -26533,14 +26533,7 @@ P
 	}
 
 
-    let psnFranchiseDefinitions = [
-        ['God of War', /^god of war(?: |$)/],
-        ['Resident Evil', /^(?:resident evil|biohazard)(?: |$)/],
-        ['Metal Gear', /^metal gear(?: |$)/],
-        ['Final Fantasy', /^(?:final fantasy|lightning returns final fantasy)(?: |$)/],
-        ['Grand Theft Auto', /^(?:grand theft auto|gta)(?: |$)/],
-        ["Assassin's Creed", /^assassins creed(?: |$)/]
-    ];
+    let psnFranchiseDefinitions = [];
     const psnFranchiseNoMembership = Object.freeze([]);
     let psnFranchiseMembership = null, psnFranchiseGameIds = null, psnFranchiseIndexRevision = 0;
     let psnFranchiseIndexRequest = null, psnFranchiseIndexRetryAt = 0;
@@ -26938,21 +26931,12 @@ P
         psnFranchiseLetter = char;
         psnFranchiseFilter('');
     };
-    const psnFranchiseIndexCache = new WeakMap();
     function psnFranchiseIndexes(game) {
-        if (!game || typeof game !== 'object') return psnFranchiseNoMembership;
-        if(psnFranchiseMembership)return psnFranchiseMembership.get(String(game.id||game.titleId||'').toUpperCase())||psnFranchiseNoMembership;
-        const raw = game.cleanName || game.title || game.name || '';
-        const cached = psnFranchiseIndexCache.get(game);
-        if (cached && cached.raw === raw) return cached.indexes;
-        const name = psnFranchiseName(raw);
-        const index = psnFranchiseDefinitions.findIndex(([,pattern])=>pattern.test(name));
-        const indexes=index<0?psnFranchiseNoMembership:[index];
-        psnFranchiseIndexCache.set(game,{raw,indexes});
-        return indexes;
+        if (!game || typeof game !== 'object' || !psnFranchiseMembership) return psnFranchiseNoMembership;
+        return psnFranchiseMembership.get(String(game.id||game.titleId||'').toUpperCase())||psnFranchiseNoMembership;
     }
     function psnFranchiseGetGroups(data) {
-        if (!Array.isArray(data)) return null;
+        if (!psnFranchiseMembership || !Array.isArray(data)) return null;
         const revision = Number(window.__contentBlocksRevision || 0);
         const catalogRevision = Number(window.__psnStoreCacheRevision || 0);
         if (data === (psnFranchiseSource?.deref?.() ?? psnFranchiseSource) && psnFranchiseGroups && psnFranchiseBlocksRevision === revision && psnFranchiseCatalogRevision === catalogRevision && psnFranchiseCatalogLength === data.length) return psnFranchiseGroups;
@@ -27077,25 +27061,25 @@ P
         if (!psnFranchiseRenderedGroups) {status.hidden=false;status.textContent='Loading franchises…';}
         try {
             const [data,indexReady]=await Promise.all([window.psnStoreRenderCache?.games || window.psnStoreCache?.games || loadStoreCategoryData('games','low'),psnFranchiseEnsureIndex()]);
+            if (!indexReady) throw new Error('Franchise index unavailable');
             const groups=psnFranchiseGetGroups(data);
             if (!groups || !data.length) throw new Error('Empty catalog');
-            if (groups === psnFranchiseRenderedGroups) { status.hidden=indexReady; if(!indexReady)status.textContent='Franchise index unavailable. Showing experimental groups.'; psnFranchiseFilter(); return; }
+            if (groups === psnFranchiseRenderedGroups) { status.hidden=true; psnFranchiseFilter(); return; }
             psnFranchiseStopProgressive(host);
             psnFranchiseClearRevealState();
             psnFranchiseResults=[];
             psnFranchiseEntries=[];
             groups.forEach((items,index)=>{
-                if(!items.length || (psnFranchiseMembership&&items.length<2))return;
+                if(items.length<2)return;
                 const name=psnFranchiseDefinitions[index][0], normalized=psnFranchiseName(name);
                 psnFranchiseEntries.push({index,name,search:normalized.replace(/ /g,''),letter:window.getPsnAlphabetBucket(normalized),titles:items.length,representative:items.find(game=>String(game.cTag).toLowerCase()==='ps3')||items[0]});
             });
-            host.replaceChildren(document.getElementById('psn-franchise-empty'));status.hidden=indexReady;
-            if(!indexReady)status.textContent='Franchise index unavailable. Showing experimental groups.';
+            host.replaceChildren(document.getElementById('psn-franchise-empty'));status.hidden=true;
             psnFranchiseRenderedGroups=groups;
             psnFranchiseFilter();
         } catch (_) {
-            status.hidden=false;status.textContent='Franchises unavailable. ';
-            const retry=document.createElement('button');retry.type='button';retry.className='btn-mini';retry.textContent='Retry';retry.onclick=psnFranchisePopulate;status.append(retry);
+            status.hidden=false;status.textContent=psnFranchiseMembership?'Franchises unavailable. ':'Franchise index unavailable. ';
+            const retry=document.createElement('button');retry.type='button';retry.className='btn-mini';retry.textContent='Retry';retry.onclick=()=>{psnFranchiseIndexRetryAt=0;psnFranchisePopulate();};status.append(retry);
         } finally { delete host.dataset.loading; }
     }
     function psnFranchiseAddRelated(body,game,category) {
