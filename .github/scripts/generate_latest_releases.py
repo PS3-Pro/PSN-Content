@@ -1,4 +1,5 @@
 import datetime
+import filecmp
 import json
 import os
 import re
@@ -46,13 +47,12 @@ def read_valid_latest_items(latest_path):
         return []
 
     with open(latest_path, "r", encoding="utf-8") as file:
-        lines = file.readlines()
-
-    valid_items = []
-    for line in lines[1:]:
-        parts = line.rstrip("\r\n").split("\t")
-        if is_valid_item(parts):
-            valid_items.append(line if line.endswith("\n") else line + "\n")
+        next(file, None)
+        valid_items = []
+        for line in file:
+            parts = line.rstrip("\r\n").split("\t")
+            if is_valid_item(parts):
+                valid_items.append(line if line.endswith("\n") else line + "\n")
 
     return valid_items
 
@@ -111,20 +111,30 @@ def build_catalog_event(parts, added_at_ms, source, event_type):
     }
 
 
-def read_json(path, default):
+def read_json(path, default, *, strict=False):
     try:
         with open(path, "r", encoding="utf-8") as file:
             value = json.load(file)
         return value
+    except FileNotFoundError:
+        return default
     except (OSError, ValueError, TypeError):
+        if strict:
+            raise
         return default
 
 
 def write_json(path, value):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="\n") as file:
-        json.dump(value, file, ensure_ascii=False, indent=2, sort_keys=False)
-        file.write("\n")
+    temporary = path + ".tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8", newline="\n") as file:
+            json.dump(value, file, ensure_ascii=False, indent=2, sort_keys=False)
+            file.write("\n")
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def get_event_month(added_at_ms):
@@ -151,7 +161,7 @@ def load_seen_event_keys(events_dir):
     # First migration: reconstruct the dedupe set from any existing monthly shards.
     seen = set()
     for path in iter_event_month_files(events_dir):
-        payload = read_json(path, {})
+        payload = read_json(path, {}, strict=True)
         for event in payload.get("events", []) if isinstance(payload, dict) else []:
             key = str(event.get("key", "")).strip().upper()
             if key:
@@ -162,9 +172,15 @@ def load_seen_event_keys(events_dir):
 def write_seen_event_keys(events_dir, seen):
     os.makedirs(events_dir, exist_ok=True)
     path = os.path.join(events_dir, EVENT_SEEN_NAME)
-    with open(path, "w", encoding="utf-8", newline="\n") as file:
-        for key in sorted({str(value).strip().upper() for value in seen if str(value).strip()}):
-            file.write(key + "\n")
+    temporary = path + ".tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8", newline="\n") as file:
+            for key in sorted({str(value).strip().upper() for value in seen if str(value).strip()}):
+                file.write(key + "\n")
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def rebuild_event_index(events_dir, event_type, updated_at_ms, tracking_started_at_ms=0):
@@ -176,7 +192,7 @@ def rebuild_event_index(events_dir, event_type, updated_at_ms, tracking_started_
     latest_event_at = 0
 
     for path in iter_event_month_files(events_dir):
-        payload = read_json(path, {})
+        payload = read_json(path, {}, strict=True)
         events = payload.get("events", []) if isinstance(payload, dict) else []
         valid_times = [
             int(event.get("addedAt", 0) or 0)
@@ -234,18 +250,11 @@ def append_catalog_events(events_dir, event_type, events, seen, tracking_started
             "type": event_type,
             "month": month_id,
             "events": [],
-        })
-        if not isinstance(payload, dict):
-            payload = {
-                "schemaVersion": EVENT_SCHEMA_VERSION,
-                "type": event_type,
-                "month": month_id,
-                "events": [],
-            }
+        }, strict=True)
+        if not isinstance(payload, dict) or not isinstance(payload.get("events"), list):
+            raise ValueError(f"Invalid event shard: {path}")
 
-        existing = payload.get("events", [])
-        if not isinstance(existing, list):
-            existing = []
+        existing = payload["events"]
 
         existing_keys = {
             str(item.get("key", "")).strip().upper()
@@ -301,20 +310,15 @@ def process_latest(old_path, new_path, latest_path, events_dir="", category="", 
     event_type = EVENT_TYPES.get(category_key, "")
     is_event_source = bool(event_type and events_dir)
 
-    old_ids = set()
-    if os.path.exists(old_path):
-        with open(old_path, "r", encoding="utf-8") as file:
-            for line in file:
-                parts = line.rstrip("\r\n").split("\t")
-                item_id = normalize_event_key(parts) if event_type else get_item_id(parts)
-                if item_id:
-                    old_ids.add(item_id)
-
+    identical = (os.path.isfile(old_path) and os.path.isfile(new_path)
+                 and filecmp.cmp(old_path, new_path, shallow=False))
     seen_event_keys = None
     if is_event_source:
         os.makedirs(events_dir, exist_ok=True)
-        seen_event_keys = load_seen_event_keys(events_dir)
-        if not os.path.exists(os.path.join(events_dir, EVENT_SEEN_NAME)):
+        needs_seed = not os.path.exists(os.path.join(events_dir, EVENT_SEEN_NAME))
+        if needs_seed or not identical:
+            seen_event_keys = load_seen_event_keys(events_dir)
+        if needs_seed:
             seed_catalog_events_from_latest(
                 events_dir,
                 event_type,
@@ -328,42 +332,63 @@ def process_latest(old_path, new_path, latest_path, events_dir="", category="", 
                 write_seen_event_keys(events_dir, seen_event_keys)
                 rebuild_event_index(events_dir, event_type, now_ms, now_ms)
 
+    old_ids = set()
+    if not identical:
+        if os.path.exists(old_path):
+            with open(old_path, "r", encoding="utf-8") as file:
+                for line in file:
+                    parts = line.rstrip("\r\n").split("\t")
+                    item_id = normalize_event_key(parts) if event_type else get_item_id(parts)
+                    if item_id:
+                        old_ids.add(item_id)
+
     header = ""
     new_items = []
-    new_event_parts = []
+    new_events = []
+    pending_event_keys = set()
     if os.path.exists(new_path):
         with open(new_path, "r", encoding="utf-8") as file:
-            lines = file.readlines()
+            header = next(file, "")
+            for line in (() if identical else file):
+                parts = line.rstrip("\r\n").split("\t")
+                if not is_valid_item(parts):
+                    continue
+                item_id = normalize_event_key(parts) if event_type else get_item_id(parts)
+                if item_id and item_id not in old_ids:
+                    while len(parts) < 11:
+                        parts.append("")
+                    if is_event_source:
+                        event_key = item_id.upper()
+                        if event_key not in seen_event_keys and event_key not in pending_event_keys:
+                            event = build_catalog_event(parts, now_ms, source, event_type)
+                            if event:
+                                new_events.append(event)
+                                pending_event_keys.add(event_key)
+                    if len(new_items) < LATEST_LIMIT:
+                        parts.append(current_date)
+                        new_items.append("\t".join(parts) + "\n")
+                    elif not event_type:
+                        break
 
-        if lines:
-            header = lines[0]
-
-        for line in lines[1:]:
-            parts = line.rstrip("\r\n").split("\t")
-            if not is_valid_item(parts):
-                continue
-            item_id = normalize_event_key(parts) if event_type else get_item_id(parts)
-            if item_id and item_id not in old_ids:
-                while len(parts) < 11:
-                    parts.append("")
-                if event_type:
-                    new_event_parts.append(list(parts))
-                parts.append(current_date)
-                new_items.append("\t".join(parts) + "\n")
-
-    if is_event_source and seen_event_keys is not None and new_event_parts:
-        events = [
-            build_catalog_event(parts, now_ms, source, event_type)
-            for parts in new_event_parts
-        ]
-        append_catalog_events(events_dir, event_type, events, seen_event_keys, now_ms)
+    if new_events:
+        append_catalog_events(events_dir, event_type, new_events, seen_event_keys, now_ms)
 
     existing_latest = read_valid_latest_items(latest_path)
     combined_latest = (new_items + existing_latest)[:LATEST_LIMIT]
     if header:
-        with open(latest_path, "w", encoding="utf-8", newline="") as file:
-            file.write(header if header.endswith("\n") else header + "\n")
-            file.writelines(combined_latest)
+        encoded = (header if header.endswith("\n") else header + "\n") + "".join(combined_latest)
+        if os.path.exists(latest_path):
+            with open(latest_path, "r", encoding="utf-8", newline="") as file:
+                if file.read() == encoded:
+                    return
+        temporary = latest_path + ".tmp"
+        try:
+            with open(temporary, "w", encoding="utf-8", newline="") as file:
+                file.write(encoded)
+            os.replace(temporary, latest_path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
 
 if __name__ == "__main__":

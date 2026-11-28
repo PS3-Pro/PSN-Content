@@ -15,6 +15,7 @@ concurrency:
 
 jobs:
   update-server:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
     defaults:
@@ -25,7 +26,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Detect latest official Node.js LTS
         id: node_lts
@@ -176,5 +177,20 @@ jobs:
           fi
 
           git commit -m "Auto-update: Validated server LTS runtime and dependencies"
-          git pull --rebase origin main
-          git push origin main
+          published=false
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              published=true
+              break
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              sleep "$((attempt * 3))"
+              if [ "$(git rev-parse --is-shallow-repository)" = true ]; then
+                git fetch --unshallow origin main || exit 1
+              else
+                git fetch origin main || exit 1
+              fi
+              git rebase FETCH_HEAD || exit 1
+            fi
+          done
+          if [ "$published" != true ]; then exit 1; fi

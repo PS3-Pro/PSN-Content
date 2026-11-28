@@ -1082,6 +1082,7 @@ EXTERNAL_AVATAR_REPOS = [
 ]
 
 _EXTERNAL_FILE_LIST_CACHE: dict[str, list[str]] = {}
+_EXTERNAL_MATCH_CACHE: dict[tuple[str, ...], dict[str, list[tuple[int, str]]]] = {}
 
 
 def normalize_lookup_text(value: str) -> str:
@@ -1285,18 +1286,15 @@ def find_external_avatar_cover(
         if not paths:
             continue
 
-        candidates: list[tuple[int, str]] = []
-
-        for path in paths:
-            external_stem = normalize_external_match_name(path)
-
-            for match_name in match_names:
-                if external_stem == match_name:
-                    score = 1000
-                    if path.lower().endswith(".png"):
-                        score += 5
-                    candidates.append((score, path))
-                    break
+        cache_key = (repo, branch, repo_info.get("png_prefix", ""), repo_info.get("list_path", ""))
+        if cache_key not in _EXTERNAL_MATCH_CACHE:
+            lookup = {}
+            for position, path in enumerate(paths):
+                lookup.setdefault(normalize_external_match_name(path), []).append((position, path))
+            _EXTERNAL_MATCH_CACHE[cache_key] = lookup
+        lookup = _EXTERNAL_MATCH_CACHE[cache_key]
+        matches = sorted({item for name in match_names for item in lookup.get(name, ())})
+        candidates = [(1005 if path.lower().endswith(".png") else 1000, path) for _, path in matches]
 
         if not candidates:
             log(f"[EXT ] No external PSNA match in {label} for {', '.join(match_names)}")

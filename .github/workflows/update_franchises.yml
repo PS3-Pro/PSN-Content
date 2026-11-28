@@ -17,13 +17,14 @@ concurrency:
   cancel-in-progress: false
 jobs:
   update:
-    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository))
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
           ref: main
+          fetch-depth: 1
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -31,7 +32,9 @@ jobs:
         uses: actions/cache/restore@v4
         continue-on-error: true
         with:
-          path: .cache/franchises-igdb-v1/games.json.gz
+          path: |
+            .cache/franchises-igdb-v1/games.json.gz
+            .cache/franchises-igdb-v1/games.checkpoint.json.gz
           key: ${{ runner.os }}-franchises-igdb-v1-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             ${{ runner.os }}-franchises-igdb-v1-
@@ -60,6 +63,15 @@ jobs:
           path: ${{ runner.temp }}/franchise-diagnostics/
           if-no-files-found: ignore
           retention-days: 14
+      - name: Save IGDB metadata cache
+        if: ${{ !cancelled() && hashFiles('.cache/franchises-igdb-v1/games.json.gz') != '' }}
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: |
+            .cache/franchises-igdb-v1/games.json.gz
+            .cache/franchises-igdb-v1/games.checkpoint.json.gz
+          key: ${{ runner.os }}-franchises-igdb-v1-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Commit index only if changed
         run: |
           git config user.name 'PS3-Pro Bot'
@@ -67,11 +79,20 @@ jobs:
           git add resources/database/helpers/franchises.json
           if git diff --cached --quiet; then exit 0; fi
           git commit -m 'Update franchise index'
-          git pull --rebase origin main
-          git push origin HEAD:main
-      - name: Save IGDB metadata cache
-        uses: actions/cache/save@v4
-        continue-on-error: true
-        with:
-          path: .cache/franchises-igdb-v1/games.json.gz
-          key: ${{ runner.os }}-franchises-igdb-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          published=false
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              published=true
+              break
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              sleep "$((attempt * 3))"
+              if [ "$(git rev-parse --is-shallow-repository)" = true ]; then
+                git fetch --unshallow origin main || exit 1
+              else
+                git fetch origin main || exit 1
+              fi
+              git rebase FETCH_HEAD || exit 1
+            fi
+          done
+          if [ "$published" != true ]; then exit 1; fi

@@ -1,50 +1,94 @@
 name: Update Manual Indexes
+
 on:
-  schedule:
-    - cron: '30 5 * * 1'
   workflow_dispatch:
+  workflow_run:
+    workflows: ['Update PSN™ Database']
+    types: [completed]
+    branches: [main]
+
 permissions:
   contents: write
   pages: write
+
 concurrency:
-  group: update-manual-indexes
+  group: ps3-manual-index
   cancel-in-progress: false
+
 jobs:
   update-manuals:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository))
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 55
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
           ref: main
-          fetch-depth: 0
-      - uses: actions/setup-python@v5
+          fetch-depth: 1
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Generate and validate public manual indexes
+      - name: Restore unified manual cache
+        id: restore
+        uses: actions/cache/restore@v4
+        continue-on-error: true
+        with:
+          path: .cache/manual-index/
+          key: manuals-unified-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: manuals-unified-v2-
+      - name: Restore legacy PS3 scan state
+        if: steps.restore.outputs.cache-matched-key == ''
+        uses: actions/cache/restore@v4
+        continue-on-error: true
+        with:
+          path: .cache/ps3-manual-index/state.json
+          key: ps3-manuals-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ps3-manuals-v2-
+      - name: Index public game manuals
+        id: index
+        continue-on-error: true
         run: python .github/scripts/build-manual-index.py resources/database/manuals
-      - name: Commit and push indexes
+      - name: Commit and push validated indexes
         id: publish
         run: |
-          git config user.name 'PS3-Pro Bot'
-          git config user.email 'bot@ps3pro.com'
-          git add -- 'resources/database/manuals/*.json'
+          for platform in ps1 ps2 ps3 ps4 psp psvita; do
+            index="resources/database/manuals/$platform.json"
+            if [ -f "$index" ]; then git add -- "$index"; fi
+          done
           if git diff --cached --quiet; then
             echo 'changed=false' >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git commit -m 'Auto-update: manual indexes'
+          git config user.name 'PS3-Pro Bot'
+          git config user.email 'bot@ps3pro.com'
+          git commit -m 'Auto-update: game manuals index'
+          published=false
           for attempt in 1 2 3; do
-            git fetch origin main
-            git rebase origin/main
             if git push origin HEAD:main; then
-              echo 'changed=true' >> "$GITHUB_OUTPUT"
-              exit 0
+              published=true
+              break
             fi
-            sleep 5
+            if [ "$attempt" -lt 3 ]; then
+              sleep "$((attempt * 3))"
+              if [ "$(git rev-parse --is-shallow-repository)" = true ]; then
+                git fetch --unshallow origin main || exit 1
+              else
+                git fetch origin main || exit 1
+              fi
+              git rebase FETCH_HEAD || exit 1
+            fi
           done
-          exit 1
+          if [ "$published" != true ]; then exit 1; fi
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+      - name: Save unified manual cache
+        if: ${{ !cancelled() && steps.publish.outcome == 'success' }}
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: .cache/manual-index/
+          key: manuals-unified-v2-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Request GitHub Pages build
         if: steps.publish.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
         env:
@@ -53,3 +97,6 @@ jobs:
           if ! gh api --method POST "repos/$GITHUB_REPOSITORY/pages/builds"; then
             echo '::warning::Indexes committed; Pages build could not be requested.'
           fi
+      - name: Report incomplete refresh
+        if: steps.index.outcome == 'failure'
+        run: exit 1

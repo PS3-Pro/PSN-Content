@@ -32,12 +32,20 @@ permissions:
   contents: write
   actions: write
 
+concurrency:
+  group: update-avatar-covers-main
+  cancel-in-progress: false
+
 jobs:
   generate-avatar-covers:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -47,7 +55,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pycryptodomex pillow pillow
+          pip install pycryptodomex pillow
 
       - name: Generate avatar covers
         env:
@@ -96,5 +104,21 @@ jobs:
             echo "No new avatar PNGs to commit."
           else
             git commit -m "Auto-update: Generate avatar covers"
-            git push
+            published=false
+            for attempt in 1 2 3; do
+              if git push origin HEAD:main; then
+                published=true
+                break
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                sleep "$((attempt * 3))"
+                if [ "$(git rev-parse --is-shallow-repository)" = true ]; then
+                  git fetch --unshallow origin main || exit 1
+                else
+                  git fetch origin main || exit 1
+                fi
+                git rebase FETCH_HEAD || exit 1
+              fi
+            done
+            if [ "$published" != true ]; then exit 1; fi
           fi

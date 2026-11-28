@@ -5,21 +5,35 @@ on:
     workflows: ["Update PSN™ Database"]
     types:
       - completed
+    branches: [main]
   push:
+    branches: [main]
     paths:
       - 'resources/database/covers/compressed/**'
       - 'resources/database/content/official/**'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
+concurrency:
+  group: update-covers-index-main
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
-    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository && github.event.workflow_run.head_branch == 'main'))
     steps:
       - name: Checkout PSN-Content
         uses: actions/checkout@v3
         with:
           path: PSN-Content
+          ref: main
+          fetch-depth: 1
 
       - name: Checkout Recently-Played-Games (Repositório de Hashes)
         uses: actions/checkout@v3
@@ -45,5 +59,22 @@ jobs:
           git config --global user.name "PS3-Pro Bot"
           git config --global user.email "bot@ps3pro.com"
           git add resources/database/covers/index.tsv resources/database/covers/blacklist.tsv
-          git commit -m "Auto-update: Covers and Blacklist indexes" || echo "No changes to commit"
-          git push
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "Auto-update: Covers and Blacklist indexes"
+          published=false
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              published=true
+              break
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              sleep "$((attempt * 3))"
+              if [ "$(git rev-parse --is-shallow-repository)" = true ]; then
+                git fetch --unshallow origin main || exit 1
+              else
+                git fetch origin main || exit 1
+              fi
+              git rebase FETCH_HEAD || exit 1
+            fi
+          done
+          if [ "$published" != true ]; then exit 1; fi

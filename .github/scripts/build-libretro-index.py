@@ -2,6 +2,7 @@
 """Build per-system indices using only Libretro GitHub tree listings (no image downloads)."""
 import argparse, collections, gzip, hashlib, http.client, json, os, re, sys, time, unicodedata, urllib.error, urllib.request
 from functools import lru_cache
+from itertools import pairwise
 from pathlib import Path
 
 REPOS={'ps1':['Sony_-_PlayStation'],'ps2':['Sony_-_PlayStation_2'],'ps3':['Sony_-_PlayStation_3','Sony_-_PlayStation_3_Downloadable'],'ps4':['Sony_-_PlayStation_4'],'psp':['Sony_-_PlayStation_Portable'],'psvita':['Sony_-_PlayStation_Vita']}
@@ -105,7 +106,7 @@ def folder_files(repo, folder, sha, cache_dir, force=False):
             files=data.get('files')
             if (data.get('version')==1 and data.get('sha')==sha and isinstance(files,list)
                     and (folder != 'Named_Boxarts' or files)
-                    and all(valid_png(name) for name in files) and files==sorted(set(files))):
+                    and all(valid_png(name) for name in files) and all(a < b for a,b in pairwise(files))):
                 print(f'{repo}/{folder}: unchanged SHA; {len(files)} cached filenames',flush=True)
                 return files
         except (OSError, EOFError, ValueError, AttributeError, TypeError): pass
@@ -147,10 +148,13 @@ def download(repo, cache_dir=CACHE_DIR, force=False, folders=None):
 
 
 def coverage(titles):
-    return {'titles':len(titles), 'front':sum(bool(v.get('front')) for v in titles.values()),
-            'screenshot':sum(bool(v.get('screenshot')) for v in titles.values()),
-            'front rows':sum(len(v.get('front',[])) for v in titles.values()),
-            'screenshot rows':sum(len(v.get('screenshot',[])) for v in titles.values())}
+    front = screenshots = front_rows = screenshot_rows = 0
+    for record in titles.values():
+        n = len(record.get('front', [])); m = len(record.get('screenshot', []))
+        front += bool(n); screenshots += bool(m)
+        front_rows += n; screenshot_rows += m
+    return {'titles':len(titles), 'front':front, 'screenshot':screenshots,
+            'front rows':front_rows, 'screenshot rows':screenshot_rows}
 
 
 def digest(path):

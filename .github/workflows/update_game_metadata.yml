@@ -1,6 +1,8 @@
 name: Update Game Metadata Index
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '40 8 * * 0'
   workflow_run:
     workflows: ['Update PSN™ Database']
     types: [completed]
@@ -13,43 +15,76 @@ concurrency:
 jobs:
   index:
     if: >-
-      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      ((github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && github.ref == 'refs/heads/main') ||
       (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - name: Check cadence
-        id: cadence
-        run: |
-          if [ '${{ github.event_name }}' = 'workflow_dispatch' ] || [ "$(date -u +%u)" = '7' ]; then
-            echo 'run=true' >> "$GITHUB_OUTPUT"
-          fi
       - uses: actions/checkout@v4
-        if: steps.cadence.outputs.run == 'true'
         with:
           ref: main
-          fetch-depth: 0
+          fetch-depth: 1
+      - uses: actions/cache/restore@v4
+        continue-on-error: true
+        with:
+          path: |
+            .cache/game-metadata/*.json.gz
+            .cache/game-metadata/cadence.txt
+          key: game-metadata-v3-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            game-metadata-v3-
+            game-metadata-v2-
+            game-metadata-v1-
+      - name: Check catalog changes or weekly refresh
+        id: cadence
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          fingerprint=$(git ls-tree -r HEAD -- resources/database/content/official/games.tsv resources/database/content/official/pending/games.tsv resources/database/content/official/demos.tsv resources/database/content/official/pending/demos.tsv resources/database/content/external/nostalgia_vault.tsv resources/database/launchbox files/website/modern.html .github/scripts/update_game_metadata.py .github/scripts/generate_franchises.py | sha256sum | cut -d ' ' -f1)
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+          current=missing
+          if [ -f resources/database/helpers/game-metadata.json ]; then
+            current=$(sha256sum resources/database/helpers/game-metadata.json | cut -d ' ' -f1)
+          fi
+          marker=.cache/game-metadata/cadence.txt
+          previous_fingerprint= previous_hash= previous_day=
+          if [ -f "$marker" ]; then
+            read -r previous_fingerprint previous_hash previous_day < "$marker" || true
+          fi
+          today=$(date -u +%F)
+          weekly=false
+          if [ "$EVENT_NAME" = schedule ] || [ "$(date -u +%u)" = 7 ]; then
+            if [ "$previous_day" != "$today" ]; then weekly=true; fi
+          fi
+          if [ "$EVENT_NAME" = workflow_dispatch ] || [ "$weekly" = true ] || [ "$current" = missing ] || [ "$previous_fingerprint $previous_hash" != "$fingerprint $current" ]; then
+            echo 'run=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'run=false' >> "$GITHUB_OUTPUT"
+            echo 'Catalog and published index unchanged; next weekly refresh remains scheduled.'
+          fi
       - uses: actions/setup-python@v5
         if: steps.cadence.outputs.run == 'true'
         with:
           python-version: '3.12'
-      - uses: actions/cache/restore@v4
-        if: steps.cadence.outputs.run == 'true'
-        with:
-          path: .cache/game-metadata/*.json.gz
-          key: game-metadata-v2-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: |
-            game-metadata-v2-
-            game-metadata-v1-
       - name: Build catalog metadata and coverage report
         if: steps.cadence.outputs.run == 'true'
-        run: python .github/scripts/update_game_metadata.py
+        env:
+          CATALOG_FINGERPRINT: ${{ steps.cadence.outputs.fingerprint }}
+        run: |
+          python .github/scripts/update_game_metadata.py
+          index_hash=$(sha256sum resources/database/helpers/game-metadata.json | cut -d ' ' -f1)
+          mkdir -p .cache/game-metadata
+          printf '%s %s %s\n' "$CATALOG_FINGERPRINT" "$index_hash" "$(date -u +%F)" > .cache/game-metadata/cadence.tmp
+          mv .cache/game-metadata/cadence.tmp .cache/game-metadata/cadence.txt
       - uses: actions/cache/save@v4
+        continue-on-error: true
         if: always() && steps.cadence.outputs.run == 'true' && hashFiles('.cache/game-metadata/*.json.gz') != ''
         with:
-          path: .cache/game-metadata/*.json.gz
-          key: game-metadata-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .cache/game-metadata/*.json.gz
+            .cache/game-metadata/cadence.txt
+          key: game-metadata-v3-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Publish index only
         if: steps.cadence.outputs.run == 'true'
         run: |
@@ -58,5 +93,20 @@ jobs:
           git config user.name 'PS3-Pro Bot'
           git config user.email 'bot@ps3pro.com'
           git commit -m 'Auto-update: game metadata index'
-          git pull --rebase origin main
-          git push origin HEAD:main
+          published=false
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              published=true
+              break
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              sleep "$((attempt * 3))"
+              if [ "$(git rev-parse --is-shallow-repository)" = true ]; then
+                git fetch --unshallow origin main || exit 1
+              else
+                git fetch origin main || exit 1
+              fi
+              git rebase FETCH_HEAD || exit 1
+            fi
+          done
+          if [ "$published" != true ]; then exit 1; fi

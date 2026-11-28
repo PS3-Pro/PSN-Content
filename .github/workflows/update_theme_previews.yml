@@ -1,6 +1,10 @@
 name: Update Theme Previews
 
 on:
+  workflow_run:
+    workflows: ['Update PSN™ Database']
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       source:
@@ -35,19 +39,52 @@ permissions:
   contents: write
   actions: write
 
+concurrency:
+  group: update-theme-previews-main
+  cancel-in-progress: false
+
 jobs:
   generate-theme-previews:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && 360 || 45 }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.x"
 
+      - name: Check for missing theme previews
+        id: missing
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+            echo 'run=true' >> "$GITHUB_OUTPUT"
+          else
+            missing=$(python .github/scripts/generate_theme_previews.py --repo . --check-missing)
+            if [ "$missing" = yes ]; then
+              echo 'run=true' >> "$GITHUB_OUTPUT"
+            elif [ "$missing" = no ]; then
+              echo 'run=false' >> "$GITHUB_OUTPUT"
+            else
+              echo 'Unexpected preview preflight response' >&2
+              exit 1
+            fi
+          fi
+
       - name: Install dependencies
+        if: steps.missing.outputs.run == 'true'
         shell: bash
         run: |
           sudo apt-get update -qq
@@ -56,8 +93,9 @@ jobs:
           pip install pycryptodomex pillow
 
       - name: Generate theme previews
+        if: steps.missing.outputs.run == 'true'
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
           SOURCE_TO_PROCESS: ${{ github.event.inputs.source }}
           TITLE_ID: ${{ github.event.inputs.title_id }}
           CONTENT_ID: ${{ github.event.inputs.content_id }}
@@ -66,6 +104,10 @@ jobs:
         shell: bash
         run: |
           args=(--repo . --source "${SOURCE_TO_PROCESS:-all}" --download-dir "$RUNNER_TEMP/theme_pkgs")
+
+          if [[ "$EVENT_NAME" == workflow_run ]]; then
+            args+=(--auto-batch 8)
+          fi
 
           if [[ "${OVERWRITE:-false}" == "true" ]]; then
             args+=(--overwrite)
@@ -100,16 +142,35 @@ jobs:
           fi
 
       - name: Commit generated theme PNGs only
+        if: steps.missing.outputs.run == 'true'
         shell: bash
         run: |
           git config --global user.name "PS3-Pro Bot"
           git config --global user.email "bot@ps3pro.com"
 
-          git add resources/database/themes
+          pathspec=':(glob)resources/database/themes/**/*.png'
+          if [ -z "$(git ls-files --cached --others --exclude-standard -- "$pathspec")" ]; then exit 0; fi
+          git add -- "$pathspec"
 
           if git diff --cached --quiet; then
             echo "No new theme previews to commit."
           else
             git commit -m "Auto-update: Generate theme previews"
-            git push
+            published=false
+            for attempt in 1 2 3; do
+              if git push origin HEAD:main; then
+                published=true
+                break
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                sleep "$((attempt * 3))"
+                if [ "$(git rev-parse --is-shallow-repository)" = true ]; then
+                  git fetch --unshallow origin main || exit 1
+                else
+                  git fetch origin main || exit 1
+                fi
+                git rebase FETCH_HEAD || exit 1
+              fi
+            done
+            if [ "$published" != true ]; then exit 1; fi
           fi

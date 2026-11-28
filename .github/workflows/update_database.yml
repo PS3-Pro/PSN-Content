@@ -5,12 +5,23 @@ on:
     - cron: '0 3 * * *'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
+concurrency:
+  group: update-database-main
+  cancel-in-progress: false
+
 jobs:
   update-database:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
@@ -48,6 +59,39 @@ jobs:
             ' "$1" > "$2"
           }
 
+          validate_tsv() {
+            python - "$1" "$2" "$3" <<'PY'
+          import filecmp
+          import re
+          import sys
+          from pathlib import Path
+
+          new, old = map(Path, sys.argv[1:3])
+          official = sys.argv[3] == 'official'
+
+          def inspect(path):
+              with path.open(encoding='utf-8-sig', newline='') as handle:
+                  header = next(handle, '').rstrip('\r\n').split('\t')
+                  if len(header) < 4 or re.sub(r'[^a-z]', '', header[0].lower()) != 'titleid':
+                      raise ValueError(f'Invalid TSV header: {path}')
+                  count = 0
+                  for line in handle:
+                      if not line.strip():
+                          continue
+                      if len(line.rstrip('\r\n').split('\t', 4)) < 4:
+                          raise ValueError(f'Invalid TSV row: {path}')
+                      count += 1
+                  return count
+
+          count = inspect(new)
+          if official:
+              previous = (count if filecmp.cmp(new, old, shallow=False) else inspect(old)) if old.exists() else 0
+              if not count or count < previous * .85:
+                  raise ValueError(f'Unexpected official catalog reduction: {new} ({previous} -> {count})')
+          print(f'Validated {new}: {count} rows')
+          PY
+          }
+
           mkdir -p "$BASE_DIR/pending"
           mkdir -p "$LATEST_DIR"
           mkdir -p "$EVENTS_DIR/dlcs" "$EVENTS_DIR/avatars" "$EVENTS_DIR/themes"
@@ -63,19 +107,29 @@ jobs:
             esac
 
             URL_OFFICIAL="https://nopaystation.com/tsv/PS3_${cat^^}.tsv"
-            curl -L "$URL_OFFICIAL" -o "nps_raw.tsv"
+            curl --fail --silent --show-error --location --retry 3 --connect-timeout 20 --max-time 180 "$URL_OFFICIAL" -o "nps_raw.tsv"
 
             clean_tsv "nps_raw.tsv" "nps_clean.tsv"
+            validate_tsv "nps_clean.tsv" "$BASE_DIR/${cat}.tsv" official
 
             python "$PY_SCRIPT" "$BASE_DIR/${cat}.tsv" "nps_clean.tsv" "$LATEST_DIR/latest_${cat}.tsv" "$EVENT_DIR" "$cat" "official"
-            mv "nps_clean.tsv" "$BASE_DIR/${cat}.tsv"
+            if cmp -s "nps_clean.tsv" "$BASE_DIR/${cat}.tsv"; then
+              rm "nps_clean.tsv"
+            else
+              mv "nps_clean.tsv" "$BASE_DIR/${cat}.tsv"
+            fi
             rm "nps_raw.tsv"
 
-            curl -L "https://nopaystation.com/tsv/pending/PS3_${cat^^}.tsv" -o "p_raw.tsv"
+            curl --fail --silent --show-error --location --retry 3 --connect-timeout 20 --max-time 180 "https://nopaystation.com/tsv/pending/PS3_${cat^^}.tsv" -o "p_raw.tsv"
             clean_tsv "p_raw.tsv" "p_clean.tsv"
+            validate_tsv "p_clean.tsv" "$BASE_DIR/pending/${cat}.tsv" pending
 
             python "$PY_SCRIPT" "$BASE_DIR/pending/${cat}.tsv" "p_clean.tsv" "$LATEST_DIR/latest_${cat}.tsv" "$EVENT_DIR" "$cat" "pending"
-            mv "p_clean.tsv" "$BASE_DIR/pending/${cat}.tsv"
+            if cmp -s "p_clean.tsv" "$BASE_DIR/pending/${cat}.tsv"; then
+              rm "p_clean.tsv"
+            else
+              mv "p_clean.tsv" "$BASE_DIR/pending/${cat}.tsv"
+            fi
             rm "p_raw.tsv"
           done
 
@@ -270,5 +324,22 @@ jobs:
           git add resources/database/helpers/child_content_index.tsv
           git add resources/database/helpers/base_game_index.tsv
 
-          git diff-index --quiet HEAD || git commit -m "Auto-update: Synchronized with NoPayStation (Official & Pending)"
-          git push
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "Auto-update: Synchronized with NoPayStation (Official & Pending)"
+          published=false
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              published=true
+              break
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              sleep "$((attempt * 3))"
+              if [ "$(git rev-parse --is-shallow-repository)" = true ]; then
+                git fetch --unshallow origin main || exit 1
+              else
+                git fetch origin main || exit 1
+              fi
+              git rebase FETCH_HEAD || exit 1
+            fi
+          done
+          if [ "$published" != true ]; then exit 1; fi

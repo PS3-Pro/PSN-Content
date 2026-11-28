@@ -28,6 +28,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 import urllib.request
 import zipfile
@@ -40,8 +41,11 @@ try:
     from Cryptodome.Cipher import AES
     from Cryptodome.Util import Counter
 except ImportError:  # Allows running with pycryptodome too.
-    from Crypto.Cipher import AES
-    from Crypto.Util import Counter
+    try:
+        from Crypto.Cipher import AES
+        from Crypto.Util import Counter
+    except ImportError:
+        AES = Counter = None
 
 try:
     from PIL import Image
@@ -73,9 +77,9 @@ def download_file(url: str, dest: Path, log: Callable[[str], None]) -> None:
     tmp = dest.with_suffix(dest.suffix + ".part")
 
     headers = {"User-Agent": "PS3-Pro-Theme-Preview-Generator/1.0"}
-    token = os.environ.get("GITHUB_TOKEN")
-    if token and "api.github.com" in url:
-        headers["Authorization"] = f"Bearer {token}"
+    target = urllib.parse.urlsplit(url)
+    if target.scheme not in ("https", "http") or not target.hostname or target.username or target.password:
+        raise ValueError("Invalid package URL")
 
     request = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(request, timeout=120) as response, tmp.open("wb") as out:
@@ -907,8 +911,7 @@ def select_preview_image(root: Path) -> Path | None:
     if not candidates:
         return None
 
-    candidates.sort(key=lambda p: score_preview_candidate(p), reverse=True)
-    return candidates[0]
+    return max(candidates, key=score_preview_candidate)
 
 
 def save_as_png(src: Path, dest: Path) -> None:
@@ -1069,6 +1072,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--title-id", action="append", help="Only process this Title ID/game ID. Can be used more than once.")
     parser.add_argument("--content-id", action="append", help="Only process this Content ID. Can be used more than once.")
     parser.add_argument("--limit", type=int, default=0, help="Limit how many entries are processed. 0 means no limit.")
+    parser.add_argument("--check-missing", action="store_true", help="Print yes/no without downloads or third-party dependencies.")
+    parser.add_argument("--auto-batch", type=int, default=0, help="Process a bounded batch of missing previews, rotating older failures.")
     parser.add_argument("--start", type=int, default=0, help="Skip the first N matching entries.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing PNG files.")
     parser.add_argument("--redownload", action="store_true", help="Download PKGs again even when they already exist in cache.")
@@ -1078,13 +1083,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def missing_previews(entries, output_root, deduplicate=True, limit=None):
+    result = []
+    seen = set()
+    for entry in entries:
+        path = output_root / safe_filename(fixed_title_id(entry)) / f"{safe_filename(entry.content_id)}.png"
+        if path.is_file() or (deduplicate and path in seen):
+            continue
+        seen.add(path)
+        result.append(entry)
+        if limit is not None and len(result)>=limit:
+            break
+    return result
+
+
+def auto_batch_entries(entries, limit, day=None):
+    if len(entries) <= limit:
+        return entries
+    # Give recently dated items priority, but rotate the backlog so failures
+    # do not indefinitely prevent new attempts on other themes.
+    count = min(2, limit // 2)
+    latest = sorted(entries, key=lambda e: (e.date, e.content_id), reverse=True)[:count]
+    reserved = {id(e) for e in latest}
+    backlog = sorted((e for e in entries if id(e) not in reserved), key=lambda e: (e.content_id, e.title_id))
+    size = limit - count
+    offset = ((int(time.time()) // 86400 if day is None else day) * size) % len(backlog)
+    return latest + backlog[offset:offset + size] + backlog[:max(0, offset + size - len(backlog))]
+
+
 def main() -> int:
     args = build_arg_parser().parse_args()
     repo = args.repo.resolve()
-
-    if Image is None:
-        print("ERROR: Pillow is required. Install with: pip install pillow", file=sys.stderr)
-        return 2
 
     if args.tsv:
         tsv_paths = args.tsv
@@ -1103,13 +1132,6 @@ def main() -> int:
     output_root = (args.output or repo / "resources/database/themes").resolve()
     download_dir = (args.download_dir or repo / ".cache/theme_pkgs").resolve()
 
-    print(f"Repo: {repo}")
-    print(f"Output: {output_root}")
-    print(f"Temporary PKG folder: {download_dir}")
-    print("TSV:")
-    for path in tsv_paths:
-        print(f"  - {path}")
-
     entries = read_all_entries(tsv_paths)
 
     title_filter = {x.upper() for x in args.title_id or []}
@@ -1123,6 +1145,27 @@ def main() -> int:
         entries = entries[args.start :]
     if args.limit > 0:
         entries = entries[: args.limit]
+
+    if args.auto_batch < 0:
+        raise SystemExit('--auto-batch must be nonnegative')
+    if args.check_missing or args.auto_batch:
+        entries = missing_previews(entries, output_root, limit=1 if args.check_missing else None)
+        if args.check_missing:
+            print('yes' if entries else 'no')
+            return 0
+        entries = auto_batch_entries(entries, args.auto_batch)
+    elif not args.overwrite:
+        entries = missing_previews(entries, output_root, deduplicate=False)
+    if entries and (Image is None or AES is None):
+        print("ERROR: Pillow and pycryptodomex are required.", file=sys.stderr)
+        return 2
+
+    print(f"Repo: {repo}")
+    print(f"Output: {output_root}")
+    print(f"Temporary PKG folder: {download_dir}")
+    print("TSV:")
+    for path in tsv_paths:
+        print(f"  - {path}")
 
     print(f"Entries to process: {len(entries)}")
     if not entries:

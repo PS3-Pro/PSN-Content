@@ -495,12 +495,15 @@ def discovery_rows(platform, archive):
     missing = 0
     requests = 0
     for ident,(key,region) in eligible:
-        if archive.cached(ident) is None:
+        files = archive.cached(ident)
+        if files is None:
             if requests >= DISCOVERY_BUDGET:
                 missing += 1
                 continue
             requests += 1
-        files = archive.pdfs(ident)
+            files = archive.pdfs(ident)
+        else:
+            archive.hits += 1
         # Multiple PDFs can be different editions or supplements. Do not guess.
         if len(files)==1:
             add(rows,ident,*files[0],key,region)

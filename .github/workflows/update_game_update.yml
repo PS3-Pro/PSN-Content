@@ -5,22 +5,69 @@ on:
     - cron: '0 3 * * *'
   workflow_dispatch:
 
+permissions:
+  contents: write
+concurrency:
+  group: game-updates-index
+  cancel-in-progress: false
 jobs:
   build:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
+          python-version: '3.12'
 
       - name: Install Dependencies
         run: pip install requests
 
+      - name: Restore update XML cache
+        uses: actions/cache/restore@v4
+        continue-on-error: true
+        with:
+          path: .cache/game-updates/
+          key: game-updates-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: game-updates-v1-
+
+      - name: Record restored cache state
+        id: cache_before
+        run: |
+          mkdir -p .cache/game-updates
+          fingerprint=$(find .cache/game-updates -type f -printf '%p %s %T@ %i\n' | LC_ALL=C sort | sha256sum | cut -d ' ' -f1)
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+
       - name: Generate TSV
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: python .github/scripts/generate_updates.py
+
+      - name: Detect cache changes
+        id: cache_after
+        if: ${{ !cancelled() && steps.cache_before.outcome == 'success' }}
+        env:
+          PREVIOUS: ${{ steps.cache_before.outputs.fingerprint }}
+        run: |
+          fingerprint=$(find .cache/game-updates -type f -printf '%p %s %T@ %i\n' | LC_ALL=C sort | sha256sum | cut -d ' ' -f1)
+          if [ "$fingerprint" != "$PREVIOUS" ] && { [ -f .cache/game-updates/rows.json.gz ]; }; then
+            echo 'changed=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save update XML cache
+        if: ${{ !cancelled() && steps.cache_after.outputs.changed == 'true' }}
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: .cache/game-updates/
+          key: game-updates-v1-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Commit Changes
         run: |
@@ -31,4 +78,20 @@ jobs:
             exit 0
           fi
           git commit -m "Auto-update: Game Updates Database"
-          git push
+          published=false
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              published=true
+              break
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              sleep "$((attempt * 3))"
+              if [ "$(git rev-parse --is-shallow-repository)" = true ]; then
+                git fetch --unshallow origin main || exit 1
+              else
+                git fetch origin main || exit 1
+              fi
+              git rebase FETCH_HEAD || exit 1
+            fi
+          done
+          if [ "$published" != true ]; then exit 1; fi

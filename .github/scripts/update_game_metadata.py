@@ -9,6 +9,7 @@ import os
 import re
 import time
 import unicodedata
+import generate_franchises as franchise
 from collections import defaultdict, Counter
 from functools import lru_cache
 from pathlib import Path
@@ -19,10 +20,11 @@ from urllib.error import HTTPError, URLError
 ROOT = Path('.')
 INDEX = Path('resources/database/helpers/game-metadata.json')
 CACHE = Path('.cache/game-metadata/igdb.json.gz')
-PLATFORMS = {'ps3': 9, 'ps2': 8, 'psx': 7, 'psp': 38, 'minis': 38, 'pce': 86, 'neogeo': 80}
-FIELDS = 'name,alternative_names.name,platforms,category,genres.name,themes.name,involved_companies.company.name,involved_companies.developer,involved_companies.publisher,release_dates.platform,release_dates.date,release_dates.category,release_dates.region,release_dates.date_format.format,release_dates.release_region.region,release_dates.human,release_dates.y,summary,aggregated_rating_count,screenshots,artworks,cover,game_modes'
+PLATFORMS = {tag:set(ids) for tag,ids in franchise.PLATFORMS.items()}
+PSN_SOURCES = {36}
+FIELDS = 'name,alternative_names.name,platforms,category,game_type.type,game_localizations.name,external_games.uid,external_games.external_game_source,external_games.platform,external_games.url,genres.name,themes.name,involved_companies.company.name,involved_companies.developer,involved_companies.publisher,release_dates.platform,release_dates.date,release_dates.category,release_dates.region,release_dates.date_format.format,release_dates.release_region.region,release_dates.human,release_dates.y,summary,aggregated_rating_count,screenshots,artworks,cover,game_modes'
 TTL = 30 * 86400
-IGDB_CACHE_VERSION = 4
+IGDB_CACHE_VERSION = 5
 IGDB_FULL_REFRESH = 30 * 86400
 IGDB_UPDATE_OVERLAP = 3600
 REGION_ALIASES = {
@@ -87,44 +89,26 @@ def title_key(value):
 
 
 def platform(tid, name, cid):
-    if 'NEOGEOSTATION' in cid.upper(): return 'neogeo'
-    for pattern, tag in [(r'\(\s*PS2[^)]*\)|\bPS2\s*CLASSICS?\b','ps2'),(r'\(\s*PS[1X]\s*\)|\bPSONE\b','psx'),(r'\(\s*MINIS?\s*\)','minis'),(r'\(\s*PSP\s*\)','psp'),(r'\(\s*(?:PC\s*ENGINE|TURBO\s*GRAFX[^)]*)\)','pce'),(r'\bNEO\s*GEO(?:\s*STATION)?\b','neogeo')]:
-        if re.search(pattern,name,re.I): return tag
-    if tid[:2] in ('UC','UL'): return 'psp'
-    if tid[:2] in ('SC','SL'): return 'ps2'
-    if tid.startswith('NP'):
-        r,t = tid[2:4]
-        if t in 'ZX': return 'minis'
-        if tid.startswith('NPUF') or tid.startswith('NPJJ3'): return 'pce'
-        if t in 'GH': return 'psp'
-        if t in 'DC': return 'ps2'
-        if t in {'U':'JFI','J':'JI','E':'FE'}.get(r,''): return 'psx'
-        if re.search(r'\bNEO\s*GEO\b|NEOGEO',name,re.I): return 'neogeo'
-    return 'ps3'
+    return franchise.platform(name, tid, cid)
 
 
 def catalog(content_ids=None):
-    html = (ROOT/'files/website/modern.html').read_text(encoding='utf-8-sig')
-    block = re.search(r'\bconst DICT_APPS_FILTER\s*=\s*\{(.*?)\};',html,re.S)
-    if not block: raise ValueError('Browse exclusions not found')
-    apps = set(re.findall(r'[\'\"]([A-Z0-9]{9})[\'\"]\s*:\s*1\b',block[1]))
-    if not apps: raise ValueError('Empty Browse exclusions')
+    browse = franchise.BrowseContentFilter(ROOT/'files/website/modern.html')
     result = defaultdict(set)
-    base = ROOT/'resources/database/content/official'
-    for path in [base/'games.tsv',base/'pending/games.tsv']:
-        if not path.exists() and path.parent.name == 'pending': continue
-        with path.open(encoding='utf-8-sig',newline='') as f:
-            for row in csv.reader(f,delimiter='\t'):
-                if len(row)<4: continue
-                tid,region,name,pkg = (x.strip() for x in row[:4]); tid=tid.upper()
-                if not re.fullmatch(r'[A-Z]{4}\d{5}',tid) or tid in apps or not name or name.upper()=='MISSING' or not pkg or pkg.upper()=='MISSING': continue
-                if re.search(r'\b(?:demo|trial|beta|network test|soundtrack|strategy guide|firstplay|qore)\b',name,re.I): continue
-                cid=row[5] if len(row)>5 else ''
+    base = ROOT/'resources/database/content'
+    for file in franchise.FILES:
+        path = base/file
+        if not path.is_file() and file != franchise.FILES[0]: continue
+        with path.open(encoding='utf-8-sig', newline='') as f:
+            for row in csv.reader(f, delimiter='\t', quoting=csv.QUOTE_NONE):
+                if len(row)<6: continue
+                tid, region, name, pkg, _, cid = (x.strip() for x in row[:6]); tid=tid.upper()
+                if not franchise.ID.fullmatch(tid) or len(name)<2 or name.upper()=='MISSING' or not pkg.lower().startswith(('http://','https://')): continue
+                if browse.category(name, tid, cid, file.endswith('demos.tsv'))!='eligible_rows': continue
                 result[tid].add((platform(tid,name,cid),region.upper(),name))
-                if content_ids is not None:
-                    product=cid.strip().upper()
-                    match=re.fullmatch(r'[A-Z]{2}\d{4}-([A-Z0-9]{9})_\d{2}-[A-Z0-9]{16}',product)
-                    if match and match[1]==tid: content_ids[tid].add(product)
+                product=cid.upper()
+                if content_ids is not None and franchise.PSN_CONTENT_ID.fullmatch(product) and franchise.psn_title_id(product)==tid:
+                    content_ids[tid].add(product)
     if not result: raise ValueError('Empty catalog')
     return result
 
@@ -204,7 +188,7 @@ def checkpoint_path(path):
     return path.with_name(path.name.removesuffix('.json.gz')+'.checkpoint.json.gz')
 
 
-def snapshot_watermark(path, header, now):
+def validated_snapshot_checkpoint(path, header, now):
     watermark=header['watermark']
     try:
         with gzip.open(checkpoint_path(path),'rt',encoding='utf-8') as handle:
@@ -212,16 +196,22 @@ def snapshot_watermark(path, header, now):
         if (isinstance(entry,dict) and type(entry.get('watermark')) is int
             and watermark < entry['watermark'] <= now
             and entry.get('digest')==snapshot_digest(path)):
-            return entry['watermark']
+            return entry
     except (OSError,ValueError,EOFError):
         pass
-    return watermark
+    return {}
 
 
-def save_snapshot_checkpoint(path, watermark):
+def snapshot_watermark(path, header, now):
+    return validated_snapshot_checkpoint(path, header, now).get('watermark',header['watermark'])
+
+
+def save_snapshot_checkpoint(path, watermark, count=None, digest=None):
     target=checkpoint_path(path); temp=target.with_suffix('.tmp')
     try:
-        entry={'watermark':watermark,'digest':snapshot_digest(path)}
+        entry={'watermark':watermark,'digest':digest or snapshot_digest(path)}
+        if count is not None:
+            entry['validated_count']=count
         with gzip.open(temp,'wt',encoding='utf-8',compresslevel=1) as handle:
             json.dump(entry,handle,separators=(',',':'))
         temp.replace(target)
@@ -232,7 +222,29 @@ def save_snapshot_checkpoint(path, watermark):
 
 
 def fetch_games():
-    started=int(time.time()); pids=sorted(set(PLATFORMS.values()))
+    started=int(time.time())
+    cid=os.environ.get('IGDB_CLIENT_ID',''); secret=os.environ.get('IGDB_CLIENT_SECRET','')
+    if not cid or not secret: raise RuntimeError('Missing IGDB credentials in server-secrets.json')
+    def authenticate():
+        return request('https://id.twitch.tv/oauth2/token',urlencode({'client_id':cid,'client_secret':secret,'grant_type':'client_credentials'}).encode(),{'Content-Type':'application/x-www-form-urlencoded'})['access_token']
+    headers={'Client-ID':cid,'Authorization':'Bearer '+authenticate(),'Accept':'application/json','Content-Type':'text/plain'}
+    def reference_pages(endpoint):
+        last=0
+        while True:
+            rows=request('https://api.igdb.com/v4/'+endpoint,f'fields id,name; where id > {last}; sort id asc; limit 500;'.encode(),headers)
+            if not isinstance(rows,list) or len(rows)>500: raise ValueError('Invalid IGDB reference page')
+            for row in rows:
+                if not isinstance(row,dict) or type(row.get('id')) is not int or row['id']<=last: raise ValueError('Invalid IGDB reference order')
+                last=row['id']; yield row
+            time.sleep(.35)
+            if len(rows)<500: return
+    platforms=list(reference_pages('platforms'))
+    resolved={tag:{r['id'] for r in platforms if franchise.norm(r.get('name','')) in variants} for tag,variants in franchise.PLATFORM_NAMES.items()}
+    if any(not ids for ids in resolved.values()): raise ValueError('IGDB platform mapping incomplete')
+    PLATFORMS.update(resolved)
+    PSN_SOURCES.clear()
+    PSN_SOURCES.update(r['id'] for r in reference_pages('external_game_sources') if 'playstation' in franchise.norm(r.get('name','')) or franchise.norm(r.get('name','')).startswith('psn'))
+    pids=sorted(set().union(*PLATFORMS.values()))
     signature={'version':IGDB_CACHE_VERSION,'fields':FIELDS,'platforms':pids}
     previous=None
     try:
@@ -243,11 +255,6 @@ def fetch_games():
             if type(full) is int and type(watermark) is int and 0<full<=watermark<=started and started-full<IGDB_FULL_REFRESH:
                 previous=header
     except (OSError,ValueError,EOFError): pass
-    cid=os.environ.get('IGDB_CLIENT_ID',''); secret=os.environ.get('IGDB_CLIENT_SECRET','')
-    if not cid or not secret: raise RuntimeError('Missing IGDB credentials in server-secrets.json')
-    def authenticate():
-        return request('https://id.twitch.tv/oauth2/token',urlencode({'client_id':cid,'client_secret':secret,'grant_type':'client_credentials'}).encode(),{'Content-Type':'application/x-www-form-urlencoded'})['access_token']
-    headers={'Client-ID':cid,'Authorization':'Bearer '+authenticate(),'Accept':'application/json','Content-Type':'text/plain'}
     where='platforms = ('+','.join(map(str,pids))+')'
     next_request=0
     def pages(extra=''):
@@ -272,15 +279,18 @@ def fetch_games():
                 yield compact_igdb_game(g)
             if len(rows)<500: return
     if previous is not None:
-        since=max(0,snapshot_watermark(CACHE,previous,started)-IGDB_UPDATE_OVERLAP)
+        checkpoint=validated_snapshot_checkpoint(CACHE,previous,started)
+        since=max(0,checkpoint.get('watermark',previous['watermark'])-IGDB_UPDATE_OVERLAP)
         changes={g['id']:g for g in pages(f' & updated_at >= {since}')}
         try:
             if not changes:
-                count=0; seen=set()
-                for game in cached_igdb_games():
-                    count+=1; seen.update(game.get('platforms') or ())
-                if not set(pids)<=seen: raise InvalidIGDBCache('Incomplete platform snapshot')
-                save_snapshot_checkpoint(CACHE,started)
+                count=checkpoint.get('validated_count')
+                if type(count) is not int or count<=0:
+                    count=0; seen=set()
+                    for game in cached_igdb_games():
+                        count+=1; seen.update(game.get('platforms') or ())
+                    if not set(pids)<=seen: raise InvalidIGDBCache('Incomplete platform snapshot')
+                save_snapshot_checkpoint(CACHE,started,count,checkpoint.get('digest'))
                 print(f'IGDB cache unchanged: {count} records')
             else:
                 old=(g for g in cached_igdb_games() if g['id'] not in changes)
@@ -349,41 +359,74 @@ def release(g,pid,region):
     return earliest_year if any(len(v)==4 for v in candidates) else min(candidates)
 
 
+def identity_keys(name, tid=None):
+    if not isinstance(name,str) or not name: return ()
+    clean=franchise.catalog_match_name(name,tid) if tid else name
+    # Full title only; no franchise, parent, edition or fuzzy inference.
+    words=franchise.extended_title_words(clean,bool(tid)) if not franchise.JAPANESE_SCRIPT.search(clean) and not re.search(r"\b(?:part|disc)\s*\d+\b",clean,re.I) else ()
+    return tuple(dict.fromkeys(k for k in (title_key(name), title_key(clean), franchise.extended_name_key(words)) if k))
+
+
 def build(cat,games):
-    buckets=defaultdict(set); byid={}
-    needed=defaultdict(set)
-    for variants in cat.values():
-        for tag,_,name in variants: needed[PLATFORMS[tag]].add(title_key(name))
+    needed=defaultdict(set); prepared={}; byid={}; exact=defaultdict(set); expanded=defaultdict(set); direct=defaultdict(set)
+    for tid,variants in cat.items():
+        prepared[tid]=tuple(dict.fromkeys((tag,identity_keys(name,tid)) for tag,name in sorted({(tag,name) for tag,_,name in variants})))
+        for tag,keys in prepared[tid]: needed[tag].update(keys)
+    tags_by_pid=defaultdict(set)
+    for tag in needed:
+        for pid in PLATFORMS[tag]: tags_by_pid[pid].add(tag)
     for g in games:
-        if g.get('category',0) not in (0,2,3,4,8,9,10,11,12,13): continue
-        gid=g['id']
-        platforms=needed.keys() & set(g.get('platforms') or ())
-        if not platforms: continue
-        keys={title_key(g.get('name')),*(title_key(a.get('name')) for a in g.get('alternative_names') or () if isinstance(a,dict))}-{''}
-        for pid in platforms:
-            for k in keys & needed[pid]:
-                buckets[(pid,k)].add(gid); byid[gid]=g
+        if g.get('game_type'):
+            if not isinstance(g['game_type'],dict): continue
+            if not franchise.is_game_record(g) and str((g.get('game_type') or {}).get('type','')).lower().replace('_',' ') not in ('expansion','fork','pack'): continue
+        elif g.get('category',0) not in (0,2,3,4,8,9,10,11,12,13): continue
+        gid=g['id']; tags=set().union(*(tags_by_pid.get(pid,()) for pid in g.get('platforms') or ()))
+        if not tags: continue
+        titles=franchise.game_names(g)
+        original={title_key(n) for n in titles}-{''}
+        more={k for n in titles+franchise.localized_game_names(g) for k in identity_keys(n)}
+        for tag in tags:
+            for k in original & needed[tag]: exact[tag,k].add(gid); byid[gid]=g
+            for k in more & needed[tag]: expanded[tag,k].add(gid); byid[gid]=g
+        for item in g.get('external_games') or ():
+            if not isinstance(item,dict): continue
+            # Accept only documented PlayStation sources or official product URLs.
+            uid=franchise.psn_title_id(item.get('uid')) if item.get('external_game_source') in PSN_SOURCES else ''
+            url_uid=franchise.psn_product_url_id(item.get('url'))
+            if uid and url_uid and uid!=url_uid: continue
+            tid=uid or url_uid
+            if tid not in cat: continue
+            for tag in tags & tags_by_pid.get(item.get('platform'),set()):
+                if any(t==tag for t,_,_ in cat[tid]): direct[tag,tid].add(gid); byid[gid]=g
     rows={}; audit=Counter(); examples=defaultdict(list); metadata={}; dates_cache={}
-    for tid, variants in sorted(cat.items()):
-        matches=None; union=set(); unresolved=False; multiple=False
-        for tag,region,name in sorted(variants):
-            ids=buckets.get((PLATFORMS[tag],title_key(name)))
-            if not ids:
-                unresolved=True
-                continue
-            candidates={(i,tag) for i in ids}
-            multiple=multiple or len(candidates)>1
-            union.update(candidates)
-            matches=candidates if matches is None else matches & candidates
-        if unresolved or not matches or len(matches)!=1:
-            reason='ambiguous' if len(union)>1 else 'unmatched'
+    for tid,variants in sorted(cat.items()):
+        tags={tag for tag,_,_ in variants}; matches=None; union=set(); missing=False; method='exact title'; multiple=False
+        if len(tags)==1:
+            tag=next(iter(tags))
+            evidence=direct.get((tag,tid),set())
+            if evidence: method='verified PS Store ID'
+            for _,keys in prepared[tid]:
+                primary=exact.get((tag,keys[0]),set()) if keys else set()
+                secondary=set().union(*(expanded.get((tag,k),()) for k in keys)) if not primary else set()
+                # External IDs may identify a localized title absent from IGDB names,
+                # but must never override a contradictory exact title.
+                candidates=primary or secondary
+                if not primary and secondary and not evidence: method='localized or normalized title'
+                if evidence: candidates=(evidence & candidates) if candidates else evidence
+                if not candidates: missing=True
+                multiple=multiple or len(candidates)>1
+                union.update(candidates)
+                matches=candidates if matches is None else matches & candidates
+        if len(tags)!=1 or missing or not matches or len(matches)!=1:
+            reason='ambiguous' if len(union)>1 or len(tags)!=1 else 'unmatched'
             audit[reason]+=1
             if len(examples[reason])<60: examples[reason].append(f'{tid} — {min(variants)[2]}')
             continue
-        if multiple: audit['resolved by exact alias intersection']+=1
-        gid,tag=next(iter(matches)); g=byid[gid]
+        gid=next(iter(matches)); g=byid[gid]
+        audit['matched by '+method]+=1
+        if multiple and method=='exact title': audit['resolved by exact alias intersection']+=1
         if gid not in metadata:
-            companies=g.get('involved_companies') or []
+            companies=[x for x in g.get('involved_companies') or [] if isinstance(x,dict)]
             metadata[gid]=(names([x.get('company',{}) for x in companies if x.get('developer')]),
                            names([x.get('company',{}) for x in companies if x.get('publisher')]),
                            names(g.get('genres')),names(g.get('themes')))
@@ -391,7 +434,11 @@ def build(cat,games):
         dates=set()
         for r in {r for _,r,_ in variants}:
             k=(gid,tag,r)
-            if k not in dates_cache: dates_cache[k]=release(g,PLATFORMS[tag],r)
+            if k not in dates_cache:
+                pids=set(g.get('platforms') or ()) & PLATFORMS[tag]
+                values={release(g,pid,r) for pid in pids}
+                # Multiple distinct platforms (e.g. Minis) must not lend dates to one another.
+                dates_cache[k]=next(iter(values)) if len(values)==1 else ''
             dates.add(dates_cache[k])
         date=next(iter(dates)) if len(dates)==1 else ''
         if not date and dates and all(dates) and len({v[:4] for v in dates})==1: date=next(iter(dates))[:4]
@@ -451,8 +498,8 @@ def lb_key(name):
 
 
 def launchbox_lookup(variants, indexes):
-    matches=[]
-    for tag,region,name in variants:
+    matches=set()
+    for tag,name in {(tag,name) for tag,_,name in variants}:
         platform=LB_PLATFORMS.get(tag)
         if not platform: return None
         if platform not in indexes:
@@ -465,9 +512,10 @@ def launchbox_lookup(variants, indexes):
         if not isinstance(titles,dict) or not isinstance(meta,dict): return None
         candidates={str(titles[k]) for k in (lb_key(name),lb_key(re.sub(r'\s*\((?:PS[123X]|PS2 Classics?|PSP)\)\s*$','',name,flags=re.I))) if k in titles}
         if len(candidates)!=1: return None
-        gid=candidates.pop(); matches.append((platform,gid))
-    if len(set(matches))!=1 or not matches: return None
-    platform,gid=matches[0]; m=indexes[platform].get('meta',{}).get(gid)
+        gid=candidates.pop(); matches.add((platform,gid))
+        if len(matches)>1: return None
+    if len(matches)!=1: return None
+    platform,gid=next(iter(matches)); m=indexes[platform].get('meta',{}).get(gid)
     if not isinstance(m,dict): return None
     return compact(m.get('developers'),m.get('publishers'),m.get('genres'))
 
@@ -488,16 +536,29 @@ def get_json(url,params=None,missing_ok=False):
     except (URLError,TimeoutError,ValueError,OSError): raise ProviderError('unavailable') from None
 
 
-def psn_lookup(tid,region,cid):
+def psn_locale(region,cid):
     prefix=cid[:2] if cid else ''
     regional=REGION_ALIASES.get(re.sub(r'[^A-Z]','',region.upper()))
     countries={1:('GB','en'),2:('US','en'),3:('AU','en'),4:('NZ','en'),5:('JP','ja'),7:('HK','en'),9:('KR','ko'),10:('BR','pt')}
     locale={'JP':('JP','ja'),'KP':('KR','ko'),'HP':('HK','en'),'AP':('HK','en'),'EP':('GB','en'),'UP':('US','en')}.get(prefix) or countries.get(regional)
+    return locale
+
+
+def psn_lookup(tid,region,cid):
+    locale=psn_locale(region,cid)
     if not locale: return compact()
     country,lang=locale
     endpoint='container' if cid else 'titlecontainer'
     data=get_json(f'https://store.playstation.com/store/api/chihiro/00_09_000/{endpoint}/{country}/{lang}/19/{cid or tid}',missing_ok=True)
     if not isinstance(data,dict): return compact()
+    # Reject a conflicting product identifier when the store supplies one.
+    for field in ('id','content_id','contentId','title_id','titleId'):
+        value=data.get(field)
+        if not isinstance(value,str): continue
+        value=value.strip().upper()
+        product=franchise.PSN_CONTENT_ID.fullmatch(value)
+        if product and (product[1]!=tid or (cid and value!=cid)): return compact()
+        if re.fullmatch(r'[A-Z]{4}\d{5}',value) and value!=tid: return compact()
     # Only root product fields; nested related products may describe another game.
     provider=next((data[k] for k in ('provider_name','providerName','publisher_name','publisherName') if isinstance(data.get(k),str) and data[k].strip()),'')
     return compact(pub=[provider],date=data.get('release_date') or data.get('releaseDate',''))
@@ -545,15 +606,20 @@ class ProviderCache:
     def __init__(self,name):
         self.path=CACHE_DIR/f'{name}.json.gz';self.rows={};self.used=0;self.limit=FALLBACK_BUDGET[name];self.disabled=False;self.errors=0;self.name=name;self.attempted=set();self.dirty=False
         try:
-            with gzip.open(self.path,'rt',encoding='utf-8') as f: data=json.load(f)
+            if self.path.stat().st_size > 4*1024*1024: raise ValueError('Provider cache exceeds size limit')
+            with gzip.open(self.path,'rb') as f: raw=f.read(64*1024*1024+1)
+            if len(raw)>64*1024*1024: raise ValueError('Provider cache exceeds expanded size limit')
+            data=json.loads(raw)
             if data.get('version')==1 and isinstance(data.get('rows'),dict):
-                self.rows={k:v for k,v in data['rows'].items() if isinstance(k,str) and isinstance(v,list) and len(v)==2 and isinstance(v[0],(int,float)) and isinstance(v[1],list) and len(v[1])==5}
+                self.rows={k:v for k,v in data['rows'].items() if isinstance(k,str) and isinstance(v,list) and len(v)==2 and isinstance(v[0],(int,float)) and isinstance(v[1],list) and len(v[1])==5 and isinstance(v[1][3],str) and all(isinstance(v[1][i],list) and all(isinstance(x,str) for x in v[1][i]) for i in (0,1,2,4))}
         except (OSError,ValueError,AttributeError,EOFError): pass
     def lookup(self,k,fn,audit):
         entry=self.rows.get(k); now=time.time(); old=None
         if isinstance(entry,list) and len(entry)==2 and isinstance(entry[0],(int,float)) and isinstance(entry[1],list) and len(entry[1])==5:
-            old=entry[1]
-            if 0<=now-entry[0]<(TTL if any(old) else 7*86400): audit[self.name+': cache hit']+=1;return old
+            age=now-entry[0]
+            if age>=0:
+                old=entry[1]
+                if age<(TTL if any(old) else 7*86400): audit[self.name+': cache hit']+=1;return old
         if self.disabled or self.used>=self.limit or k in self.attempted: return old
         self.attempted.add(k)
         self.used+=1
@@ -585,20 +651,23 @@ def supplement(cat,payload,content_ids):
     if os.environ.get('SCREENSCRAPER_USER') and os.environ.get('SCREENSCRAPER_PASSWORD'): ss.update(ssid=os.environ['SCREENSCRAPER_USER'],sspassword=os.environ['SCREENSCRAPER_PASSWORD'])
     if not rawg: audit['RAWG not configured']=1
     if not ss['devid'] or not ss['devpassword']: audit['ScreenScraper not configured']=1
-    jobs=[];deadline=time.monotonic()+FALLBACK_TIME_BUDGET
+    jobs=[];title_safe=set();deadline=time.monotonic()+FALLBACK_TIME_BUDGET
     for tid,variants in sorted(cat.items()):
         tags={v[0] for v in variants}; regions={v[1] for v in variants}; keys={title_key(v[2]) for v in variants}
         if len(tags)!=1: continue
         tag=next(iter(tags));row=rows.get(tid,[0,tag,[],[],[],'',[]])
-        # Avoid ambiguous title associations. Only a single catalog identity can use remote title lookup.
-        if len(keys)==1 and not all(row[i] for i in (2,3,4)):
+        # LaunchBox must independently resolve every variant to the same game.
+        if not all(row[i] for i in (2,3,4)):
             lb=launchbox_lookup(variants,indexes)
             if lb: merge(row,lb,'LaunchBox',audit)
         # Prefer full regional date only from PS Store or IGDB, not other platform dates.
-        if len(keys)==1 and '' not in keys:
-            region=next(iter(regions)) if len(regions)==1 else ''
-            name=min(v[2] for v in variants); cids=content_ids.get(tid,set())
-            cid=(next(iter(cids)) if len(cids)==1 else '' if not cids else None) if region else None
+        safe=len(keys)==1 and '' not in keys
+        if safe: title_safe.add(tid)
+        region=next(iter(regions)) if len(regions)==1 else ''
+        cids=content_ids.get(tid,set())
+        cid=(next(iter(cids)) if len(cids)==1 else '' if not cids and safe else None) if region else None
+        if safe or cid:
+            name=min(v[2] for v in variants)
             jobs.append((tid,tag,region,name,cid,row))
         if any(row[2:]): rows[tid]=row
     # Unqueried entries first; refresh expired entries after new work. Cache hits still apply to every title.
@@ -616,22 +685,22 @@ def supplement(cat,payload,content_ids):
         def priority(pair):
             k, members=pair
             return (cache.rows.get(k,[0])[0],-sum(not j[-1][i] for j in members for i in positions),k)
-        for k,members in sorted(grouped.items(),key=priority):
+        candidates=grouped.items() if cache.disabled else sorted(grouped.items(),key=priority)
+        for k,members in candidates:
             if time.monotonic()>=source_deadline: cache.disabled=True
-            representative=max(members,key=lambda j:sum(not j[-1][i] for i in positions))
-            value=cache.lookup(k,lambda:fetch(representative),audit)
+            value=cache.lookup(k,lambda:fetch(max(members,key=lambda j:sum(not j[-1][i] for i in positions))),audit)
             if value:
                 for j in members: merge(j[-1],value,source,audit)
         audit[source+': requests']=cache.used
     try:
         # PS Store identifies by product rather than fuzzy name, but is used only to fill missing fields.
-        run('psn',lambda j:'|'.join((j[0],j[2],j[4])),lambda j:j[4] is not None and (not j[-1][3] or not j[-1][5]),lambda j:psn_lookup(j[0],j[2],j[4]))
+        run('psn',lambda j:'|'.join((j[0],j[2],j[4])),lambda j:j[4] is not None and re.fullmatch(r'[A-Z]{4}\d{5}',j[0]) and (not j[-1][3] or not j[-1][5]) and psn_locale(j[2],j[4]) is not None,lambda j:psn_lookup(j[0],j[2],j[4]))
         if rawg or caches['rawg'].rows:
             if not rawg: caches['rawg'].disabled=True
-            run('rawg',lambda j:j[1]+'|'+title_key(j[3]),lambda j:not all(j[-1][i] for i in (2,3,4)),lambda j:rawg_lookup(j[1],j[3],rawg))
+            run('rawg',lambda j:j[1]+'|'+title_key(j[3]),lambda j:j[0] in title_safe and not all(j[-1][i] for i in (2,3,4)),lambda j:rawg_lookup(j[1],j[3],rawg))
         if (ss['devid'] and ss['devpassword']) or caches['screenscraper'].rows:
             if not ss['devid'] or not ss['devpassword']: caches['screenscraper'].disabled=True
-            run('screenscraper',lambda j:'|'.join((j[0],j[1],title_key(j[3]))),lambda j:bool(re.fullmatch(r'(?:B[CL]|S[CL]|U[CL])[A-Z]{2}\d{5}',j[0])) and not all(j[-1][i] for i in (2,3,4)),lambda j:ss_lookup(j[0],j[1],j[3],ss))
+            run('screenscraper',lambda j:'|'.join((j[0],j[1],title_key(j[3]))),lambda j:j[0] in title_safe and bool(re.fullmatch(r'(?:B[CL]|S[CL]|U[CL])[A-Z]{2}\d{5}',j[0])) and not all(j[-1][i] for i in (2,3,4)),lambda j:ss_lookup(j[0],j[1],j[3],ss))
     finally:
         for c in caches.values(): c.save()
     for tid,_,_,_,_,row in jobs:
@@ -652,7 +721,10 @@ def main():
     if isinstance(old,dict) and old.get('version')==1:
         for tid,row in payload['games'].items():
             previous=old.get('games',{}).get(tid)
-            if not isinstance(previous,list) or len(previous)!=7 or not row[0] or row[:2]!=previous[:2]: continue
+            if not isinstance(previous,list) or len(previous)!=7: continue
+            if previous[0] and not row[0]: combined['previous IGDB identity no longer resolved']+=1
+            if previous[0] and row[0] and previous[:2]!=row[:2]: combined['previous IGDB identity changed']+=1
+            if not row[0] or row[:2]!=previous[:2]: continue
             # Keep previously verified non-date metadata for the same identity only.
             for pos,label in ((2,'developer'),(3,'publisher'),(4,'genre'),(6,'theme')):
                 if not row[pos]:

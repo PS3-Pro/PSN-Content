@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import filecmp
 import json
 import sys
 from pathlib import Path
@@ -34,13 +35,13 @@ def main(staging, published):
             if platform in CORE and (not counts[0] or not counts[1]):
                 raise ValueError(f'Empty title or cover index: {new}')
             if old.is_file():
-                previous = read(old, provider, platform)
+                previous = counts if filecmp.cmp(new, old, shallow=False) else read(old, provider, platform)
                 for current, before in zip(counts, previous):
                     if before and current < before * 0.75:
                         raise ValueError(f'Unexpected reduction in {new}: {previous} -> {counts}')
+            if provider == 'launchbox' and platform == 'ps3' and not counts[2]:
+                raise ValueError('LaunchBox PS3 fanart index is empty')
             print(f'{provider}/{filename}: {counts[0]} titles, {counts[1]} covers, {counts[2]} backgrounds/screenshots')
-        if provider == 'launchbox' and not read(staging / provider / 'ps3.json', provider, 'ps3')[2]:
-            raise ValueError('LaunchBox PS3 fanart index is empty')
 
 if __name__ == '__main__':
     main(Path(sys.argv[1]), Path(sys.argv[2]))

@@ -97,10 +97,16 @@ def save_manifest(source_hash, output_hashes, cache_path):
 
 def coverage(data):
     result = {'titles': len(data['titles']), 'metadata': len(data['meta']), 'artwork': len(data['art'])}
-    for kind in set(TYPES.values()):
-        result[kind] = sum(bool(v.get(kind)) for v in data['art'].values())
-    for field in ('developers','publishers','genres','year','releaseDate','modes'):
-        result['meta:'+field] = sum(bool(v.get(field)) for v in data['meta'].values())
+    kinds = set(TYPES.values())
+    fields = {field: 'meta:'+field for field in ('developers','publishers','genres','year','releaseDate','modes')}
+    result.update(dict.fromkeys(kinds, 0))
+    result.update(dict.fromkeys(fields.values(), 0))
+    for record in data['art'].values():
+        for kind, value in record.items():
+            if value and kind in kinds: result[kind] += 1
+    for record in data['meta'].values():
+        for field, value in record.items():
+            if value and field in fields: result[fields[field]] += 1
     return result
 
 
