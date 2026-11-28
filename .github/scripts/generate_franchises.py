@@ -114,6 +114,9 @@ REISSUE_SUFFIX = re.compile(r'\s*(?:PlayStation\s*3|PS3)\s+the\s+Best\s*$', re.I
 LANG_DASH_SUFFIX = re.compile(r'\s+[-–—]\s+(?:EN|ENG|DE|GER|FR|FRA|IT|ITA|ES|SPA|JP|JPN|KR|KOR|RU|RUS|PT|POR)\s*$', re.I)
 VERSION_SUFFIX = re.compile(r'\s*\(\s*(?:app\s+)?version\s+\d+(?:\.\d+){1,3}\s*\)\s*$', re.I)
 HD_EDITION = re.compile(r'\s*(?:[-:–—]\s*)?HD\s+Edition\s*$', re.I)
+ORDINAL_WORDS = {'first':'1st','second':'2nd','third':'3rd','fourth':'4th','fifth':'5th','sixth':'6th','seventh':'7th','eighth':'8th','ninth':'9th','tenth':'10th'}
+ORDINAL_WORD = re.compile(r'\b(?:' + '|'.join(ORDINAL_WORDS) + r')\b', re.I)
+ORDINAL_NUMBER = re.compile(r'\b(?:' + '|'.join(ORDINAL_WORDS.values()) + r')\b', re.I)
 NUMBER_PAIR = re.compile(r'(?<!\w)([IVXLCDM]+|\d+)\s+(?:and|&)\s+(?=(?:[IVXLCDM]+|\d+)(?:\b|[-/]))', re.I)
 NON_GAME_SUFFIX = re.compile(r'(?:\s+(?:Official|Gameplay|Launch)\s+Trailer|\s*[-–—]\s*Console Application)\s*$', re.I)
 MANUAL_SUFFIX = re.compile(r'(?:\b(?:DigiManual|Digital Manual|Manual)\b)(?:\s*\(Digital\))?\s*$', re.I)
@@ -155,6 +158,17 @@ def late_recovery_keys(value, catalog=False):
         if base != clean and len(franchise_words(base)) == 1 and len(base) >= 5:
             keys.update(recovery_keys(base)[0])
     return frozenset(keys - {''})
+
+
+@lru_cache(maxsize=4096)
+def ordinal_recovery_keys(value, catalog=False):
+    raw = recovery_base(value, catalog)
+    if catalog:
+        raw = DIGITAL_SUFFIX.sub('', REGIONAL_SUFFIX.sub('', PLATFORM_PREFIX.sub('', raw))).strip()
+    if not (ORDINAL_WORD.search(raw) or ORDINAL_NUMBER.search(raw)) or len(franchise_words(raw)) < 3:
+        return frozenset()
+    canonical = ORDINAL_WORD.sub(lambda match: ORDINAL_WORDS[match[0].lower()], raw)
+    return recovery_keys(canonical, catalog)[0]
 
 
 def platform(title, tid, cid):
@@ -979,9 +993,14 @@ def attach_exact_numbered_pairs(groups, pending, records, catalog, rejected_game
         if len(words) < 3 or ROMAN.get(words[-1], words[-1]) != '2':
             continue
         root_words = words[:-1]
+        if root_words[-1] == 'chapter':
+            root_words = root_words[:-1]
+        if len(root_words) < 2:
+            continue
         root_ids = by_name.get(root_words, set())
-        # Do not choose between two records for an original or a sequel.
-        sequel_ids = by_name.get(root_words + ('2',), set()) | by_name.get(root_words + ('ii',), set())
+        # All equivalent second-installment spellings must identify one record.
+        sequel_ids = set().union(*(by_name.get(root_words + suffix, ()) for suffix in
+            (('2',), ('ii',), ('chapter', '2'), ('chapter', 'ii'))))
         if len(root_ids) != 1 or sequel_ids != {gid}:
             continue
         original = next(iter(root_ids))
@@ -1017,8 +1036,9 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
     requested_names=defaultdict(set); requested_ids=defaultdict(set)
     catalog_keys={}; recovery_catalog={}; recovery_requested=defaultdict(set); recovery_index=defaultdict(set)
     late_catalog={}; late_requested=defaultdict(set); late_extra_requested=defaultdict(set); late_index=defaultdict(set)
+    ordinal_catalog={}; ordinal_requested=defaultdict(set); ordinal_index=defaultdict(set)
     for tid, variants in catalog.items():
-        prepared=[]; recovery=[]; late_prepared=[]
+        prepared=[]; recovery=[]; late_prepared=[]; ordinal_prepared=[]
         for name, tag in sorted(variants):
             keys=names(name)
             prepared.append((tag,keys))
@@ -1027,6 +1047,10 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
             match_name=catalog_match_name(name, tid)
             strong,weak=recovery_keys(match_name, True)
             extra=late_recovery_keys(match_name, True)
+            ordinal=ordinal_recovery_keys(match_name, True)
+            if ordinal:
+                ordinal_prepared.append((tag,ordinal))
+                ordinal_requested[tag].update(ordinal)
             recovery.append((tag,strong,weak))
             late_prepared.append((tag,extra,strong))
             recovery_requested[tag].update(strong)
@@ -1037,6 +1061,8 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
         catalog_keys[tid]=prepared
         recovery_catalog[tid]=recovery
         late_catalog[tid]=late_prepared
+        if ordinal_prepared:
+            ordinal_catalog[tid]=ordinal_prepared
     tags_by_platform=defaultdict(set)
     for tag, platforms in platform_map.items():
         if requested_ids.get(tag):
@@ -1055,14 +1081,18 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
         titles = game_names(game)
         official_keys = set(names(official)) if official else set()
         keys = official_keys.copy()
-        secondary = set(); late = set()
+        secondary = set(); late = set(); ordinals = set()
         for title in titles:
             if title != official:
                 keys.update(names(title))
             secondary.update(recovery_keys(title)[0])
             late.update(late_recovery_keys(title))
+            ordinals.update(ordinal_recovery_keys(title))
         relevant=False
         for tag in tags:
+            for key in ordinals & ordinal_requested[tag]:
+                ordinal_index[tag,key].add(gid)
+                relevant=True
             for key in (late & late_requested[tag]) | (secondary & late_extra_requested[tag]):
                 late_index[tag,key].add(gid)
                 relevant=True
@@ -1116,6 +1146,14 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
             if len(possible)==1:
                 recovered_matches['reissue_or_edition'] += 1
             candidates=possible
+        if not candidates and tid in ordinal_catalog:
+            possible=set()
+            for tag,keys in ordinal_catalog[tid]:
+                for key in keys:
+                    possible.update(ordinal_index.get((tag,key), ()))
+            if len(possible)==1:
+                recovered_matches['ordinal'] += 1
+            candidates=possible
         if len(candidates)>1:
             refined=resolve_plus_variant(tid, candidates, catalog[tid], records, ext)
             if len(refined)==1:
@@ -1161,7 +1199,7 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
         collect_diagnostics(diagnostic, catalog, records, canonical, unresolved, groups,
                             memberships, rejected_memberships, output, metadata_count, recovered)
     result = {'version':1,'franchises':output,'games':{tid:canonical[tid] for tid in sorted(used)}}
-    for cached in (norm, names, recovery_base, recovery_keys, late_recovery_keys, franchise_words, franchise_name_key, label_in_name):
+    for cached in (norm, names, recovery_base, recovery_keys, late_recovery_keys, ordinal_recovery_keys, franchise_words, franchise_name_key, label_in_name):
         cached.cache_clear()
     return result
 
@@ -1276,7 +1314,7 @@ def write_diagnostics(report, directory):
         lines.append(f'| {label} | {excluded[key]} |')
     lines += ['', 'Counts are source rows, not unique Title IDs.', '']
     recoveries = report.get('secondary_match_recoveries', {})
-    lines += ['### Secondary recovery', '', f"Normalized names: **{recoveries.get('normalized', 0)}** | Edition fallback: **{recoveries.get('edition', 0)}** | Explicit plus variants: **{recoveries.get('explicit_plus', 0)}** | Numbered series memberships: **{report.get('numbered_series_recoveries', 0)}** | Exact numbered pair memberships: **{report.get('exact_numbered_pair_recoveries', 0)}**.", '']
+    lines += ['### Secondary recovery', '', f"Normalized names: **{recoveries.get('normalized', 0)}** | Edition fallback: **{recoveries.get('edition', 0)}** | Ordinal spelling: **{recoveries.get('ordinal', 0)}** | Reissue / alternate spelling: **{recoveries.get('reissue_or_edition', 0)}** | Explicit plus variants: **{recoveries.get('explicit_plus', 0)}** | Numbered series memberships: **{report.get('numbered_series_recoveries', 0)}** | Exact numbered pair memberships: **{report.get('exact_numbered_pair_recoveries', 0)}**.", '']
     summary = '\n'.join(lines)
     (directory / 'summary.md').write_text(summary, encoding='utf-8')
     print(summary)
