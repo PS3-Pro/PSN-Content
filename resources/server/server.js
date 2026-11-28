@@ -2269,15 +2269,17 @@ function registerArtworkFallback(app, setCors, pool) {
     return memo(kind+':'+id,24*60*60*1000,async()=>{
       const query=new URLSearchParams({types:'static',nsfw:'false',humor:'false',epilepsy:'false'});
       if(kind==='cover')query.set('dimensions','600x900');
-      const rows=await api((kind==='cover'?'grids':'heroes')+'/game/'+id+'?'+query);
+      if(kind==='logo')query.set('styles','official');
+      const rows=await api(({cover:'grids',hero:'heroes',logo:'logos'})[kind]+'/game/'+id+'?'+query);
       const candidates=rows.filter(r=>{
         const w=Number(r.width),h=Number(r.height);
-        return safeUrl(r.url)&&Number.isFinite(w)&&Number.isFinite(h)&&r.nsfw!==true&&r.humor!==true&&r.epilepsy!==true&&(kind==='cover'?w>=300&&h>=450&&w/h>=.6&&w/h<=.8:w>=640&&h>=320&&w/h>=1.45&&w/h<=4);
+        return safeUrl(r.url)&&Number.isFinite(w)&&Number.isFinite(h)&&r.nsfw!==true&&r.humor!==true&&r.epilepsy!==true&&(kind==='logo'?w>=120&&h>=40&&w/h>=.5&&w/h<=12&&/\.(?:png|webp)$/i.test(new URL(r.url).pathname):kind==='cover'?w>=300&&h>=450&&w/h>=.6&&w/h<=.8:w>=640&&h>=320&&w/h>=1.45&&w/h<=4);
       });
       candidates.sort((a,b)=>Number(b.score||0)-Number(a.score||0));
       return [...new Set(candidates.map(r=>{
         const pixels=Number(r.width)*Number(r.height);
         // Avoid downloading large hero originals when a CDN thumbnail is available.
+        if(kind==='logo'&&pixels>600000){const thumb=safeUrl(r.thumb);if(thumb&&/\.(?:png|webp)$/i.test(new URL(thumb).pathname))return thumb;}
         return kind==='hero'&&pixels>1920*1080?safeUrl(r.thumb):safeUrl(r.url);
       }).filter(Boolean))].slice(0,2);
     });
@@ -2288,7 +2290,7 @@ function registerArtworkFallback(app, setCors, pool) {
   app.get('/api/artwork-fallback',async(req,res)=>{
     cors(req,res);res.setHeader('Cache-Control','no-store');
     const name=String(req.query.name||'').trim(),key=norm(name),system=Number(req.query.system),kind=String(req.query.kind||'');
-    if(name.length>140||key.length<2||!systems.has(system)||!['cover','hero','gametdb'].includes(kind))return res.status(400).json({ok:false});
+    if(name.length>140||key.length<2||!systems.has(system)||!['cover','hero','logo','gametdb'].includes(kind))return res.status(400).json({ok:false});
     if(kind==='gametdb'){
       const id=String(req.query.titleId||'').toUpperCase().replace(/[-_ .]/g,'');
       const region=String(req.query.region||'').toLowerCase();
@@ -5134,7 +5136,7 @@ async function ssExtraFetchImage(data) {
   url.searchParams.set('systemeid',String(data.s));
   url.searchParams.set('jeuid',String(data.g));
   url.searchParams.set('media',data.t+(data.r?'('+data.r+')':''));
-  url.searchParams.set('outputformat',data.t.startsWith('support-')?'png':'jpg');
+  url.searchParams.set('outputformat',data.t.startsWith('support-')||data.t==='wheel'||data.t==='wheel-hd'?'png':'jpg');
   url.searchParams.set('maxwidth',data.t==='box-texture'?'1800':'1050');
   url.searchParams.set('maxheight','720');
   if (SS_PREVIEW_USER && SS_PREVIEW_PASSWORD) {url.searchParams.set('ssid',SS_PREVIEW_USER);url.searchParams.set('sspassword',SS_PREVIEW_PASSWORD);}
