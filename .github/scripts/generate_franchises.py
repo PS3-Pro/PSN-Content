@@ -31,7 +31,7 @@ ALLOWED_TYPES = {'main game', 'remake', 'remaster', 'port', 'bundle', 'standalon
 ID = re.compile(r'^[A-Z0-9]{9}$')
 TRIAL = re.compile(r'\btrial\s+to\s+full\b', re.I)
 EXCLUDED = re.compile(r'\b(?:demo|trial|beta|prototype|network\s+test|test\s+version|soundtrack|guidebook|playview|avatar|dlc)\b|体験版|체험판', re.I)
-TECH = re.compile(r'\s*[\[(]\s*(?:PS[123XP]|PS2\s*classics?|minis?|PC\s*Engine|TurboGrafx(?:-16)?|Neo\s*Geo(?:\s*Station)?|Nostalgia Vault|(?:English|French|German|Spanish|Italian|Japanese)(?:\s+Version)?|digital version|trial to full|part\s*\d+|disc\s*\d+)\s*[\])]\s*', re.I)
+TECH = re.compile(r'\s*[\[(]\s*(?:PS[123XP]|PS[12]\s*classics?|minis?|PC\s*Engine|TurboGrafx(?:-16)?|Neo\s*Geo(?:\s*Station)?|Nostalgia Vault|(?:English|French|German|Spanish|Italian|Japanese)(?:\s+Version)?|digital version|trial to full|part\s*\d+|disc\s*\d+)\s*[\])]\s*', re.I)
 
 
 @lru_cache(maxsize=4096)
@@ -56,6 +56,16 @@ VAULT_PART = re.compile(r'\s+(?:part|disc)\s*\d+\s*$', re.I)
 PLATFORM_PREFIX = re.compile(r'^\s*(?:PSP|PS[123X]|NEO\s*GEO\s+STATION|PC\s*ENGINE)\s*(?:[-:–—]\s*|\s+)', re.I)
 EDITION_SUFFIX = re.compile(r'(?:\s*[-:–—]\s*|\s+)(?:game of the year(?: edition)?|goty(?: edition)?|(?:deluxe|complete|collector[’\']?s|special|templar|ultimate|digital) edition|classics? hd|hd)\s*$', re.I)
 
+REGIONAL_LABEL = r'(?:EN|ENG|ENGLISH|FR|FRA|FRE|FRENCH|FRANCE|DE|DEU|GER|GERMAN|GERMANY|IT|ITA|ITALIAN|ITALY|ES|SPA|ESP|SPANISH|SPAIN|JP|JPN|JAPANESE|JAPAN|KR|KOR|KOREAN|CN|CHN|CHINESE|PL|POL|POLISH|RU|RUS|RUSSIAN|PT|POR|PORTUGUESE|BR|BRAZIL|UK|ENGLAND|US|USA|EU|EUR|ANZ|TUR|TURKISH)'
+REGIONAL_SUFFIX = re.compile(r'\s*\(\s*' + REGIONAL_LABEL + r'(?:\s*[-/,]\s*' + REGIONAL_LABEL + r')*\s*\)\s*$', re.I)
+DIGITAL_SUFFIX = re.compile(r'\s*\(\s*(?:digital|downloadable ver(?:sion)?\.?)\s*\)\s*$', re.I)
+
+
+def catalog_match_name(name, tid):
+    # Some regional catalog names repeat their own Title ID as a suffix.
+    return re.sub(r'\s*\(\s*' + re.escape(tid) + r'\s*\)\s*$', '', name, flags=re.I)
+
+
 @lru_cache(maxsize=4096)
 def recovery_keys(value, catalog=False):
     raw = unicodedata.normalize('NFKC', str(value).replace('™', '').replace('®', '').replace('©', '')).strip()
@@ -64,7 +74,9 @@ def recovery_keys(value, catalog=False):
     raw = TECH.sub(' ', raw)
     raw = TRIAL.sub(' ', raw).strip()
     if catalog:
+        raw = REGIONAL_SUFFIX.sub('', raw).strip()
         raw = re.sub(r'\s*[\[(](?:ENG|FRA|FRE|GER|DEU|ITA|SPA|ESP|JPN|KOR|POR)[\])]\s*$', '', raw, flags=re.I).strip()
+        raw = DIGITAL_SUFFIX.sub('', raw).strip()
     if catalog:
         raw = PLATFORM_PREFIX.sub('', raw).strip()
     def key(title):
@@ -91,9 +103,10 @@ def recovery_keys(value, catalog=False):
 
 def platform(title, tid, cid):
     if 'NEOGEOSTATION' in cid.upper(): return 'neogeo'
-    for regex, tag in [(r'\(\s*PS2[^)]*\)|\bPS2\s*CLASSICS?\b','ps2'), (r'\(\s*PS[1X]\s*\)|\bPSONE\b','psx'), (r'\(\s*MINIS?\s*\)','minis'), (r'\(\s*PSP\s*\)','psp'), (r'\(\s*(?:PC\s*ENGINE|TURBO\s*GRAFX(?:\s*-\s*16)?)\s*\)','pce'), (r'\bNEO\s*GEO(?:\s*STATION)?\b','neogeo')]:
+    for regex, tag in [(r'\(\s*PS2[^)]*\)|\bPS2\s*CLASSICS?\b','ps2'), (r'\(\s*PS[1X]\s*\)|\bPSONE\b|\bPS1\s*CLASSICS?\b','psx'), (r'\(\s*MINIS?\s*\)','minis'), (r'\(\s*PSP\s*\)','psp'), (r'\(\s*(?:PC\s*ENGINE|TURBO\s*GRAFX(?:\s*-\s*16)?)\s*\)','pce'), (r'\bNEO\s*GEO(?:\s*STATION)?\b','neogeo')]:
         if re.search(regex,title,re.I): return tag
     if tid[:2] in ('UC','UL'): return 'psp'
+    if tid.startswith(('SLUS0', 'SLES0', 'SCES0', 'SCUS94')): return 'psx'
     if tid[:2] in ('SL','SC'): return 'ps2'
     if tid[:2] == 'NP':
         if tid[3] in 'ZX': return 'minis'
@@ -726,6 +739,26 @@ def resolve_catalog_game(tid, variants, primary, aliases, ext):
     return exact or alternate
 
 
+def plus_identity(value):
+    return norm(value.replace('+', ' plus '))
+
+
+def resolve_plus_variant(tid, candidates, catalog_variants, records, ext):
+    if len(candidates) < 2 or any(ext.get((tag, tid)) for _, tag in catalog_variants):
+        return candidates
+    keys = set()
+    for name, _ in catalog_variants:
+        clean = TECH.sub(' ', name)
+        clean = TRIAL.sub(' ', clean)
+        if '+' not in clean:
+            return candidates
+        keys.add(plus_identity(clean))
+    if len(keys) != 1:
+        return candidates
+    found = {gid for gid in candidates if '+' in records[gid].get('name', '') and plus_identity(records[gid]['name']) in keys}
+    return found if len(found) == 1 else candidates
+
+
 def attach_exact_series_roots(groups, pending, records):
     # An unclassified, matched game can be the original of an established
     # series. Only exact official names and established series qualify.
@@ -803,7 +836,7 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
             requested_names[tag].update(keys)
             requested_ids[tag].add(tid)
         catalog_keys[tid]=prepared
-        recovery_catalog[tid]=[(tag, *recovery_keys(name, True)) for name,tag in sorted(variants)]
+        recovery_catalog[tid]=[(tag, *recovery_keys(catalog_match_name(name, tid), True)) for name,tag in sorted(variants)]
         for tag,strong,weak in recovery_catalog[tid]:
             recovery_requested[tag].update(strong | weak)
     tags_by_platform=defaultdict(set)
@@ -872,6 +905,11 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
             candidates=possible
             if len(possible)==1:
                 recovered_matches['edition' if used_edition else 'normalized'] += 1
+        if len(candidates)>1:
+            refined=resolve_plus_variant(tid, candidates, catalog[tid], records, ext)
+            if len(refined)==1:
+                recovered_matches['explicit_plus'] += 1
+            candidates=refined
         if len(candidates)!=1:
             ambiguous+=bool(candidates)
             unresolved.append((tid, variants, candidates))
@@ -1017,7 +1055,7 @@ def write_diagnostics(report, directory):
     lines += ['', 'Rows include headers, duplicates and regional releases. See coverage.json for exclusions by reason.',
               '', 'Download the franchise-diagnostics artifact for all Title IDs, candidate names, accepted/rejected memberships and discarded groups. No credentials or download URLs are included.', '']
     recoveries = report.get('secondary_match_recoveries', {})
-    lines += ['### Secondary recovery', '', f"Normalized names: **{recoveries.get('normalized', 0)}** | Edition fallback: **{recoveries.get('edition', 0)}** | Numbered series memberships: **{report.get('numbered_series_recoveries', 0)}**.", '']
+    lines += ['### Secondary recovery', '', f"Normalized names: **{recoveries.get('normalized', 0)}** | Edition fallback: **{recoveries.get('edition', 0)}** | Explicit plus variants: **{recoveries.get('explicit_plus', 0)}** | Numbered series memberships: **{report.get('numbered_series_recoveries', 0)}**.", '']
     summary = '\n'.join(lines)
     (directory / 'summary.md').write_text(summary, encoding='utf-8')
     print(summary)
