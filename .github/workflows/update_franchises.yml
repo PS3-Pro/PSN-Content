@@ -1,6 +1,11 @@
 name: Update Franchises
 on:
   workflow_dispatch:
+    inputs:
+      full_refresh:
+        description: Rebuild all IGDB metadata (ignore cache)
+        type: boolean
+        default: false
   workflow_run:
     workflows: ['Update PSN™ Database']
     types: [completed]
@@ -22,12 +27,24 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Restore IGDB metadata cache
+        uses: actions/cache/restore@v4
+        continue-on-error: true
+        with:
+          path: .cache/franchises-igdb-v1/games.json.gz
+          key: ${{ runner.os }}-franchises-igdb-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ${{ runner.os }}-franchises-igdb-v1-
       - name: Generate franchise index
         env:
           PSN_SECRETS_FILE: ${{ vars.PSN_SECRETS_FILE || 'resources/server/server-secrets.json' }}
           IGDB_CLIENT_ID: ${{ secrets.IGDB_CLIENT_ID }}
           IGDB_CLIENT_SECRET: ${{ secrets.IGDB_CLIENT_SECRET }}
-        run: python .github/scripts/generate_franchises.py
+          FULL_REFRESH: ${{ inputs.full_refresh || false }}
+        run: |
+          args=()
+          if [ "$FULL_REFRESH" = "true" ]; then args+=(--full-refresh); fi
+          python .github/scripts/generate_franchises.py "${args[@]}"
       - name: Commit index only if changed
         run: |
           git config user.name 'PS3-Pro Bot'
@@ -37,3 +54,9 @@ jobs:
           git commit -m 'Update franchise index'
           git pull --rebase origin main
           git push origin HEAD:main
+      - name: Save IGDB metadata cache
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: .cache/franchises-igdb-v1/games.json.gz
+          key: ${{ runner.os }}-franchises-igdb-v1-${{ github.run_id }}-${{ github.run_attempt }}
