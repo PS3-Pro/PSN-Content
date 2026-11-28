@@ -1031,6 +1031,95 @@ def attach_exact_numbered_pairs(groups, pending, records, catalog, rejected_game
     return recovered
 
 
+SERIES_SUBTITLE = re.compile(r'^(.+?):\s*(\S.+)$')
+SERIES_SECOND = re.compile(r'^(.+?)\s+(?:2|II)$', re.I)
+SERIES_EDITION = re.compile(r'\b(?:edition|collection|bundle|remaster(?:ed)?|compact|pack|version|deluxe|gold|goty|complete)\b', re.I)
+
+
+def subtitle_parts(name):
+    match = SERIES_SUBTITLE.fullmatch(name.strip())
+    if not match:
+        return None
+    root, subtitle = match.groups()
+    return franchise_name_key(root.replace('&', ' and ')), root, subtitle
+
+
+def attach_subtitle_series(groups, pending, records, catalog, rejected_games):
+    # Exact official series prefix, with independent evidence from known members.
+    grouped = defaultdict(set)
+    tags = defaultdict(set)
+    for entry, members in groups.items():
+        for tid, gid in members.items():
+            grouped[gid].add(entry)
+            tags[gid].update(tag for _, tag in catalog[tid])
+    for gid, tids in pending.items():
+        for tid in tids:
+            tags[gid].update(tag for _, tag in catalog[tid])
+    labels = defaultdict(list)
+    for entry in groups:
+        labels[franchise_name_key(entry[1].replace('&', ' and '))].append(entry)
+    by_root = defaultdict(list)
+    for gid in tags:
+        if gid in rejected_games:
+            continue
+        name = records[gid].get('name', '')
+        parts = subtitle_parts(name)
+        if parts:
+            by_root[parts[0]].append((gid, parts[1], parts[2]))
+    recovered = 0
+    for key, entries in sorted(labels.items()):
+        candidates = by_root.get(key, ())
+        if not candidates or len({franchise_name_key(e[1]) for e in entries}) != 1:
+            continue
+        members = set().union(*(set(groups[e].values()) for e in entries))
+        anchors = {gid for gid, _, _ in candidates if gid in members}
+        if not anchors:
+            continue
+        entry = min(entries, key=franchise_label_order)
+        words = franchise_words(entry[1])
+        if len(words) < 2 and (len(key) < 5 or len(anchors) < 2):
+            continue
+        anchor_tags = set().union(*(tags[gid] for gid in anchors))
+        for gid, _, subtitle in candidates:
+            if gid not in pending or grouped[gid] or not tags[gid] & anchor_tags:
+                continue
+            # Do not create a two-game series from an edition of its only member.
+            if len(members) < 2 and SERIES_EDITION.search(subtitle):
+                continue
+            groups[entry].update((tid, gid) for tid in pending[gid])
+            grouped[gid].add(entry)
+            recovered += len(pending[gid])
+            print(f'Recover anchored subtitle: {records[gid]["name"]} -> {entry[1]}')
+    # A uniquely identified second installment can establish a series with a
+    # uniquely identified subtitled original, on a shared catalog platform.
+    seconds = defaultdict(list)
+    exact_names = set()
+    for gid in tags:
+        name = records[gid].get('name', '')
+        exact_names.add(franchise_name_key(name.replace('&', ' and ')))
+        match = SERIES_SECOND.fullmatch(name)
+        if match and len(franchise_words(match[1])) >= 2:
+            seconds[franchise_name_key(match[1].replace('&', ' and '))].append(gid)
+    for key, gids in sorted(seconds.items()):
+        candidates = by_root.get(key, ())
+        if key in labels or len(gids) != 1 or len(candidates) != 1:
+            continue
+        sequel = gids[0]
+        original, root, subtitle = candidates[0]
+        if sequel not in pending or grouped[sequel] or sequel in rejected_games or original == sequel or original not in pending or grouped[original] or not tags[original] & tags[sequel] or SERIES_EDITION.search(subtitle):
+            continue
+        # Avoid inventing a root if an exact-title original also exists.
+        if key in exact_names:
+            continue
+        entry = ('s:' + str(original), root)
+        for gid in (original, sequel):
+            groups[entry].update((tid, gid) for tid in pending[gid])
+            grouped[gid].add(entry)
+            recovered += len(pending[gid])
+        print(f'Recover subtitled numbered pair: {root} -> {records[sequel]["name"]}')
+    return recovered
+
+
 def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(), diagnostic=None):
     primary=defaultdict(set); aliases=defaultdict(set); ext=defaultdict(set); records={}
     requested_names=defaultdict(set); requested_ids=defaultdict(set)
@@ -1181,7 +1270,9 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
     recovered=attach_exact_series_roots(groups, pending, records)
     numbered_recovered=attach_numbered_series(groups, pending, records)
     pair_recovered=attach_exact_numbered_pairs(groups, pending, records, catalog, rejected_games)
+    subtitle_recovered=attach_subtitle_series(groups, pending, records, catalog, rejected_games)
     if diagnostic is not None:
+        diagnostic['subtitle_series_recoveries']=subtitle_recovered
         diagnostic['numbered_series_recoveries']=numbered_recovered
         diagnostic['exact_numbered_pair_recoveries']=pair_recovered
     series_keys={franchise_name_key(entry[1]) for entry in groups}
@@ -1314,7 +1405,7 @@ def write_diagnostics(report, directory):
         lines.append(f'| {label} | {excluded[key]} |')
     lines += ['', 'Counts are source rows, not unique Title IDs.', '']
     recoveries = report.get('secondary_match_recoveries', {})
-    lines += ['### Secondary recovery', '', f"Normalized names: **{recoveries.get('normalized', 0)}** | Edition fallback: **{recoveries.get('edition', 0)}** | Ordinal spelling: **{recoveries.get('ordinal', 0)}** | Reissue / alternate spelling: **{recoveries.get('reissue_or_edition', 0)}** | Explicit plus variants: **{recoveries.get('explicit_plus', 0)}** | Numbered series memberships: **{report.get('numbered_series_recoveries', 0)}** | Exact numbered pair memberships: **{report.get('exact_numbered_pair_recoveries', 0)}**.", '']
+    lines += ['### Secondary recovery', '', f"Normalized names: **{recoveries.get('normalized', 0)}** | Edition fallback: **{recoveries.get('edition', 0)}** | Ordinal spelling: **{recoveries.get('ordinal', 0)}** | Reissue / alternate spelling: **{recoveries.get('reissue_or_edition', 0)}** | Explicit plus variants: **{recoveries.get('explicit_plus', 0)}** | Numbered series memberships: **{report.get('numbered_series_recoveries', 0)}** | Exact numbered pair memberships: **{report.get('exact_numbered_pair_recoveries', 0)}** | Subtitle series memberships: **{report.get('subtitle_series_recoveries', 0)}**.", '']
     summary = '\n'.join(lines)
     (directory / 'summary.md').write_text(summary, encoding='utf-8')
     print(summary)

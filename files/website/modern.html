@@ -27045,7 +27045,24 @@ P
         const positions={developer:2,publisher:3,genre:4};
         const normalize=value=>String(value||'').normalize('NFKC').trim().toLowerCase().replace(/\s+/g,' ');
         const facetName=(kind,name)=>{const value=normalize(name);return kind==='genre'?({'rpg':'role-playing (rpg)','role-playing':'role-playing (rpg)','platformer':'platform','platformers':'platform','fighting games':'fighting'}[value]||value):value;};
-        let rows=null, facets=null, request=null, retryAt=0;
+        let rows=null, facets=null, request=null, retryAt=0, overrideRevision=-1, overrideRows=new Map(), overrideFacets=null;
+        const addFacet=(groups,id,kind,name)=>{const key=kind+':'+facetName(kind,name);let group=groups.get(key);if(!group){group={key,kind,name,ids:new Set()};groups.set(key,group);}group.ids.add(id);};
+        function effectiveFacets(){
+            if(!facets)return null;
+            const revision=Number(window.__contentMetadataOverridesRevision||0);
+            if(revision===overrideRevision)return overrideFacets||facets;
+            overrideRevision=revision;overrideRows=new Map();overrideFacets=null;
+            const overrides=window.__contentMetadataOverridesMap;if(!(overrides instanceof Map)||!overrides.size)return facets;
+            const ids=new Set();for(const entry of overrides.values())if(entry?.category==='games'&&entry.titleId)ids.add(entry.titleId);
+            for(const id of ids){if(!/^[A-Z]{4}\d{5}$/.test(id))continue;const base=rows.get(id)||[0,'',[],[],[],'',[]];const entry=window.getContentMetadataOverride?.({titleId:id},'games');if(!entry)continue;
+                const genres=Array.isArray(entry.genres)&&entry.genres.length?entry.genres:null;const date=/^\d{4}$/.test(entry.year||'')?entry.year:null;
+                if(!genres&&!date)continue;const next=base.slice();if(genres){next[4]=genres;next[6]=[];}if(date)next[5]=date;overrideRows.set(id,next);
+                if(!genres)continue;
+                if(!overrideFacets)overrideFacets=new Map(facets);
+                for(const name of [...base[4],...base[6]]){const k='genre:'+facetName('genre',name),g=overrideFacets.get(k);if(!g)continue;const copy={...g,ids:new Set(g.ids)};copy.ids.delete(id);if(copy.ids.size)overrideFacets.set(k,copy);else overrideFacets.delete(k);}
+                for(const name of genres){const k='genre:'+facetName('genre',name),g=overrideFacets.get(k);if(g)overrideFacets.set(k,{...g,ids:new Set(g.ids)});addFacet(overrideFacets,id,'genre',name);}
+            }return overrideFacets||facets;
+        }
         function ensure(){
             if(rows)return Promise.resolve(true);
             if(request)return request;
@@ -27059,21 +27076,21 @@ P
                     const payload=JSON.parse(raw);if(payload?.version!==1||!payload.games||Array.isArray(payload.games))throw new Error('Invalid index');
                     const next=new Map(), groups=new Map();
                     for(const [id,row] of Object.entries(payload.games)){
-                        if(!/^[A-Z]{4}\d{5}$/.test(id)||!Array.isArray(row)||row.length!==7||!Number.isSafeInteger(row[0])||row[0]<=0||!['ps3','ps2','psx','psp','minis','pce','neogeo'].includes(row[1])||![2,3,4,6].every(i=>Array.isArray(row[i])&&row[i].length<=100&&row[i].every(v=>typeof v==='string'&&v.length<=250&&v.trim()))||typeof row[5]!=='string'||(row[5]&&!/^\d{4}(?:-\d{2}-\d{2})?$/.test(row[5])))continue;
+                        if(!/^[A-Z]{4}\d{5}$/.test(id)||!Array.isArray(row)||row.length!==7||!Number.isSafeInteger(row[0])||row[0]<0||!['ps3','ps2','psx','psp','minis','pce','neogeo'].includes(row[1])||![2,3,4,6].every(i=>Array.isArray(row[i])&&row[i].length<=100&&row[i].every(v=>typeof v==='string'&&v.length<=250&&v.trim()))||typeof row[5]!=='string'||(row[5]&&!/^\d{4}(?:-\d{2}-\d{2})?$/.test(row[5])))continue;
                         next.set(id,row);
                         for(const kind of Object.keys(positions))for(const name of (kind==='genre'?[...row[4],...row[6]]:row[positions[kind]])){
                             const key=kind+':'+facetName(kind,name);let group=groups.get(key);
                             if(!group){group={key,kind,name,ids:new Set()};groups.set(key,group);}group.ids.add(id);
                         }
                     }
-                    if(!next.size)throw new Error('Empty index');rows=next;facets=groups;return true;
+                    if(!next.size)throw new Error('Empty index');rows=next;facets=groups;overrideRevision=-1;return true;
                 }catch(_){retryAt=Date.now()+30000;return false;}
                 finally{clearTimeout(timeout);request=null;}
             })();return request;
         }
-        function row(id){return rows?.get(String(id||'').toUpperCase())||null;}
-        function group(kind,name){return facets?.get(kind+':'+facetName(kind,name))||null;}
-        function context(){const history=navHistory?.contextualType==='regions'?navHistory.parentHistory:navHistory;return history?.contextualType==='metadata'?facets?.get(history.metadataFacetKey)||null:null;}
+        function row(id){effectiveFacets();const key=String(id||'').toUpperCase();return overrideRows.get(key)||rows?.get(key)||null;}
+        function group(kind,name){return effectiveFacets()?.get(kind+':'+facetName(kind,name))||null;}
+        function context(){const history=navHistory?.contextualType==='regions'?navHistory.parentHistory:navHistory;if(history?.contextualType!=='metadata')return null;const key=history.metadataFacetKey;return effectiveFacets()?.get(key)||{key,kind:String(key||'').split(':')[0],name:history.contextualGameTitle,ids:new Set()};}
         function notify(message){window.showToastNotification?.('Discover Games',message);}
         function capture(){return {fromExplore:'browse',parentHistory:navHistory,category:document.getElementById('cat-select').value,search:document.getElementById('search-input').value,letter:activeLetter,region:document.getElementById('region-select').value,consoles:getBrowseCheckedValueList(PSN_BROWSE_CONSOLE_FILTER_INPUTS),appsFilters:getBrowseCheckedValueList(PSN_BROWSE_APP_FILTER_INPUTS),showMissingRap:!!document.getElementById('show-missing-rap-toggle')?.checked,scroll:document.getElementById('scroll-area')?.scrollTop||0,limit:renderLimit};}
         function open(facet,modal=null){
@@ -27093,13 +27110,13 @@ P
         async function showPicker(){
             if(picker||isBrowseContextualNavigationActive()||document.getElementById('cat-select')?.value!=='games')return;
             const dialog=document.createElement('dialog');picker=dialog;dialog.id='psn-metadata-picker';dialog.className='psn-metadata-picker';
-            dialog.innerHTML='<div class="sys-modal-content"><div class="sys-modal-header"><h2>Discover Games</h2><button type="button" class="sys-modal-close" aria-label="Close"><i class="fas fa-times"></i></button></div><div class="sys-modal-body"><div class="psn-metadata-picker-controls"><select aria-label="Filter type"><option value="genre">Genre / Theme</option><option value="developer">Developer</option><option value="publisher">Publisher</option></select><input type="search" placeholder="Search…" aria-label="Search filters"></div><div class="psn-metadata-picker-results" aria-live="polite">Loading…</div><div class="psn-metadata-picker-note">Metadata: IGDB</div></div></div>';
+            dialog.innerHTML='<div class="sys-modal-content"><div class="sys-modal-header"><h2>Discover Games</h2><button type="button" class="sys-modal-close" aria-label="Close"><i class="fas fa-times"></i></button></div><div class="sys-modal-body"><div class="psn-metadata-picker-controls"><select aria-label="Filter type"><option value="genre">Genre / Theme</option><option value="developer">Developer</option><option value="publisher">Publisher</option></select><input type="search" placeholder="Search…" aria-label="Search filters"></div><div class="psn-metadata-picker-results" aria-live="polite">Loading…</div><div class="psn-metadata-picker-note">Metadata: catalog sources</div></div></div>';
             const close=()=>{if(picker!==dialog)return;picker=null;dialog.close();dialog.remove();};
             dialog.__psnRequestClose=close;dialog.addEventListener('cancel',e=>{e.preventDefault();close();});dialog.querySelector('.sys-modal-close').onclick=close;dialog.addEventListener('click',e=>{if(e.target===dialog)close();});
             const select=dialog.querySelector('select'),input=dialog.querySelector('input'),results=dialog.querySelector('.psn-metadata-picker-results');
             const render=()=>{
                 if(picker!==dialog||!facets)return;
-                const term=normalize(input.value),matches=[...facets.values()].filter(f=>f.kind===select.value&&normalize(f.name).includes(term)).sort((a,b)=>a.name.localeCompare(b.name));
+                const term=normalize(input.value),matches=[...effectiveFacets().values()].filter(f=>f.kind===select.value&&normalize(f.name).includes(term)).sort((a,b)=>a.name.localeCompare(b.name));
                 const fragment=document.createDocumentFragment();
                 for(const facet of matches.slice(0,80)){const button=document.createElement('button');button.type='button';button.className='ps5-pill-btn psn-metadata-choice';button.textContent=facet.name;button.addEventListener('mouseenter',()=>window.playUiHover?.());button.onclick=()=>{window.playUiClick?.();close();open(facet);};fragment.append(button);}
                 if(!matches.length)fragment.append(document.createTextNode('No matching filters.'));
@@ -27137,7 +27154,7 @@ P
         }
         document.addEventListener('click',e=>{const link=e.target.closest?.('#game-modal [data-psn-meta-kind]');if(link){e.preventDefault();e.stopPropagation();follow(link);}},true);
         document.addEventListener('keydown',e=>{const link=e.target.closest?.('#game-modal [data-psn-meta-kind]');if(link&&(e.key==='Enter'||e.key===' ')){e.preventDefault();e.stopPropagation();follow(link);}},true);
-        return {ensure,row,group,context,showPicker,decorate,labels};
+        return {ensure,row,group,context,showPicker,decorate,labels,signature(){const f=context();return f?f.key+':'+overrideRevision:'';}};
     })();
     function psnFranchiseActiveIndex() {
         let history = navHistory;
@@ -38567,7 +38584,7 @@ P
 			ctx && ctx.isExactTitleIdSearch ? 'id:1' : 'id:0', activeConsoles,
 			ctx && ctx.showFirstPlay ? 'fp:1' : 'fp:0', ctx && ctx.showQore ? 'q:1' : 'q:0', ctx && ctx.showMedia ? 'm:1' : 'm:0',
 			`blocks:${Number(window.__contentBlocksRevision || 0)}`,
-            `metadata:${psnMetadataDiscovery.context()?.key||''}`,
+            `metadata:${psnMetadataDiscovery.signature()}`,
             `franchise:${franchise}:${psnFranchisePersonalToken(personalSet)}:${franchise>=0?Number(window.__psnStoreCacheRevision||0)+':'+psnFranchiseIndexRevision:0}`
 		].join('|');
 	}
@@ -38582,9 +38599,9 @@ P
 		}
         const metadataFacet=psnMetadataDiscovery.context();
         if(metadataFacet){
-            if(!index.metadataPool||index.metadataPool.key!==metadataFacet.key){
+            if(!index.metadataPool||index.metadataPool.key!==psnMetadataDiscovery.signature()){
                 const pool=[];for(const id of metadataFacet.ids){const items=index.byIdNormalized.get(id);if(items)pool.push(...items);}
-                index.metadataPool={key:metadataFacet.key,pool};
+                index.metadataPool={key:psnMetadataDiscovery.signature(),pool};
             }
             consider(index.metadataPool.pool);
         }
@@ -38735,7 +38752,7 @@ P
 			window.contentSizeSortOrders?.browse || 'off',
 			browseExpandedGroupTitle && browseExpandedGroupTitle.key ? `groupkey:${browseExpandedGroupTitle.key}` : '',
 			navHistory && navHistory.lockSearch ? `nav:${String(navHistory.contextualGameTitle || navHistory.fromExplore || 'locked')}` : '',
-            `metadata:${psnMetadataDiscovery.context()?.key||''}`
+            `metadata:${psnMetadataDiscovery.signature()}`
 		].join('|');
 	}
 
@@ -46898,10 +46915,10 @@ P
             if(indexedMetadataApplied||metadataCategory!=='games'||!isCurrentRequest())return;
             const indexed=psnMetadataDiscovery.row(gameId);if(!indexed)return;indexedMetadataApplied=true;
             if(indexed[5]&&!contentMetadataOverride?.year&&!psnStoreMeta.releaseDate&&!psnStoreMeta.releaseYear){
-                mergedMetadata.released=indexed[5];indexedReleaseLocked=true;addMetadataProviderSource('year','IGDB');
+                mergedMetadata.released=indexed[5];indexedReleaseLocked=true;addMetadataProviderSource('year','Catalog index');
             }
             const asNames=values=>values.map(name=>({name}));
-            const changed=mergeMetadataDetails({developers:asNames(indexed[2]),publishers:asNames(indexed[3]),genres:asNames(indexed[4])},'IGDB');
+            const changed=mergeMetadataDetails({developers:asNames(indexed[2]),publishers:asNames(indexed[3]),genres:asNames(indexed[4])},'Catalog index');
             if(changed||indexedReleaseLocked)renderMergedMetadata();
         };
         applyIndexedMetadata();
