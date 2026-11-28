@@ -155,6 +155,185 @@ def metadata(api):
     return list(api.pages('games',fields,where)),platform_map,sources
 
 
+def franchise_words(value):
+    value = unicodedata.normalize('NFKD', str(value).replace('™', '').replace('®', '').replace('©', '')).casefold()
+    value = ''.join(c for c in value if not unicodedata.combining(c))
+    return re.findall(r'[^\W_]+', value, re.UNICODE)
+
+
+def franchise_name_key(name):
+    plain = re.sub(r'\s+(?:series|franchise)\s*$', '', str(name).strip(), flags=re.I)
+    return norm(plain) or norm(name)
+
+
+def label_in_name(label, title):
+    # Whole words, with punctuation/spacing variants (e.g. apostrophes).
+    label_key = franchise_name_key(label)
+    words = franchise_words(title)
+    if not label_key:
+        return False
+    for i in range(len(words)):
+        candidate = ''
+        for word in words[i:]:
+            candidate += word
+            if candidate == label_key:
+                return True
+            if len(candidate) >= len(label_key) or not label_key.startswith(candidate):
+                break
+    return False
+
+
+def game_names(game):
+    return tuple(dict.fromkeys(str(name) for name in [game.get('name', '')] +
+        [item.get('name', '') for item in game.get('alternative_names') or [] if isinstance(item, dict)] if name))
+
+
+def source_entries(game, field, prefix):
+    items = list(game.get(field) or [])
+    if field == 'franchises' and isinstance(game.get('franchise'), dict):
+        items.append(game['franchise'])
+    return set((prefix + ':' + str(item['id']), str(item['name']).strip())
+               for item in items if isinstance(item, dict) and isinstance(item.get('id'), int) and str(item.get('name') or '').strip())
+
+
+def select_game_groups(game):
+    collections = source_entries(game, 'collections', 'c')
+    franchises = source_entries(game, 'franchises', 'f')
+    if len({franchise_name_key(name) for _, name in franchises}) <= 1:
+        return collections | franchises, set()
+    titles = game_names(game)
+    # Several IPs on one game are often character/crossover associations.
+    # Prefer the game's series and labels supported by its own names.
+    # A collection's name may also establish a parent franchise.
+    anchors = titles + tuple(name for _, name in collections)
+    supported = {entry for entry in franchises if any(label_in_name(entry[1], title) for title in anchors)}
+    return collections | supported, franchises - supported
+
+
+def franchise_label_order(entry):
+    key, name = entry
+    qualified = bool(re.search(r'\s+(?:series|franchise)\s*$', name.strip(), re.I))
+    return qualified, key.startswith('f:'), name.casefold(), name, key
+
+
+def acronym(name):
+    words = franchise_words(name)
+    return ''.join(word if word.isdigit() else word[0] for word in words) if len(words) > 1 else ''
+
+
+def consolidate_groups(groups, records=None):
+    records = records or {}
+    entries = sorted(groups, key=franchise_label_order)
+    parents = list(range(len(entries)))
+    by_source, by_name = {}, {}
+
+    def find(index):
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(a, b):
+        a, b = find(a), find(b)
+        if a != b:
+            parents[max(a,b)] = min(a,b)
+
+    for i, (key, name) in enumerate(entries):
+        if key in by_source:
+            union(i, by_source[key])
+        else:
+            by_source[key] = i
+        normalized = franchise_name_key(name)
+        if normalized in by_name:
+            union(i, by_name[normalized])
+        else:
+            by_name[normalized] = i
+
+    merged = defaultdict(list)
+    for i, entry in enumerate(entries):
+        merged[find(i)].append(entry)
+
+    components = []
+    name_merges = 0
+    for component in merged.values():
+        chosen = min(component, key=franchise_label_order)
+        members = {}
+        for entry in component:
+            members.update(groups[entry])
+        if len(component) > 1:
+            name_merges += len(component)-1
+            print(f'Merge by name/source: {component!r} -> {chosen!r}')
+        if len(set(members.values())) >= 2:
+            components.append((chosen, members))
+
+    # Merge abbreviations only with strong canonical-game overlap. Other
+    # differently named, partly overlapping series stay separate.
+    keys = defaultdict(list)
+    for i, ((_, name), _) in enumerate(components):
+        keys[franchise_name_key(name)].append(i)
+    parents = list(range(len(components)))
+    abbreviation_merges = 0
+    for i, ((_, name), members) in enumerate(components):
+        short = acronym(name)
+        if len(short) < 2:
+            continue
+        a = set(members.values())
+        for j in keys.get(short, []):
+            if i == j or find(i) == find(j):
+                continue
+            b = set(components[j][1].values())
+            if len(a & b) >= 3 and len(a & b) / len(a | b) >= .75:
+                union(i,j)
+                abbreviation_merges += 1
+                print(f'Merge abbreviation: {components[j][0][1]} -> {name}')
+    combined = defaultdict(list)
+    for i, item in enumerate(components):
+        combined[find(i)].append(item)
+
+    # Resolve duplicate views by actual game identity. A collection or a
+    # label supported by the games is preferable to an incidental IP label.
+    def rank(entry, signature):
+        support = sum(any(label_in_name(entry[1], title) for title in game_names(records.get(gid, {}))) for gid in signature)
+        return -support, franchise_label_order(entry)
+
+    by_games = {}
+    content_merges = 0
+    for component in combined.values():
+        members = {}
+        for _, part in component:
+            members.update(part)
+        signature = frozenset(members.values())
+        chosen = min((entry for entry, _ in component), key=lambda entry: rank(entry, signature))
+        previous = by_games.get(signature)
+        if previous is None:
+            by_games[signature] = (chosen, members)
+        else:
+            previous_entry, previous_members = previous
+            winner = min(previous_entry, chosen, key=lambda entry: rank(entry, signature))
+            previous_members.update(members)
+            by_games[signature] = (winner, previous_members)
+            content_merges += 1
+            print(f'Consolidate identical game view ({len(signature)}): {previous_entry!r}, {chosen!r} -> {winner!r}')
+
+    result = [{'id': key, 'name': name, 'titles': sorted(members)}
+              for (key, name), members in by_games.values()]
+    result.sort(key=lambda g: (g['name'].casefold(), g['id']))
+    print(f'Consolidation: {name_merges} name/source duplicates; {abbreviation_merges} abbreviations; {content_merges} identical-game views')
+    return result
+
+
+def validate_coverage(previous, result, catalog):
+    # A successful consolidation reduces the number of groups, not the coverage
+    # of existing catalog entries. Do not reject a valid deduplication as shrinkage.
+    old_titles = {tid for group in previous.get('franchises', []) for tid in group.get('titles', [])}
+    old_titles.intersection_update(catalog)
+    new_titles = {tid for group in result['franchises'] for tid in group['titles']}
+    retained = len(old_titles & new_titles)
+    print(f'Coverage of previously indexed catalog IDs: {retained}/{len(old_titles)}')
+    if len(old_titles) >= 20 and retained < len(old_titles)*0.75:
+        raise RuntimeError('Unexpected index coverage loss; previous index preserved')
+
+
 def build(catalog, games, platform_map, psn_sources=frozenset({36})):
     aliases=defaultdict(set); ext=defaultdict(set); records={}
     for game in games:
@@ -166,7 +345,7 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36})):
             for item in game.get('external_games') or []:
                 uid=str(item.get('uid','')).upper() if isinstance(item,dict) else ''
                 if ID.fullmatch(uid) and item.get('external_game_source') in psn_sources and item.get('platform') in platforms: ext[tag,uid].add(gid)
-    groups=defaultdict(dict); matched=0; ambiguous=0; canonical={}
+    groups=defaultdict(dict); matched=0; ambiguous=0; canonical={}; memberships={}; rejected_games=set(); rejected_links=0
     for tid, variants in sorted(catalog.items()):
         candidates=set()
         for name,tag in variants:
@@ -186,20 +365,17 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36})):
         if not isinstance(kind,dict) or str(kind.get('type','')).lower().replace('_',' ') not in ALLOWED_TYPES: continue
         matched+=1
         canonical[tid]=gid
-        for field,prefix in [('collections','c'),('franchises','f')]:
-            items=list(game.get(field) or [])
-            if field=='franchises' and isinstance(game.get('franchise'),dict):items.append(game['franchise'])
-            for item in items:
-                if not isinstance(item,dict) or not item.get('name') or not isinstance(item.get('id'),int): continue
-                groups[(prefix+':'+str(item['id']),item['name'])][tid]=gid
-    output=[]; seen=set()
-    for (key,name), members in sorted(groups.items(),key=lambda x:(x[0][0][0]!='c',x[0][1].casefold(),x[0][0])):
-        if len(set(members.values()))<2:continue
-        signature=(norm(name),tuple(sorted(members)))
-        if signature in seen:continue
-        seen.add(signature)
-        output.append({'id':key,'name':name,'titles':sorted(members)})
-    output.sort(key=lambda g:(g['name'].casefold(),g['id']))
+        if gid not in memberships:
+            accepted, rejected = select_game_groups(game)
+            memberships[gid] = accepted
+            if rejected:
+                rejected_games.add(gid)
+                rejected_links += len(rejected)
+                print(f'Ignore incidental IP associations: {game.get("name", gid)} ({gid}): {", ".join(sorted(name for _,name in rejected))}')
+        for entry in memberships[gid]:
+            groups[entry][tid]=gid
+    print(f'Incidental IP associations: {rejected_links} removed across {len(rejected_games)} games')
+    output = consolidate_groups(groups, records)
     print(f'Catalog: {len(catalog)} IDs | matched: {matched} | ambiguous: {ambiguous} | franchises: {len(output)}')
     used={tid for group in output for tid in group['titles']}
     return {'version':1,'franchises':output,'games':{tid:canonical[tid] for tid in sorted(used)}}
@@ -216,8 +392,7 @@ def main():
     if not result['franchises']:raise RuntimeError('No franchises matched; previous index preserved')
     path=args.root/OUTPUT
     if path.exists():
-        old=json.loads(path.read_text()); old_count=len(old.get('franchises',[]))
-        if old_count>=20 and len(result['franchises'])<old_count*0.75:raise RuntimeError('Unexpected index shrinkage; previous index preserved')
+        validate_coverage(json.loads(path.read_text(encoding='utf-8')), result, catalog)
     path.parent.mkdir(parents=True,exist_ok=True)
     content=json.dumps(result,ensure_ascii=False,separators=(',',':'))+'\n'
     if not path.exists() or path.read_text(encoding='utf-8')!=content:
