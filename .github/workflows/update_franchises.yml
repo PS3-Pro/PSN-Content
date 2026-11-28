@@ -1,0 +1,39 @@
+name: Update Franchises
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ['Update PSN™ Database']
+    types: [completed]
+    branches: [main]
+permissions:
+  contents: write
+concurrency:
+  group: update-franchises-main
+  cancel-in-progress: false
+jobs:
+  update:
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Generate franchise index
+        env:
+          PSN_SECRETS_FILE: ${{ vars.PSN_SECRETS_FILE }}
+          IGDB_CLIENT_ID: ${{ secrets.IGDB_CLIENT_ID }}
+          IGDB_CLIENT_SECRET: ${{ secrets.IGDB_CLIENT_SECRET }}
+        run: python .github/scripts/generate_franchises.py
+      - name: Commit index only if changed
+        run: |
+          git config user.name 'PS3-Pro Bot'
+          git config user.email 'bot@ps3pro.com'
+          git add resources/database/helpers/franchises.json
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'Update franchise index'
+          git pull --rebase origin main
+          git push origin HEAD:main
