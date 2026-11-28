@@ -13,7 +13,7 @@ from collections import Counter, defaultdict
 from functools import lru_cache
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit, unquote
 from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -121,12 +121,14 @@ ORDINAL_WORD = re.compile(r'\b(?:' + '|'.join(ORDINAL_WORDS) + r')\b', re.I)
 ORDINAL_NUMBER = re.compile(r'\b(?:' + '|'.join(ORDINAL_WORDS.values()) + r')\b', re.I)
 NUMBER_PAIR = re.compile(r'(?<!\w)([IVXLCDM]+|\d+)\s+(?:and|&)\s+(?=(?:[IVXLCDM]+|\d+)(?:\b|[-/]))', re.I)
 NON_GAME_SUFFIX = re.compile(r'(?:\s+(?:Official|Gameplay|Launch)\s+Trailer|\s*[-–—]\s*Console Application)\s*$', re.I)
+EXPLICIT_STORE_EXTRAS = re.compile(r'(?:\s*[-–—:]\s*[^:–—]{1,80}\s+Avatar|\s+Interactive Ad|\s+Digital Treasure Map(?: for PS3)?|\s+Digital Download Preview|\s+Early Access|\s+Early Release|\s+オリジナルサウンドトラック|\s*サウンドトラック|\s*解説書|\s*リハーサル版|\s*お試し版|\s*デモ版|\s*데모|\s*βテストver\.?)\s*$', re.I)
+NON_GAME_ADDON_SUFFIX = re.compile(r'(?:\s+PS[123]\s+Patch|\s*[-–—:]\s*(?:Costume\s+Pack|Kostüm[ -]Paket))\s*$', re.I)
 MANUAL_SUFFIX = re.compile(r'(?:\b(?:DigiManual|Digital Manual|Manual)\b)(?:\s*\(Digital\))?\s*$', re.I)
 
 
 def is_explicit_non_game(title, tid):
-    title = unicodedata.normalize('NFKC', title).replace('™', '').replace('®', '').strip()
-    return bool(NON_GAME_SUFFIX.search(title) or (tid.startswith('NPUO') and MANUAL_SUFFIX.search(title)))
+    title = unicodedata.normalize('NFKC', title.translate(MARKS)).strip()
+    return bool(NON_GAME_SUFFIX.search(title) or NON_GAME_ADDON_SUFFIX.search(title) or EXPLICIT_STORE_EXTRAS.search(title) or (tid.startswith('NPUO') and MANUAL_SUFFIX.search(title)))
 
 
 @lru_cache(maxsize=4096)
@@ -395,6 +397,24 @@ def psn_title_id(value):
     return match[1] if match else ''
 
 
+
+def psn_product_url_id(value):
+    if not isinstance(value, str):
+        return ''
+    try:
+        parsed = urlsplit(value)
+        if parsed.scheme != 'https' or parsed.hostname not in {'store.playstation.com', 'www.store.playstation.com'} or parsed.username or parsed.password:
+            return ''
+    except ValueError:
+        return ''
+    pieces = unquote(parsed.path).split('/')
+    for index, piece in enumerate(pieces[:-1]):
+        if piece.lower() == 'product':
+            match = PSN_CONTENT_ID.fullmatch(pieces[index + 1].upper())
+            if match:
+                return match[1]
+    return ''
+
 def localized_game_names(game):
     return tuple(dict.fromkeys(str(item['name']) for item in game.get('game_localizations') or []
         if isinstance(item,dict) and item.get('name')))
@@ -487,7 +507,7 @@ class BrowseContentFilter:
         return 'eligible_rows'
 
 
-def read_catalog(root, diagnostic=None):
+def read_catalog(root, diagnostic=None, content_ids=None):
     base = root / 'resources/database/content'
     if not (base / FILES[0]).is_file(): raise RuntimeError('Missing official games.tsv')
     modern = root / 'files/website/modern.html'
@@ -519,6 +539,10 @@ def read_catalog(root, diagnostic=None):
                     reason = browse_filter.category(title, tid, cid, explicit_demo)
                     if reason == 'eligible_rows':
                         result[tid].add((title, platform(title,tid,cid)))
+                        if content_ids is not None:
+                            product = cid.upper()
+                            if PSN_CONTENT_ID.fullmatch(product) and psn_title_id(product)==tid:
+                                content_ids[tid].add(product)
                 counts[reason] += 1
     if diagnostic is not None:
         diagnostic['catalog_sources'] = sources
@@ -688,7 +712,7 @@ def metadata(api, cache_path, force_full=False):
     if any(not ids for ids in platform_map.values()):raise RuntimeError('IGDB platform mapping incomplete')
     sources={r['id'] for r in api.pages('external_game_sources','id,name') if 'playstation' in norm(r.get('name','')) or norm(r.get('name','')).startswith('psn')}
     all_platforms=sorted(set().union(*platform_map.values()))
-    fields='id,name,platforms,game_type.type,alternative_names.name,collections.id,collections.name,franchises.id,franchises.name,franchise.id,franchise.name,external_games.uid,external_games.external_game_source,external_games.platform,external_games.name,game_localizations.name,involved_companies.publisher,involved_companies.company.name,version_parent,remakes,remasters,ports,expanded_games,standalone_expansions'
+    fields='id,name,platforms,game_type.type,alternative_names.name,collections.id,collections.name,franchises.id,franchises.name,franchise.id,franchise.name,external_games.uid,external_games.external_game_source,external_games.platform,external_games.name,external_games.url,game_localizations.name,game_localizations.region.identifier,involved_companies.publisher,involved_companies.developer,involved_companies.company.name,version_parent,remakes,remasters,ports,expanded_games,standalone_expansions,parent_game,bundles,version_title,first_release_date,release_dates.platform,release_dates.date,release_dates.release_region.region,release_dates.date_format.format'
     games = metadata_snapshot(api, cache_path, fields, all_platforms, force_full)
     relations = list(api.pages('collection_relations', 'id,child_collection.id,child_collection.name,parent_collection.id,parent_collection.name,type.name'))
     return games,platform_map,sources,relations
@@ -2563,6 +2587,270 @@ def resolve_regional_alias_conflict(tid,candidates,variants,records,ext,anchors)
     return matches if len(matches)==1 else candidates
 
 
+def credited_company_ids(game, role):
+    return {item['company']['id'] for item in game.get('involved_companies') or ()
+            if isinstance(item.get('company'), dict) and type(item['company'].get('id')) is int
+            and (item.get(role) is True or (role == 'developer' and 'developer' not in item and item.get('publisher') is False))}
+
+
+def resolve_documented_duplicate(tid, candidates, variants, records, ext):
+    # Do not infer identity from shared franchise or title alone. A documented
+    # alias, matching localization, and independent company credits are needed.
+    if len(candidates) != 2 or len(variants) != 1 or any(ext.get((tag, tid)) for _, tag in variants):
+        return candidates
+    title, tag = next(iter(variants))
+    w = norm(recovery_base(catalog_match_name(title, tid), True))
+    a, b = (records[gid] for gid in sorted(candidates))
+    if any((g.get('game_type') or {}).get('type', '').lower() != 'main game' for g in (a,b)):
+        return candidates
+    if set(a.get('platforms', ())) != set(b.get('platforms', ())) or explicit_version_links(a) or explicit_version_links(b):
+        return candidates
+    if a.get('version_parent') or b.get('version_parent') or a.get('parent_game') or b.get('parent_game'):
+        return candidates
+    if not credited_company_ids(a,'developer') & credited_company_ids(b,'developer') or not publisher_ids(a) & publisher_ids(b):
+        return candidates
+    groups_a = {e[0] for e in select_game_groups(a)[0]}
+    groups_b = {e[0] for e in select_game_groups(b)[0]}
+    if not groups_a or groups_a != groups_b:
+        return candidates
+    locales = [{norm(n) for n in localized_game_names(g) if JAPANESE_SCRIPT.search(n)} for g in (a,b)]
+    if not w or w not in locales[0] & locales[1] or not JAPANESE_SCRIPT.search(title):
+        return candidates
+    if a.get('first_release_date') and b.get('first_release_date') and abs(a['first_release_date']-b['first_release_date']) > 86400:
+        return candidates
+    # Prefer the record that explicitly lists the other record's official
+    # title as an alias, not the record with the lowest ID or more metadata.
+    proven = {g['id'] for g, other in ((a,b),(b,a))
+              if norm(g['name']) != norm(other['name'])
+              and norm(other['name']) in {norm(n) for n in game_names(g)[1:]}}
+    return proven if len(proven) == 1 else candidates
+
+
+
+def localized_series_ordinal(value):
+    text = unicodedata.normalize('NFKC', str(value or '')).strip()
+    if not JAPANESE_SCRIPT.search(text):
+        return None
+    match = re.fullmatch(r'(.+?)[\s・]*(1[0-6]|[1-9]|XVI|XV|XIV|XIII|XII|XI|IX|VIII|VII|VI|IV|III|II|I|V|X)', text, re.I)
+    if match and JAPANESE_SCRIPT.search(match[1]):
+        return terminal_title_key(match[1]), int(ROMAN.get(match[2].lower(), match[2]))
+    return terminal_title_key(text), 1
+
+
+def resolve_japanese_series_number(tid, candidates, variants, records, ext):
+    # Japanese PS Classics can retain Western names with shifted numbering.
+    # Require exact title/alias support and a shared localized stem and collection.
+    if not tid.startswith('NPJJ') or {tag for _,tag in variants} != {'psx'} or len(candidates) < 2 or any(ext.get((tag,tid)) for _,tag in variants):
+        return set()
+    words = {extended_title_words(catalog_match_name(n,tid), True) for n,_ in variants}
+    if len(words) != 1:
+        return set()
+    w = next(iter(words))
+    if not w:
+        return set()
+    number = int(w[-1]) if w[-1].isdigit() else 1
+    root = w[:-1] if w[-1].isdigit() else w
+    if len(root) < 2 or not 1 <= number <= 16:
+        return set()
+    shared = set.intersection(*[{entry for entry in source_entries(records[g],'collections','c') if extended_title_words(entry[1]) == root} for g in candidates])
+    if not shared:
+        return set()
+    common_publishers = set.intersection(*(publisher_ids(records[g]) for g in candidates))
+    if not common_publishers:
+        return set()
+    local = {g:{v for name in localized_game_names(records[g]) if (v:=localized_series_ordinal(name))} for g in candidates}
+    if any(len(v) != 1 for v in local.values()):
+        return set()
+    local = {g:next(iter(v)) for g,v in local.items()}
+    if len({stem for stem,_ in local.values()}) != 1 or len({num for _,num in local.values()}) != len(candidates):
+        return set()
+    winners = {g for g,(_,num) in local.items() if num == number and w in {extended_title_words(n) for n in game_names(records[g])}}
+    return winners if len(winners) == 1 else set()
+
+
+def resolve_anchored_named_port(tid, candidates, variants, records, ext, anchors):
+    # An explicitly linked port, listed in other regions under the same full
+    # store title, can identify a named edition of that port. No bare subtitles.
+    if len(candidates) != 2 or any(ext.get((tag,tid)) for _,tag in variants):
+        return candidates
+    raw = {extended_title_words(catalog_match_name(n,tid), True) for n,_ in variants}
+    if len(raw) != 1:
+        return candidates
+    words = next(iter(raw))
+    if words[-2:] not in (('ultimate','edition'),('complete','edition'),('definitive','edition')) or len(words) < 5:
+        return candidates
+    base = words[:-2]
+    winners = set()
+    for gid in candidates:
+        g = records[gid]; parent = records[next(iter(candidates-{gid}))]
+        if (g.get('game_type') or {}).get('type','').lower() != 'port' or gid not in (parent.get('ports') or ()):
+            continue
+        if extended_title_words(g['name']) != base or base not in {extended_title_words(n) for n in game_names(parent)}:
+            continue
+        if not all(len(anchors.get((gid,tag),set())) >= 2 for _,tag in variants):
+            continue
+        if not source_entries(g,'collections','c') & source_entries(parent,'collections','c'):
+            continue
+        winners.add(gid)
+    return winners if len(winners) == 1 else candidates
+
+
+def resolve_confirmed_bundle(tid, candidates, variants, records, ext):
+    # Resolve only when metadata explicitly identifies the competing bundle
+    # as a different named edition, not merely because one is a bundle.
+    if len(candidates) != 2 or any(ext.get((tag,tid)) for _,tag in variants):
+        return candidates
+    words = {extended_title_words(catalog_match_name(n,tid),True) for n,_ in variants}
+    if len(words)!=1:
+        return candidates
+    w=next(iter(words))
+    for gid in candidates:
+        g=records[gid]; b=records[next(iter(candidates-{gid}))]
+        if (b.get('game_type') or {}).get('type','').lower()!='bundle' or (g.get('game_type') or {}).get('type','').lower()!='main game':
+            continue
+        if b['id'] not in (g.get('bundles') or ()) and g.get('parent_game')!=b['id']:
+            continue
+        edition=extended_title_words(b.get('version_title') or '')
+        if not edition or not any(x in edition for x in ('bundle','collection','pack','edition')):
+            continue
+        if w==extended_title_words(g['name']) and w!=edition and not any(x in w for x in ('bundle','collection','pack','edition')):
+            return {gid}
+    return candidates
+
+
+STORE_DOWNLOAD_MARKER = re.compile(r'\s*(?:\(\s*download(?:able)?\s+ver(?:sion)?\.?\s*\)|\s+DOWNLOAD)\s*$', re.I)
+
+
+def strict_store_key(name):
+    text = unicodedata.normalize('NFKC', name).replace('&', ' and ')
+    text = ''.join(chr(ord(c)-96) if 'ァ'<=c<='ヶ' else c for c in text)
+    return ''.join(franchise_words(text))
+
+
+def verified_store_catalog_keys(name, tid):
+    raw = recovery_base(catalog_match_name(name,tid),True)
+    if EXTRA_NON_GAME.search(raw) or SUBTITLE_BLOCK.search(raw):
+        return set()
+    clean = STORE_DOWNLOAD_MARKER.sub('',raw).strip()
+    key = strict_store_key(clean)
+    return {key} if len(key)>=6 or (key and re.fullmatch(r'(?:[A-Z]\.){3,}[A-Z]\.?\s*\d{1,2}',clean,re.I)) else set()
+
+
+def verified_store_metadata_keys(game, all_names):
+    keys = set()
+    franchises = [franchise_words(label) for _,label in source_entries(game,'franchises','f')]
+    collections = source_entries(game,'collections','c')
+    publishers = publisher_prefixes(game)
+    for name in all_names:
+        k = strict_store_key(name)
+        if not k or len(k)<6:
+            continue
+        keys.add(k)
+        words = franchise_words(name)
+        # The exact remaining title must still contain its independently
+        # documented collection label, after dropping a larger IP prefix.
+        for prefix in franchises:
+            if prefix and words[:len(prefix)] == prefix and len(words)>len(prefix):
+                tail = words[len(prefix):]
+                if any(label_in_name(c,' '.join(tail)) for _,c in collections):
+                    keys.add(''.join(tail))
+        # Store packaging, only with the actual credited publisher.
+        for publisher in publishers:
+            keys.add(''.join(publisher+('classics',))+k)
+    return keys
+
+
+def exact_variant_conflict(variants, primary, aliases):
+    # Only independent, non-overlapping exact name evidence is reported.
+    # Several variants of one title sharing a candidate are not conflicts.
+    evidence=[]
+    for tag,keys in variants:
+        exact=set().union(*(primary.get((tag,key),()) for key in keys))
+        alternate=set().union(*(aliases.get((tag,key),()) for key in keys))
+        if exact or alternate:
+            evidence.append(exact | alternate)
+    if len(evidence)>1 and not set.intersection(*evidence):
+        return set.union(*evidence)
+    return set()
+
+
+def resolve_content_id_alias(tid,candidates,variants,records,ext,content_ids):
+    # Sony's product identifier can include an exact official short title.
+    # Match the entire mnemonic (apart from fixed-length zero padding),
+    # never a substring, and require each supplied product ID to agree.
+    if len(candidates)<2 or not tid.startswith('NP') or any(ext.get((tag,tid)) for _,tag in variants):
+        return candidates
+    if len({extended_title_words(catalog_match_name(n,tid),True) for n,_ in variants})!=1:
+        return candidates
+    products=content_ids.get(tid,())
+    if not products:
+        return candidates
+    evidence=[]
+    for product in products:
+        if not isinstance(product,str) or not PSN_CONTENT_ID.fullmatch(product) or psn_title_id(product)!=tid:
+            return candidates
+        mnemonic=product.rsplit('-',1)[1].casefold()
+        options={mnemonic,re.sub(r'0{4,}$','',mnemonic)}
+        options={x for x in options if len(x)>=6 and sum(c.isalpha() for c in x)>=4}
+        if not options:
+            return candidates
+        hits={gid for gid in candidates if options & {strict_store_key(n) for n in game_names(records[gid])}}
+        if len(hits)!=1:
+            return candidates
+        evidence.append(hits)
+    common=set.intersection(*evidence)
+    return common if len(common)==1 else candidates
+
+
+def release_region_key(value):
+    if isinstance(value,dict):
+        return norm(value.get('region',''))
+    return ''
+
+
+def resolve_same_release_duplicate(tid,candidates,variants,records,ext,platform_map):
+    # Independently documented regional platform release, exact same developer
+    # and collection, same title, no explicit version relationship. A strictly
+    # broader platform record may then be the canonical duplicate.
+    if len(candidates)!=2 or any(ext.get((tag,tid)) for _,tag in variants):
+        return candidates
+    a,b=(records[g] for g in sorted(candidates))
+    if any((g.get('game_type') or {}).get('type','').lower()!='main game' for g in (a,b)):
+        return candidates
+    if strict_store_key(a['name'])!=strict_store_key(b['name']):
+        return candidates
+    if len({extended_title_words(catalog_match_name(n,tid),True) for n,_ in variants})!=1:
+        return candidates
+    if any(g.get('version_title') or g.get('version_parent') or g.get('parent_game') for g in (a,b)):
+        return candidates
+    if a['id'] in explicit_version_links(b) or b['id'] in explicit_version_links(a):
+        return candidates
+    devs=lambda g: {x['company']['id'] for x in g.get('involved_companies') or () if x.get('developer') is True and isinstance(x.get('company'),dict) and type(x['company'].get('id')) is int}
+    if not devs(a) or devs(a)!=devs(b):
+        return candidates
+    ga={x[0] for x in select_game_groups(a)[0]};gb={x[0] for x in select_game_groups(b)[0]}
+    if not ga or ga!=gb:
+        return candidates
+    pa,pb=set(a.get('platforms',())),set(b.get('platforms',()))
+    if not (pa<pb or pb<pa):
+        return candidates
+    if not a.get('first_release_date') or not b.get('first_release_date') or a['first_release_date']!=b['first_release_date']:
+        return candidates
+    for _,tag in variants:
+        platform_ids=platform_map.get(tag,())
+        def dated(g):
+            return {(r.get('platform'),release_region_key(r.get('release_region')),r.get('date')) for r in g.get('release_dates') or () if r.get('platform') in platform_ids and release_region_key(r.get('release_region')) and type(r.get('date')) is int and r['date']>0 and isinstance(r.get('date_format'),dict) and norm(r['date_format'].get('format','')) in ('yyyymmmmdd','yyyymmdd')}
+        da,db=dated(a),dated(b)
+        if not da or not db or da!=db:
+            return candidates
+    return {a['id'] if pb<pa else b['id']}
+
+def ambiguity_evidence(game):
+    return {key: game[key] for key in ('game_type','platforms','first_release_date','release_dates',
+            'game_localizations','alternative_names','involved_companies','parent_game','bundles',
+            'version_parent','version_title','ports','remakes','remasters','collections','franchises') if key in game}
+
+
 def attach_confirmed_spinoffs(groups,pending,records,catalog,rejected_games):
     # A specifically labeled Japanese side story can join an official
     # collection if two independently documented titles share the label,
@@ -2620,7 +2908,14 @@ def attach_verified_singleton_parents(groups,pending,records,rejected_games,pare
     return sum(len(tids) for _,_,tids in plans)
 
 
-def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(), diagnostic=None):
+def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(), diagnostic=None, content_ids=None):
+    content_ids = content_ids or {}
+    removed = {tid: sorted(variants) for tid, variants in catalog.items()
+               if all(is_explicit_non_game(name, tid) for name, _ in variants)}
+    catalog = {tid: {pair for pair in variants if not is_explicit_non_game(pair[0], tid)}
+               for tid, variants in catalog.items() if tid not in removed}
+    if diagnostic is not None:
+        diagnostic['additional_explicit_non_game_ids'] = sorted(removed)
     primary=defaultdict(set); aliases=defaultdict(set); ext=defaultdict(set); records={}
     requested_names=defaultdict(set); requested_ids=defaultdict(set)
     catalog_keys={}; recovery_catalog={}; recovery_requested=defaultdict(set); recovery_index=defaultdict(set)
@@ -2723,6 +3018,10 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
     terminal_requested=defaultdict(set);terminal_index=defaultdict(set)
     for variants in terminal_catalog.values():
         for tag,keys in variants:terminal_requested[tag].update(keys)
+    verified_store_catalog={tid:[(tag,verified_store_catalog_keys(n,tid)) for n,tag in sorted(variants)] for tid,variants in catalog.items()}
+    verified_store_requested=defaultdict(set);verified_store_index=defaultdict(set)
+    for variants in verified_store_catalog.values():
+        for tag,keys in variants: verified_store_requested[tag].update(keys)
     metadata_count=0; version_parent_groups={}; bridge_records=[]; digital_named=set()
     for game in games:
         metadata_count+=1
@@ -2755,6 +3054,10 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
             ordinals.update(ordinal_recovery_keys(title))
         relevant=False
         all_names=titles + localized_game_names(game)
+        verified_store_keys=verified_store_metadata_keys(game,all_names)
+        for tag in tags:
+            for key in verified_store_keys & verified_store_requested[tag]:
+                verified_store_index[tag,key].add(gid);relevant=True
         terminal_keys=terminal_metadata_keys(game,titles,localized_game_names(game),accepted)
         for tag in tags:
             for kind,key in terminal_keys & terminal_requested[tag]:
@@ -2903,6 +3206,11 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
         for item in game.get('external_games') or []:
             if not isinstance(item,dict) or item.get('external_game_source') not in psn_sources: continue
             uid=psn_title_id(item.get('uid'))
+            url_uid=psn_product_url_id(item.get('url'))
+            # Conflicting identifiers must not be silently preferred.
+            if uid and url_uid and uid != url_uid:
+                continue
+            external_ids={v for v in (uid,url_uid) if v}
             external_platform = item.get('platform')
             compatible = tags if external_platform is None else tags.intersection(tags_by_platform.get(external_platform, ()))
             external_name = item.get('name')
@@ -2911,8 +3219,8 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
                 if external_key and external_key in extended_requested[tag]:
                     extended_index[tag,external_key].add(gid)
                     relevant=True
-                if uid and uid in requested_ids[tag]:
-                    ext[tag,uid].add(gid)
+                for external_id in external_ids & requested_ids[tag]:
+                    ext[tag,external_id].add(gid)
                     relevant=True
         if relevant:
             records[gid]=compact_game(game)
@@ -2936,10 +3244,38 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
         if len(found)==1:
             gid=next(iter(found))
             for tag,_ in variants:terminal_anchors[gid,tag].add(tid)
-    rejected_memberships = {}; recovered_matches = Counter(); match_methods = {}
+    rejected_memberships = {}; recovered_matches = Counter(); match_methods = {}; catalog_conflicts = {}
     for tid, variants in sorted(catalog_keys.items()):
         candidates=resolve_catalog_game(tid, variants, primary, aliases, ext)
         method='baseline'
+        conflict=exact_variant_conflict(variants,primary,aliases)
+        if not conflict and len(verified_store_catalog[tid])>1:
+            hits=[{gid for key in keys for gid in verified_store_index.get((tag,key),())} for tag,keys in verified_store_catalog[tid]]
+            hits=[x for x in hits if x]
+            if len(hits)>1 and not set.intersection(*hits):
+                conflict=set.union(*hits)
+        if not conflict and len(recovery_catalog[tid])>1:
+            hits=[{gid for key in strong for gid in recovery_index.get((tag,key),())} for tag,strong,_ in recovery_catalog[tid]]
+            hits=[x for x in hits if x]
+            if len(hits)>1 and not set.intersection(*hits):
+                conflict=set.union(*hits)
+        if conflict:
+            catalog_conflicts[tid]=sorted(conflict)
+            # Never narrow a conflict between independent full titles by a
+            # weak edition, alias or regional rule.
+            unresolved.append((tid,variants,conflict))
+            ambiguous+=1
+            continue
+        if tid.startswith('NPJJ'):
+            regional_candidates=set(candidates)
+            for tag,keys in variants:
+                for key in keys:
+                    regional_candidates.update(primary.get((tag,key),()))
+                    regional_candidates.update(aliases.get((tag,key),()))
+            regional=resolve_japanese_series_number(tid,regional_candidates,catalog[tid],records,ext)
+            if regional and regional!=candidates:
+                candidates=regional
+                method='verified_localized_series_number';recovered_matches[method]+=1
         if not candidates:
             possible=set()
             used_edition=False
@@ -3041,6 +3377,10 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
             candidates=terminal_resolution(tid,terminal_catalog[tid],terminal_index,terminal_anchors)
             if len(candidates)==1:
                 method='terminal_release_identity';recovered_matches[method]+=1
+        if not candidates:
+            candidates=corroborated_candidates(verified_store_catalog[tid],lambda item: {gid for key in item[1] for gid in verified_store_index.get((item[0],key),())})
+            if len(candidates)==1:
+                method='verified_store_packaging';recovered_matches[method]+=1
         if len(candidates)>1:
             refined=resolve_plus_variant(tid, candidates, catalog[tid], records, ext)
             if len(refined)==1:
@@ -3072,6 +3412,31 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
             refined=resolve_regional_alias_conflict(tid,candidates,catalog[tid],records,ext,terminal_anchors)
             if len(refined)==1:
                 method='confirmed_regional_alias';recovered_matches[method]+=1
+            candidates=refined
+        if len(candidates)>1:
+            refined=resolve_documented_duplicate(tid,candidates,catalog[tid],records,ext)
+            if len(refined)==1:
+                method='documented_duplicate';recovered_matches[method]+=1
+            candidates=refined
+        if len(candidates)>1:
+            refined=resolve_anchored_named_port(tid,candidates,catalog[tid],records,ext,terminal_anchors)
+            if len(refined)==1:
+                method='anchored_named_port';recovered_matches[method]+=1
+            candidates=refined
+        if len(candidates)>1:
+            refined=resolve_confirmed_bundle(tid,candidates,catalog[tid],records,ext)
+            if len(refined)==1:
+                method='confirmed_bundle_identity';recovered_matches[method]+=1
+            candidates=refined
+        if len(candidates)>1 and tid not in catalog_conflicts:
+            refined=resolve_content_id_alias(tid,candidates,catalog[tid],records,ext,content_ids)
+            if len(refined)==1:
+                method='verified_product_alias';recovered_matches[method]+=1
+            candidates=refined
+        if len(candidates)>1 and tid not in catalog_conflicts:
+            refined=resolve_same_release_duplicate(tid,candidates,catalog[tid],records,ext,platform_map)
+            if len(refined)==1:
+                method='same_release_duplicate';recovered_matches[method]+=1
             candidates=refined
         if len(candidates)!=1:
             ambiguous+=bool(candidates)
@@ -3111,6 +3476,7 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
     spinoff_recovered=attach_confirmed_spinoffs(groups,pending,records,catalog,rejected_games)
     character_merges=flatten_verified_character_subsets(groups,records)
     if diagnostic is not None:
+        diagnostic['catalog_variant_conflicts']=catalog_conflicts
         diagnostic['confirmed_spinoff_recoveries']=spinoff_recovered
         diagnostic['singleton_parent_recoveries']=singleton_parent_recovered
         diagnostic['volume_alias_recoveries']=volume_alias_recovered
@@ -3194,7 +3560,8 @@ def collect_diagnostics(report, catalog, records, canonical, unresolved, groups,
             'platforms': tags, 'status': status, 'igdb_id': gid,
             'match_method': (match_methods or {}).get(tid,''),
             'igdb_name': records[gid].get('name', '') if gid is not None else '',
-            'candidates': [{'id': candidate, 'name': records.get(candidate, {}).get('name', '')}
+            'candidates': [{'id': candidate, 'name': records.get(candidate, {}).get('name', ''),
+                            'evidence': ambiguity_evidence(records.get(candidate, {}))}
                            for candidate in sorted(candidates)],
             'accepted_groups': sorted({name for _, name in memberships.get(gid, ())}),
             'rejected_groups': sorted({name for _, name in rejected.get(gid, ())}),
@@ -3261,6 +3628,10 @@ def write_diagnostics(report, directory):
     lines += [f"Release evidence: **{recoveries.get('release_evidence',0)}** | Strict full-title typos: **{recoveries.get('strict_title_typo',0)}** | Release identities: **{recoveries.get('release_identity',0)}** | Supported series memberships: **{report.get('supported_series_recoveries',0)}** | Official version aliases: **{recoveries.get('official_version_alias',0)}** | Verified regional brands: **{recoveries.get('verified_regional_brand',0)}** | Explicit edition memberships: **{report.get('explicit_edition_recoveries',0)}** | Explicit subseries merges: **{report.get('character_subseries_merges',0)}**.", '']
     lines += [f"Packaging identity: **{recoveries.get('packaging_identity',0)}** | Digital distribution identity: **{recoveries.get('distribution_identity',0)}** | Token identity: **{recoveries.get('word_identity',0)}** | Mixed-script crossover identity: **{recoveries.get('mixed_crossover_identity',0)}** | Official series-volume aliases: **{report.get('volume_alias_recoveries',0)}** | Confirmed regional omitted word: **{recoveries.get('confirmed_omitted_word',0)}**.", '']
     lines += [f"Terminal release identities: **{recoveries.get('terminal_release_identity',0)}** | Verified original edition and sequel: **{report.get('singleton_parent_recoveries',0)}** | Confirmed side stories: **{report.get('confirmed_spinoff_recoveries',0)}** | Confirmed regional aliases: **{recoveries.get('confirmed_regional_alias',0)}**.", '']
+    lines += [f"Documented duplicate recoveries: **{recoveries.get('documented_duplicate',0)}**.", '']
+    lines += [f"Verified localized series numbers: **{recoveries.get('verified_localized_series_number',0)}** | Anchored named ports: **{recoveries.get('anchored_named_port',0)}** | Verified store packaging: **{recoveries.get('verified_store_packaging',0)}** | Explicit bundle identities: **{recoveries.get('confirmed_bundle_identity',0)}** | Product ID aliases: **{recoveries.get('verified_product_alias',0)}** | Same-release duplicates: **{recoveries.get('same_release_duplicate',0)}**.", '', f"Catalog variant conflicts: **{len(report.get('catalog_variant_conflicts',{}))}**. See coverage.json for the exact candidates.", '']
+    if report.get('additional_explicit_non_game_ids'):
+        lines += [f"Additional excluded IDs during replay: **{len(report['additional_explicit_non_game_ids'])}**.", '']
     summary = '\n'.join(lines)
     (directory / 'summary.md').write_text(summary, encoding='utf-8')
     print(summary)
@@ -3280,7 +3651,7 @@ def main():
         if diagnostic is not None:
             diagnostic.update(context.get('catalog_diagnostics', {}))
         games=cached_games(args.replay/'metadata-snapshot.json.gz')
-        result=build(catalog,games,platforms,sources,relations,diagnostic)
+        result=build(catalog,games,platforms,sources,relations,diagnostic,context.get('catalog_content_ids',{}))
         if diagnostic is not None: write_diagnostics(diagnostic,args.diagnostics)
         if args.replay_output:
             if args.replay_output.resolve() == (args.root/OUTPUT).resolve(): p.error('Replay output cannot overwrite the published index')
@@ -3288,13 +3659,14 @@ def main():
             args.replay_output.write_text(json.dumps(result,ensure_ascii=False,separators=(',',':'))+'\n',encoding='utf-8')
         print(f'Offline replay: {len(result["franchises"])} franchises; {len(result["games"])} indexed IDs')
         return
-    catalog=read_catalog(args.root, diagnostic)
+    content_ids=defaultdict(set)
+    catalog=read_catalog(args.root, diagnostic, content_ids)
     if args.metadata:
         fixture=json.loads(args.metadata.read_text()); platforms=PLATFORMS; sources={36}
         games,relations=(fixture['games'],fixture.get('relations',[])) if isinstance(fixture,dict) else (fixture,[])
     else:
         api=IGDB(args.root,args.secrets_file);games,platforms,sources,relations=metadata(api, args.root/CACHE_FILE, args.full_refresh)
-    result=build(catalog,games,platforms,sources,relations,diagnostic)
+    result=build(catalog,games,platforms,sources,relations,diagnostic,content_ids)
     if diagnostic is not None:
         write_diagnostics(diagnostic, args.diagnostics)
         if not args.metadata:
@@ -3304,6 +3676,7 @@ def main():
             replay={'catalog':{tid:sorted(variants) for tid,variants in sorted(catalog.items())},
                     'platforms':{tag:sorted(ids) for tag,ids in platforms.items()},
                     'psn_sources':sorted(sources),'collection_relations':relations,
+                    'catalog_content_ids':{tid:sorted(ids) for tid,ids in sorted(content_ids.items())},
                     'catalog_diagnostics':{key:diagnostic[key] for key in ('catalog_sources','apps_filter_available','browse_filter_app_ids') if key in diagnostic}}
             (args.diagnostics/'replay-context.json').write_text(json.dumps(replay,ensure_ascii=False,separators=(',',':'))+'\n',encoding='utf-8')
     if not args.metadata: print(f'IGDB requests: {api.requests}')
