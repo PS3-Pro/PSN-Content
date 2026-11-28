@@ -2,6 +2,7 @@
 import argparse
 import csv
 import gzip
+import hashlib
 import heapq
 import json
 import os
@@ -236,6 +237,7 @@ def equivalent_title_keys(value, catalog=False):
 CATALOG_STORE_SUFFIX = re.compile(r"\s+(?:PS3|PlayStation\s*3|EU|USA|EUR|JPN|\(Download Ver\.\))\s*$", re.I)
 
 
+@lru_cache(maxsize=8192)
 def store_title_keys(value, catalog=False):
     raw = recovery_base(value, catalog)
     if catalog:
@@ -267,7 +269,7 @@ def store_title_keys(value, catalog=False):
             variants.add(tuple('and' if w=='n' else w for w in parts))
         if len(parts)>=4 and parts[-2]=='episode' and parts[-1] in ('one','two','three','four','five','six','seven','eight','nine'):
             variants.add(parts[:-1]+(str(('one','two','three','four','five','six','seven','eight','nine').index(parts[-1])+1),))
-    return {extended_name_key(w) for w in variants if len(w) >= 2 and sum(map(len,w)) >= 8}
+    return frozenset(extended_name_key(w) for w in variants if len(w) >= 2 and sum(map(len,w)) >= 8)
 
 
 def supported_store_keys(game, titles, accepted):
@@ -582,8 +584,11 @@ class IGDB:
     def authenticate(self):
         req = Request('https://id.twitch.tv/oauth2/token', data=urlencode({'client_id':self.client,'client_secret':self.secret,'grant_type':'client_credentials'}).encode(), headers={'Content-Type':'application/x-www-form-urlencoded'})
         try:
-            with urlopen(req,timeout=30) as response: return json.load(response)['access_token']
-        except (HTTPError, URLError, KeyError, ValueError): raise RuntimeError('IGDB authentication failed') from None
+            with urlopen(req,timeout=30) as response:
+                raw=response.read(1024*1024+1)
+                if len(raw)>1024*1024: raise ValueError('Authentication response too large')
+                return json.loads(raw)['access_token']
+        except (HTTPError, URLError, TimeoutError, KeyError, ValueError): raise RuntimeError('IGDB authentication failed') from None
 
     def query(self, endpoint, body):
         for attempt in range(5):
@@ -592,14 +597,17 @@ class IGDB:
             self.requests+=1
             req=Request('https://api.igdb.com/v4/'+endpoint, data=body.encode(), headers={'Client-ID':self.client,'Authorization':'Bearer '+self.token,'Accept':'application/json','Content-Type':'text/plain'})
             try:
-                with urlopen(req,timeout=60) as response: data=json.load(response)
+                with urlopen(req,timeout=60) as response:
+                    raw=response.read(24*1024*1024+1)
+                    if len(raw)>24*1024*1024: raise RuntimeError('IGDB response exceeds limit')
+                    data=json.loads(raw)
                 if not isinstance(data,list): raise RuntimeError('Invalid IGDB response')
                 return data
             except HTTPError as err:
                 if err.code==401 and attempt==0: self.token=self.authenticate();continue
                 if err.code not in (429,500,502,503,504): raise RuntimeError(f'IGDB {endpoint}: HTTP {err.code}') from None
             except (URLError, TimeoutError): pass
-            time.sleep(min(30,2**(attempt+1)))
+            if attempt<4: time.sleep(min(30,2**(attempt+1)))
         raise RuntimeError(f'IGDB {endpoint}: retries exhausted')
 
     def pages(self, endpoint, fields, where=''):
@@ -607,6 +615,7 @@ class IGDB:
         while True:
             rows=self.query(endpoint,f'fields {fields}; where id > {last}{" & " + where if where else ""}; sort id asc; limit 500;')
             if not rows: return
+            if len(rows)>500: raise RuntimeError('Invalid IGDB page size')
             ids=[row.get('id') if isinstance(row,dict) else None for row in rows]
             if any(type(gid) is not int for gid in ids) or ids != sorted(set(ids)) or ids[0]<=last:
                 raise RuntimeError('Invalid IGDB pagination')
@@ -652,7 +661,7 @@ def write_metadata_cache(path, header, games):
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix('.tmp')
     count = 0
-    previous = 0
+    previous = 0; seen=set()
     try:
         with gzip.open(temp, 'wt', encoding='utf-8', compresslevel=3, newline='\n') as handle:
             handle.write(json.dumps(header, separators=(',', ':')) + '\n')
@@ -660,14 +669,54 @@ def write_metadata_cache(path, header, games):
                 if not isinstance(game, dict) or type(game.get('id')) is not int or game['id'] <= previous:
                     raise RuntimeError('Invalid IGDB game ID or cache order')
                 previous = game['id']
+                seen.update(game.get('platforms') or ())
                 handle.write(json.dumps(game, ensure_ascii=False, separators=(',', ':')) + '\n')
                 count += 1
-        if not count:
-            raise RuntimeError('Empty IGDB metadata; previous cache preserved')
+        if not count or not set(header.get('platforms',()))<=seen:
+            raise RuntimeError('Incomplete IGDB metadata; previous cache preserved')
         temp.replace(path)
     finally:
         temp.unlink(missing_ok=True)
     return count
+
+
+def snapshot_digest(path):
+    digest=hashlib.sha256()
+    with path.open('rb') as handle:
+        for block in iter(lambda: handle.read(1024*1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def checkpoint_path(path):
+    return path.with_name(path.name.removesuffix('.json.gz')+'.checkpoint.json.gz')
+
+
+def snapshot_watermark(path, header, now):
+    watermark=header['watermark']
+    try:
+        with gzip.open(checkpoint_path(path),'rt',encoding='utf-8') as handle:
+            entry=json.load(handle)
+        if (isinstance(entry,dict) and type(entry.get('watermark')) is int
+            and watermark < entry['watermark'] <= now
+            and entry.get('digest')==snapshot_digest(path)):
+            return entry['watermark']
+    except (OSError,ValueError,EOFError):
+        pass
+    return watermark
+
+
+def save_snapshot_checkpoint(path, watermark):
+    target=checkpoint_path(path); temp=target.with_suffix('.tmp')
+    try:
+        entry={'watermark':watermark,'digest':snapshot_digest(path)}
+        with gzip.open(temp,'wt',encoding='utf-8',compresslevel=1) as handle:
+            json.dump(entry,handle,separators=(',',':'))
+        temp.replace(target)
+    except OSError:
+        print('IGDB checkpoint unavailable; using snapshot watermark next run')
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def metadata_snapshot(api, path, fields, platform_ids, force_full=False, now=None):
@@ -689,9 +738,17 @@ def metadata_snapshot(api, path, fields, platform_ids, force_full=False, now=Non
         except InvalidMetadataCache:
             print('IGDB cache header invalid; full refresh')
     if previous is not None:
-        since = max(0, previous['watermark'] - UPDATE_OVERLAP_SECONDS)
+        since = max(0, snapshot_watermark(path, previous, started) - UPDATE_OVERLAP_SECONDS)
         changes = {game['id']: game for game in api.pages('games', fields, f'{where} & updated_at >= {since}')}
         try:
+            if not changes:
+                count = 0; seen=set()
+                for game in cached_games(path):
+                    count+=1; seen.update(game.get('platforms') or ())
+                if not set(platform_ids)<=seen: raise InvalidMetadataCache('Incomplete platform snapshot')
+                save_snapshot_checkpoint(path,started)
+                print(f'IGDB cache unchanged: {count} cached records')
+                return cached_games(path)
             old = (game for game in cached_games(path) if game['id'] not in changes)
             merged = heapq.merge(old, (changes[key] for key in sorted(changes)), key=lambda game: game['id'])
             count = write_metadata_cache(path, {**signature, 'full_at': previous['full_at'], 'watermark': started}, merged)
@@ -2058,12 +2115,12 @@ def verified_camelcase_number_keys(official, aliases, labels):
     return result
 
 
-def confirmed_omitted_word_index(catalog,catalog_keys,primary,aliases,ext,records):
+def confirmed_omitted_word_index(catalog,catalog_keys,primary,aliases,ext,records,baseline=None):
     # Require another exact, already confirmed regional catalog release and
     # an official title/series relationship. No fuzzy title similarity alone.
     anchors=defaultdict(set)
     for tid,prepared in catalog_keys.items():
-        found=resolve_catalog_game(tid,prepared,primary,aliases,ext)
+        found=baseline[tid] if baseline is not None else resolve_catalog_game(tid,prepared,primary,aliases,ext)
         if len(found)!=1:
             continue
         gid=next(iter(found));official=catalog_identity_words(records[gid]['name'])
@@ -2149,6 +2206,7 @@ def release_distribution_identity(tid, candidates, variants, records, ext, digit
     return candidates
 
 
+@lru_cache(maxsize=4096)
 def supplemental_typo_keys(key):
     if len(key)<10 or len(key)>80 or not key.isascii():return ()
     numbers=tuple(re.findall(r'\d+',key))
@@ -3039,8 +3097,9 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
         for platform_id in game.get('platforms') or []:
             tags.update(tags_by_platform.get(platform_id, ()))
         if not tags: continue
+        compact_record=compact_game(game) if accepted else None
         if accepted:
-            bridge_records.append(compact_game(game))
+            bridge_records.append(compact_record)
         official = game.get('name', '')
         titles = game_names(game)
         official_keys = set(names(official)) if official else set()
@@ -3053,12 +3112,13 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
             late.update(late_recovery_keys(title))
             ordinals.update(ordinal_recovery_keys(title))
         relevant=False
-        all_names=titles + localized_game_names(game)
+        localized=localized_game_names(game)
+        all_names=titles + localized
         verified_store_keys=verified_store_metadata_keys(game,all_names)
         for tag in tags:
             for key in verified_store_keys & verified_store_requested[tag]:
                 verified_store_index[tag,key].add(gid);relevant=True
-        terminal_keys=terminal_metadata_keys(game,titles,localized_game_names(game),accepted)
+        terminal_keys=terminal_metadata_keys(game,titles,localized,accepted)
         for tag in tags:
             for kind,key in terminal_keys & terminal_requested[tag]:
                 terminal_index[tag,kind,key].add(gid);relevant=True
@@ -3085,7 +3145,7 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
         # game title. Only labels explicitly attached to this metadata record
         # are accepted, and never strip a substring from an arbitrary title.
         brand_parts={franchise_words(label) for _,label in source_entries(game,'franchises','f')}
-        brand_parts.update(publisher_prefixes(game))
+        brand_parts.update(prefixes)
         brand_parts={b for b in brand_parts if b and len(b)<=3 and sum(map(len,b))>=4}
         single={b for b in brand_parts if len(b)==1}
         brand_parts.update(a+b for a in single for b in single if a!=b)
@@ -3117,7 +3177,7 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
         extra_keys.update(key for n in all_names for key in last_identity_keys(n,labels=final_labels,kind=(game.get('game_type') or {}).get('type','').lower()))
         extra_keys.update(verified_camelcase_number_keys(official,titles[1:],final_labels))
         extra_keys.update(verified_extended_brand_keys(official,titles[1:],final_labels))
-        extra_keys.update(mixed_crossover_keys(official,localized_game_names(game)))
+        extra_keys.update(mixed_crossover_keys(official,localized))
         identity_slots={slot for n in all_names for w in identity_title_variants(n,final_labels) for slot in identity_typo_slots(w)}
         official_words=supplemental_words(official)
         if official_words and official_words[-1].isdigit():
@@ -3151,16 +3211,17 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
                     m=re.fullmatch(re.escape(initials)+r'(\d+)',norm(title))
                     if m:extra_keys.add(('exact',''.join(root+(m[1],)+tail)))
         typo_words={supplemental_words(n) for n in all_names}
+        short_slots=[(key,supplemental_typo_keys(key)) for w in typo_words if len(w)>=2 for key in (''.join(w),)]
         for tag in tags:
             for left,right,word in identity_slots:
                 if (left,right) in identity_typo_requested[tag]:
                     identity_typo_index[tag,left,right].add((word,gid));relevant=True
             for key in extra_keys & extra_requested[tag]:
                 extra_index[tag,key].add(gid);relevant=True
-            for w in typo_words:
-                for slot in supplemental_typo_keys(''.join(w)) if len(w)>=2 else ():
+            for key,slots in short_slots:
+                for slot in slots:
                     if slot in short_typo_requested[tag]:
-                        short_typo_index[tag,slot].add((''.join(w),gid));relevant=True
+                        short_typo_index[tag,slot].add((key,gid));relevant=True
             # Exact names from a platform-specific external retail release
             # are independent evidence; never use names from other platforms.
             for item in game.get('external_games') or ():
@@ -3223,7 +3284,7 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
                     ext[tag,external_id].add(gid)
                     relevant=True
         if relevant:
-            records[gid]=compact_game(game)
+            records[gid]=compact_record if compact_record is not None else compact_game(game)
             if any(item.get('external_game_source') in psn_sources and item.get('name') and catalog_identity_words(item['name'],True)==catalog_identity_words(official) for item in game.get('external_games') or ()):
                 digital_named.add(gid)
     release_bridges=release_alias_bridges(records,extra_requested,bridge_records,tags_by_platform)
@@ -3232,21 +3293,22 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
     print(f'IGDB metadata rows: {metadata_count}; relevant records indexed: {len(records)}')
     groups=defaultdict(dict); matched=0; ambiguous=0; canonical={}; memberships={}; rejected_games=set(); rejected_links=0
     pending=defaultdict(list); unresolved=[]
+    baseline={tid:frozenset(resolve_catalog_game(tid,variants,primary,aliases,ext)) for tid,variants in catalog_keys.items()}
     classic_confirmed=set()
     for tid,variants in catalog_keys.items():
         if {tag for tag,_ in variants}=={'psx'}:
-            found=resolve_catalog_game(tid,variants,primary,aliases,ext)
+            found=baseline[tid]
             if len(found)==1:classic_confirmed.update(found)
-    omitted_word_index=confirmed_omitted_word_index(catalog,catalog_keys,primary,aliases,ext,records)
+    omitted_word_index=confirmed_omitted_word_index(catalog,catalog_keys,primary,aliases,ext,records,baseline)
     terminal_anchors=defaultdict(set)
     for tid,variants in catalog_keys.items():
-        found=resolve_catalog_game(tid,variants,primary,aliases,ext)
+        found=baseline[tid]
         if len(found)==1:
             gid=next(iter(found))
             for tag,_ in variants:terminal_anchors[gid,tag].add(tid)
     rejected_memberships = {}; recovered_matches = Counter(); match_methods = {}; catalog_conflicts = {}
     for tid, variants in sorted(catalog_keys.items()):
-        candidates=resolve_catalog_game(tid, variants, primary, aliases, ext)
+        candidates=set(baseline[tid])
         method='baseline'
         conflict=exact_variant_conflict(variants,primary,aliases)
         if not conflict and len(verified_store_catalog[tid])>1:

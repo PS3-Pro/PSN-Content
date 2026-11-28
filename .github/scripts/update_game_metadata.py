@@ -2,12 +2,15 @@
 import csv
 import datetime as dt
 import gzip
+import hashlib
+import heapq
 import json
 import os
 import re
 import time
 import unicodedata
 from collections import defaultdict, Counter
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -17,8 +20,18 @@ ROOT = Path('.')
 INDEX = Path('resources/database/helpers/game-metadata.json')
 CACHE = Path('.cache/game-metadata/igdb.json.gz')
 PLATFORMS = {'ps3': 9, 'ps2': 8, 'psx': 7, 'psp': 38, 'minis': 38, 'pce': 86, 'neogeo': 80}
-FIELDS = 'name,alternative_names.name,platforms,category,genres.name,themes.name,involved_companies.company.name,involved_companies.developer,involved_companies.publisher,release_dates.platform,release_dates.date,release_dates.category,release_dates.region,release_dates.y,summary,aggregated_rating,aggregated_rating_count,screenshots,artworks,cover,game_modes.name'
+FIELDS = 'name,alternative_names.name,platforms,category,genres.name,themes.name,involved_companies.company.name,involved_companies.developer,involved_companies.publisher,release_dates.platform,release_dates.date,release_dates.category,release_dates.region,release_dates.date_format.format,release_dates.release_region.region,release_dates.human,release_dates.y,summary,aggregated_rating_count,screenshots,artworks,cover,game_modes'
 TTL = 30 * 86400
+IGDB_CACHE_VERSION = 4
+IGDB_FULL_REFRESH = 30 * 86400
+IGDB_UPDATE_OVERLAP = 3600
+REGION_ALIASES = {
+    "US": 2, "USA": 2, "NA": 2, "NORTHAMERICA": 2, "EU": 1, "EUR": 1, "EUROPE": 1,
+    "JP": 5, "JPN": 5, "JAPAN": 5, "ASIA": 7, "ASI": 7, "ASN": 7, "AS": 7,
+    "KR": 9, "KOR": 9, "KOREA": 9, "SOUTHKOREA": 9, "BR": 10, "BRA": 10, "BRAZIL": 10,
+    "AU": 3, "AUS": 3, "AUSTRALIA": 3, "NZ": 4, "NEWZEALAND": 4,
+    "CN": 6, "CHN": 6, "CHINA": 6, "WORLDWIDE": 8, "WORLD": 8, "WW": 8,
+}
 
 
 
@@ -64,6 +77,7 @@ def key(value):
     return ''.join(c for c in s if c.isalnum())
 
 
+@lru_cache(maxsize=32768)
 def title_key(value):
     s = str(value or '').replace('™', '').replace('®', '').replace('©', '')
     s = re.sub(r'[\[(]\s*(?:PS[123X]|PSP|Minis?|PS[12]\s*Classics?|PC\s*Engine|Turbo\s*Grafx(?:\s*-\s*16)?|Neo\s*Geo(?:\s*Station)?|English|French|German|Japanese|US|EU|JP)\s*[\])]', ' ', s, flags=re.I)
@@ -85,6 +99,7 @@ def platform(tid, name, cid):
         if t in 'GH': return 'psp'
         if t in 'DC': return 'ps2'
         if t in {'U':'JFI','J':'JI','E':'FE'}.get(r,''): return 'psx'
+        if re.search(r'\bNEO\s*GEO\b|NEOGEO',name,re.I): return 'neogeo'
     return 'ps3'
 
 
@@ -106,7 +121,10 @@ def catalog(content_ids=None):
                 if re.search(r'\b(?:demo|trial|beta|network test|soundtrack|strategy guide|firstplay|qore)\b',name,re.I): continue
                 cid=row[5] if len(row)>5 else ''
                 result[tid].add((platform(tid,name,cid),region.upper(),name))
-                if content_ids is not None and re.fullmatch(r'[A-Z]{2}\d{4}-[A-Z0-9]{9}_\d{2}-[A-Z0-9]{16}',cid.strip().upper()) and tid in cid.upper(): content_ids[tid].add(cid.strip().upper())
+                if content_ids is not None:
+                    product=cid.strip().upper()
+                    match=re.fullmatch(r'[A-Z]{2}\d{4}-([A-Z0-9]{9})_\d{2}-[A-Z0-9]{16}',product)
+                    if match and match[1]==tid: content_ids[tid].add(product)
     if not result: raise ValueError('Empty catalog')
     return result
 
@@ -115,7 +133,9 @@ def request(url, body, headers):
     for attempt in range(4):
         try:
             with urlopen(Request(url,data=body,headers=headers),timeout=45) as r:
-                return json.loads(r.read(24*1024*1024+1))
+                raw=r.read(24*1024*1024+1)
+                if len(raw)>24*1024*1024: raise ValueError("IGDB response exceeds limit")
+                return json.loads(raw)
         except HTTPError as e:
             if e.code not in (429,500,502,503,504) or attempt==3: raise RuntimeError(f'Provider HTTP {e.code}') from None
         except (URLError,TimeoutError):
@@ -123,76 +143,259 @@ def request(url, body, headers):
         time.sleep(2**attempt)
 
 
+AUDIT_ONLY_FIELDS = ('summary', 'screenshots', 'artworks', 'cover', 'game_modes', 'aggregated_rating_count')
+
+
+def compact_igdb_game(game):
+    for field in AUDIT_ONLY_FIELDS:
+        if field in game:
+            game[field] = bool(game[field])
+    return game
+
+
+class InvalidIGDBCache(Exception):
+    pass
+
+
+def cached_igdb_games():
+    try:
+        with gzip.open(CACHE,'rt',encoding='utf-8') as f:
+            f.readline()
+            last=0
+            for line in f:
+                game=json.loads(line)
+                if not isinstance(game,dict) or type(game.get('id')) is not int or game['id']<=last:
+                    raise ValueError('invalid game order')
+                last=game['id']
+                yield game
+            if not last: raise ValueError('empty cache')
+    except (OSError,ValueError,EOFError) as e:
+        raise InvalidIGDBCache('Invalid IGDB snapshot') from e
+
+
+def write_igdb_snapshot(header,games,required_platforms=()):
+    CACHE.parent.mkdir(parents=True,exist_ok=True)
+    tmp=CACHE.with_suffix('.tmp'); count=0; last=0; seen=set()
+    try:
+        with gzip.open(tmp,'wt',encoding='utf-8',compresslevel=3,newline='\n') as f:
+            f.write(json.dumps(header,separators=(',',':'))+'\n')
+            for game in games:
+                if type(game.get('id')) is not int or game['id']<=last: raise ValueError('Invalid IGDB snapshot order')
+                last=game['id']; count+=1
+                if required_platforms: seen.update(game.get('platforms') or ())
+                f.write(json.dumps(game,ensure_ascii=False,separators=(',',':'))+'\n')
+        if not count or not set(required_platforms)<=seen:
+            raise ValueError('Incomplete IGDB snapshot; previous cache preserved')
+        tmp.replace(CACHE)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return count
+
+
+def snapshot_digest(path):
+    digest=hashlib.sha256()
+    with path.open('rb') as handle:
+        for block in iter(lambda: handle.read(1024*1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def checkpoint_path(path):
+    return path.with_name(path.name.removesuffix('.json.gz')+'.checkpoint.json.gz')
+
+
+def snapshot_watermark(path, header, now):
+    watermark=header['watermark']
+    try:
+        with gzip.open(checkpoint_path(path),'rt',encoding='utf-8') as handle:
+            entry=json.load(handle)
+        if (isinstance(entry,dict) and type(entry.get('watermark')) is int
+            and watermark < entry['watermark'] <= now
+            and entry.get('digest')==snapshot_digest(path)):
+            return entry['watermark']
+    except (OSError,ValueError,EOFError):
+        pass
+    return watermark
+
+
+def save_snapshot_checkpoint(path, watermark):
+    target=checkpoint_path(path); temp=target.with_suffix('.tmp')
+    try:
+        entry={'watermark':watermark,'digest':snapshot_digest(path)}
+        with gzip.open(temp,'wt',encoding='utf-8',compresslevel=1) as handle:
+            json.dump(entry,handle,separators=(',',':'))
+        temp.replace(target)
+    except OSError:
+        print('IGDB checkpoint unavailable; using snapshot watermark next run')
+    finally:
+        temp.unlink(missing_ok=True)
+
+
 def fetch_games():
-    if CACHE.exists() and time.time()-CACHE.stat().st_mtime<TTL:
-        with gzip.open(CACHE,'rt',encoding='utf-8') as f: data=json.load(f)
-        if isinstance(data,dict) and data.get('version')==2 and data.get('games') and time.time()-data['at']<TTL: return data['games']
+    started=int(time.time()); pids=sorted(set(PLATFORMS.values()))
+    signature={'version':IGDB_CACHE_VERSION,'fields':FIELDS,'platforms':pids}
+    previous=None
+    try:
+        with gzip.open(CACHE,'rt',encoding='utf-8') as f:
+            header=json.loads(f.readline())
+        if isinstance(header,dict) and all(header.get(k)==v for k,v in signature.items()):
+            full,watermark=header.get('full_at'),header.get('watermark')
+            if type(full) is int and type(watermark) is int and 0<full<=watermark<=started and started-full<IGDB_FULL_REFRESH:
+                previous=header
+    except (OSError,ValueError,EOFError): pass
     cid=os.environ.get('IGDB_CLIENT_ID',''); secret=os.environ.get('IGDB_CLIENT_SECRET','')
     if not cid or not secret: raise RuntimeError('Missing IGDB credentials in server-secrets.json')
-    token=request('https://id.twitch.tv/oauth2/token',urlencode({'client_id':cid,'client_secret':secret,'grant_type':'client_credentials'}).encode(),{'Content-Type':'application/x-www-form-urlencoded'})['access_token']
-    headers={'Client-ID':cid,'Authorization':'Bearer '+token,'Accept':'application/json','Content-Type':'text/plain'}
-    games={}
-    for pid in sorted(set(PLATFORMS.values())):
+    def authenticate():
+        return request('https://id.twitch.tv/oauth2/token',urlencode({'client_id':cid,'client_secret':secret,'grant_type':'client_credentials'}).encode(),{'Content-Type':'application/x-www-form-urlencoded'})['access_token']
+    headers={'Client-ID':cid,'Authorization':'Bearer '+authenticate(),'Accept':'application/json','Content-Type':'text/plain'}
+    where='platforms = ('+','.join(map(str,pids))+')'
+    next_request=0
+    def pages(extra=''):
+        nonlocal next_request
         last=0; count=0
         while True:
-            rows=request('https://api.igdb.com/v4/games',f'fields {FIELDS}; where platforms = ({pid}) & id > {last}; sort id asc; limit 500;'.encode(),headers)
-            if not isinstance(rows,list): raise ValueError('Invalid IGDB page')
-            if not rows: break
-            for g in rows: games[g['id']]=g
-            nxt=rows[-1]['id']; count+=len(rows)
-            if nxt<=last or count>100000: raise ValueError('Invalid pagination')
-            last=nxt; time.sleep(.28)
-            if len(rows)<500: break
-        if not count: raise ValueError(f'No games returned for platform {pid}')
-        print(f'Platform {pid}: {count} records')
-    if not games: raise ValueError('Empty IGDB response')
-    CACHE.parent.mkdir(parents=True,exist_ok=True); tmp=CACHE.with_suffix('.tmp')
-    with gzip.open(tmp,'wt',encoding='utf-8',compresslevel=5) as f: json.dump({'version':2,'at':time.time(),'games':list(games.values())},f,ensure_ascii=False,separators=(',',':'))
-    tmp.replace(CACHE)
-    return list(games.values())
+            body=f'fields {FIELDS}; where {where} & id > {last}{extra}; sort id asc; limit 500;'.encode()
+            time.sleep(max(0,next_request-time.monotonic()))
+            next_request=time.monotonic()+.35
+            try:
+                rows=request('https://api.igdb.com/v4/games',body,headers)
+            except RuntimeError as e:
+                if str(e)!='Provider HTTP 401': raise
+                headers['Authorization']='Bearer '+authenticate()
+                rows=request('https://api.igdb.com/v4/games',body,headers)
+            if not isinstance(rows,list) or len(rows)>500: raise ValueError('Invalid IGDB page')
+            for g in rows:
+                if not isinstance(g,dict) or type(g.get('id')) is not int or g['id']<=last:
+                    raise ValueError('Invalid IGDB pagination order')
+                last=g['id']; count+=1
+                if count>100000*len(pids): raise ValueError('IGDB pagination limit exceeded')
+                yield compact_igdb_game(g)
+            if len(rows)<500: return
+    if previous is not None:
+        since=max(0,snapshot_watermark(CACHE,previous,started)-IGDB_UPDATE_OVERLAP)
+        changes={g['id']:g for g in pages(f' & updated_at >= {since}')}
+        try:
+            if not changes:
+                count=0; seen=set()
+                for game in cached_igdb_games():
+                    count+=1; seen.update(game.get('platforms') or ())
+                if not set(pids)<=seen: raise InvalidIGDBCache('Incomplete platform snapshot')
+                save_snapshot_checkpoint(CACHE,started)
+                print(f'IGDB cache unchanged: {count} records')
+            else:
+                old=(g for g in cached_igdb_games() if g['id'] not in changes)
+                merged=heapq.merge(old,(changes[k] for k in sorted(changes)),key=lambda g:g['id'])
+                count=write_igdb_snapshot({**signature,'full_at':previous['full_at'],'watermark':started},merged,pids)
+                print(f'IGDB incremental refresh: {len(changes)} updated records; {count} cached records')
+            return cached_igdb_games()
+        except InvalidIGDBCache:
+            print('IGDB cache damaged; full refresh')
+    count=write_igdb_snapshot({**signature,'full_at':started,'watermark':started},pages(),pids)
+    print(f'IGDB full refresh: {count} records')
+    return cached_igdb_games()
 
 
 def names(rows):
     return sorted({str(x.get('name','')).strip() for x in rows or [] if isinstance(x,dict) and x.get('name')},key=str.casefold)
 
 
+def release_region(d):
+    current=d.get('release_region')
+    if isinstance(current,dict):
+        value=REGION_ALIASES.get(re.sub(r'[^A-Z]','',str(current.get('region','')).upper()))
+        if value is not None: return value
+    return d.get('region')
+
+
+def release_value(d):
+    current=d.get('date_format')
+    fmt=re.sub(r'[^a-z0-9]','',str(current.get('format','')).lower()) if isinstance(current,dict) else ''
+    category=d.get('category')
+    human=str(d.get('human','')).strip()
+    if fmt in ('tbd','unknown') or human.casefold()=='tbd': return ''
+    if fmt in ('yyyymmmmdd','yyyymmdd','ddmmmmyyyy','ddmmmyyyy'): precision=0
+    elif fmt in ('yyyymmmm','yyyymm','yyyy','yyyyq1','yyyyq2','yyyyq3','yyyyq4'): precision=1
+    elif category in (0,1,2,3,4,5,6): precision=0 if category==0 else 1
+    elif category==7: return ''
+    elif re.fullmatch(r'[A-Za-z]{3,9} \d{1,2},? \d{4}|\d{1,2} [A-Za-z]{3,9} \d{4}|\d{4}-\d{2}-\d{2}',human): precision=0
+    elif re.search(r'\b(?:19|20)\d{2}\b',human): precision=1
+    else: return ''
+    stamp=d.get('date')
+    if precision==0 and isinstance(stamp,(int,float)):
+        try: return valid_date(dt.datetime.fromtimestamp(stamp,dt.timezone.utc).date().isoformat())
+        except (ValueError,OverflowError,OSError): return ''
+    year=valid_date(str(d.get('y','')))
+    if year: return year
+    if isinstance(stamp,(int,float)):
+        try: return valid_date(str(dt.datetime.fromtimestamp(stamp,dt.timezone.utc).year))
+        except (ValueError,OverflowError,OSError): pass
+    return ''
+
+
 def release(g,pid,region):
-    regions={'US':2,'EU':1,'JP':5,'ASIA':7,'ASI':7,'KR':9,'BR':10}
-    rows=[d for d in g.get('release_dates',[]) if d.get('platform')==pid and d.get('region') in (regions.get(region,-1),8) and d.get('date') and d.get('category') in (0,1,2)]
-    exact=[d for d in rows if d.get('region')==regions.get(region,-1)]
-    rows=exact or rows
-    if not rows: return ''
-    d=min(rows,key=lambda x:(x['date'],x['category']))
-    try:
-        date=dt.datetime.fromtimestamp(d['date'],dt.timezone.utc).date().isoformat()
-        return date if d['category']==0 else date[:4]
-    except (ValueError,OverflowError,OSError): return ''
+    region_id=REGION_ALIASES.get(re.sub(r'[^A-Z]','',region.upper()))
+    exact=[]; worldwide=[]
+    for d in g.get('release_dates') or []:
+        if not isinstance(d,dict) or d.get('platform')!=pid: continue
+        rid=release_region(d)
+        if rid not in (region_id,8) or rid is None: continue
+        value=release_value(d)
+        if value: (exact if rid==region_id else worldwide).append(value)
+    values=exact or worldwide
+    if not values: return ''
+    # Never manufacture a day from a month/year placeholder.
+    earliest_year=min(v[:4] for v in values)
+    candidates=[v for v in values if v.startswith(earliest_year)]
+    return earliest_year if any(len(v)==4 for v in candidates) else min(candidates)
 
 
 def build(cat,games):
     buckets=defaultdict(set); byid={}
+    needed=defaultdict(set)
+    for variants in cat.values():
+        for tag,_,name in variants: needed[PLATFORMS[tag]].add(title_key(name))
     for g in games:
         if g.get('category',0) not in (0,2,3,4,8,9,10,11,12,13): continue
-        gid=g['id']; byid[gid]=g
-        keys={title_key(g.get('name')),*(title_key(a.get('name')) for a in g.get('alternative_names',[]) if isinstance(a,dict))}-{''}
-        for pid in g.get('platforms',[]):
-            for k in keys: buckets[(pid,k)].add(gid)
-    rows={}; audit=Counter(); examples=defaultdict(list)
+        gid=g['id']
+        platforms=needed.keys() & set(g.get('platforms') or ())
+        if not platforms: continue
+        keys={title_key(g.get('name')),*(title_key(a.get('name')) for a in g.get('alternative_names') or () if isinstance(a,dict))}-{''}
+        for pid in platforms:
+            for k in keys & needed[pid]:
+                buckets[(pid,k)].add(gid); byid[gid]=g
+    rows={}; audit=Counter(); examples=defaultdict(list); metadata={}; dates_cache={}
     for tid, variants in sorted(cat.items()):
-        matches=set(); unresolved=False
+        matches=None; union=set(); unresolved=False; multiple=False
         for tag,region,name in sorted(variants):
-            ids=buckets.get((PLATFORMS[tag],title_key(name)),set())
-            if len(ids)!=1: unresolved=True
-            matches.update((i,tag) for i in ids)
-        if unresolved or len(matches)!=1:
-            reason='ambiguous' if len(matches)>1 else 'unmatched'
+            ids=buckets.get((PLATFORMS[tag],title_key(name)))
+            if not ids:
+                unresolved=True
+                continue
+            candidates={(i,tag) for i in ids}
+            multiple=multiple or len(candidates)>1
+            union.update(candidates)
+            matches=candidates if matches is None else matches & candidates
+        if unresolved or not matches or len(matches)!=1:
+            reason='ambiguous' if len(union)>1 else 'unmatched'
             audit[reason]+=1
-            if len(examples[reason])<60: examples[reason].append(f'{tid} — {sorted(variants)[0][2]}')
+            if len(examples[reason])<60: examples[reason].append(f'{tid} — {min(variants)[2]}')
             continue
-        gid,tag=next(iter(matches)); g=byid[gid]; companies=g.get('involved_companies',[])
-        dev=names([x.get('company',{}) for x in companies if x.get('developer')]); pub=names([x.get('company',{}) for x in companies if x.get('publisher')]); genre=names(g.get('genres',[]))
-        dates={release(g,PLATFORMS[tag],r) for _,r,_ in variants}; date=next(iter(dates)) if len(dates)==1 else ''
-        rows[tid]=[gid,tag,dev,pub,genre,date,names(g.get('themes',[]))]
+        if multiple: audit['resolved by exact alias intersection']+=1
+        gid,tag=next(iter(matches)); g=byid[gid]
+        if gid not in metadata:
+            companies=g.get('involved_companies') or []
+            metadata[gid]=(names([x.get('company',{}) for x in companies if x.get('developer')]),
+                           names([x.get('company',{}) for x in companies if x.get('publisher')]),
+                           names(g.get('genres')),names(g.get('themes')))
+        dev,pub,genre,themes=metadata[gid]
+        dates=set()
+        for r in {r for _,r,_ in variants}:
+            k=(gid,tag,r)
+            if k not in dates_cache: dates_cache[k]=release(g,PLATFORMS[tag],r)
+            dates.add(dates_cache[k])
+        date=next(iter(dates)) if len(dates)==1 else ''
+        if not date and dates and all(dates) and len({v[:4] for v in dates})==1: date=next(iter(dates))[:4]
+        rows[tid]=[gid,tag,dev,pub,genre,date,themes]
         audit['matched']+=1
         for field,value in [('developer',dev),('publisher',pub),('genre',genre),('platform release date',date),('summary',g.get('summary')),('critic rating',g.get('aggregated_rating_count')),('screenshots',g.get('screenshots')),('artwork',g.get('artworks')),('cover',g.get('cover')),('game modes',g.get('game_modes'))]:
             if not value: audit['missing '+field]+=1
@@ -241,6 +444,7 @@ def merge(row, values, source, audit):
             row[pos]=value; audit[f'{source}: filled { {2:"developer",3:"publisher",4:"genre",5:"date",6:"theme"}[pos]}']+=1
 
 
+@lru_cache(maxsize=16384)
 def lb_key(name):
     s=unicodedata.normalize('NFKD',str(name).replace('™',' ').replace('®',' ').replace('©',' '))
     return re.sub(r'[^a-z0-9]+',' ',''.join(c for c in s if not unicodedata.combining(c)).lower()).strip()
@@ -286,7 +490,11 @@ def get_json(url,params=None,missing_ok=False):
 
 def psn_lookup(tid,region,cid):
     prefix=cid[:2] if cid else ''
-    country,lang=('JP','ja') if prefix=='JP' or region=='JP' else ('KR','ko') if prefix=='KP' or region=='KR' else ('HK','en') if prefix in ('HP','AP') or region=='ASIA' else ('GB','en') if prefix=='EP' or region=='EU' else ('US','en')
+    regional=REGION_ALIASES.get(re.sub(r'[^A-Z]','',region.upper()))
+    countries={1:('GB','en'),2:('US','en'),3:('AU','en'),4:('NZ','en'),5:('JP','ja'),7:('HK','en'),9:('KR','ko'),10:('BR','pt')}
+    locale={'JP':('JP','ja'),'KP':('KR','ko'),'HP':('HK','en'),'AP':('HK','en'),'EP':('GB','en'),'UP':('US','en')}.get(prefix) or countries.get(regional)
+    if not locale: return compact()
+    country,lang=locale
     endpoint='container' if cid else 'titlecontainer'
     data=get_json(f'https://store.playstation.com/store/api/chihiro/00_09_000/{endpoint}/{country}/{lang}/19/{cid or tid}',missing_ok=True)
     if not isinstance(data,dict): return compact()
@@ -335,27 +543,32 @@ def ss_lookup(tid,tag,name,credentials):
 
 class ProviderCache:
     def __init__(self,name):
-        self.path=CACHE_DIR/f'{name}.json.gz';self.rows={};self.used=0;self.limit=FALLBACK_BUDGET[name];self.disabled=False;self.errors=0;self.name=name
+        self.path=CACHE_DIR/f'{name}.json.gz';self.rows={};self.used=0;self.limit=FALLBACK_BUDGET[name];self.disabled=False;self.errors=0;self.name=name;self.attempted=set();self.dirty=False
         try:
             with gzip.open(self.path,'rt',encoding='utf-8') as f: data=json.load(f)
             if data.get('version')==1 and isinstance(data.get('rows'),dict):
                 self.rows={k:v for k,v in data['rows'].items() if isinstance(k,str) and isinstance(v,list) and len(v)==2 and isinstance(v[0],(int,float)) and isinstance(v[1],list) and len(v[1])==5}
-        except (OSError,ValueError,AttributeError): pass
+        except (OSError,ValueError,AttributeError,EOFError): pass
     def lookup(self,k,fn,audit):
         entry=self.rows.get(k); now=time.time(); old=None
         if isinstance(entry,list) and len(entry)==2 and isinstance(entry[0],(int,float)) and isinstance(entry[1],list) and len(entry[1])==5:
             old=entry[1]
-            if now-entry[0]<(TTL if any(old) else 7*86400): audit[self.name+': cache hit']+=1;return old
-        if self.disabled or self.used>=self.limit: return old
+            if 0<=now-entry[0]<(TTL if any(old) else 7*86400): audit[self.name+': cache hit']+=1;return old
+        if self.disabled or self.used>=self.limit or k in self.attempted: return old
+        self.attempted.add(k)
         self.used+=1
         try:
-            result=fn(); self.rows[k]=[now,result];self.errors=0;return result
+            result=fn()
+            # Preserve verified fields when a refresh returns only partial data.
+            if old: result=[new or previous for new,previous in zip(result,old)]
+            self.rows[k]=[now,result];self.dirty=True;self.errors=0;return result
         except ProviderError as e:
             self.errors+=1;audit[self.name+': errors']+=1
             if self.errors>=3 or str(e) in ('HTTP 400','HTTP 401','HTTP 403','HTTP 429','HTTP 430','HTTP 431'): self.disabled=True
             return old
         finally: time.sleep(.25)
     def save(self):
+        if not self.dirty: return
         self.path.parent.mkdir(parents=True,exist_ok=True)
         # Bound cache by records and compressed bytes; keep newest first.
         rows=dict(sorted(self.rows.items(),key=lambda x:x[1][0],reverse=True)[:12000]);tmp=self.path.with_suffix('.tmp')
@@ -382,20 +595,33 @@ def supplement(cat,payload,content_ids):
             lb=launchbox_lookup(variants,indexes)
             if lb: merge(row,lb,'LaunchBox',audit)
         # Prefer full regional date only from PS Store or IGDB, not other platform dates.
-        if len(keys)==1 and len(regions)==1:
-            region=next(iter(regions)); name=sorted(variants)[0][2]; cids=content_ids.get(tid,set()); cid=next(iter(cids)) if len(cids)==1 else '' if not cids else None
+        if len(keys)==1 and '' not in keys:
+            region=next(iter(regions)) if len(regions)==1 else ''
+            name=min(v[2] for v in variants); cids=content_ids.get(tid,set())
+            cid=(next(iter(cids)) if len(cids)==1 else '' if not cids else None) if region else None
             jobs.append((tid,tag,region,name,cid,row))
         if any(row[2:]): rows[tid]=row
     # Unqueried entries first; refresh expired entries after new work. Cache hits still apply to every title.
+    remaining_sources=1+bool(rawg)+bool(ss['devid'] and ss['devpassword'])
     def run(source,key_fn,eligible,fetch):
+        nonlocal remaining_sources
         cache=caches[source]
-        candidates=[j for j in jobs if eligible(j)]
-        candidates.sort(key=lambda j:cache.rows.get(key_fn(j),[0])[0])
-        for j in candidates:
-            k=key_fn(j)
-            if time.monotonic()>=deadline: cache.disabled=True
-            value=cache.lookup(k,lambda j=j:fetch(j),audit)
-            if value: merge(j[-1],value,source,audit)
+        active=not cache.disabled
+        source_deadline=time.monotonic()+max(0,deadline-time.monotonic())/max(1,remaining_sources)
+        if active: remaining_sources-=1
+        grouped=defaultdict(list)
+        for j in jobs:
+            if eligible(j): grouped[key_fn(j)].append(j)
+        positions=(3,5) if source=='psn' else (2,3,4)
+        def priority(pair):
+            k, members=pair
+            return (cache.rows.get(k,[0])[0],-sum(not j[-1][i] for j in members for i in positions),k)
+        for k,members in sorted(grouped.items(),key=priority):
+            if time.monotonic()>=source_deadline: cache.disabled=True
+            representative=max(members,key=lambda j:sum(not j[-1][i] for i in positions))
+            value=cache.lookup(k,lambda:fetch(representative),audit)
+            if value:
+                for j in members: merge(j[-1],value,source,audit)
         audit[source+': requests']=cache.used
     try:
         # PS Store identifies by product rather than fuzzy name, but is used only to fill missing fields.
@@ -419,8 +645,21 @@ def supplement(cat,payload,content_ids):
 def main():
     load_provider_secrets()
     content_ids=defaultdict(set);cat=catalog(content_ids); payload,audit,examples=build(cat,fetch_games())
-    combined=supplement(cat,payload,content_ids)
     if not audit['matched']: raise ValueError('No trusted IGDB matches; refusing to replace index')
+    combined=supplement(cat,payload,content_ids)
+    old_text=INDEX.read_text(encoding='utf-8') if INDEX.exists() else None
+    old=json.loads(old_text) if old_text is not None else None
+    if isinstance(old,dict) and old.get('version')==1:
+        for tid,row in payload['games'].items():
+            previous=old.get('games',{}).get(tid)
+            if not isinstance(previous,list) or len(previous)!=7 or not row[0] or row[:2]!=previous[:2]: continue
+            # Keep previously verified non-date metadata for the same identity only.
+            for pos,label in ((2,'developer'),(3,'publisher'),(4,'genre'),(6,'theme')):
+                if not row[pos]:
+                    value=strings(previous[pos],pos in (4,6))
+                    if value: row[pos]=value; combined['retained previous '+label]+=1
+        for i,label in [(2,'developer'),(3,'publisher'),(4,'genre'),(5,'date')]:
+            combined['final missing '+label]=sum(not r[i] for r in payload['games'].values())+len(cat)-len(payload['games'])
     if not payload['games']: raise ValueError('No trusted matches; refusing to replace index')
     report=['## IGDB metadata coverage','',f'Eligible Title IDs: **{len(cat)}**','', '| Metric | Title IDs |','|---|---:|']+[f'| {k} | {v} |' for k,v in sorted(audit.items())]
     report+=['','Missing fields above describe IGDB only.','', '## Combined discovery index', '', '| Metric | Title IDs / lookups |','|---|---:|']+[f'| {k} | {v} |' for k,v in sorted(combined.items())]
@@ -429,12 +668,15 @@ def main():
     if os.environ.get('GITHUB_STEP_SUMMARY'):
         with open(os.environ['GITHUB_STEP_SUMMARY'],'a',encoding='utf-8') as f:f.write('\n'.join(report)+'\n')
     print('\n'.join(report[:len(audit)+7]))
+    payload['games']=dict(sorted(payload['games'].items()))
     INDEX.parent.mkdir(parents=True,exist_ok=True); text=json.dumps(payload,ensure_ascii=False,separators=(',',':'))+'\n'
     if len(text.encode())>8*1024*1024: raise ValueError('Index exceeds browser limit')
-    if INDEX.exists():
-        old=json.loads(INDEX.read_text(encoding='utf-8'))
-        if len(payload['games'])<.8*len(old.get('games',{})): raise ValueError('Coverage unexpectedly dropped; refusing to replace index')
-        if INDEX.read_text(encoding='utf-8')==text:return
+    if old is not None:
+        previous_ids=set(old.get('games',{})) & cat.keys()
+        retained=len(previous_ids & payload['games'].keys())
+        print(f'Coverage of previously indexed catalog IDs: {retained}/{len(previous_ids)}')
+        if retained<.8*len(previous_ids): raise ValueError('Coverage unexpectedly dropped; refusing to replace index')
+        if old_text==text:return
     tmp=INDEX.with_suffix('.tmp');tmp.write_text(text,encoding='utf-8');tmp.replace(INDEX)
 
 
