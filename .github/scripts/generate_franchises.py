@@ -9,6 +9,7 @@ import re
 import time
 import unicodedata
 from collections import Counter, defaultdict
+from functools import lru_cache
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -33,17 +34,59 @@ EXCLUDED = re.compile(r'\b(?:demo|trial|beta|prototype|network\s+test|test\s+ver
 TECH = re.compile(r'\s*[\[(]\s*(?:PS[123XP]|PS2\s*classics?|minis?|PC\s*Engine|TurboGrafx(?:-16)?|Neo\s*Geo(?:\s*Station)?|Nostalgia Vault|(?:English|French|German|Spanish|Italian|Japanese)(?:\s+Version)?|digital version|trial to full|part\s*\d+|disc\s*\d+)\s*[\])]\s*', re.I)
 
 
+@lru_cache(maxsize=4096)
 def norm(value):
     value = unicodedata.normalize('NFKD', str(value).replace('™', '').replace('®', '').replace('©', '')).casefold()
     return ''.join(c for c in value if c.isalnum())
 
 
+@lru_cache(maxsize=4096)
 def names(value):
     raw = str(value).strip()
     cleaned = TECH.sub(' ', raw)
     cleaned = TRIAL.sub(' ', cleaned)
     cleaned = re.sub(r'\s+(?:digital version|(?:French|English|German|Italian|Spanish|Japanese) version)\s*$', '', cleaned, flags=re.I)
-    return list(dict.fromkeys(x for x in (norm(raw), norm(cleaned)) if x))
+    return tuple(dict.fromkeys(x for x in (norm(raw), norm(cleaned)) if x))
+
+
+# Secondary keys are deliberately separate from the original exact index.
+ROMAN = {'i':'1','ii':'2','iii':'3','iv':'4','v':'5','vi':'6','vii':'7','viii':'8','ix':'9','x':'10','xi':'11','xii':'12','xiii':'13','xiv':'14','xv':'15','xvi':'16'}
+VAULT = re.compile(r'\s*\(Nostalgia Vault\)\s*$', re.I)
+VAULT_PART = re.compile(r'\s+(?:part|disc)\s*\d+\s*$', re.I)
+PLATFORM_PREFIX = re.compile(r'^\s*(?:PSP|PS[123X]|NEO\s*GEO\s+STATION|PC\s*ENGINE)\s*(?:[-:–—]\s*|\s+)', re.I)
+EDITION_SUFFIX = re.compile(r'(?:\s*[-:–—]\s*|\s+)(?:game of the year(?: edition)?|goty(?: edition)?|(?:deluxe|complete|collector[’\']?s|special|templar|ultimate|digital) edition|classics? hd|hd)\s*$', re.I)
+
+@lru_cache(maxsize=4096)
+def recovery_keys(value, catalog=False):
+    raw = unicodedata.normalize('NFKC', str(value).replace('™', '').replace('®', '').replace('©', '')).strip()
+    if catalog and VAULT.search(raw):
+        raw = VAULT_PART.sub('', VAULT.sub('', raw))
+    raw = TECH.sub(' ', raw)
+    raw = TRIAL.sub(' ', raw).strip()
+    if catalog:
+        raw = re.sub(r'\s*[\[(](?:ENG|FRA|FRE|GER|DEU|ITA|SPA|ESP|JPN|KOR|POR)[\])]\s*$', '', raw, flags=re.I).strip()
+    if catalog:
+        raw = PLATFORM_PREFIX.sub('', raw).strip()
+    def key(title):
+        words = franchise_words(title.replace('&', ' and '))
+        return ''.join(ROMAN.get(w, w) if i and (w != 'i' or i == len(words)-1) else w for i,w in enumerate(words))
+    strong = {norm(raw), key(raw)} - {''}
+    article = re.fullmatch(r'(.+),\s*(the|an|a)', raw, re.I)
+    if article:
+        reordered = article[2] + ' ' + article[1]
+        strong.update((norm(reordered), key(reordered)))
+    # A numeric brand (e.g. 007) may be preceded by a publisher's IP name
+    # in the official title. Keep the entire branded suffix, never just words.
+    words = franchise_words(raw)
+    for i,w in enumerate(words[:4]):
+        if re.fullmatch(r'0\d{2,3}', w) and len(words)-i >= 2:
+            strong.add(key(' '.join(words[i:])))
+    weak = set()
+    if catalog:
+        stripped = EDITION_SUFFIX.sub('', raw).strip()
+        if stripped != raw and len(franchise_words(stripped)) >= 2:
+            weak.update((norm(stripped), key(stripped)))
+    return frozenset(strong), frozenset(weak - strong)
 
 
 def platform(title, tid, cid):
@@ -267,17 +310,20 @@ def metadata(api, cache_path, force_full=False):
     return games,platform_map,sources,relations
 
 
+@lru_cache(maxsize=4096)
 def franchise_words(value):
     value = unicodedata.normalize('NFKD', str(value).replace('™', '').replace('®', '').replace('©', '')).casefold()
     value = ''.join(c for c in value if not unicodedata.combining(c))
-    return re.findall(r'[^\W_]+', value, re.UNICODE)
+    return tuple(re.findall(r'[^\W_]+', value, re.UNICODE))
 
 
+@lru_cache(maxsize=2048)
 def franchise_name_key(name):
     plain = re.sub(r'\s+(?:series|franchise)\s*$', '', str(name).strip(), flags=re.I)
     return norm(plain) or norm(name)
 
 
+@lru_cache(maxsize=8192)
 def label_in_name(label, title):
     # Whole words, with punctuation/spacing variants (e.g. apostrophes).
     label_key = franchise_name_key(label)
@@ -685,12 +731,12 @@ def attach_exact_series_roots(groups, pending, records):
     # series. Only exact official names and established series qualify.
     by_name = defaultdict(list)
     for entry, members in groups.items():
-        if len(set(members.values())) >= 2:
+        if members:
             by_name[franchise_name_key(entry[1])].append(entry)
     recovered = 0
     for gid, tids in sorted(pending.items()):
         name = records[gid].get('name', '')
-        entries = by_name.get(franchise_name_key(name), ())
+        entries = [entry for entry in by_name.get(franchise_name_key(name), ()) if any(other != gid for other in groups[entry].values())]
         if not entries:
             continue
         # All candidates share the same normalized label and will be merged.
@@ -701,10 +747,54 @@ def attach_exact_series_roots(groups, pending, records):
     return recovered
 
 
+def attach_numbered_series(groups, pending, records):
+    # Require an existing IGDB group, an explicit sequel marker immediately
+    # after its label and at least one already named member with another ID.
+    labels=defaultdict(list)
+    for entry,members in groups.items():
+        words=franchise_words(entry[1])
+        if not words:
+            continue
+        ids=set(members.values())
+        if len(ids)<2:
+            continue
+        anchors={gid for gid in ids if label_in_name(entry[1],records.get(gid,{}).get('name',''))}
+        if len(words)>=2 and anchors:
+            labels[words].append(entry)
+        elif len(words)==1 and len(words[0])>=4:
+            # Single-word series need two independently named members, at
+            # least one with an explicit number, before inferring a sequel.
+            named=[franchise_words(records.get(gid,{}).get('name','')) for gid in anchors]
+            rooted=[title for title in named if title[:1]==words and (len(title)==1 or (len(title)>1 and ROMAN.get(title[1],title[1]).isdigit()))]
+            if len(rooted)>=2 and any(len(title)>1 for title in rooted):
+                labels[words].append(entry)
+    recovered=0
+    already={tid for members in groups.values() for tid in members}
+    for gid,tids in sorted(pending.items()):
+        tids=[tid for tid in tids if tid not in already]
+        if not tids: continue
+        words=tuple(franchise_words(records[gid].get('name','')))
+        matches=[]
+        for i in range(1,len(words)):
+            number=ROMAN.get(words[i],words[i])
+            if not number.isdigit() or not 2<=int(number)<=99: continue
+            for entry in labels.get(words[:i],()):
+                matches.append((i,entry))
+        if not matches: continue
+        best=max(i for i,_ in matches)
+        entries=[entry for i,entry in matches if i==best]
+        if len({franchise_name_key(entry[1]) for entry in entries})!=1: continue
+        entry=min(entries,key=franchise_label_order)
+        groups[entry].update((tid,gid) for tid in tids)
+        recovered+=len(tids)
+        print(f'Recover numbered series member: {records[gid].get("name")} -> {entry[1]} ({len(tids)} catalog IDs)')
+    return recovered
+
+
 def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(), diagnostic=None):
     primary=defaultdict(set); aliases=defaultdict(set); ext=defaultdict(set); records={}
     requested_names=defaultdict(set); requested_ids=defaultdict(set)
-    catalog_keys={}
+    catalog_keys={}; recovery_catalog={}; recovery_requested=defaultdict(set); recovery_index=defaultdict(set)
     for tid, variants in catalog.items():
         prepared=[]
         for name, tag in variants:
@@ -713,6 +803,9 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
             requested_names[tag].update(keys)
             requested_ids[tag].add(tid)
         catalog_keys[tid]=prepared
+        recovery_catalog[tid]=[(tag, *recovery_keys(name, True)) for name,tag in sorted(variants)]
+        for tag,strong,weak in recovery_catalog[tid]:
+            recovery_requested[tag].update(strong | weak)
     tags_by_platform=defaultdict(set)
     for tag, platforms in platform_map.items():
         if requested_ids.get(tag):
@@ -727,10 +820,20 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
         for platform_id in game.get('platforms') or []:
             tags.update(tags_by_platform.get(platform_id, ()))
         if not tags: continue
-        official_keys=set(names(game.get('name', ''))) if game.get('name') else set()
-        keys={key for name in game_names(game) for key in names(name)}
+        official = game.get('name', '')
+        titles = game_names(game)
+        official_keys = set(names(official)) if official else set()
+        keys = official_keys.copy()
+        secondary = set()
+        for title in titles:
+            if title != official:
+                keys.update(names(title))
+            secondary.update(recovery_keys(title)[0])
         relevant=False
         for tag in tags:
+            for key in secondary & recovery_requested[tag]:
+                recovery_index[tag,key].add(gid)
+                relevant=True
             for key in official_keys & requested_names[tag]:
                 primary[tag,key].add(gid)
             for key in keys & requested_names[tag]:
@@ -740,7 +843,9 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
             if not isinstance(item,dict) or item.get('external_game_source') not in psn_sources: continue
             uid=str(item.get('uid','')).upper()
             if not ID.fullmatch(uid): continue
-            for tag in tags.intersection(tags_by_platform.get(item.get('platform'), ())):
+            external_platform = item.get('platform')
+            compatible = tags if external_platform is None else tags.intersection(tags_by_platform.get(external_platform, ()))
+            for tag in compatible:
                 if uid in requested_ids[tag]:
                     ext[tag,uid].add(gid)
                     relevant=True
@@ -749,9 +854,24 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
     print(f'IGDB metadata rows: {metadata_count}; relevant records indexed: {len(records)}')
     groups=defaultdict(dict); matched=0; ambiguous=0; canonical={}; memberships={}; rejected_games=set(); rejected_links=0
     pending=defaultdict(list); unresolved=[]
-    rejected_memberships = {}
+    rejected_memberships = {}; recovered_matches = Counter()
     for tid, variants in sorted(catalog_keys.items()):
         candidates=resolve_catalog_game(tid, variants, primary, aliases, ext)
+        if not candidates:
+            possible=set()
+            used_edition=False
+            for tag,strong,weak in recovery_catalog[tid]:
+                found=set()
+                for key in strong:
+                    found.update(recovery_index.get((tag,key), ()))
+                if not found:
+                    for key in weak:
+                        found.update(recovery_index.get((tag,key), ()))
+                    used_edition = used_edition or bool(found)
+                possible.update(found)
+            candidates=possible
+            if len(possible)==1:
+                recovered_matches['edition' if used_edition else 'normalized'] += 1
         if len(candidates)!=1:
             ambiguous+=bool(candidates)
             unresolved.append((tid, variants, candidates))
@@ -772,11 +892,15 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
         for entry in memberships[gid]:
             groups[entry][tid]=gid
     recovered=attach_exact_series_roots(groups, pending, records)
+    numbered_recovered=attach_numbered_series(groups, pending, records)
+    if diagnostic is not None: diagnostic['numbered_series_recoveries']=numbered_recovered
     series_keys={franchise_name_key(entry[1]) for entry in groups}
     for tid, variants, candidates in unresolved:
         if any(key in series_keys for _, keys in variants for key in keys):
             print(f'Unresolved exact series-title candidate: {tid}; IGDB candidates: {sorted(candidates)}')
     print(f'Exact series-root recovery: {recovered} catalog IDs')
+    print(f'Secondary name recovery: {dict(recovered_matches)}')
+    if diagnostic is not None: diagnostic['secondary_match_recoveries'] = dict(recovered_matches)
     print(f'Incidental IP associations: {rejected_links} removed across {len(rejected_games)} games')
     output = consolidate_groups(groups, records, relations, diagnostic)
     print(f'Catalog: {len(catalog)} IDs | matched: {matched} | ambiguous: {ambiguous} | franchises: {len(output)}')
@@ -784,7 +908,10 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
     if diagnostic is not None:
         collect_diagnostics(diagnostic, catalog, records, canonical, unresolved, groups,
                             memberships, rejected_memberships, output, metadata_count, recovered)
-    return {'version':1,'franchises':output,'games':{tid:canonical[tid] for tid in sorted(used)}}
+    result = {'version':1,'franchises':output,'games':{tid:canonical[tid] for tid in sorted(used)}}
+    for cached in (norm, names, recovery_keys, franchise_words, franchise_name_key, label_in_name):
+        cached.cache_clear()
+    return result
 
 
 STATUS_LABELS = {
@@ -889,6 +1016,8 @@ def write_diagnostics(report, directory):
         else: lines.append(f"| {file} | {counts.get('rows',0)} | {counts.get('eligible_rows',0)} | {counts.get('rows',0)-counts.get('eligible_rows',0)} |")
     lines += ['', 'Rows include headers, duplicates and regional releases. See coverage.json for exclusions by reason.',
               '', 'Download the franchise-diagnostics artifact for all Title IDs, candidate names, accepted/rejected memberships and discarded groups. No credentials or download URLs are included.', '']
+    recoveries = report.get('secondary_match_recoveries', {})
+    lines += ['### Secondary recovery', '', f"Normalized names: **{recoveries.get('normalized', 0)}** | Edition fallback: **{recoveries.get('edition', 0)}** | Numbered series memberships: **{report.get('numbered_series_recoveries', 0)}**.", '']
     summary = '\n'.join(lines)
     (directory / 'summary.md').write_text(summary, encoding='utf-8')
     print(summary)
