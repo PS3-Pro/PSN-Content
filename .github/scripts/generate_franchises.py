@@ -85,7 +85,7 @@ def igdb_credentials(root, config_path=None):
     secret = os.environ.get('IGDB_CLIENT_SECRET', '').strip()
     if client and secret:
         return client, secret
-    path = Path(config_path) if config_path else Path('server-secrets.json')
+    path = Path(config_path) if config_path else Path('resources/server/server-secrets.json')
     if not path.is_absolute():
         path = root / path
     try:
@@ -97,7 +97,7 @@ def igdb_credentials(root, config_path=None):
             raise ValueError()
         return tuple(value.strip() for value in pair)
     except (OSError, ValueError, UnicodeError):
-        raise RuntimeError('IGDB credentials unavailable: configure a private server-secrets.json or Actions secrets') from None
+        raise RuntimeError(f'IGDB credentials unavailable at {path}: check file location, JSON format and IGDB keys, or configure Actions secrets') from None
 
 
 class IGDB:
