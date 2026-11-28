@@ -21,6 +21,44 @@ FIELDS = 'name,alternative_names.name,platforms,category,genres.name,themes.name
 TTL = 30 * 86400
 
 
+
+def load_provider_secrets():
+    path = ROOT / 'resources/server/server-secrets.json'
+    try:
+        data = json.loads(path.read_text(encoding='utf-8-sig'))
+    except FileNotFoundError:
+        raise RuntimeError('Missing resources/server/server-secrets.json') from None
+    except (OSError, ValueError):
+        raise RuntimeError('Cannot read resources/server/server-secrets.json') from None
+    if not isinstance(data, dict):
+        raise RuntimeError('Invalid server-secrets.json: expected a JSON object')
+    aliases = {
+        'IGDB_CLIENT_ID': ('IGDB_CLIENT_ID',),
+        'IGDB_CLIENT_SECRET': ('IGDB_CLIENT_SECRET',),
+        'RAWG_KEY': ('RAWG_KEYS', 'RAWG_KEY', 'RAWG_API_KEY', 'RAWG_API_KEYS'),
+        'SCREENSCRAPER_DEV_ID': ('SCREENSCRAPER_DEV_ID',),
+        'SCREENSCRAPER_DEV_PASSWORD': ('SCREENSCRAPER_DEV_PASSWORD',),
+        'SCREENSCRAPER_USER': ('SCREENSCRAPER_USER',),
+        'SCREENSCRAPER_PASSWORD': ('SCREENSCRAPER_PASSWORD',),
+    }
+    values = {}
+    for target, keys in aliases.items():
+        for name in keys:
+            value = data.get(name)
+            if target == 'RAWG_KEY' and isinstance(value, list):
+                value = ' '.join(x.strip() for x in value if isinstance(x, str) and x.strip())
+            if isinstance(value, str) and value.strip():
+                values[target] = value.strip()
+                break
+    missing = [name for name in ('IGDB_CLIENT_ID', 'IGDB_CLIENT_SECRET') if not values.get(name)]
+    if missing:
+        raise RuntimeError('Missing provider keys in server-secrets.json: ' + ', '.join(missing))
+    # Only the metadata providers are exposed to this process; never log values.
+    for target in aliases:
+        os.environ.pop(target, None)
+    os.environ.update(values)
+
+
 def key(value):
     s = unicodedata.normalize('NFKC', str(value or '')).casefold()
     return ''.join(c for c in s if c.isalnum())
@@ -90,7 +128,7 @@ def fetch_games():
         with gzip.open(CACHE,'rt',encoding='utf-8') as f: data=json.load(f)
         if isinstance(data,dict) and data.get('version')==2 and data.get('games') and time.time()-data['at']<TTL: return data['games']
     cid=os.environ.get('IGDB_CLIENT_ID',''); secret=os.environ.get('IGDB_CLIENT_SECRET','')
-    if not cid or not secret: raise RuntimeError('Configure IGDB_CLIENT_ID and IGDB_CLIENT_SECRET as GitHub Actions secrets')
+    if not cid or not secret: raise RuntimeError('Missing IGDB credentials in server-secrets.json')
     token=request('https://id.twitch.tv/oauth2/token',urlencode({'client_id':cid,'client_secret':secret,'grant_type':'client_credentials'}).encode(),{'Content-Type':'application/x-www-form-urlencoded'})['access_token']
     headers={'Client-ID':cid,'Authorization':'Bearer '+token,'Accept':'application/json','Content-Type':'text/plain'}
     games={}
@@ -379,6 +417,7 @@ def supplement(cat,payload,content_ids):
     return audit
 
 def main():
+    load_provider_secrets()
     content_ids=defaultdict(set);cat=catalog(content_ids); payload,audit,examples=build(cat,fetch_games())
     combined=supplement(cat,payload,content_ids)
     if not audit['matched']: raise ValueError('No trusted IGDB matches; refusing to replace index')
