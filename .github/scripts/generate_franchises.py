@@ -59,7 +59,7 @@ VAULT_PART = re.compile(r'\s+(?:part|disc)\s*\d+\s*$', re.I)
 PLATFORM_PREFIX = re.compile(r'^\s*(?:PSP|PS[123X]|NEO\s*GEO\s+STATION|PC\s*ENGINE)\s*(?:[-:–—]\s*|\s+)', re.I)
 EDITION_SUFFIX = re.compile(r'(?:\s*[-:–—]\s*|\s+)(?:game of the year(?: edition)?|goty(?: edition)?|(?:deluxe|complete|collector[’\']?s|special|templar|ultimate|digital) edition|classics? hd|hd)\s*$', re.I)
 
-REGIONAL_LABEL = r'(?:EN|ENG|ENGLISH|FR|FRA|FRE|FRENCH|FRANCE|DE|DEU|GER|GERMAN|GERMANY|IT|ITA|ITALIAN|ITALY|ES|SPA|ESP|SPANISH|SPAIN|JP|JPN|JAPANESE|JAPAN|KR|KOR|KOREAN|CN|CHN|CHINESE|PL|POL|POLISH|RU|RUS|RUSSIAN|PT|POR|PORTUGUESE|BR|BRAZIL|UK|ENGLAND|US|USA|EU|EUR|ANZ|TUR|TURKISH)'
+REGIONAL_LABEL = r'(?:EN|ENG|ENGLISH|FR|FRA|FRE|FRENCH|FRANCE|DE|DEU|GER|GERMAN|GERMANY|IT|ITA|ITALIAN|ITALY|ES|SPA|ESP|SPANISH|SPAIN|JP|JPN|JAPANESE|JAPAN|KR|KOR|KOREAN|CN|CHN|CHINESE|PL|POL|POLISH|RU|RUS|RUSSIAN|RUSSIA|PT|POR|PORTUGUESE|BR|BRAZIL|UK|ENGLAND|US|USA|EU|EUR|ANZ|TUR|TURKISH)'
 REGIONAL_SUFFIX = re.compile(r'\s*\(\s*' + REGIONAL_LABEL + r'(?:\s*[-/,]\s*' + REGIONAL_LABEL + r')*\s*\)\s*$', re.I)
 DIGITAL_SUFFIX = re.compile(r'\s*\(\s*(?:digital|downloadable ver(?:sion)?\.?)\s*\)\s*$', re.I)
 
@@ -112,6 +112,7 @@ def recovery_keys(value, catalog=False):
 
 REISSUE_SUFFIX = re.compile(r'\s*(?:PlayStation\s*3|PS3)\s+the\s+Best\s*$', re.I)
 LANG_DASH_SUFFIX = re.compile(r'\s+[-–—]\s+(?:EN|ENG|DE|GER|FR|FRA|IT|ITA|ES|SPA|JP|JPN|KR|KOR|RU|RUS|PT|POR)\s*$', re.I)
+VERSION_SUFFIX = re.compile(r'\s*\(\s*(?:app\s+)?version\s+\d+(?:\.\d+){1,3}\s*\)\s*$', re.I)
 HD_EDITION = re.compile(r'\s*(?:[-:–—]\s*)?HD\s+Edition\s*$', re.I)
 NUMBER_PAIR = re.compile(r'(?<!\w)([IVXLCDM]+|\d+)\s+(?:and|&)\s+(?=(?:[IVXLCDM]+|\d+)(?:\b|[-/]))', re.I)
 NON_GAME_SUFFIX = re.compile(r'(?:\s+(?:Official|Gameplay|Launch)\s+Trailer|\s*[-–—]\s*Console Application)\s*$', re.I)
@@ -134,6 +135,7 @@ def late_recovery_keys(value, catalog=False):
     clean = REISSUE_SUFFIX.sub('', raw).strip()
     if catalog:
         clean = LANG_DASH_SUFFIX.sub('', clean).strip()
+        clean = VERSION_SUFFIX.sub('', clean).strip()
     if clean != raw:
         keys.update(recovery_keys(clean, catalog)[0])
     # Compare only explicit pairs of installment numbers, not arbitrary conjunctions.
@@ -199,6 +201,7 @@ class BrowseContentFilter:
         self.video_cid_exclusion = regex('PSN_VIDEO_CONTENT_ID_EXCLUSION_REGEX')
         self.video_name_exclusion = regex('PSN_VIDEO_NAME_EXCLUSION_REGEX')
         self.video_test = regex('PSN_VIDEO_TEST_VERSION_REGEX')
+        self.physical_game_id = re.compile(r'^[BS][CL][A-Z]{2}\d{5}$', re.I)
         analysis = re.search(r'function buildStoreRowAnalysis\(.*?\n\s*function getStoreRowAnalysis\(', source, re.S)
         guide = re.search(r'const isGuide\s*=\s*/((?:\\.|[^/\n])+)/i\.test\(rawName\);', analysis[0] if analysis else '')
         if not guide:
@@ -224,7 +227,7 @@ class BrowseContentFilter:
         if self.soundtrack.search(title):
             return 'soundtrack'
         if not (self.video_test.search(title) or self.video_name_exclusion.search(title) or self.video_cid_exclusion.search(cid)):
-            if self.video_name.search(title) or self.video_cid.search(cid):
+            if self.video_name.search(title) or (not self.physical_game_id.fullmatch(tid) and self.video_cid.search(cid)):
                 return 'video'
         normalized = unicodedata.normalize('NFKC', title).strip()
         if explicit_demo:
@@ -948,6 +951,67 @@ def attach_numbered_series(groups, pending, records):
     return recovered
 
 
+def attach_exact_numbered_pairs(groups, pending, records, catalog, rejected_games):
+    # Infer an original + explicit second installment only from distinct,
+    # uniquely matched official names on a shared catalog platform.
+    by_name = defaultdict(set)
+    grouped = defaultdict(set)
+    ids_to_tids = defaultdict(set)
+    for entry, members in groups.items():
+        for tid, gid in members.items():
+            grouped[gid].add(entry)
+            ids_to_tids[gid].add(tid)
+    for gid, tids in pending.items():
+        ids_to_tids[gid].update(tids)
+    for gid in ids_to_tids:
+        if gid not in rejected_games:
+            by_name[franchise_words(records[gid].get('name', ''))].add(gid)
+    tags = {gid: {tag for tid in tids for _, tag in catalog[tid]}
+            for gid, tids in ids_to_tids.items()}
+    labels = defaultdict(list)
+    for entry in groups:
+        labels[franchise_name_key(entry[1])].append(entry)
+    recovered = 0
+    for gid in sorted(pending):
+        if gid in grouped or gid in rejected_games:
+            continue
+        words = franchise_words(records[gid].get('name', ''))
+        if len(words) < 3 or ROMAN.get(words[-1], words[-1]) != '2':
+            continue
+        root_words = words[:-1]
+        root_ids = by_name.get(root_words, set())
+        # Do not choose between two records for an original or a sequel.
+        sequel_ids = by_name.get(root_words + ('2',), set()) | by_name.get(root_words + ('ii',), set())
+        if len(root_ids) != 1 or sequel_ids != {gid}:
+            continue
+        original = next(iter(root_ids))
+        if original == gid or not tags[original] & tags[gid]:
+            continue
+        name = records[original]['name']
+        key = franchise_name_key(name)
+        known = labels.get(key, [])
+        if grouped.get(original):
+            if not known or any(franchise_name_key(entry[1]) != key for entry in grouped[original]):
+                continue
+            entries = [entry for entry in known if entry in grouped[original]]
+            if not entries:
+                continue
+            entry = min(entries, key=franchise_label_order)
+        else:
+            if known or original not in pending:
+                continue
+            entry = ('s:' + str(original), name)
+            labels[key].append(entry)
+            groups[entry].update((tid, original) for tid in pending[original])
+            grouped[original].add(entry)
+            recovered += len(pending[original])
+        groups[entry].update((tid, gid) for tid in pending[gid])
+        grouped[gid].add(entry)
+        recovered += len(pending[gid])
+        print(f'Recover exact numbered pair: {name} -> {records[gid]["name"]}')
+    return recovered
+
+
 def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(), diagnostic=None):
     primary=defaultdict(set); aliases=defaultdict(set); ext=defaultdict(set); records={}
     requested_names=defaultdict(set); requested_ids=defaultdict(set)
@@ -1078,7 +1142,10 @@ def build(catalog, games, platform_map, psn_sources=frozenset({36}), relations=(
             groups[entry][tid]=gid
     recovered=attach_exact_series_roots(groups, pending, records)
     numbered_recovered=attach_numbered_series(groups, pending, records)
-    if diagnostic is not None: diagnostic['numbered_series_recoveries']=numbered_recovered
+    pair_recovered=attach_exact_numbered_pairs(groups, pending, records, catalog, rejected_games)
+    if diagnostic is not None:
+        diagnostic['numbered_series_recoveries']=numbered_recovered
+        diagnostic['exact_numbered_pair_recoveries']=pair_recovered
     series_keys={franchise_name_key(entry[1]) for entry in groups}
     for tid, variants, candidates in unresolved:
         if any(key in series_keys for _, keys in variants for key in keys):
@@ -1209,7 +1276,7 @@ def write_diagnostics(report, directory):
         lines.append(f'| {label} | {excluded[key]} |')
     lines += ['', 'Counts are source rows, not unique Title IDs.', '']
     recoveries = report.get('secondary_match_recoveries', {})
-    lines += ['### Secondary recovery', '', f"Normalized names: **{recoveries.get('normalized', 0)}** | Edition fallback: **{recoveries.get('edition', 0)}** | Explicit plus variants: **{recoveries.get('explicit_plus', 0)}** | Numbered series memberships: **{report.get('numbered_series_recoveries', 0)}**.", '']
+    lines += ['### Secondary recovery', '', f"Normalized names: **{recoveries.get('normalized', 0)}** | Edition fallback: **{recoveries.get('edition', 0)}** | Explicit plus variants: **{recoveries.get('explicit_plus', 0)}** | Numbered series memberships: **{report.get('numbered_series_recoveries', 0)}** | Exact numbered pair memberships: **{report.get('exact_numbered_pair_recoveries', 0)}**.", '']
     summary = '\n'.join(lines)
     (directory / 'summary.md').write_text(summary, encoding='utf-8')
     print(summary)

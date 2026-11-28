@@ -1,0 +1,79 @@
+name: Update PS3 Manuals Index
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ['Update PSN™ Database']
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ps3-manual-index
+  cancel-in-progress: false
+
+jobs:
+  update-manuals:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check update cadence
+        id: cadence
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = 'workflow_dispatch' ] || [ "$(date -u +%u)" = '7' ]; then
+            echo 'run=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'run=false' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Checkout repository
+        if: steps.cadence.outputs.run == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Set up Python
+        if: steps.cadence.outputs.run == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Restore manual scan state
+        if: steps.cadence.outputs.run == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache/ps3-manual-index/state.json
+          key: ps3-manuals-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ps3-manuals-v2-
+      - name: Index public PS3 manuals
+        id: index
+        if: steps.cadence.outputs.run == 'true'
+        run: python .github/scripts/update_ps3_manuals.py
+      - name: Commit and push index only
+        id: publish
+        if: steps.cadence.outputs.run == 'true'
+        run: |
+          INDEX=resources/database/manuals/ps3.json
+          if [ ! -f "$INDEX" ]; then exit 0; fi
+          git add "$INDEX"
+          if git diff --cached --quiet; then exit 0; fi
+          git config user.name 'PS3-Pro Bot'
+          git config user.email 'bot@ps3pro.com'
+          git commit -m 'Auto-update: PS3 manuals index'
+          git pull --rebase origin main
+          git push origin HEAD:main
+      - name: Save manual scan state
+        if: >-
+          ${{ !cancelled() && steps.cadence.outputs.run == 'true' &&
+          (steps.index.outcome == 'failure' || steps.publish.outcome == 'success') }}
+        uses: actions/cache/save@v4
+        with:
+          path: .cache/ps3-manual-index/state.json
+          key: ps3-manuals-v2-${{ github.run_id }}-${{ github.run_attempt }}
