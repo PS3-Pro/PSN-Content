@@ -26598,6 +26598,7 @@ P
     let psnFranchiseVisibleTiles = [];
     let psnFranchiseEntries = [], psnFranchiseResults = [];
     let psnFranchiseProgressiveRevision = 0;
+    let psnFranchiseBottomFrame = 0;
     function psnFranchiseStopReveal(tile) {
         psnFranchiseRevealAnimations.get(tile)?.cancel();
         psnFranchiseRevealAnimations.delete(tile);
@@ -26682,20 +26683,21 @@ P
     }
     function psnFranchiseStopProgressive(host=document.getElementById('psn-franchise-grid')) {
         psnFranchiseProgressiveRevision++;
+        if(psnFranchiseBottomFrame){cancelAnimationFrame(psnFranchiseBottomFrame);psnFranchiseBottomFrame=0;}
         clearProgressiveGridObserver('franchises',host);
     }
     function psnFranchiseSetupProgressive(host) {
-        if(getCurrentPsnViewElement()?.id!=='view-franchises')return;
+        if(psnFranchiseBottomFrame||getCurrentPsnViewElement()?.id!=='view-franchises')return;
         const revision=psnFranchiseProgressiveRevision, rendered=psnFranchiseVisibleTiles.length;
         setupProgressiveGridObserver('franchises',host,rendered,psnFranchiseResults.length,()=>{
             if(revision!==psnFranchiseProgressiveRevision||rendered!==psnFranchiseVisibleTiles.length||getCurrentPsnViewElement()?.id!=='view-franchises')return;
             psnFranchiseAppend(host,rendered+psnFranchiseBatchSize(true));
         },null,'400px',revision);
     }
-    function psnFranchiseAppend(host,limit) {
+    function psnFranchiseAppend(host,limit,setupProgressive=true) {
         const end=Math.min(limit,psnFranchiseResults.length);
         const start=psnFranchiseVisibleTiles.length;
-        if(end<=start){psnFranchiseSetupProgressive(host);return;}
+        if(end<=start){if(setupProgressive)psnFranchiseSetupProgressive(host);return;}
         const fragment=document.createDocumentFragment(), added=[];
         for(let i=start;i<end;i++){
             const tile=psnFranchiseCreateTile(psnFranchiseResults[i]);
@@ -26704,7 +26706,23 @@ P
         host.insertBefore(fragment,document.getElementById('psn-franchise-empty'));
         psnFranchiseVisibleTiles.push(...added);
         psnFranchiseReveal(added);
-        psnFranchiseSetupProgressive(host);
+        if(setupProgressive)psnFranchiseSetupProgressive(host);
+    }
+    function psnFranchiseScrollBottom(scroll) {
+        const host=document.getElementById('psn-franchise-grid');
+        if(!host||psnFranchiseBottomFrame)return;
+        const finish=()=>scroll.scrollTo({top:scroll.scrollHeight,behavior:browseMotionReduced()?'auto':'smooth'});
+        if(psnFranchiseVisibleTiles.length>=psnFranchiseResults.length){finish();return;}
+        psnFranchiseStopProgressive(host);
+        const revision=psnFranchiseProgressiveRevision;
+        const append=()=>{
+            psnFranchiseBottomFrame=0;
+            if(revision!==psnFranchiseProgressiveRevision||getCurrentPsnViewElement()?.id!=='view-franchises')return;
+            psnFranchiseAppend(host,psnFranchiseVisibleTiles.length+psnFranchiseBatchSize(true),false);
+            if(psnFranchiseVisibleTiles.length<psnFranchiseResults.length)psnFranchiseBottomFrame=requestAnimationFrame(append);
+            else{psnFranchiseSetupProgressive(host);finish();}
+        };
+        psnFranchiseBottomFrame=requestAnimationFrame(append);
     }
     function psnFranchiseReconcile(host,limit,revealAll=false) {
         const old=psnFranchiseVisibleTiles;
@@ -57894,6 +57912,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
     [btnTop, btnBottom].forEach(button => { if (button) { button.setAttribute('aria-hidden', 'true'); button.tabIndex = -1; } });
     const scrollButtonViews = {
         browse: document.getElementById('view-browse'),
+        franchises: document.getElementById('view-franchises'),
         social: document.getElementById('view-social'),
         wishlist: document.getElementById('view-wishlist'),
         downloads: document.getElementById('view-downloads'),
@@ -57903,7 +57922,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 
    function isScrollButtonRelevantViewVisible() {
         const isConnected = window._lastConnectionState === true;
-        const isBrowse = scrollButtonViews.browse?.style.display === 'block';
+        const isBrowse = scrollButtonViews.browse?.style.display === 'block' || scrollButtonViews.franchises?.style.display === 'block';
         const isSocial = scrollButtonViews.social?.style.display === 'block';
         const isWishlist = scrollButtonViews.wishlist?.style.display === 'block';
         const isDownloads = scrollButtonViews.downloads?.style.display === 'block';
@@ -57945,7 +57964,8 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
         const scrollTop = scrollArea.scrollTop;
         const scrollHeight = scrollArea.scrollHeight;
         const clientHeight = scrollArea.clientHeight;
-        if (scrollHeight <= clientHeight + 50) {
+        const hasMoreFranchises = scrollButtonViews.franchises?.style.display === 'block' && psnFranchiseVisibleTiles.length < psnFranchiseResults.length;
+        if (scrollHeight <= clientHeight + 50 && !hasMoreFranchises) {
             setScrollNavigationButtonVisible(btnTop, false);
             setScrollNavigationButtonVisible(btnBottom, false);
             syncScrollNavFloatingLayout();
@@ -57955,7 +57975,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
         setScrollNavigationButtonVisible(btnTop, scrollTop > 300);
 
         const distanceToBottom = scrollHeight - scrollTop - clientHeight;
-        setScrollNavigationButtonVisible(btnBottom, distanceToBottom > 300);
+        setScrollNavigationButtonVisible(btnBottom, distanceToBottom > 300 || hasMoreFranchises);
         syncScrollNavFloatingLayout();
     }
 
@@ -57963,6 +57983,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 
     const scrollButtonMutationRoots = {
         browse: document.getElementById('database-grid'),
+        franchises: document.getElementById('psn-franchise-grid'),
         social: document.getElementById('psn-social-feed'),
         wishlist: document.getElementById('wishlist-grid'),
         downloads: document.getElementById('downloads-list'),
@@ -57983,6 +58004,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
     function getActiveScrollButtonObserverRoot() {
         if (document.hidden) return null;
         if (scrollButtonViews.browse?.style.display === 'block') return scrollButtonMutationRoots.browse;
+        if (scrollButtonViews.franchises?.style.display === 'block') return scrollButtonMutationRoots.franchises;
         if (scrollButtonViews.social?.style.display === 'block') return scrollButtonMutationRoots.social;
         if (scrollButtonViews.wishlist?.style.display === 'block') return scrollButtonMutationRoots.wishlist;
         if (scrollButtonViews.downloads?.style.display === 'block') return scrollButtonMutationRoots.downloads;
@@ -58085,10 +58107,12 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
     }, { passive: true });
 
     btnTop.addEventListener("click", () => {
+        if(psnFranchiseBottomFrame){psnFranchiseStopProgressive();psnFranchiseSetupProgressive(document.getElementById('psn-franchise-grid'));}
         scrollArea.scrollTo({ top: 0, behavior: "smooth" });
     });
 
     btnBottom.addEventListener("click", () => {
+        if(getMainScrollActiveViewId()==='view-franchises'){psnFranchiseScrollBottom(scrollArea);return;}
         scrollArea.scrollTo({ top: scrollArea.scrollHeight, behavior: "smooth" });
     });
 
