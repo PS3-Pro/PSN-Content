@@ -9301,6 +9301,9 @@ body.interface-auto-translate-enabled .psn-social-translate-btn { display:none !
 .psn-site-select-group:not(:first-child) { margin-top:5px; border-top:1px solid rgba(255,255,255,.08); }
 .psn-site-select-option { display:flex; align-items:center; justify-content:space-between; gap:12px; width:100%; min-height:34px; padding:8px 11px; text-align:left; font-family:inherit; font-size:11px; font-weight:700; line-height:1.35; color:rgba(255,255,255,.88); background:transparent; border:1px solid transparent; border-radius:9px; cursor:var(--psn-hand-cursor), pointer; transition:background .14s ease,border-color .14s ease,box-shadow .14s ease,color .14s ease,transform .09s ease,filter .10s ease; }
 .psn-site-select-option > span { min-width:0; flex:1; overflow-wrap:anywhere; }
+.psn-site-select-menu.is-genre .psn-site-select-option { gap:5px; padding-inline:8px; }
+.psn-site-select-menu.is-genre { width:max-content; max-width:calc(100vw - 16px); }
+.psn-site-select-menu.is-genre .psn-site-select-option > span { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .psn-site-select-menu.is-category .psn-site-select-option { gap:4px; padding-inline:7px; }
 .psn-site-select-menu.is-category .psn-site-select-option:not(.is-selected) > i { display:none; }
 .psn-site-select-menu.is-category :is(.psn-site-select-option > span,.psn-site-select-group) { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -26802,6 +26805,7 @@ P
         }
         host.insertBefore(fragment,document.getElementById('psn-franchise-empty'));
         psnFranchiseVisibleTiles.push(...added);
+        if(start<2&&psnFranchiseVisibleTiles.length>=2)psnFranchiseSyncControls(psnFranchiseResults.length);
         psnFranchiseReveal(added);
         psnFranchiseSetupProgressive(host);
     }
@@ -26835,7 +26839,7 @@ P
         const labels = [psnFranchiseAlphaDesc?'Z–A':'A–Z',psnFranchiseCountDesc?'Most Titles First':'Fewest Titles First','Surprise Me'];
         buttons.forEach((button,i)=>{
             if (!button) return;
-            const disabled = visible < 2;
+            const disabled = (i===2?psnFranchiseVisibleTiles.length:visible) < 2;
             if(button.disabled!==disabled)button.disabled=disabled;
             const title=disabled?'At least two franchises are required':labels[i];
             if(button.title!==title)button.title=title;
@@ -26864,13 +26868,13 @@ P
     };
     window.psnFranchiseSurprise = function(button) {
         const host = document.getElementById('psn-franchise-grid');
-        const results = psnFranchiseResults;
-        if (!host || results.length < 2 || button?.disabled) return;
-        const last=results.findIndex(entry=>String(entry.index)===psnFranchiseLastSurprise);
-        let index=Math.floor(Math.random()*(results.length-(last>=0?1:0)));
+        if (!host || button?.disabled) return;
+        const tiles = psnFranchiseVisibleTiles.filter(tile=>tile.parentElement===host&&!tile.hidden);
+        if(tiles.length<2)return;
+        const last=tiles.findIndex(tile=>tile.dataset.franchise===psnFranchiseLastSurprise);
+        let index=Math.floor(Math.random()*(tiles.length-(last>=0?1:0)));
         if(last>=0&&index>=last)index++;
-        if(index>=psnFranchiseVisibleTiles.length)psnFranchiseAppend(host,index+1);
-        const picked=psnFranchiseVisibleTiles[index];
+        const picked=tiles[index];
         if(!picked)return;
         psnFranchiseLastSurprise = picked.dataset.franchise;
         if(button){clearTimeout(button.__psnFranchiseDiceTimer);button.classList.remove('is-rolling');void button.offsetWidth;button.classList.add('is-rolling');button.__psnFranchiseDiceTimer=setTimeout(()=>{button.classList.remove('is-rolling');delete button.__psnFranchiseDiceTimer;},520);}
@@ -60452,25 +60456,26 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		return true;
 	};
 
-	window.getVisibleSurpriseCards = function(grid) {
-		if (!grid) return [];
-		return Array.from(grid.querySelectorAll(':scope > .game-card')).filter(card => {
-			if (!card || card.classList.contains('category-remove-effect')) return false;
-			const style = window.getComputedStyle ? window.getComputedStyle(card) : null;
-			return !style || (style.display !== 'none' && style.visibility !== 'hidden');
-		});
+	function isEligibleSurpriseCard(card, installedOnly) {
+		if (!card || !card.classList.contains('game-card') || card.hidden || card.classList.contains('category-remove-effect')) return false;
+		if (installedOnly && !card.classList.contains('is-installed-on-ps3')) return false;
+		const style = window.getComputedStyle ? window.getComputedStyle(card) : null;
+		return !style || (style.display !== 'none' && style.visibility !== 'hidden' && style.visibility !== 'collapse');
+	}
+
+	window.getVisibleSurpriseCards = function(grid, installedOnly = false) {
+		const cards = [];
+		if (grid) for (const card of grid.children) {
+			if (isEligibleSurpriseCard(card, installedOnly)) cards.push(card);
+		}
+		return cards;
 	};
 
-	window.hasAtLeastTwoVisibleSurpriseCards = function(grid) {
+	window.hasAtLeastTwoVisibleSurpriseCards = function(grid, installedOnly = false) {
 		if (!grid) return false;
-		let visibleCount = 0;
-		const children = grid.children || [];
-		for (let i = 0; i < children.length; i++) {
-			const card = children[i];
-			if (!card || !card.matches?.('.game-card') || card.classList.contains('category-remove-effect')) continue;
-			const style = window.getComputedStyle ? window.getComputedStyle(card) : null;
-			if (style && (style.display === 'none' || style.visibility === 'hidden')) continue;
-			if (++visibleCount >= 2) return true;
+		let count = 0;
+		for (const card of grid.children) {
+			if (isEligibleSurpriseCard(card, installedOnly) && ++count >= 2) return true;
 		}
 		return false;
 	};
@@ -60497,40 +60502,43 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		};
 		const config = configs[scope];
 		const grid = config ? document.getElementById(config.gridId) : null;
-		if (!config || !grid) return;
+		if (!config || !grid || button?.disabled) return;
 
-		const cards = window.getVisibleSurpriseCards(grid).filter(card => scope !== 'favorites' || card.classList.contains('is-installed-on-ps3'));
-		if (!cards.length) {
+		const cards = window.getVisibleSurpriseCards(grid, scope === 'favorites');
+		if (cards.length < 2) {
 			if (typeof playUiError === 'function') playUiError();
 			if (typeof showToastNotification === 'function') showToastNotification('Surprise Me', config.empty);
 			return;
 		}
 
 		window.__lastSurpriseKeys = window.__lastSurpriseKeys || {};
-		let pool = cards;
+		let picked = cards[Math.floor(Math.random() * cards.length)];
+		let pickedKey = window.getSurpriseCardKey(picked);
 		const lastKey = window.__lastSurpriseKeys[scope] || '';
-		if (cards.length > 1 && lastKey) {
-			const withoutLast = cards.filter(card => window.getSurpriseCardKey(card) !== lastKey);
-			if (withoutLast.length) pool = withoutLast;
+		if (lastKey && pickedKey === lastKey) {
+			const alternatives = cards.filter(card => window.getSurpriseCardKey(card) !== lastKey);
+			if (alternatives.length) {
+				picked = alternatives[Math.floor(Math.random() * alternatives.length)];
+				pickedKey = window.getSurpriseCardKey(picked);
+			}
 		}
-
-		const picked = pool[Math.floor(Math.random() * pool.length)];
-		if (!picked) return;
 		window.__pendingStoreFocus = null;
-		window.__lastSurpriseKeys[scope] = window.getSurpriseCardKey(picked);
+		window.__lastSurpriseKeys[scope] = pickedKey;
 
 		if (button) {
+			clearTimeout(button.__psnSurpriseDiceTimer);
 			button.classList.remove('is-rolling');
 			void button.offsetWidth;
 			button.classList.add('is-rolling');
-			setTimeout(() => {
-				if (button && button.isConnected) button.classList.remove('is-rolling');
+			button.__psnSurpriseDiceTimer = setTimeout(() => {
+				button.classList.remove('is-rolling');
+				delete button.__psnSurpriseDiceTimer;
 			}, 520);
 		}
 		if (typeof playUiClick === 'function') playUiClick();
 
 		requestAnimationFrame(() => requestAnimationFrame(() => {
-			window.highlightBrowseCardEvidence(picked, { duration: 6500 });
+			if (picked.parentElement === grid && isEligibleSurpriseCard(picked, scope === 'favorites')) window.highlightBrowseCardEvidence(picked, { duration: 6500 });
 		}));
 	};
 
@@ -60552,14 +60560,13 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		const button = config ? document.getElementById(config.buttonId) : null;
 		const grid = config ? document.getElementById(config.gridId) : null;
 		if (!config || !button || !grid) return;
-		const surpriseCards = window.getVisibleSurpriseCards(grid).filter(card => scope !== 'favorites' || card.classList.contains('is-installed-on-ps3'));
-		const enabled = surpriseCards.length > 1;
+		const enabled = window.hasAtLeastTwoVisibleSurpriseCards(grid, scope === 'favorites');
 		const disabled = !enabled;
 		if (button.disabled !== disabled) button.disabled = disabled;
 		if (button.classList.contains('is-disabled') !== disabled) button.classList.toggle('is-disabled', disabled);
 		const nextAriaDisabled = enabled ? 'false' : 'true';
 		if (button.getAttribute('aria-disabled') !== nextAriaDisabled) button.setAttribute('aria-disabled', nextAriaDisabled);
-		const nextTitle = enabled ? config.title : 'Surprise Me needs at least two visible items';
+		const nextTitle = enabled ? config.title : 'Surprise Me needs at least two loaded items';
 		if (button.title !== nextTitle) button.title = nextTitle;
 	};
 
@@ -60597,14 +60604,8 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 		const observer = new MutationObserver(mutations => {
 			if (!observedScope || !observedGrid) return;
 			for (const mutation of mutations) {
-				if (mutation.type === 'childList') {
-					if (mutation.target === observedGrid) { schedule(observedScope); return; }
-					const touchesGameCard = node => !!(node && node.nodeType === 1 && (node.matches?.('.game-card') || node.querySelector?.('.game-card')));
-					for (const node of mutation.addedNodes || []) { if (touchesGameCard(node)) { schedule(observedScope); return; } }
-					for (const node of mutation.removedNodes || []) { if (touchesGameCard(node)) { schedule(observedScope); return; } }
-					continue;
-				}
-				if (mutation.type === 'attributes' && mutation.target?.matches?.('.game-card')) {
+				if (mutation.type === 'childList' && mutation.target === observedGrid ||
+					mutation.type === 'attributes' && mutation.target.parentElement === observedGrid && mutation.target.matches?.('.game-card')) {
 					schedule(observedScope);
 					return;
 				}
@@ -60629,7 +60630,7 @@ window.adminMetadataPreviewCoverLoaded = function(image) {
 			observedGrid = nextGrid || null;
 			if (!observedGrid || !observedScope || document.hidden) return;
 
-			observer.observe(observedGrid, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
+			observer.observe(observedGrid, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'hidden', 'style'] });
 			schedule(observedScope);
 		};
 
@@ -123384,7 +123385,8 @@ function getVisibleChatStackEl(id) {
         closeMenu();
         const shell = select.parentElement;
         const menu = document.createElement('div');
-        menu.className = select.id === 'cat-select' ? 'psn-site-select-menu is-category' : 'psn-site-select-menu';
+        const isGenre = select.id === 'browse-metadata-select' || select.classList.contains('psn-collection-genre-select');
+        menu.className = 'psn-site-select-menu' + (select.id === 'cat-select' ? ' is-category' : isGenre ? ' is-genre' : '');
         const viewport = document.createElement('div');
         viewport.className = 'psn-site-select-options psn-scrollbar-polished';
         menu.appendChild(viewport);
@@ -123420,6 +123422,7 @@ function getVisibleChatStackEl(id) {
             node.classList.toggle('is-selected', option.selected);
             const label = document.createElement('span');
             label.textContent = option.textContent.trim();
+            if(isGenre)label.title=label.textContent;
             const check = document.createElement('i');
             check.className = 'fas fa-check';
             check.setAttribute('aria-hidden', 'true');
@@ -123443,7 +123446,7 @@ function getVisibleChatStackEl(id) {
             viewport.classList.toggle('psn-scrollbar-hover', viewport.scrollHeight > viewport.clientHeight + 4 && event.clientX >= bounds.right - 14);
         }, { passive:true });
         viewport.addEventListener('pointerleave', () => viewport.classList.remove('psn-scrollbar-hover'), { passive:true });
-        current = { select, shell, menu, viewport, options, activeIndex:-1, preferredWidth:select.id === 'cat-select' ? 154 : Math.min(350, longest * 6.6 + 54) };
+        current = { select, shell, menu, viewport, options, activeIndex:-1, preferredWidth:select.id === 'cat-select' ? 154 : isGenre ? menu.offsetWidth : Math.min(350, longest * 6.6 + 54) };
         select.setAttribute('aria-expanded', 'true');
         select.setAttribute('aria-controls', menu.id);
         shell.classList.add('is-open');
